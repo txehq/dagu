@@ -7,12 +7,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	gotoken "go/token"
 	"net/http"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/dagucloud/dagu/v2/api/v1"
@@ -180,6 +186,11 @@ type adminRoute struct {
 	// own role check: an owner-scoped or unowned route the manager role
 	// opens.
 	managerPasses bool
+	// dagFirst marks a platform-class decision reached only after the
+	// DAG's owner decision (a run with a protected profile): under enforce
+	// a legacy caller is refused by that decision, as not found, before the
+	// platform rule is asked.
+	dagFirst bool
 }
 
 const (
@@ -196,8 +207,9 @@ func slug(caller string) string {
 }
 
 // adminRoutes are the routes under every function txeAdminOperations
-// classifies, each reached through the real router. The protected profile's
-// run path (ensureRunnableRuntimeProfileAccess) is exercised on its own below.
+// classifies, each reached through the real router; the set of functions
+// they reach is held to the inventory and to the source by
+// TestTxeAdminRoutesReachEveryClassifiedFunction.
 func (h adminHub) adminRoutes() []adminRoute {
 	p := func(handler, method, path string, body func(string) any) adminRoute {
 		return adminRoute{handler: handler, method: method, path: path, body: body, class: classPlatform}
@@ -241,6 +253,10 @@ func (h adminHub) adminRoutes() []adminRoute {
 		p("SetGlobalRuntimeProfileDefaultVariable", http.MethodPut, "/api/v1/profiles/_global/variables/K", func(string) any { return map[string]any{"value": "v"} }),
 		p("SetGlobalRuntimeProfileDefaultSecret", http.MethodPut, "/api/v1/profiles/_global/secrets/S", func(string) any { return map[string]any{"value": "v"} }),
 		p("DeleteGlobalRuntimeProfileDefaultEntry", http.MethodDelete, "/api/v1/profiles/_global/entries/K", none),
+		{handler: "ensureRunnableRuntimeProfileAccess", method: http.MethodPost, path: "/api/v1/dags/ownerless/start", body: func(c string) any {
+			runID, profile := "run-"+slug(c), h.protected
+			return api.ExecuteDAGJSONRequestBody{DagRunId: &runID, Profile: &profile}
+		}, class: classPlatform, dagFirst: true},
 
 		{handler: "ListRuntimeProfiles", method: http.MethodGet, path: "/api/v1/profiles", body: none, class: classUnowned, managerPasses: true},
 		{handler: "CreateRuntimeProfile", method: http.MethodPost, path: "/api/v1/profiles", body: func(c string) any {
@@ -298,6 +314,9 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 	case callerAdminKey, callerProxyAdmin:
 		switch route.class {
 		case classPlatform:
+			if enforce && route.dagFirst {
+				return ownerNotFound
+			}
 			if enforce {
 				return platformAdminRequired
 			}
@@ -314,6 +333,9 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 	case callerManager:
 		switch route.class {
 		case classPlatform:
+			if enforce && route.dagFirst {
+				return ownerNotFound
+			}
 			return insufficient
 		case classHubRecords:
 			if enforce {
@@ -336,6 +358,9 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 		// at the door or by the DAG's owner decision. The platform rule's
 		// own refusal of a caller held to its owner is a person's,
 		// exercised in the package's own tests.
+		if route.dagFirst {
+			return ownerNotFound
+		}
 		if route.class == classOwner && !route.managerPasses {
 			return insufficient
 		}
@@ -391,27 +416,81 @@ func TestTxeAdminRoutesDecideEachCallerThroughTheRouter(t *testing.T) {
 					require.Equal(t, want, got, "%s: %s %s: %s", caller, route.method, route.path, answer)
 				}
 			}
-			// Every classified function is reached here, by name (the
-			// protected profile's run path on its own below).
-			for name := range strings.FieldsSeq(classifiedAdminFunctions) {
-				require.True(t, covered[name] || name == "ensureRunnableRuntimeProfileAccess", "no route sweeps %s", name)
-			}
 		})
 	}
 }
 
-// classifiedAdminFunctions are the keys of txeAdminOperations, as the guard
-// test pins them (TestEveryAdminRoleCallerIsClassified).
-const classifiedAdminFunctions = `
-ActivateLicense ConfigureDAGWebhookProfileSelection CreateAPIKey CreateDAGWebhookProfileToken CreateRemoteNode
-CreateRuntimeProfile CreateUser DeactivateLicense DeleteAPIKey DeleteGlobalRuntimeProfileDefaultEntry DeleteRemoteNode
-DeleteUser GetAPIKey GetGlobalRuntimeProfileDefaults GetRemoteNode GetUser ListAPIKeys ListAuditLogs ListEventLogs
-ListRemoteNodes ListRuntimeProfiles ListUsers ResetUserPassword RevokeDAGWebhookProfileToken
-SetGlobalRuntimeProfileDefaultSecret SetGlobalRuntimeProfileDefaultVariable SyncTestConnection TestRemoteNodeConnection
-UpdateAPIKey UpdateGlobalRuntimeProfileDefaults UpdateRemoteNode UpdateSchedulerPauseState UpdateSyncConfig UpdateUser
-ValidateDAGProfileUpdate ensureRunnableRuntimeProfileAccess getRuntimeProfileForView requireRuntimeProfileManage
-requireRuntimeProfileUpdate requireRuntimeProfileView syncProxyAuthorization
-`
+// adminPolicyFromSource reads, from the package's source, the functions
+// txeAdminOperations classifies and the functions that call requireAdmin or
+// requireManagerOrAbove. The sweep's route registry is held to both, so a
+// new caller, a new classification or a phantom route each fails loudly.
+func adminPolicyFromSource(t *testing.T) (classified, callers []string) {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	require.NoError(t, err)
+	fset := gotoken.NewFileSet()
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
+		require.NoError(t, err)
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.GenDecl:
+				for _, spec := range d.Specs {
+					v, ok := spec.(*ast.ValueSpec)
+					if !ok || len(v.Names) != 1 || v.Names[0].Name != "txeAdminOperations" || len(v.Values) != 1 {
+						continue
+					}
+					lit, ok := v.Values[0].(*ast.CompositeLit)
+					require.True(t, ok, "txeAdminOperations is a map literal")
+					for _, elt := range lit.Elts {
+						kv, ok := elt.(*ast.KeyValueExpr)
+						require.True(t, ok)
+						key, ok := kv.Key.(*ast.BasicLit)
+						require.True(t, ok, "each key is a function name literal")
+						classified = append(classified, strings.Trim(key.Value, `"`))
+					}
+				}
+			case *ast.FuncDecl:
+				if d.Body == nil {
+					continue
+				}
+				calls := false
+				ast.Inspect(d.Body, func(n ast.Node) bool {
+					if sel, ok := n.(*ast.SelectorExpr); ok && (sel.Sel.Name == "requireAdmin" || sel.Sel.Name == "requireManagerOrAbove") {
+						calls = true
+					}
+					return true
+				})
+				if calls {
+					callers = append(callers, d.Name.Name)
+				}
+			}
+		}
+	}
+	slices.Sort(classified)
+	slices.Sort(callers)
+	return classified, callers
+}
+
+// The sweep's routes reach exactly the functions the policy classifies, and
+// those are exactly the functions that ask for the role: one registry, held
+// to the source on both sides.
+func TestTxeAdminRoutesReachEveryClassifiedFunction(t *testing.T) {
+	t.Parallel()
+	classified, callers := adminPolicyFromSource(t)
+	require.NotEmpty(t, classified)
+	assert.Equal(t, callers, classified, "txeAdminOperations names exactly the functions that ask for the administrator or manager role")
+	var reached []string
+	for _, route := range (adminHub{plain: "plain", protected: "protected"}).adminRoutes() {
+		reached = append(reached, route.handler)
+	}
+	slices.Sort(reached)
+	assert.Equal(t, classified, slices.Compact(reached), "the sweep reaches every classified function, and no other")
+}
 
 // A protected runtime profile is the platform's (TXE-6139): under enforce
 // an admin-role API key no longer lists it, reads it, changes it, or runs

@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -40,10 +42,13 @@ func adminCallers(f *identityFixture, t *testing.T) map[string]context.Context {
 		"the platform administrator signed in through the identity provider": txeauth.WithPlatformAdminSession(
 			auth.WithUser(bg, &auth.User{Username: "connor", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderOIDC, OIDCIssuer: identityIssuer, OIDCSubject: adminSubject}),
 			authn.Identity{Issuer: identityIssuer, Subject: adminSubject}),
-		"an admin-role API key":                        auth.WithAPIKey(auth.WithUser(bg, &auth.User{Username: "automation", Role: auth.RoleAdmin}), key),
-		"an administrator a trusted proxy named":       auth.WithUser(bg, &auth.User{Username: "proxied", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderProxy}),
-		"a builtin manager":                            auth.WithUser(bg, &auth.User{Username: "manager", Role: auth.RoleManager, AuthProvider: auth.AuthProviderBuiltin}),
-		"a person the hub gave the administrator role": personCtx("subject-person"),
+		"an admin-role API key":                  auth.WithAPIKey(auth.WithUser(bg, &auth.User{Username: "automation", Role: auth.RoleAdmin}), key),
+		"an administrator a trusted proxy named": auth.WithUser(bg, &auth.User{Username: "proxied", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderProxy}),
+		"a builtin manager":                      auth.WithUser(bg, &auth.User{Username: "manager", Role: auth.RoleManager, AuthProvider: auth.AuthProviderBuiltin}),
+		// An account that says it came from the provider and names no
+		// identity is nobody\'s: a legacy caller (txeauth.Classify).
+		"an administrator account from the provider naming no identity": auth.WithUser(bg, &auth.User{Username: "half", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderOIDC}),
+		"a person the hub gave the administrator role":                  personCtx("subject-person"),
 		"a bound person the hub gave the administrator role": auth.WithUser(bg, &auth.User{
 			Username: "bound", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderOIDC, OIDCIssuer: identityIssuer, OIDCSubject: "subject-bound"}),
 		"an owner's command-line token": txeauth.WithToken(bg, authn.Principal{Identity: bound, Class: authn.ClassCLI, ClientID: "dagu-cli", Expires: time.Now().Add(time.Hour)}),
@@ -68,6 +73,7 @@ func TestRequireAdminDecidesEachCallerInEachMode(t *testing.T) {
 		"an admin-role API key":                                              legacyAdmin,
 		"an administrator a trusted proxy named":                             legacyAdmin,
 		"a builtin manager":                                                  {errInsufficientPermissions, errInsufficientPermissions, errInsufficientPermissions},
+		"an administrator account from the provider naming no identity":      legacyAdmin,
 		"a person the hub gave the administrator role":                       {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
 		"a bound person the hub gave the administrator role":                 {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
 		"an owner's command-line token":                                      {errTxePlatformAdmin, errTxePlatformAdmin, errTxePlatformAdmin},
@@ -124,8 +130,19 @@ func TestRequireAdminObserveLogsWhatEnforceWouldRefuse(t *testing.T) {
 	assert.Contains(t, logged.String(), "permission=administer")
 	assert.Contains(t, logged.String(), "resource_kind=platform")
 	assert.Contains(t, logged.String(), "caller=legacy")
-	assert.Equal(t, 1, strings.Count(logged.String(), "would deny"))
+	assert.Equal(t, 1, strings.Count(logged.String(), "would deny"), "once per decision")
 	assert.NotContains(t, logged.String(), "automation", "the caller is named by class, never by its key")
+
+	// The rule itself logs nothing: a list path asking txeHubHidden per
+	// item does not flood the log, and a helper nesting the predicate adds
+	// no line.
+	logged.Reset()
+	for range 3 {
+		assert.False(t, observe.api.txeHubHidden(keyCtx))
+		_, err := observe.api.txePlatformReserved(keyCtx)
+		require.NoError(t, err)
+	}
+	assert.Empty(t, logged.String(), "the predicate is silent")
 
 	logged.Reset()
 	require.NoError(t, observe.api.requireAdmin(adminCtx))
@@ -163,4 +180,53 @@ func (b *lockedBuffer) Reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buf.Reset()
+}
+
+// The owner store's outage is txeResolve's contract, the same here as for
+// every owner decision (CC3's Q1 for #230): a legacy caller and the builtin
+// administrator read no store, so an outage changes nothing for them in any
+// mode; the platform administrator signed in through the identity provider
+// is resolved through the store, so under enforce the outage is a 503 and
+// under observe it is allowed and logged as an evaluation failure; a caller
+// held to its owner is always under enforce.
+func TestRequireAdminOnAnUnreadableOwnerStore(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs POSIX permissions and a non-root user")
+	}
+	key := &auth.APIKey{ID: "key_01", Name: "automation", Role: auth.RoleAdmin}
+	keyCtx := auth.WithAPIKey(auth.WithUser(context.Background(), &auth.User{Username: "automation", Role: auth.RoleAdmin}), key)
+	builtinAdmin := auth.WithUser(context.Background(), &auth.User{Username: "admin", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderBuiltin})
+	ssoAdmin := txeauth.WithPlatformAdminSession(
+		auth.WithUser(context.Background(), &auth.User{Username: "connor", Role: auth.RoleAdmin, AuthProvider: auth.AuthProviderOIDC, OIDCIssuer: identityIssuer, OIDCSubject: adminSubject}),
+		authn.Identity{Issuer: identityIssuer, Subject: adminSubject})
+	token := txeauth.WithToken(context.Background(), authn.Principal{Identity: authn.Identity{Issuer: identityIssuer, Subject: "subject-x"}, Class: authn.ClassCLI, ClientID: "dagu-cli", Expires: time.Now().Add(time.Hour)})
+
+	for _, tc := range []struct {
+		mode              string
+		key, builtin, sso error
+		token             error
+	}{
+		{config.TXEAuthzModeOff, nil, nil, nil, errTxeAuthzUnavailable},
+		{config.TXEAuthzModeObserve, nil, nil, nil, errTxeAuthzUnavailable},
+		{config.TXEAuthzModeEnforce, errTxePlatformAdmin, nil, errTxeAuthzUnavailable, errTxeAuthzUnavailable},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			f := newIdentityFixture(t, tc.mode)
+			f.api.txePlatformAdmins = []config.TXEPlatformAdmin{{Issuer: identityIssuer, Subject: adminSubject}}
+			// The store's directory is made on its first write; an empty
+			// one that cannot be read is the outage.
+			dir := authz.Dir(f.dataDir)
+			require.NoError(t, os.MkdirAll(dir, 0o750))
+			require.NoError(t, os.Chmod(dir, 0))
+			t.Cleanup(func() { _ = os.Chmod(dir, 0o750) })
+
+			assert.Equal(t, tc.key, f.api.requireAdmin(keyCtx), "an admin-role API key")
+			assert.Equal(t, tc.builtin, f.api.requireAdmin(builtinAdmin), "the builtin administrator")
+			assert.Equal(t, tc.sso, f.api.requireAdmin(ssoAdmin), "the platform administrator from the identity provider")
+			assert.Equal(t, tc.token, f.api.requireAdmin(token), "a command-line token")
+			// txeHubHidden on the same outage: hidden exactly where
+			// requireAdmin refuses.
+			assert.Equal(t, tc.sso != nil, f.api.txeHubHidden(ssoAdmin))
+		})
+	}
 }

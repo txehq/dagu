@@ -148,10 +148,19 @@ mode.
 
 One rule decides what is the platform's, `txePlatformReserved`: a caller held to its owner, or
 under enforce anyone but the platform administrator. `requireAdmin`, `txeHubHidden` and the writes
-to what the whole hub shares apply it, so they cannot disagree on who the administrator is. In
-`off` the role alone decides, as before; in `observe` the role decides and what enforce would
-refuse is logged as a would-deny on the platform with the administer permission, so an automation
-that still uses an admin-role key can be found before the switch.
+to what the whole hub shares apply it, so they cannot disagree on who the administrator is; a guard
+test fails a restatement of it elsewhere unless the function is named with the reason it is a
+different rule. The rule decides and nothing more. In `off` the role alone decides, as before; in
+`observe` the role decides and `requireAdmin` logs, once per decision, what enforce would refuse,
+as a would-deny on the platform with the administer permission, so an automation that still uses an
+admin-role key can be found before the switch. An owner store that cannot be read is an error
+only where the mode decides (enforce, and always for a caller held to its owner); a legacy caller
+and the builtin administrator read no store, so an outage changes nothing for them.
+
+The unowned class is the rule as it stood: under enforce a legacy manager still creates and changes
+runtime profiles that are not protected, whose values reach runs on DAGs of no owner and on owners'
+DAGs the platform administrator attached them to. Whether those writes should also be the platform
+administrator's alone is a separate decision; this change neither widens nor narrows it.
 
 ## Who edits what
 

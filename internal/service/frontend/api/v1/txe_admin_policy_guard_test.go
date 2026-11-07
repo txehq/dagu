@@ -103,12 +103,12 @@ func txeAdminGuardFindings(files []*ast.File, inventory map[string]txeAdminOpera
 	return findings
 }
 
-func parsePackageSources(t *testing.T) []*ast.File {
+func parsePackageSourcesByName(t *testing.T) map[string]*ast.File {
 	t.Helper()
 	entries, err := os.ReadDir(".")
 	require.NoError(t, err)
 	fset := gotoken.NewFileSet()
-	var files []*ast.File
+	files := map[string]*ast.File{}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -116,9 +116,14 @@ func parsePackageSources(t *testing.T) []*ast.File {
 		}
 		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
 		require.NoError(t, err)
-		files = append(files, file)
+		files[name] = file
 	}
 	return files
+}
+
+func parsePackageSources(t *testing.T) []*ast.File {
+	t.Helper()
+	return slices.Collect(maps.Values(parsePackageSourcesByName(t)))
 }
 
 // Every function that asks for the hub's administrator or manager role is
@@ -128,31 +133,106 @@ func TestEveryAdminRoleCallerIsClassified(t *testing.T) {
 	t.Parallel()
 	findings := txeAdminGuardFindings(parsePackageSources(t), txeAdminOperations)
 	assert.Empty(t, findings, strings.Join(findings, "\n"))
-	// The inventory is the whole of it: the counts the policy was reviewed
-	// with, so a silent growth of either side is seen here.
-	byClass := map[txeAdminClass]int{}
-	for _, op := range txeAdminOperations {
-		byClass[op.class]++
-	}
-	assert.Equal(t, map[txeAdminClass]int{
-		txeAdminPlatform: 30, txeAdminUnowned: 5, txeAdminOwnerScoped: 4, txeAdminHubRecords: 2,
-	}, byClass)
-	// The router sweep (txe_admin_routes_router_test.go) reaches every one
-	// of these by name; the two lists are kept the same by hand.
-	assert.Equal(t, strings.Fields(classifiedAdminFunctions), slices.Sorted(maps.Keys(txeAdminOperations)))
+	// The router sweep (txe_admin_routes_router_test.go) reads the same
+	// inventory and callers from the source and reaches each by route.
 }
 
-// classifiedAdminFunctions are the keys of txeAdminOperations, sorted.
-const classifiedAdminFunctions = `
-ActivateLicense ConfigureDAGWebhookProfileSelection CreateAPIKey CreateDAGWebhookProfileToken CreateRemoteNode
-CreateRuntimeProfile CreateUser DeactivateLicense DeleteAPIKey DeleteGlobalRuntimeProfileDefaultEntry DeleteRemoteNode
-DeleteUser GetAPIKey GetGlobalRuntimeProfileDefaults GetRemoteNode GetUser ListAPIKeys ListAuditLogs ListEventLogs
-ListRemoteNodes ListRuntimeProfiles ListUsers ResetUserPassword RevokeDAGWebhookProfileToken
-SetGlobalRuntimeProfileDefaultSecret SetGlobalRuntimeProfileDefaultVariable SyncTestConnection TestRemoteNodeConnection
-UpdateAPIKey UpdateGlobalRuntimeProfileDefaults UpdateRemoteNode UpdateSchedulerPauseState UpdateSyncConfig UpdateUser
-ValidateDAGProfileUpdate ensureRunnableRuntimeProfileAccess getRuntimeProfileForView requireRuntimeProfileManage
-requireRuntimeProfileUpdate requireRuntimeProfileView syncProxyAuthorization
-`
+// txePlatformRuleCopies are the functions outside txe_admin_policy.go that
+// compare the mode with enforce and the scope with the platform
+// administrator in one body: each is a different rule, not a copy of the
+// platform rule, with its reason. A new function doing both without an
+// entry here fails the guard (TXE-6139, proposed by CC3 for #230).
+var txePlatformRuleCopies = map[string]string{
+	"txeAuthorizeJobFor":   "a write only the job's machine makes: the administrator is held to the machine under enforce, which is a machine need, not the platform rule",
+	"txeWholeHubListScope": "list filtering, not a refusal: a caller held to its owner gets an owner-filtered list, and only a non-platform caller under enforce an empty one",
+	"txeNativeWriteName":   "a native write of a DAG of no owner: observe lets a legacy caller through, and the administrator is decided per DAG",
+	"txeNativeCheck":       "a native read of a DAG of no owner: observe lets a legacy caller through, and the administrator is decided per DAG",
+}
+
+// txePlatformRuleCopyFindings holds the source to txePlatformRuleCopies.
+func txePlatformRuleCopyFindings(files map[string]*ast.File, allowed map[string]string) []string {
+	seen := map[string]bool{}
+	for name, file := range files {
+		if name == "txe_admin_policy.go" {
+			continue
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			enforce, platformAdmin := false, false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok {
+					switch sel.Sel.Name {
+					case "ModeEnforce":
+						enforce = true
+					case "ScopePlatformAdmin":
+						platformAdmin = true
+					}
+				}
+				return true
+			})
+			if enforce && platformAdmin {
+				seen[fn.Name.Name] = true
+			}
+		}
+	}
+	var findings []string
+	for name := range seen {
+		if reason, ok := allowed[name]; !ok || strings.TrimSpace(reason) == "" {
+			findings = append(findings, fmt.Sprintf("%s compares the mode with enforce and the scope with the platform administrator outside txe_admin_policy.go: a copy of the platform rule, or a different rule missing its reason in txePlatformRuleCopies", name))
+		}
+	}
+	for name := range allowed {
+		if !seen[name] {
+			findings = append(findings, fmt.Sprintf("txePlatformRuleCopies names %s, which no longer does: a stale entry", name))
+		}
+	}
+	sort.Strings(findings)
+	return findings
+}
+
+// No function outside txe_admin_policy.go restates the platform rule: the
+// ones that compare mode and scope the same way are different rules, each
+// named with its reason. It reads the two selectors, not the expression's
+// text, so a restatement in another shape is caught too; a rule written
+// without either name is not, and the classification guard above is what
+// holds every role-guarded route to the policy.
+func TestNoCopyOfThePlatformRuleOutsideThePolicy(t *testing.T) {
+	t.Parallel()
+	findings := txePlatformRuleCopyFindings(parsePackageSourcesByName(t), txePlatformRuleCopies)
+	assert.Empty(t, findings, strings.Join(findings, "\n"))
+}
+
+func TestPlatformRuleCopyGuardCatchesEachDrift(t *testing.T) {
+	t.Parallel()
+	copyOf := `func (a *API) other(c txeCall) bool { return c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin }`
+	cases := []struct {
+		name, file, source string
+		allowed            map[string]string
+		want               string
+	}{
+		{"a copy in another file", "other.go", copyOf, map[string]string{}, "other compares the mode with enforce"},
+		{"a copy with no reason", "other.go", copyOf, map[string]string{"other": " "}, "other compares the mode with enforce"},
+		{"a stale entry", "other.go", `func (a *API) other() bool { return true }`, map[string]string{"gone": "was a rule"}, "names gone, which no longer does"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			file, err := parser.ParseFile(gotoken.NewFileSet(), tc.file, "package api\n"+tc.source, parser.SkipObjectResolution)
+			require.NoError(t, err)
+			findings := txePlatformRuleCopyFindings(map[string]*ast.File{tc.file: file}, tc.allowed)
+			require.Len(t, findings, 1, strings.Join(findings, "\n"))
+			assert.Contains(t, findings[0], tc.want)
+		})
+	}
+	// The policy file itself, and a reasoned different rule, are clean.
+	policy, err := parser.ParseFile(gotoken.NewFileSet(), "txe_admin_policy.go", "package api\n"+copyOf, parser.SkipObjectResolution)
+	require.NoError(t, err)
+	reasoned, err := parser.ParseFile(gotoken.NewFileSet(), "other.go", "package api\n"+copyOf, parser.SkipObjectResolution)
+	require.NoError(t, err)
+	assert.Empty(t, txePlatformRuleCopyFindings(map[string]*ast.File{"txe_admin_policy.go": policy, "other.go": reasoned}, map[string]string{"other": "a different rule"}))
+}
 
 func parseSnippet(t *testing.T, body string) []*ast.File {
 	t.Helper()

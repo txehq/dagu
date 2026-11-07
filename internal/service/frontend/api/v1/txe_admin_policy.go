@@ -30,7 +30,7 @@ import (
 //     administrator passes, with errTxePlatformAdmin for anyone else; a
 //     caller held to its owner never passes, in any mode; in off and
 //     observe the role alone decides, and observe logs what enforce would
-//     refuse.
+//     refuse, once per decision (txeRequirePlatform).
 //   - txeAdminHubRecords: a read of the whole hub's records that is not
 //     decided DAG by DAG, audit and event logs. The manager role as before,
 //     then txeHubHidden (TXE-4752), which is the same platform rule with
@@ -147,41 +147,66 @@ var errTxePlatformAdmin = &Error{
 
 // txePlatformReserved is the platform rule: whether what is the platform's
 // is held from the request's caller. It is a caller held to its owner, in
-// every mode, or under enforce anyone but the platform administrator. In
-// observe it reports false and logs what enforce would refuse. An error is
-// an owner store that could not be read where the mode decides; the caller
-// refuses. Every decision on the platform's own resources goes through it,
-// so they cannot drift: requireAdmin, txeHubHidden, and the writes to what
-// the whole hub shares.
+// every mode, or under enforce anyone but the platform administrator. It
+// decides and nothing more; the caller refuses, hides or logs. Every
+// decision on the platform's own resources goes through it, so they cannot
+// drift: requireAdmin (txeRequirePlatform), txeHubHidden, and the writes to
+// what the whole hub shares.
+//
+// The error is txeResolve's contract, the same for every owner decision: a
+// legacy caller and the builtin administrator read no store, so nothing can
+// fail for them; a platform administrator signed in through the identity
+// provider, and a caller held to its owner, are resolved through the owner
+// store, and a store that cannot be read is an error where the mode decides
+// (enforce, and always for a caller held to its owner), which the caller
+// turns into a refusal; in observe it is noted on the call (failed), logged
+// by txeResolve as an evaluation failure, and the rule reports not reserved,
+// as every observe decision on an unreadable store is allowed; off resolves
+// nothing.
 func (a *API) txePlatformReserved(ctx context.Context) (bool, error) {
+	_, reserved, err := a.txePlatformDecision(ctx)
+	return reserved, err
+}
+
+// txePlatformDecision resolves the caller once and decides the platform
+// rule on it.
+func (a *API) txePlatformDecision(ctx context.Context) (txeCall, bool, error) {
 	if a.txeAuth == nil {
-		return false, nil
+		return txeCall{mode: authz.ModeOff}, false, nil
 	}
 	c, err := a.txeResolve(ctx)
 	if err != nil {
-		return true, err
+		return c, true, err
 	}
 	if c.ownerOnly() {
-		return true, nil
+		return c, true, nil
 	}
-	if c.mode == authz.ModeOff || c.failed || c.scope.Kind() == authz.ScopePlatformAdmin {
-		return false, nil
-	}
-	a.txeLogDecision(ctx, c, authz.PermissionAdminister, authz.Platform(), authz.Decision{
-		Allowed: c.mode == authz.ModeObserve, Mode: c.mode, Evaluated: true,
-		WouldDeny: c.mode == authz.ModeObserve, Reason: authz.ReasonNotOwner})
-	return c.mode == authz.ModeEnforce, nil
+	return c, c.mode == authz.ModeEnforce && !c.failed && c.scope.Kind() != authz.ScopePlatformAdmin, nil
 }
 
 // txeRequirePlatform applies the platform rule to a route of the
-// txeAdminPlatform class, after the hub's own role check.
+// txeAdminPlatform class, after the hub's own role check. It is the one
+// place the rule logs, once per decision: in observe, what enforce would
+// refuse, as a would-deny on the platform with the administer permission,
+// so an automation that still uses an admin-role key is found before the
+// switch; in enforce, the refusal. The platform administrator, a caller
+// held to its owner (refused in every mode by contract, not as a would-be)
+// and off log nothing here.
 func (a *API) txeRequirePlatform(ctx context.Context) error {
-	reserved, err := a.txePlatformReserved(ctx)
+	c, reserved, err := a.txePlatformDecision(ctx)
 	if err != nil {
 		return err
 	}
+	if reserved && !c.ownerOnly() {
+		a.txeLogDecision(ctx, c, authz.PermissionAdminister, authz.Platform(), authz.Decision{
+			Mode: c.mode, Evaluated: true, Reason: authz.ReasonNotOwner})
+	}
 	if reserved {
 		return errTxePlatformAdmin
+	}
+	if c.mode == authz.ModeObserve && !c.failed && c.scope.Kind() != authz.ScopePlatformAdmin {
+		a.txeLogDecision(ctx, c, authz.PermissionAdminister, authz.Platform(), authz.Decision{
+			Allowed: true, Mode: c.mode, Evaluated: true, WouldDeny: true, Reason: authz.ReasonNotOwner})
 	}
 	return nil
 }
