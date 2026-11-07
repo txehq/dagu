@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,20 +25,38 @@ import (
 // hubFilesContaining returns every file in the coordinator's own storage that
 // contains needle. The worker in these tests is isolated, so its directories
 // are not searched: only what reached the hub is. A file that cannot be read
-// fails the test, because an unread file proves nothing about its content. A
-// file the coordinator removes while the scan runs, as it does a lease, is no
-// longer in storage and is passed over.
+// fails the test, because an unread file proves nothing about its content.
 func hubFilesContaining(t *testing.T, f *testFixture, needle string) []string {
 	t.Helper()
 	paths := f.coord.Config.Paths
+	found, err := storageFilesContaining([]string{paths.DataDir, paths.LogDir, paths.ArtifactDir, paths.DAGsDir}, needle)
+	require.NoError(t, err, "scan hub storage")
+	return found
+}
+
+// storageFilesContaining walks the storage roots and returns every regular
+// file holding needle. Two kinds of entry are passed over and nothing else:
+// a file the store removes while the scan runs, as it does a lease, which is
+// no longer in storage; and the store's own coordination lock metadata
+// (persisfile.IsLockMetadataPath), which holds no stored data and which the
+// live process may hold open or be renaming, so that on Windows it cannot
+// be read. Any other entry that cannot be listed or read is an error, since
+// an unread file proves nothing about its content.
+func storageFilesContaining(roots []string, needle string) ([]string, error) {
 	var found []string
-	for _, root := range []string{paths.DataDir, paths.LogDir, paths.ArtifactDir, paths.DAGsDir} {
+	for _, root := range roots {
 		err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
 			}
+			if persisfile.IsLockMetadataPath(p) {
+				if err == nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			if err != nil {
-				return err
+				return fmt.Errorf("list %s: %w", p, err)
 			}
 			if !d.Type().IsRegular() {
 				return nil
@@ -47,16 +66,18 @@ func hubFilesContaining(t *testing.T, f *testFixture, needle string) []string {
 				return nil
 			}
 			if err != nil {
-				return err
+				return fmt.Errorf("read %s: %w", p, err)
 			}
 			if bytes.Contains(data, []byte(needle)) {
 				found = append(found, p)
 			}
 			return nil
 		})
-		require.NoError(t, err, "scan hub storage under %s", root)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("scan storage under %s: %w", root, err)
+		}
 	}
-	return found
+	return found, nil
 }
 
 // hubLog returns the hub's copy of one log of the run: a step's "stdout" or

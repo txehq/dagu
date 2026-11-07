@@ -9,7 +9,6 @@ import (
 
 	"github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/remotenode"
-	"github.com/dagucloud/dagu/v2/internal/txe/authz"
 )
 
 // errRemoteNodeRefused answers a remote-node request the local decision did
@@ -29,14 +28,10 @@ var errRemoteNodeRefused = &Error{
 // the context marked as allowed (remotenode.WithUseAuthorized), without which
 // RemoteNode.ApplyAuth sends no credential.
 func (a *API) authorizeRemoteNode(ctx context.Context) (context.Context, error) {
-	if a.txeAuth != nil {
-		c, err := a.txeResolve(ctx)
-		if err != nil {
-			return ctx, errRemoteNodeRefused
-		}
-		if c.ownerOnly() || (c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin) {
-			return ctx, errRemoteNodeRefused
-		}
+	// The platform rule decides even where the hub's roles do not apply
+	// (rolesApply), which requireAdmin leaves to nobody.
+	if reserved, err := a.txePlatformReserved(ctx); err != nil || reserved {
+		return ctx, errRemoteNodeRefused
 	}
 	if err := a.requireAdmin(ctx); err != nil {
 		return ctx, errRemoteNodeRefused

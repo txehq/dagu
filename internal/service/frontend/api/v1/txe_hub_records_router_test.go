@@ -255,11 +255,15 @@ func TestTxeHostExecutionNeedsThePlatformAdministratorUnderEnforce(t *testing.T)
 		Command: &api.NotificationCommandTarget{Command: "id"},
 	}
 
+	// The channel's administrator check carries the platform rule
+	// (requireAdmin, TXE-6139), which refuses the key before the host
+	// execution check is asked; the decision is the same.
 	resp := h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(key).Send(t)
 	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
-	require.Contains(t, resp.Body, "host_execution_not_permitted")
+	require.Contains(t, resp.Body, "platform_admin_required")
 
 	resp = h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(h.admin).Send(t)
+	require.NotContains(t, resp.Body, "platform_admin_required", "the platform administrator is decided by the hub's own checks")
 	require.NotContains(t, resp.Body, "host_execution_not_permitted", "the platform administrator is decided by the hub's own checks")
 
 	// The terminal takes its token from the query only.
@@ -282,36 +286,40 @@ func TestTxeCloudReportIsThePlatformAdministratorsUnderEnforce(t *testing.T) {
 	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
 	key := createAPIKeyForRole(t, h.server, h.admin, "legacy-admin-report", api.UserRoleAdmin)
 
+	// Each route's administrator check carries the platform rule
+	// (requireAdmin, TXE-6139), which refuses the key before the hub
+	// records check is asked; the decision is the same.
 	status, body := h.send(t, "/api/v1/license/monitoring", key)
 	require.Equal(t, http.StatusForbidden, status, body)
-	require.Contains(t, body, "hub_records_not_permitted")
+	require.Contains(t, body, "platform_admin_required")
 	resp := h.server.Client().Put("/api/v1/license/monitoring", api.UpdateLicenseMonitoringJSONRequestBody{Level: "runs"}).
 		WithBearerToken(key).Send(t)
 	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
-	require.Contains(t, resp.Body, "hub_records_not_permitted")
+	require.Contains(t, resp.Body, "platform_admin_required")
 
 	status, body = h.send(t, "/api/v1/license/monitoring", h.admin)
 	require.NotContains(t, body, "hub_records_not_permitted", "the platform administrator is decided by the hub's own checks (%d)", status)
+	require.NotContains(t, body, "platform_admin_required", "the platform administrator is decided by the hub's own checks (%d)", status)
 	// The connect route's report and remote access choices, and the remote
 	// access route, are the same decision: refused before anything starts.
 	report := api.LicenseMonitoringLevel("errors")
 	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{Report: &report}).
 		WithBearerToken(key).Send(t)
 	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
-	require.Contains(t, resp.Body, "hub_records_not_permitted")
+	require.Contains(t, resp.Body, "platform_admin_required")
 	status, body = h.send(t, "/api/v1/license/remote-access", key)
 	require.Equal(t, http.StatusForbidden, status, body)
-	require.Contains(t, body, "hub_records_not_permitted")
+	require.Contains(t, body, "platform_admin_required")
 	// Opening the link at all sends whatever level is in effect, one chosen
 	// earlier included: an empty connect request is refused too.
 	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{}).
 		WithBearerToken(key).Send(t)
 	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
-	require.Contains(t, resp.Body, "hub_records_not_permitted")
+	require.Contains(t, resp.Body, "platform_admin_required")
 	status, body = h.send(t, "/api/v1/license/connect", key)
 	require.Equal(t, http.StatusForbidden, status, body)
 	// The deprecation inventory reads every workspace's settings.
 	status, body = h.send(t, "/api/v1/workspaces/deprecation", key)
 	require.Equal(t, http.StatusForbidden, status, body)
-	require.Contains(t, body, "hub_records_not_permitted")
+	require.Contains(t, body, "platform_admin_required")
 }

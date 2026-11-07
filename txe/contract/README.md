@@ -180,6 +180,47 @@ Constraints the coordinator set for the freeze:
 Lifecycle values are `active`, `paused`, `needs-human`, `completed` and `retired`. They are separate
 from run status, and from machine availability (`ready`, `offline`, `auth-required`).
 
+## Hub administration under owner enforcement (TXE-6139)
+
+Under `txe.authz.mode: enforce` only the platform administrator is the hub's administrator: the
+builtin administrator account, or the person `txe.authz.platform_admins` names. An admin-role API
+key, a user a trusted proxy names and every other credential the hub accepted before owners
+existed are legacy callers; a person or token from the identity provider is held to its owner. The
+hub's roles say nothing about owners, so every route that asks for the administrator or manager
+role is classified by what it reaches, in
+`internal/service/frontend/api/v1/txe_admin_policy.go` (`txeAdminOperations`), with what it means
+to owners. A test fails a new caller of `requireAdmin` or `requireManagerOrAbove` that is not
+classified there, and a router sweep answers every classified route as each kind of caller in each
+mode.
+
+| Class | What it reaches | Under enforce |
+|---|---|---|
+| platform | the installation, or every owner at once: accounts, API keys, remote nodes, the license, Git sync, the scheduler, inherited runtime profile defaults, protected runtime profiles, and every write to a runtime profile | the platform administrator alone (`platform_admin_required`); a caller held to its owner never, in any mode |
+| hub records | audit and event logs | hidden from everyone but the platform administrator (`hub_records_not_permitted`, TXE-4752) |
+| owner scoped | one DAG's webhook profile tokens and settings | the DAG's owner decision, made before or around the role |
+| unowned | reads of runtime profiles that are not protected | the manager role, as before |
+
+One rule decides what is the platform's, `txePlatformReserved`: a caller held to its owner, or
+under enforce anyone but the platform administrator. `requireAdmin`, `txeHubHidden` and the writes
+to what the whole hub shares apply it, so they cannot disagree on who the administrator is; a guard
+test fails a restatement of it elsewhere unless the function is named with the reason it is a
+different rule. The rule decides and nothing more. In `off` the role alone decides, as before; in
+`observe` the role decides and `requireAdmin` logs, once per decision, what enforce would refuse,
+as a would-deny on the platform with the administer permission, so an automation that still uses an
+admin-role key can be found before the switch. An owner store that cannot be read is an error
+only where the mode decides (enforce, and always for a caller held to its owner); a legacy caller
+and the builtin administrator read no store, so an outage changes nothing for them.
+
+A runtime profile's values reach every run that names it, on DAGs of no owner and on owners' DAGs
+the platform administrator attached it to, so its writes are the platform's whether or not it is
+protected (Connor, 2026-11-07). One function decides every write (`requireRuntimeProfileWrite`):
+creating, describing, protecting or removing a profile and setting or removing its variables and
+secrets. A protected profile's write is the administrator role's, as before. Any other profile's
+write is the manager role, as before, and then the platform rule: in `off` and `observe` the manager
+role still writes; under enforce the platform administrator alone does, with
+`platform_admin_required`. Listing and reading profiles that are not protected stay the manager
+role's in every mode, and a caller held to its owner names no profile anywhere (TXE-4704).
+
 ## Who edits what
 
 One editor per path. A change outside your rows goes through that row's owner.

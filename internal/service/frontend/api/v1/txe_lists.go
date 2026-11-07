@@ -204,11 +204,11 @@ func (a *API) txePlatformResourceWrite(ctx context.Context) error {
 	if a.txeAuth == nil {
 		return nil
 	}
-	c, err := a.txeResolve(ctx)
+	reserved, err := a.txePlatformReserved(ctx)
 	if err != nil {
 		return err
 	}
-	if c.ownerOnly() || (c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin) {
+	if reserved {
 		return errTxePlatformResource
 	}
 	return nil
@@ -219,14 +219,9 @@ func (a *API) txePlatformResourceWrite(ctx context.Context) error {
 // artifact list, event and audit logs, and workers. A caller held to its
 // owner reads only through its owner, and in enforce every caller but the
 // platform administrator reads no DAG, so these show them nothing of any
-// owner's. A failure to decide hides them.
+// owner's. It is the platform rule (txePlatformReserved, TXE-6139); a
+// failure to decide hides them.
 func (a *API) txeHubHidden(ctx context.Context) bool {
-	if a.txeAuth == nil {
-		return false
-	}
-	c, err := a.txeResolve(ctx)
-	if err != nil {
-		return true
-	}
-	return c.ownerOnly() || (c.mode == authz.ModeEnforce && c.scope.Kind() != authz.ScopePlatformAdmin)
+	reserved, err := a.txePlatformReserved(ctx)
+	return err != nil || reserved
 }

@@ -43,7 +43,7 @@ var errTxeHostExecution = &Error{
 // its owner never does. An admin-role API key, or any other administrator the
 // owner model does not take for the platform administrator, is refused.
 func (a *API) txeHostExecution(ctx context.Context) error {
-	if err := a.txePlatformResourceWrite(ctx); err != nil {
+	if reserved, err := a.txePlatformReserved(ctx); err != nil || reserved {
 		return errTxeHostExecution
 	}
 	return nil
