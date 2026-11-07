@@ -63,6 +63,19 @@ export function outputsFromRunId(
 export const INPUT_LABEL_KEY = 'dagu.input';
 const INPUT_LABEL_PREFIX = `${INPUT_LABEL_KEY}=`;
 
+/**
+ * The label of a run that reused a stale step whose own `dagu.input` label
+ * could not be written, its name or run id too long for a label value. The
+ * run cannot say which reused step was stale, so every step it reused counts
+ * as stale: a lost marker never makes the run's outputs look fresh.
+ */
+export const STALE_UNRECORDED_LABEL = 'dagu.input-stale=unrecorded';
+
+/** True when the run reused a stale step it could not name. */
+function staleUnrecorded(labels: readonly string[] | undefined): boolean {
+  return labels?.includes(STALE_UNRECORDED_LABEL) ?? false;
+}
+
 // The server keeps a label value of at most 255 characters, made of
 // a-z, 0-9, '-', '_', '.' and '/', and it writes the value in lower case.
 const MAX_VALUE_LENGTH = 255;
@@ -258,7 +271,8 @@ export function fromDetails(
       step: item.step,
       source: item.via === ReusedInputVia.cache ? 'cache' : 'run',
       runId: item.runId,
-      stale: stale.get(item.step)?.stale ?? false,
+      stale:
+        (stale.get(item.step)?.stale ?? false) || staleUnrecorded(run.labels),
       capturedAt: isoMs(item.capturedAt),
       startedAt: isoMs(item.startedAt),
       finishedAt: isoMs(item.finishedAt),
@@ -302,6 +316,10 @@ export function runInputProvenance(
     if (!record || !isReusedNode(node)) continue;
     if (record.startedAt == null) record.startedAt = nodeTime(node.startedAt);
     if (record.finishedAt == null) record.finishedAt = finishedAtMs(node);
+  }
+  // A run that could not name its stale step has every reused step stale.
+  if (staleUnrecorded(run.labels)) {
+    for (const record of found.values()) record.stale = true;
   }
   // A label can name a step that the run executed anyway (a run that the
   // user retried): only a step that did not run is a reused one.

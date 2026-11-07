@@ -4,6 +4,7 @@
 import {
   inputLabel,
   OUTPUTS_FROM_PREFIX,
+  STALE_UNRECORDED_LABEL,
   type InputProvenance,
 } from './inputProvenance';
 
@@ -82,8 +83,17 @@ function runLabels(step?: StepRunOptions): string[] {
     ...(from && LABEL_VALUE_START.test(from)
       ? [`${OUTPUTS_FROM_PREFIX}${from}`]
       : []),
-    ...(step?.reused ?? [])
-      .filter((reused) => reused.stale)
-      .flatMap((reused) => inputLabel(reused) ?? []),
+    ...staleLabels(step?.reused ?? []),
   ];
+}
+
+// The labels that mark the stale reused steps. One that no label can hold
+// (a name or run id too long for a label value) still marks the run: a
+// stale input is never dropped silently.
+function staleLabels(reused: readonly InputProvenance[]): string[] {
+  const stale = reused.filter((r) => r.stale);
+  const labels = stale.flatMap((r) => inputLabel(r) ?? []);
+  return labels.length < stale.length
+    ? [...labels, STALE_UNRECORDED_LABEL]
+    : labels;
 }

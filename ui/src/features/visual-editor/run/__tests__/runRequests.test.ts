@@ -8,6 +8,7 @@ import {
   EDITOR_RUN_LABEL,
   outputsFromRunId,
 } from '../runRequests';
+import { STALE_UNRECORDED_LABEL } from '../inputProvenance';
 
 describe('runRequests', () => {
   it('uses the editor source label', () => {
@@ -196,20 +197,41 @@ describe('the labels of the reused inputs', () => {
     ]);
   });
 
-  // A name that the label cannot hold is left out, not cut.
-  it('leaves out the label of a step with a name that is too long', () => {
+  // A name that the label cannot hold is left out, not cut, and the run is
+  // still marked as having reused a stale step it could not name, so the
+  // marker is never lost.
+  it('marks the run when a stale step has a name too long for its label', () => {
+    for (const step of ['é'.repeat(60), 'A'.repeat(100)]) {
+      const labels = buildStartBody({
+        steps: ['b'],
+        reused: [
+          {
+            step,
+            source: 'run',
+            runId: 'r1',
+            stale: true,
+            capturedAt: 1000,
+          },
+          {
+            step: 'fresh',
+            source: 'run',
+            runId: 'r1',
+            stale: false,
+            capturedAt: 1000,
+          },
+        ],
+      }).labels;
+      expect(labels).toEqual([EDITOR_RUN_LABEL, STALE_UNRECORDED_LABEL]);
+    }
+  });
+
+  it('adds no mark when every stale step is named', () => {
     const labels = buildStartBody({
       steps: ['b'],
       reused: [
-        {
-          step: 'é'.repeat(60),
-          source: 'run',
-          runId: 'r1',
-          stale: true,
-          capturedAt: 1000,
-        },
+        { step: 'a', source: 'run', runId: 'r1', stale: true, capturedAt: 0 },
       ],
     }).labels;
-    expect(labels).toEqual([EDITOR_RUN_LABEL]);
+    expect(labels).not.toContain(STALE_UNRECORDED_LABEL);
   });
 });

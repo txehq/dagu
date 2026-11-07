@@ -23,7 +23,7 @@ import {
   stepNeeds,
   type ReuseRun,
 } from '../reuseSource';
-import { inputLabel } from '../inputProvenance';
+import { inputLabel, STALE_UNRECORDED_LABEL } from '../inputProvenance';
 import type { CacheEntry } from '../outputCache';
 import type { RunSpecDiff } from '../runSpecDiff';
 
@@ -281,6 +281,16 @@ describe('a source run that reused a step', () => {
     ['with no provenance at all, as a plain skip', {}, ['a']],
   ])('a reused step %s', (_, p, want) => {
     expect(staleReusedInputs(sourceRun(p))).toEqual(want);
+  });
+
+  // A run that reused a stale step it could not name (its label too long)
+  // has every reused step stale, though the server's record names them.
+  it('takes every reused step for stale when a stale one went unrecorded', () => {
+    expect(
+      staleReusedInputs(
+        sourceRun({ reusedInputs: record, labels: [STALE_UNRECORDED_LABEL] })
+      )
+    ).toEqual(['a']);
   });
 
   it('names no step that ran, whatever its labels say', () => {
