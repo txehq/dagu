@@ -34,6 +34,11 @@ var (
 		isBool: true,
 		usage:  "Show the browser window",
 	}
+	sessionRevealCDPURLFlag = commandLineFlag{
+		name:   "reveal-cdp-url",
+		isBool: true,
+		usage:  "Print the browser's whole DevTools address in cdp_url, its token included: a credential that controls the browser",
+	}
 	sessionViewportFlag = commandLineFlag{
 		name:  "viewport",
 		usage: "Size of the page area, as WIDTHxHEIGHT, such as 1280x800",
@@ -247,6 +252,12 @@ session's commands. The result carries the session ID the other commands
 take, the page, its outline, and the browser's DevTools address, where an
 application can show the page and let a person act on it.
 
+The address's token is a credential: whoever has it controls the browser,
+its cookies and its signed-in pages. cdp_url therefore shows it redacted,
+http://127.0.0.1:<port>/<token>, unless --reveal-cdp-url asks for the whole
+address. Ask for it only where the output is read by the application that
+connects, never where a job's log or an artifact keeps it.
+
 Give the model the session's acts, extracts, and judged conditions ask with
 --llm or with --provider and --model. Without one, the session runs only
 operations that need no model, such as goto and fixed expects. The model's
@@ -274,6 +285,7 @@ Examples:
 		sessionProfileFlag, sessionHeadedFlag, sessionViewportFlag, sessionExecutableFlag, sessionProxyFlag,
 		sessionAllowedDomainFlag, sessionIdleTimeoutFlag, sessionLLMFlag, sessionProviderFlag, sessionModelFlag,
 		sessionBaseURLFlag, sessionAPIKeyNameFlag, sessionOutlineFlag, sessionWriteGateFlag, sessionWritePolicyFlag,
+		sessionRevealCDPURLFlag,
 	}, runBrowserSessionOpen)
 }
 
@@ -328,6 +340,7 @@ func sessionOpenOptions(ctx *Context, args []string) (browser.SessionOptions, er
 	}
 	headed, _ := flags.GetBool(sessionHeadedFlag.name)
 	opts.Headless = !headed
+	opts.RevealCDPURL, _ = flags.GetBool(sessionRevealCDPURLFlag.name)
 	opts.Profile, _ = flags.GetString(sessionProfileFlag.name)
 	opts.Executable, _ = flags.GetString(sessionExecutableFlag.name)
 	opts.Proxy, _ = flags.GetString(sessionProxyFlag.name)

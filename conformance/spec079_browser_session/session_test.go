@@ -601,6 +601,49 @@ func TestSessionWithoutModel(t *testing.T) {
 	assert.Zero(t, s.model.count(kindAct)+s.model.count(kindExtract))
 }
 
+// The browser's DevTools address carries the token that reaches it, so a
+// session's results name it redacted unless the caller asks for the whole
+// address: open's cdp_url, and every session list, never hand the
+// credential to a log or an artifact that keeps a command's output. Only
+// the whole address reaches the browser, and the redacted one reaches
+// nothing.
+func TestSessionAddressIsACredential(t *testing.T) {
+	t.Parallel()
+
+	s := newSessionEnv(t)
+	probe := func(address string) int {
+		response, err := http.Get(address + "/json/version") //nolint:noctx // a probe of a local browser
+		if err != nil {
+			return 0
+		}
+		_ = response.Body.Close()
+		return response.StatusCode
+	}
+
+	opened := s.session("", "open", s.portal+"/login")
+	opened.ExpectExitCode(0)
+	plain := printed(t, opened)
+	id, _ := plain["id"].(string)
+	t.Cleanup(func() { s.session("", "close", id, "--force") })
+	redacted, _ := plain["cdp_url"].(string)
+	assert.Regexp(t, `^http://127\.0\.0\.1:\d+/<token>$`, redacted)
+	assert.Equal(t, http.StatusNotFound, probe(redacted), "the redacted address reaches nothing")
+
+	listed := s.session("", "list")
+	listed.ExpectExitCode(0)
+	assert.Contains(t, listed.Stdout(), "/<token>", "a list names the browser redacted")
+
+	revealed := s.session("", "open", s.portal+"/login", "--reveal-cdp-url")
+	revealed.ExpectExitCode(0)
+	whole := printed(t, revealed)
+	other, _ := whole["id"].(string)
+	t.Cleanup(func() { s.session("", "close", other, "--force") })
+	address, _ := whole["cdp_url"].(string)
+	assert.NotContains(t, address, "<token>")
+	assert.Equal(t, http.StatusOK, probe(address), "the whole address reaches the browser")
+	assert.NotContains(t, s.session("", "list").Stdout(), address, "a list never hands out the whole address")
+}
+
 // Commands refuse what a session cannot use before any browser starts.
 func TestSessionInputErrors(t *testing.T) {
 	t.Parallel()

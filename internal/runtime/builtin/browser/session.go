@@ -147,6 +147,12 @@ type SessionOptions struct {
 	// endpoints whose writes the gate sends. The secrets its rules name are
 	// read from the environment.
 	WritePolicyFile string
+	// RevealCDPURL puts the browser's whole DevTools address, its token
+	// included, in the result. Without it the result names the address
+	// with its token redacted: the token is the credential that reaches
+	// the browser, and the result is printed where a job's log or an
+	// artifact may keep it.
+	RevealCDPURL bool
 }
 
 // SessionViewport is the size of the browser's page area.
@@ -183,9 +189,9 @@ type OpenResult struct {
 	TLSVerified bool `json:"tls_verified"`
 	// CDPURL is the browser's DevTools address behind its gate, where an
 	// application can show the page and let a person act on it. Its token is
-	// the credential that reaches the browser, so it is given only to the
-	// account that opened the session, in the command's own output, and is
-	// written nowhere else.
+	// the credential that reaches the browser, so the address carries it
+	// only when the caller asked for it (SessionOptions.RevealCDPURL), and
+	// otherwise reads http://127.0.0.1:<port>/<token>.
 	CDPURL       string    `json:"cdp_url"`
 	Headless     bool      `json:"headless"`
 	Profile      string    `json:"profile,omitempty"`
@@ -303,8 +309,9 @@ type SessionSummary struct {
 	State string `json:"state"`
 	URL   string `json:"url"`
 	Title string `json:"title"`
-	// CDPURL is the browser's address behind its gate, as OpenResult gives
-	// it, for the account whose sessions are listed.
+	// CDPURL is the browser's address behind its gate with its token
+	// redacted: a list names a session's browser, and never hands out the
+	// credential that reaches it.
 	CDPURL       string     `json:"cdp_url,omitempty"`
 	Profile      string     `json:"profile,omitempty"`
 	Headless     bool       `json:"headless"`
@@ -498,7 +505,7 @@ func (s *Sessions) Open(ctx context.Context, opts SessionOptions) (OpenResult, e
 	return OpenResult{
 		ID:              id,
 		TLSVerified:     op.tlsVerified(ctx, pageURL),
-		CDPURL:          record.CDPURL,
+		CDPURL:          shownCDPURL(record.CDPURL, opts.RevealCDPURL),
 		Headless:        opts.Headless,
 		Profile:         opts.Profile,
 		Model:           state.modelLabel(),
@@ -1134,9 +1141,9 @@ func (s *Sessions) List(ctx context.Context) ([]SessionSummary, error) {
 		case browserhost.StateEnded:
 			summary.State = SessionEnded
 		case browserhost.StateRunning:
-			summary.State, summary.CDPURL = SessionBusy, record.CDPURL
+			summary.State, summary.CDPURL = SessionBusy, shownCDPURL(record.CDPURL, false)
 		default:
-			summary.State, summary.CDPURL = SessionIdle, record.CDPURL
+			summary.State, summary.CDPURL = SessionIdle, shownCDPURL(record.CDPURL, false)
 			deadline := record.Deadline
 			summary.IdleDeadline = &deadline
 		}
@@ -1437,4 +1444,14 @@ func nonNil[T any](items []T) []T {
 		return []T{}
 	}
 	return items
+}
+
+// shownCDPURL is the browser's address as a session command prints it: the
+// whole address only when the caller asked for it, and otherwise with the
+// gate's token, the credential that reaches the browser, redacted.
+func shownCDPURL(cdpURL string, reveal bool) string {
+	if reveal {
+		return cdpURL
+	}
+	return browserhost.RedactCDPURL(cdpURL, cdpURL)
 }

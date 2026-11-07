@@ -41,7 +41,12 @@ at most `24h`), and the model as `--llm` (a step's `llm` field, in YAML or
 JSON) or `--provider`, `--model`, `--base-url`, and `--api-key-name`. Its
 result carries the session ID, the page's URL, title, and outline, and the
 browser's DevTools address (`cdp_url`), where an application can show the
-page and let a person act on it.
+page and let a person act on it. The address is the browser's DevTools gate,
+and its token is a credential: whoever has it controls the browser. `cdp_url`
+shows it redacted, `http://127.0.0.1:<port>/<token>`, unless `open` is given
+`--reveal-cdp-url`, for the application that connects; `list` never shows the
+token. A command's output can end up in a job's log or an artifact, so the
+whole address is printed only when asked for.
 
 `open` also returns `tls_verified`: true confirms that the certificate proxy
 verified the final HTTPS page's host. False means no such evidence was

@@ -134,6 +134,20 @@ func sessionCode(err error) string {
 
 // A session opens its browser, runs one operation per command against the
 // same browser, and leaves the browser waiting between commands.
+// The whole address, the credential that reaches the browser, is in the
+// result only when the caller asks for it.
+func TestSessionRevealsItsAddressOnlyWhenAsked(t *testing.T) {
+	t.Parallel()
+	ts := newTestSessions(t, pageModel(nil))
+	ts.engine.snapshot = fixtureSnapshot(t, "login")
+	opened := ts.open(SessionOptions{URL: "https://portal.example.com/login", Headless: true, RevealCDPURL: true})
+	assert.Equal(t, ts.engine.handle.CDPURL, opened.CDPURL)
+	summaries, err := ts.sessions.List(ts.context())
+	require.NoError(t, err)
+	require.Len(t, summaries, 1)
+	assert.Equal(t, "http://127.0.0.1:1/<token>", summaries[0].CDPURL, "a list never hands out the token")
+}
+
 func TestSessionWorksThePageBetweenCommands(t *testing.T) {
 	t.Parallel()
 
@@ -145,7 +159,9 @@ func TestSessionWorksThePageBetweenCommands(t *testing.T) {
 	assert.Equal(t, "https://portal.example.com/login", opened.URL)
 	assert.Contains(t, opened.Outline, `textbox "パスワード"`)
 	assert.Equal(t, "openai/test-model", opened.Model)
-	assert.Equal(t, ts.engine.handle.CDPURL, opened.CDPURL)
+	// The address's token reaches the browser, so the result names it
+	// redacted unless the caller asks for the whole address.
+	assert.Equal(t, "http://127.0.0.1:1/<token>", opened.CDPURL)
 	assert.True(t, ts.engine.detached, "the browser waits for the next command")
 	record := ts.record(opened.ID)
 	assert.Equal(t, browserhost.StateInteractive, record.State)
@@ -497,7 +513,7 @@ func TestSessionCloseAndList(t *testing.T) {
 	assert.Equal(t, first.ID, summaries[0].ID)
 	assert.Equal(t, SessionIdle, summaries[0].State)
 	assert.Equal(t, "portal", summaries[0].Profile)
-	assert.Equal(t, ts.engine.handle.CDPURL, summaries[0].CDPURL)
+	assert.Equal(t, "http://127.0.0.1:1/<token>", summaries[0].CDPURL, "a list never hands out the token")
 
 	require.NoError(t, ts.sessions.Close(ts.context(), CloseRequest{ID: first.ID}))
 	_, err = ts.store().Load(first.ID)
