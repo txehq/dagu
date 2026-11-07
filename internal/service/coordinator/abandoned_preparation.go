@@ -70,13 +70,20 @@ var errQueueUnknown = fmt.Errorf("%w: this coordinator has no queue store, so wh
 //
 // queuedAt names one execution of a reused attempt (empty for a newly created
 // attempt): its status may then still read Queued, with exactly that marker.
+// A newly created attempt is judged by persis.AttemptNeverStarted: it reads
+// Queued, with its empty marker, once Dispatch held it for a worker
+// (markPreparedAttemptHeld) before its task is stored, and one whose task
+// was then never stored, because publishing it failed or the coordinator
+// stopped in between, is never dispatched either, and is abandoned like one
+// that never left NotStarted. A held attempt whose task was stored is not:
+// the task is pending, and expires through failHeldDispatch.
 func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey, queuedAt string, status *ir.DAGRunStatus) (persis.AbandonmentEvidence, error) {
 	var evidence persis.AbandonmentEvidence
 	if h.dispatchTaskStore == nil || h.dagRunLeaseStore == nil {
 		return evidence, errAbandonmentUnavailable
 	}
-	waiting := status != nil && (status.Status == ir.NotStarted ||
-		(queuedAt != "" && status.Status == ir.Queued && status.QueuedAt == queuedAt))
+	waiting := status != nil && ((queuedAt == "" && persis.AttemptNeverStarted(status)) ||
+		(queuedAt != "" && (status.Status == ir.NotStarted || status.Status == ir.Queued && status.QueuedAt == queuedAt)))
 	if status != nil && (status.WorkerID != "" || !waiting) {
 		return evidence, fmt.Errorf("%w: attempt is %s with worker %q",
 			persis.ErrAttemptNotAbandonable, status.Status, status.WorkerID)
