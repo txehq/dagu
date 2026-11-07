@@ -8,6 +8,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/merge-test.XXXXXX")" || exit 2
 trap 'rm -rf "$TMP"' EXIT
 H=1111111111111111111111111111111111111111
+M=3333333333333333333333333333333333333333  # main's tip
+TREE=4444444444444444444444444444444444444444  # the head's tree
+MAIN_TREE=5555555555555555555555555555555555555555
 mkdir -p "$TMP/bin"
 # The stand-in gh answers each read with the already-shaped value merge.sh's --jq would produce;
 # FAIL_ON names a read that fails (with partial output), as a broken API page would.
@@ -18,6 +21,11 @@ fail() { case "$*" in *"$FAIL_ON"*) [ -n "$FAIL_ON" ] && { printf '{"partial":';
 case "$*" in
   *contents/.github/codex-review/codex-review-check.sh*) fail "$@"; printf '%s' "$MAIN_CHECK" | base64 ;;
   "api repos/txehq/dagu/pulls/7 "*) fail "$@"; printf '%s\n' "$PR_TSV" ;;
+  *branches/main*) fail "$@"; printf '%s\n' "$MAIN_TIP" ;;
+  *git/commits/"$MAIN_TIP"*) fail "$@"; printf '%s\n' "$MAIN_COMMIT_TSV" ;;
+  *git/commits/*) fail "$@"; printf '%s\n' "$COMMIT_TSV" ;;
+  *compare/*per_page=1\ *) fail "$@"; printf '%s\n' "$COMPARE" ;;
+  *compare/*per_page=100*) fail "$@"; printf '%s\n' "$COMMITS" ;;
   *actions/runs*) fail "$@"; printf '%s' "$RUNS" ;;
   *check-runs*) fail "$@"; printf '%s' "$CHECKS" ;;
   */status*) fail "$@"; printf '%s\n' "$STATUS" ;;
@@ -37,6 +45,8 @@ run() {
     shift 4
     : >"$log"
     out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="" PR_TSV="open	false	$H	main" \
+        MAIN_TIP="$M" COMMIT_TSV="$TREE	$M" MAIN_COMMIT_TSV="$MAIN_TREE	0000000000000000000000000000000000000000" \
+        COMPARE="ahead	1" COMMITS="$H $M" \
         RUNS="$GATE
 $CI" CHECKS="$CHK" STATUS="success	1" MAIN_CHECK="$OK_CHECK" "$@" bash "$HERE/merge.sh" 7 "$H" 2>&1)"; rc=$?
     if [ "$rc" = "$want_rc" ] && [[ "$out" == *"$want"* ]] \
@@ -93,5 +103,43 @@ run runs-unread   2 "could not read the workflow runs"    not-merged FAIL_ON=act
 run checks-unread 2 "could not read the check runs"       not-merged FAIL_ON=check-runs
 run status-unread 2 "could not read the commit status"    not-merged FAIL_ON=/status
 run pull-unread   2 "could not read PR #7"                not-merged FAIL_ON=pulls/7
+# The history the PR brings (TXE-6221); the real git cases are in test-merge-git.sh.
+A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+run tip-unread    2 "could not read main's tip"           not-merged FAIL_ON=branches/main
+run head-unread   2 "could not read the head commit $H"   not-merged FAIL_ON="git/commits/$H"
+run compare-unread 2 "could not read the comparison of main with $H" not-merged FAIL_ON=compare/
+run commits-short 2 "commits of PR #7 (got 1 of 3)"       not-merged COMPARE="ahead	3"
+run no-commits    1 "brings main no commit (compare says behind)" not-merged COMPARE="behind	0" COMMITS=""
+# A PR that merged main into its branch has a merge commit with one parent in main: squash is fine.
+run merged-main   0 merged                                merged COMPARE="ahead	2" COMMITS="$A $M
+$H $A $M"
+# A PR whose commit merges two lines main lacks is an upstream sync: squash refuses and names the mode.
+run sync-squash   1 "carries history main does not have: 1 commit(s) off its own first-parent line, such as $B; a squash would drop them. Merge it with --method merge" not-merged \
+    COMPARE="ahead	3" COMMITS="$B 0000000000000000000000000000000000000000
+$A $M
+$H $A $B"
+# The sync's shape when the merge sits directly on main's tip: upstream is the merge's second parent.
+run sync-on-tip-squash 1 "2 commit(s) off its own first-parent line, such as $A" not-merged \
+    COMPARE="ahead	3" COMMITS="$A 0000000000000000000000000000000000000000
+$B $A
+$H $M $B"
+run same-tree-squash 1 "head has main's tree: a squash would record nothing" not-merged COMMIT_TSV="$MAIN_TREE	$M"
+# Arguments: nothing is read and nothing merged.
+usage() {
+    local name="$1" want="$2" out rc; shift 2
+    out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$TMP/usage.log" bash "$HERE/merge.sh" "$@" 2>&1)"; rc=$?
+    if [ "$rc" = 2 ] && [[ "$out" == *"$want"* ]] && [ ! -s "$TMP/usage.log" ]; then
+        PASS=$((PASS + 1)); printf '  ok   %s\n' "$name"
+    else
+        FAIL=$((FAIL + 1)); printf '  FAIL %s: exit %s, output:\n%s\n' "$name" "$rc" "$out"
+    fi
+}
+usage method-rebase   "--method is squash or merge"            --method rebase 7 "$H"
+usage merge-no-anc    "needs --expect-ancestor"                --method merge 7 "$H"
+usage merge-short-anc "needs --expect-ancestor"                --method merge --expect-ancestor abc 7 "$H"
+usage squash-anc      "go with --method merge"                 --expect-ancestor "$A" 7 "$H"
+usage repair-alone    "go with --method merge"                 --repair 7 "$H"
+usage unknown-flag    "usage:"                                 --force 7 "$H"
+usage three-args      "usage:"                                 7 "$H" extra
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

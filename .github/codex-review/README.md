@@ -53,6 +53,54 @@ code), and a PR from another repository fails unless a person adds `review-overr
    it was merged after an independent review of its source and a canary of the connector on its
    own head.
 
+## The merge method (TXE-6221)
+
+The wrapper squashes by default, and a squash keeps the PR's tree while dropping its history. That
+is right for a PR made of its author's own commits and wrong for a PR whose point is the history it
+carries. PR #230 merged upstream v2.25.8 into the fork and was squashed (main `025b6847a`), so
+v2.25.8 is not an ancestor of main and the next sync would conflict again on everything it changed.
+Two rules, both in `merge.sh` and both behind every check above:
+
+- **The default squash refuses history it would drop.** The PR's own line is its first-parent
+  history back to main. A commit of the PR that is not on that line came in through a merge's other
+  parent (an upstream release, another branch); the wrapper names it and refuses. A PR that merged
+  main into its branch is all on its own line and squashes as before. Rebase a PR whose foreign
+  history is not meant to be kept; merge one whose history is with the mode below.
+- **`--method merge --expect-ancestor <sha>` keeps the history**, for an upstream sync or a
+  provenance repair. It merges with a merge commit, after the same checks, and in addition requires
+  the repository to allow merge commits (read from the API, never assumed), the expected ancestor to
+  be a commit's own id, reachable from the head and not yet from main, and then reads the merge
+  commit back and prints it only once the ancestor is reachable from it and its second parent is
+  the head. For a repair it re-reads main's tip as the last thing before the merge and refuses if
+  main moved. That is not an atomic check (`--match-head-commit` pins the head, not main): a move
+  in the seconds after that read is merged by GitHub onto the new tip, and the readback judges the
+  merge commit itself: a tree equal to its actual first parent's (main as it was at the merge) is
+  accepted and the move reported; a tree that differs is reported as **merged, with an error**
+  (exit 1) and left as it is, for a person to read main. Nothing is retried or rewritten. `--repair` declares a provenance repair that
+  changes no file (`git merge -s ours --no-ff <upstream>` on main's tip): the head's parents must be
+  exactly main's current tip and the expected ancestor, and its tree must be main's; a main that
+  moved, a wrong parent or any file change refuses. A head with main's tree is accepted only this
+  way.
+
+   ```bash
+   # the commit the upstream tag points to, from upstream's own repository: .object.type is
+   # "commit" for a lightweight tag; for an annotated tag ("tag") read git/tags/<sha> and take its
+   # .object.sha. The wrapper takes a commit id only and refuses a tag object rather than peel it.
+   gh api repos/dagucloud/dagu/git/ref/tags/v2.25.8 --jq '.object | "\(.type) \(.sha)"'
+   anc=<that commit sha>   # v2.25.8: 28022fee38b59c1474491fecf571791fbde8e9e7, a lightweight tag (read 2026-11-08)
+   git show origin/main:.github/codex-review/merge.sh | bash -s -- --method merge --expect-ancestor "$anc" <n> <head sha>
+   # a provenance repair: no file changes
+   git show origin/main:.github/codex-review/merge.sh | bash -s -- --method merge --expect-ancestor "$anc" --repair <n> <head sha>
+   ```
+
+   GitHub's merge method always makes its own merge commit: main's new tip has main's old tip and
+   the PR head as parents, and the expected ancestor is reachable through the head. Neither mode
+   has a flag that skips a check, and neither replaces the wrapper with a direct push.
+   `test-merge-git.sh` runs both methods over a real git fixture: the squash of a sync loses the
+   tag and the merge keeps it, the guard refuses the sync under squash, and the repair path refuses
+   a moved main, swapped parents, a wrong ancestor and a changed tree, accepts a main that moved
+   after the last read, and reports a merge commit that differs from its first parent.
+
 `review-override` is a person's decision: the check names who added it, and refuses one a bot
 added. Adding or removing the label re-runs the check, so removing it revokes the pass.
 
@@ -70,4 +118,6 @@ does not depend on how a review started: it requires a completed review of the c
 either way.
 
 `test-codex-review-check.sh` runs the check over recorded connector payloads (`testdata/`, from
-txehq/sub2api, txehq/txe and txehq/dagu PRs, reduced by `testdata/sanitize.py`); `codex-review-test.yaml` runs it with shellcheck.
+txehq/sub2api, txehq/txe and txehq/dagu PRs, reduced by `testdata/sanitize.py`); `test-merge.sh`
+runs the wrapper's refusals with a stand-in `gh`, and `test-merge-git.sh` its merge methods over a
+real git history; `codex-review-test.yaml` runs them with shellcheck.
