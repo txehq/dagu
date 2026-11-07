@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -42,6 +44,11 @@ type vaultClientSettings struct {
 	caCert     string
 	clientCert string
 	clientKey  string
+	// foreign is set when the DAG names a Vault address other than the
+	// host's own: the client then carries only credentials the DAG itself
+	// gave, never the host's configured ones or the ambient VAULT_TOKEN and
+	// client certificate of the process environment.
+	foreign bool
 }
 
 // Name returns the provider identifier.
@@ -164,6 +171,15 @@ func (r *vaultResolver) resolveClientSettings(ctx context.Context, ref secretref
 		settings.clientKey = cfg.Secrets.Vault.ClientKey
 	}
 	if addr := ref.Options["vault_address"]; addr != "" {
+		// A credential the host holds, configured or ambient, is for the
+		// host's own Vault: a DAG that may point the client anywhere would
+		// otherwise receive it there.
+		if !sameVaultAddress(addr, hostVaultAddress(settings.address)) {
+			settings.foreign = true
+			settings.token = ""
+			settings.clientCert = ""
+			settings.clientKey = ""
+		}
 		settings.address = addr
 	}
 	if token := ref.Options["vault_token"]; token != "" {
@@ -182,6 +198,24 @@ func (r *vaultResolver) resolveClientSettings(ctx context.Context, ref secretref
 	return settings
 }
 
+// hostVaultAddress is the Vault address the host itself uses: its configured
+// one, else the standard VAULT_ADDR, else the client's default.
+func hostVaultAddress(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	if env := os.Getenv(api.EnvVaultAddress); env != "" {
+		return env
+	}
+	return api.DefaultAddress
+}
+
+// sameVaultAddress reports whether two Vault addresses name the same server,
+// as written apart from a trailing slash.
+func sameVaultAddress(a, b string) bool {
+	return strings.TrimRight(strings.TrimSpace(a), "/") == strings.TrimRight(strings.TrimSpace(b), "/")
+}
+
 func (r *vaultResolver) newClient(settings vaultClientSettings) (vaultClient, error) {
 	if r.clientFactory != nil {
 		return r.clientFactory(settings)
@@ -194,6 +228,13 @@ func (r *vaultResolver) newClient(settings vaultClientSettings) (vaultClient, er
 	if settings.address != "" {
 		cfg.Address = settings.address
 		cfg.AgentAddress = ""
+	}
+	if settings.foreign {
+		// The environment's client certificate is the host's credential.
+		if transport, ok := cfg.HttpClient.Transport.(*http.Transport); ok && transport.TLSClientConfig != nil {
+			transport.TLSClientConfig.Certificates = nil
+			transport.TLSClientConfig.GetClientCertificate = nil
+		}
 	}
 
 	tlsConfig := &api.TLSConfig{
@@ -210,8 +251,12 @@ func (r *vaultResolver) newClient(settings vaultClientSettings) (vaultClient, er
 		return nil, fmt.Errorf("failed to create vault client: %w", err)
 	}
 
-	if settings.token != "" {
+	switch {
+	case settings.token != "":
 		client.SetToken(settings.token)
+	case settings.foreign:
+		// NewClient read the ambient VAULT_TOKEN, the host's credential.
+		client.ClearToken()
 	}
 
 	return &realVaultClient{client: client}, nil
