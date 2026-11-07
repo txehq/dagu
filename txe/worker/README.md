@@ -177,9 +177,12 @@ Upgrade while no job is running, because restarting the worker ends its running 
   (successes are otherwise silent). When no new stream has worked, and the worker has logged
   heartbeat failures with no recovery or `Starting worker` line in between, for 90 seconds
   (doubled for each replacement in the last hour, at most 10 minutes), it ends kubectl and launchd
-  starts a fresh one. It never replaces a forward while a new stream works, or within 90 seconds of
-  any successful call of the worker to its coordinator, and does nothing if it cannot read
-  `worker.log`. A hub that stops answering entirely for over 90 seconds also meets the condition:
+  starts a fresh one. It never replaces a forward while a new stream works. While new streams fail
+  but the worker's existing connection still works (no heartbeat failure, or a recovery within 90
+  seconds), or `worker.log` cannot be read, it waits, but only for 5 minutes (`--streams-only-after`,
+  doubled for each replacement in the last hour, at most 10 minutes): after that nothing new reaches
+  the hub through the forward (`dagu txe` commands, the UI), so it is replaced anyway, which also
+  cuts the worker's stream (TXE-6144: 09:16-09:29Z on 2026-11-07). A hub that stops answering entirely for over 90 seconds also meets the condition:
   the forward is then replaced once, and launchd waits up to 5 seconds (its `ThrottleInterval`)
   before the new one starts. `status.sh` prints the supervisor's latest line.
 - **Credential expiry.** The tunnel credential expires (`status.sh` shows when). Rerun

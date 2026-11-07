@@ -25,14 +25,20 @@ Every --interval seconds after --grace it checks two things:
                  line since the first failure shows the failures were uninterrupted.
 
 New streams count as failing only when both probes fail: one that works shows the forward's
-connection is alive. It replaces the forward only when new streams and the worker are both
+connection is alive. It replaces the forward when new streams and the worker are both
 unhealthy for the required time, measured from the first failed round: every round has failed
 both probes since then (monotonic clock),
 and the worker has logged heartbeat failures with no recovery or start line in between (and no
-gap over --worker-gap seconds) for that long, the last one within --worker-gap. New streams failing while the worker's heartbeats
-succeed (the existing stream still works) never restarts it. Neither does a worker log that is
-missing or unreadable: the forward is then left as launchd would leave it. The required time is
+gap over --worker-gap seconds) for that long, the last one within --worker-gap. The required time is
 --unhealthy-after, doubled for each replacement in the last hour (at most --max-unhealthy-after).
+
+New streams failing while the worker's heartbeats succeed (the existing stream still works), or
+while the worker log is missing or unreadable, is a reason to wait, but not forever (TXE-6144):
+a forward whose new streams have failed for --streams-only-after seconds is replaced whatever the
+worker shows, because nothing new (a `dagu txe` command, the UI, a reconnecting worker) reaches
+the hub through it. That bound is doubled for each replacement in the last hour as well, at most
+the larger of itself and --max-unhealthy-after; 0 turns it off. The replacement line names how
+long new streams failed, what the worker showed, and both bounds.
 
 Replacing means: one log line, SIGTERM to kubectl, SIGKILL after --kill-timeout, then exit 75,
 so launchd (KeepAlive) is the only thing that starts a new forward. If kubectl exits by itself,
@@ -211,13 +217,22 @@ def worker_unhealthy_since(path, now_wall, gap):
 class Verdict:
     """The replace decision, apart from the probes and the clocks so that tests can drive it."""
 
-    def __init__(self, unhealthy_after, max_unhealthy_after, restarts):
+    def __init__(self, unhealthy_after, max_unhealthy_after, restarts, streams_only_after=0):
         self.base, self.cap, self.restarts = unhealthy_after, max_unhealthy_after, restarts
+        self.streams_only = streams_only_after  # 0: new streams alone never replace the forward
         self.dead_since = None                  # monotonic time of the first failed new-stream round
 
+    def _recent(self, now_wall):
+        return sum(1 for t in self.restarts if now_wall - t < RESTART_WINDOW_S)
+
     def required(self, now_wall):
-        recent = sum(1 for t in self.restarts if now_wall - t < RESTART_WINDOW_S)
-        return min(self.base * (2 ** recent), self.cap)
+        return min(self.base * (2 ** self._recent(now_wall)), self.cap)
+
+    def streams_only_required(self, now_wall):
+        """How long new streams alone must fail, whatever the worker shows; None when off."""
+        if self.streams_only <= 0:
+            return None
+        return min(self.streams_only * (2 ** self._recent(now_wall)), max(self.cap, self.streams_only))
 
     def observe(self, now_mono, now_wall, streams_ok, worker_since):
         """Record one round; return the reason to replace the forward, or None."""
@@ -228,10 +243,16 @@ class Verdict:
             self.dead_since = now_mono
         need = self.required(now_wall)
         dead_for = now_mono - self.dead_since
-        if dead_for < need or worker_since is None or now_wall - worker_since < need:
+        if dead_for >= need and worker_since is not None and now_wall - worker_since >= need:
+            return (f"new streams failing for {dead_for:.0f}s and worker heartbeats failing for "
+                    f"{now_wall - worker_since:.0f}s (required {need:.0f}s)")
+        alone = self.streams_only_required(now_wall)
+        if alone is None or dead_for < alone:
             return None
-        return (f"new streams failing for {dead_for:.0f}s and worker heartbeats failing for "
-                f"{now_wall - worker_since:.0f}s (required {need:.0f}s)")
+        worker = ("no worker heartbeat failure" if worker_since is None
+                  else f"worker heartbeats failing for {now_wall - worker_since:.0f}s")
+        return (f"new streams failing for {dead_for:.0f}s with {worker} (required {alone:.0f}s "
+                f"for new streams alone, {need:.0f}s for both)")
 
 
 def load_restarts(path, now_wall):
@@ -275,6 +296,7 @@ def parse(argv):
     p.add_argument("--probe-timeout", type=float, default=10)
     p.add_argument("--unhealthy-after", type=float, default=90)
     p.add_argument("--max-unhealthy-after", type=float, default=600)
+    p.add_argument("--streams-only-after", type=float, default=300)
     p.add_argument("--worker-gap", type=float, default=45)
     p.add_argument("--kill-timeout", type=float, default=10)
     if "--" not in argv:
@@ -299,7 +321,8 @@ def main(argv):
 
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, forward)
-    verdict = Verdict(a.unhealthy_after, a.max_unhealthy_after, load_restarts(a.state, time.time()))
+    verdict = Verdict(a.unhealthy_after, a.max_unhealthy_after, load_restarts(a.state, time.time()),
+                      a.streams_only_after)
     worker = WorkerLog(a.worker_log, a.worker_gap)
     next_round = time.monotonic() + a.grace
     try:

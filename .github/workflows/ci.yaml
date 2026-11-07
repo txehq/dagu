@@ -19,6 +19,9 @@ on:
       - "scripts/installer.cmd"
       - "scripts/installer.iss"
       - "scripts/installer.ps1"
+      # Go tests under txe/ run its Python and shell scripts (tunnel-supervise.py, logpipe.py,
+      # install.sh): a change to one of those alone must run them (TXE-6144).
+      - "txe/**"
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
@@ -45,6 +48,9 @@ on:
       - "scripts/installer.cmd"
       - "scripts/installer.iss"
       - "scripts/installer.ps1"
+      # Go tests under txe/ run its Python and shell scripts (tunnel-supervise.py, logpipe.py,
+      # install.sh): a change to one of those alone must run them (TXE-6144).
+      - "txe/**"
       - "ui/**"
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
@@ -124,7 +130,7 @@ jobs:
           windows_installer_changed=false
           while IFS= read -r file; do
             case "${file}" in
-              *.go|go.mod|go.sum|Makefile|scripts/ci/*|.github/opencode/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
+              *.go|go.mod|go.sum|Makefile|scripts/ci/*|txe/*|.github/opencode/*|.github/actions/setup-go-cache/*|.github/workflows/ci.yaml)
                 go_changed=true
                 ;;
             esac
