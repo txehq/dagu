@@ -95,6 +95,13 @@ func TestHeldDispatchWhoseTaskCannotBeStoredIsAbandoned(t *testing.T) {
 // conditions and its prepared, empty queuedAt.
 func (f *strandedFixture) writeHeldAttempt(t *testing.T) (*ir.DAGRunStatus, string) {
 	t.Helper()
+	return f.writeQueuedAttempt(t, "")
+}
+
+// writeQueuedAttempt is writeHeldAttempt with the queued-at marker given: a
+// marker is what the scheduler's queue writes, never a held direct start.
+func (f *strandedFixture) writeQueuedAttempt(t *testing.T, queuedAt string) (*ir.DAGRunStatus, string) {
+	t.Helper()
 	dag := &ir.DAG{Name: strandedDAG}
 	attempt, err := f.repository.CreateAttempt(t.Context(), dag, time.Now(), f.ref.ID, persis.DAGRunCreateAttemptOptions{TrackPreparation: true})
 	require.NoError(t, err)
@@ -104,6 +111,7 @@ func (f *strandedFixture) writeHeldAttempt(t *testing.T) (*ir.DAGRunStatus, stri
 	status.AttemptID = attempt.ID()
 	status.AttemptKey = ir.GenerateAttemptKey(strandedDAG, f.ref.ID, strandedDAG, f.ref.ID, attempt.ID())
 	status.Status = ir.Queued
+	status.QueuedAt = queuedAt
 	status.Conditions = ir.MergeDAGRunConditions(status.Conditions, ir.NoMatchingWorkerConditions(time.Now())...)
 	require.NoError(t, attempt.Write(t.Context(), status))
 	require.NoError(t, attempt.Close(t.Context()))
@@ -161,5 +169,58 @@ func TestReconcileAbandonsAHeldAttemptOnlyWithoutItsTask(t *testing.T) {
 		records, err := f.repository.ListAttemptAbandonments(t.Context(), f.ref, ir.DAGRunRef{})
 		require.NoError(t, err)
 		assert.Empty(t, records)
+	})
+}
+
+// The never-started rule tells a held direct start from what it must not
+// take for one: a queued execution with a marker, which only its own marker
+// may abandon and only when no queue holds the run; and a held attempt that
+// is no longer the run's latest, which the store refuses to touch.
+func TestReconcileTellsAHeldStartFromWhatItIsNot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("queued with a marker", func(t *testing.T) {
+		t.Parallel()
+		f := newHeldPreparationFixture(t, nil)
+		_, _ = f.writeQueuedAttempt(t, "2026-11-08T01:00:00Z")
+
+		f.h.reconcileAbandonedPreparations(t.Context(), later())
+
+		attempt, err := f.repository.FindAttempt(t.Context(), f.ref)
+		require.NoError(t, err)
+		got, err := attempt.ReadStatus(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, ir.Queued, got.Status, "a marked execution is not taken for a held direct start")
+		records, err := f.repository.ListAttemptAbandonments(t.Context(), f.ref, ir.DAGRunRef{})
+		require.NoError(t, err)
+		assert.Empty(t, records)
+	})
+
+	t.Run("not the run's latest", func(t *testing.T) {
+		t.Parallel()
+		f := newHeldPreparationFixture(t, nil)
+		_, held := f.writeHeldAttempt(t)
+		// A later attempt of the same run, which a worker took.
+		dag := &ir.DAG{Name: strandedDAG}
+		later2, err := f.repository.CreateAttempt(t.Context(), dag, time.Now().Add(time.Second), f.ref.ID, persis.DAGRunCreateAttemptOptions{Retry: true})
+		require.NoError(t, err)
+		require.NoError(t, later2.Open(t.Context()))
+		running := ir.InitialStatus(dag)
+		running.DAGRunID = f.ref.ID
+		running.AttemptID = later2.ID()
+		running.Status = ir.Running
+		running.WorkerID = "worker-1"
+		require.NoError(t, later2.Write(t.Context(), running))
+		require.NoError(t, later2.Close(t.Context()))
+
+		_, err = f.h.abandonExecutionLocked(t.Context(), f.ref, f.ref, held, "", "test", nil)
+		require.Error(t, err, "a held attempt that is no longer the run's latest is not abandoned")
+
+		latest, err := f.repository.FindAttempt(t.Context(), f.ref)
+		require.NoError(t, err)
+		assert.Equal(t, later2.ID(), latest.ID())
+		got, err := latest.ReadStatus(t.Context())
+		require.NoError(t, err)
+		assert.Equal(t, ir.Running, got.Status, "the running attempt is untouched")
 	})
 }
