@@ -215,6 +215,12 @@ func (g *gate) serveWebSocket(w http.ResponseWriter, r *http.Request, targetID s
 		http.Error(w, "forbidden origin", http.StatusForbidden)
 		return
 	}
+	// After the token and the Origin: a helper marker, exact or refused.
+	helper, ok := helperMarked(r.Header)
+	if !ok {
+		http.Error(w, "unknown helper marker", http.StatusBadRequest)
+		return
+	}
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		// The token in the path is the credential; originAllowed has
 		// already refused what a web page could send.
@@ -226,6 +232,7 @@ func (g *gate) serveWebSocket(w http.ResponseWriter, r *http.Request, targetID s
 	// DevTools payloads carry screenshots and DOM snapshots.
 	conn.SetReadLimit(-1)
 	c := newClient(g.mux, conn)
+	c.helper = helper
 	ctx := context.Background()
 	if targetID != "" {
 		attachCtx, cancel := context.WithTimeout(ctx, listTimeout)
@@ -241,6 +248,22 @@ func (g *gate) serveWebSocket(w http.ResponseWriter, r *http.Request, targetID s
 		return
 	}
 	c.serve(ctx)
+}
+
+// helperMarked reads the helper marker of a handshake that already passed
+// the token and Origin checks: absent means an ordinary client; exactly
+// HelperValue means a helper, left out of attendance; anything else is
+// refused (ok false), fail closed.
+func helperMarked(h http.Header) (helper, ok bool) {
+	values, present := h[http.CanonicalHeaderKey(HelperHeader)]
+	switch {
+	case !present:
+		return false, true
+	case len(values) == 1 && values[0] == HelperValue:
+		return true, true
+	default:
+		return false, false
+	}
 }
 
 // originAllowed admits a websocket without an Origin, as DevTools libraries

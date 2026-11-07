@@ -151,6 +151,10 @@ type mux struct {
 	closed    bool
 	closeOnce sync.Once
 	done      chan struct{}
+	// attendance, when set, is told of every admitted client that is not a
+	// helper and of its leaving, under mu, so the lifetime policy's count
+	// matches the registrations (attend.go).
+	attendance *keeper
 	// onGateEvent receives events on the gate's own sessions, for the gate's
 	// own protocol use.
 	onGateEvent func(t *target, m message)
@@ -1020,6 +1024,9 @@ func (m *mux) addClient(c *client) bool {
 		return false
 	}
 	m.clients[c] = struct{}{}
+	if m.attendance != nil && !c.helper {
+		m.attendance.joined()
+	}
 	return true
 }
 
@@ -1032,6 +1039,9 @@ func (m *mux) removeClient(c *client) {
 		return
 	}
 	delete(m.clients, c)
+	if m.attendance != nil && !c.helper {
+		m.attendance.left()
+	}
 	delete(m.discoverers, c)
 	for id, p := range m.pending {
 		if p.client == c {

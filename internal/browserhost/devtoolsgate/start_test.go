@@ -117,6 +117,80 @@ func TestStartHonoursLifetimeCap(t *testing.T) {
 	assert.False(t, procutil.IsAlive(handle.BrowserPID), "the browser ends with its gate")
 }
 
+// TestStartEndsAnUnattendedBrowser: with no client ever admitted, the
+// browser and its gate end at MaxUnattended, as they did under the old cap.
+func TestStartEndsAnUnattendedBrowser(t *testing.T) {
+	t.Parallel()
+	self, err := os.Executable()
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := Start(ctx, self, Config{
+		Token:         NewToken(),
+		Executable:    self,
+		Args:          fakeBrowserArgs(),
+		MaxUnattended: 500 * time.Millisecond,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = handle.Kill() })
+	eventually(t, 15*time.Second, func() bool { return !procutil.IsAlive(handle.PID) }, "the gate's exit at the unattended cap")
+	assert.False(t, procutil.IsAlive(handle.BrowserPID), "the browser ends with its gate")
+}
+
+// TestStartKeepsAnAttendedBrowser: a connected DevTools client keeps the
+// browser past the unattended cap, and the cap runs from the client's
+// leaving. The process form, with real short values, over real pipes.
+func TestStartKeepsAnAttendedBrowser(t *testing.T) {
+	t.Parallel()
+	self, err := os.Executable()
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const unattended = 2 * time.Second
+	handle, err := Start(ctx, self, Config{
+		Token:         NewToken(),
+		Executable:    self,
+		Args:          fakeBrowserArgs(),
+		MaxUnattended: unattended,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = handle.Kill() })
+	c := dialWS(t, "ws"+strings.TrimPrefix(handle.URL, "http")+"/devtools/browser/"+browserIDOf(t, handle.URL), nil)
+	// Twice the cap with the client connected and idle: the gate and the
+	// browser are still there, and the client still gets answers.
+	time.Sleep(2 * unattended)
+	assert.True(t, procutil.IsAlive(handle.PID), "the gate runs while a client is connected")
+	assert.True(t, procutil.IsAlive(handle.BrowserPID), "the browser runs while a client is connected")
+	c.mustCall("", "Browser.getVersion", nil)
+	// The client leaves: the unattended clock runs from now.
+	c.close()
+	eventually(t, 15*time.Second, func() bool { return !procutil.IsAlive(handle.PID) }, "the gate's exit after the last client left")
+	assert.False(t, procutil.IsAlive(handle.BrowserPID), "the browser ends with its gate")
+}
+
+// TestStartEndsABrowserWhoseOnlyClientIsAHelper: through the real helper
+// process, a connected client that marks itself a helper does not keep the
+// browser, so it ends at MaxUnattended as if nobody were connected.
+func TestStartEndsABrowserWhoseOnlyClientIsAHelper(t *testing.T) {
+	t.Parallel()
+	self, err := os.Executable()
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := Start(ctx, self, Config{
+		Token:         NewToken(),
+		Executable:    self,
+		Args:          fakeBrowserArgs(),
+		MaxUnattended: time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = handle.Kill() })
+	c := dialWS(t, "ws"+strings.TrimPrefix(handle.URL, "http")+"/devtools/browser/"+browserIDOf(t, handle.URL), HelperHandshake())
+	c.mustCall("", "Browser.getVersion", nil)
+	eventually(t, 15*time.Second, func() bool { return !procutil.IsAlive(handle.PID) }, "the gate's exit with only a helper connected")
+	assert.False(t, procutil.IsAlive(handle.BrowserPID), "the browser ends with its gate")
+}
+
 func TestStartRefusesBadConfig(t *testing.T) {
 	t.Parallel()
 	_, err := Start(context.Background(), "dagu", Config{Executable: "x"})
