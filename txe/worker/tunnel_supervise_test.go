@@ -31,6 +31,8 @@ import (
 //	ok            health 200, and the coordinator port answers the HTTP/2 preface with SETTINGS
 //	dead-streams  every new connection is accepted and closed, as kubectl does when it cannot
 //	              create a stream; the worker's existing connection is healthy (no log lines)
+//	hung-streams  every new connection is accepted and never answered, as kubectl holds one
+//	              while its stream creation waits to time out (TXE-6144); the worker is healthy
 //	dead-all      the same, and the worker logs a heartbeat failure every 0.2 s
 //	http-dead     health is closed, the coordinator still answers; the worker logs failures
 //	flapping      new connections fail as in dead-streams; the worker's heartbeats fail and
@@ -56,12 +58,16 @@ for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(s, on_signal)
 def mode():
     return open(mode_file).read().strip()
+held = []
 def serve(port, kind):
     ls = socket.socket(); ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     ls.bind(("127.0.0.1", int(port))); ls.listen(16)
     while True:
         c, _ = ls.accept()
         m = mode()
+        if m == "hung-streams":
+            held.append(c)
+            continue
         try:
             if m == "ok" or (m == "http-dead" and kind == "h2"):
                 if kind == "http":
@@ -253,13 +259,43 @@ func TestTunnelSuperviseReplacesADeadForward(t *testing.T) {
 	assert.Len(t, state["restarts"], 1)
 }
 
-// New streams fail while the worker's existing connection keeps working (no heartbeat failure):
-// replacing kubectl would cut that connection, so the forward is left alone.
+// New streams fail (closed, or hung) while the worker's existing connection keeps working (no
+// heartbeat failure): replacing kubectl would cut that connection, so within --streams-only-after
+// (default 300 s) the forward is left alone.
 func TestTunnelSuperviseKeepsAForwardTheWorkerStillUses(t *testing.T) {
-	s := startSupervised(t, "dead-streams")
-	s.stillRunning(t, 4*time.Second)
-	assert.Contains(t, s.stderr.String(), "new streams through the forward are failing")
-	assert.NotContains(t, s.stderr.String(), "replacing")
+	for _, mode := range []string{"dead-streams", "hung-streams"} {
+		t.Run(mode, func(t *testing.T) {
+			s := startSupervised(t, mode)
+			s.stillRunning(t, 4*time.Second)
+			assert.Contains(t, s.stderr.String(), "new streams through the forward are failing")
+			assert.NotContains(t, s.stderr.String(), "replacing")
+		})
+	}
+}
+
+// New streams hang (accepted, never answered) while the worker logs that it started and then
+// nothing (its heartbeats succeed silently), as on 2026-11-07 09:16-09:29Z (TXE-6144): the
+// worker's old stream is a reason to wait, not forever. Past --streams-only-after the forward is
+// replaced, through the same exit, state file and back-off as any replacement.
+func TestTunnelSuperviseReplacesAForwardWhoseNewStreamsHangPastTheBound(t *testing.T) {
+	s := startSupervised(t, "ok", "--streams-only-after", "3")
+	started := time.Now().UTC().Format(time.RFC3339Nano)
+	require.NoError(t, os.WriteFile(filepath.Join(s.dir, "worker.log"),
+		[]byte(`time=`+started+` level=INFO msg="Starting worker" worker-id=mch_x`+"\n"), 0o600))
+	time.Sleep(600 * time.Millisecond)
+	start := time.Now()
+	s.setMode(t, "hung-streams")
+	assert.Equal(t, 75, s.exit(t, 15*time.Second))
+	assert.GreaterOrEqual(t, time.Since(start), 3000*time.Millisecond)
+	assert.Equal(t, fmt.Sprintf("%d\n", syscall.SIGTERM), s.signals())
+	out := s.stderr.String()
+	assert.Regexp(t, `replacing the forward: new streams failing for \d+s with no worker heartbeat failure `+
+		`\(required 3s for new streams alone, 2s for both\)`, out)
+	var state map[string][]float64
+	b, err := os.ReadFile(s.state)
+	require.NoError(t, err)
+	require.NoError(t, json.Unmarshal(b, &state))
+	assert.Len(t, state["restarts"], 1)
 }
 
 // New streams fail, and the worker's heartbeats fail often but keep succeeding in between (its
@@ -320,8 +356,8 @@ import importlib.util, json, sys
 sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("ts", sys.argv[1]); ts = importlib.util.module_from_spec(spec); spec.loader.exec_module(ts)
 W = 1_000_000.0
-def run(rounds, restarts=()):
-    v = ts.Verdict(90, 600, list(restarts))
+def run(rounds, restarts=(), alone=0):
+    v = ts.Verdict(90, 600, list(restarts), alone)
     return [bool(v.observe(m, W + m, ok, None if ws is None else W + ws)) for m, ok, ws in rounds]
 out = {
   # three failed 30 s rounds span only 60 s: no replacement until 90 s after the first
@@ -338,6 +374,16 @@ out = {
   "backoff": run([(0, False, -1000), (179, False, -1000), (180, False, -1000)], restarts=[W - 600]),
   # many recent replacements: capped at 600 s
   "cap": run([(0, False, -1000), (600, False, -1000)], restarts=[W - 60] * 5),
+  # TXE-6144: new streams alone, 300 s bound; the worker healthy (None) or failing only briefly
+  "alone_299": run([(0, False, None), (299.9, False, None)], alone=300),
+  "alone_300": run([(0, False, None), (300, False, None)], alone=300),
+  "alone_worker_short": run([(0, False, None), (290, False, 250), (300, False, 250)], alone=300),
+  "alone_reset": run([(0, False, None), (200, True, None), (450, False, None), (500, False, None)], alone=300),
+  # one replacement 10 min ago: 600 s; many: capped at max(600, 300)
+  "alone_backoff": run([(0, False, None), (599, False, None), (600, False, None)], restarts=[W - 600], alone=300),
+  "alone_cap": run([(0, False, None), (600, False, None)], restarts=[W - 60] * 5, alone=300),
+  # a bound above --max-unhealthy-after is its own cap
+  "alone_above_cap": run([(0, False, None), (899, False, None), (900, False, None)], restarts=[W - 60] * 5, alone=900),
 }
 print(json.dumps(out))
 `
@@ -353,6 +399,13 @@ print(json.dumps(out))
 	assert.Equal(t, []bool{false, false}, got["no_worker"])
 	assert.Equal(t, []bool{false, false, true}, got["backoff"])
 	assert.Equal(t, []bool{false, true}, got["cap"])
+	assert.Equal(t, []bool{false, false}, got["alone_299"])
+	assert.Equal(t, []bool{false, true}, got["alone_300"])
+	assert.Equal(t, []bool{false, false, true}, got["alone_worker_short"])
+	assert.Equal(t, []bool{false, false, false, false}, got["alone_reset"])
+	assert.Equal(t, []bool{false, false, true}, got["alone_backoff"])
+	assert.Equal(t, []bool{false, true}, got["alone_cap"])
+	assert.Equal(t, []bool{false, false, true}, got["alone_above_cap"])
 }
 
 // The worker's episode of failed coordinator calls is read from its log: the heartbeat failures

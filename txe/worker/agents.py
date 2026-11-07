@@ -150,7 +150,8 @@ def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label
               "ProcessType": "Background"}
     # launchd restarts the tunnel only when it exits, and a port-forward whose connection is
     # dead can keep running, so the supervisor ends it when its streams and the worker's
-    # heartbeats have both failed long enough (TXE-5398).
+    # heartbeats have both failed long enough (TXE-5398), or its new streams alone have failed
+    # for --streams-only-after (TXE-6144).
     tunnel = dict(common, Label=tunnel_label, ProgramArguments=[
         python, "-I", f"{home}/bin/logpipe.py",
         "--path", f"{home}/logs/tunnel.log", "--max-bytes", "8388608", "--backups", "5", "--",
