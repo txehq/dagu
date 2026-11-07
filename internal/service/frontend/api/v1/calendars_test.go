@@ -384,4 +384,12 @@ func TestRequireHostFileRead(t *testing.T) {
 	require.NoError(t, apiImpl.RequireHostFileRead(as(auth.RoleDeveloper)))
 	require.NoError(t, apiImpl.RequireHostFileRead(as(auth.RoleAdmin)))
 	require.Error(t, apiImpl.RequireHostFileRead(context.Background()), "no caller")
+
+	// While a read-only Git sync disables DAG writes, no host file is read.
+	readOnly := test.Setup(t, test.WithConfigMutator(func(cfg *config.Config) {
+		cfg.GitSync.Enabled = true
+		cfg.GitSync.PushEnabled = false
+	}))
+	readOnlyAPI := newCalendarAPI(t, readOnly, localapi.WithAuthService(stubAuthService{}))
+	require.Error(t, readOnlyAPI.RequireHostFileRead(as(auth.RoleAdmin)))
 }
