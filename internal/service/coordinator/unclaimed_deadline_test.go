@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/persis/file"
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
+	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 )
 
 // The claim deadline (TXE-5923, coordinator.unclaimed_dispatch_timeout), as
@@ -300,4 +302,149 @@ func TestUnclaimedDeadline_ZeroKeepsTheTaskWaiting(t *testing.T) {
 	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p"})
 	require.NoError(t, err)
 	assert.NotNil(t, claimed)
+}
+
+// A task published without an execution marker, as a legacy queued task was,
+// is told apart from a newer attempt of its run by its attempt id alone: the
+// newer attempt is neither failed nor stripped of its task.
+func TestUnclaimedDeadline_TheAttemptIDAloneKeepsANewerAttempt(t *testing.T) {
+	t.Parallel()
+	f := newDeadlineFixture(t, deadlineCeiling)
+	old := f.writeQueued(t, "", "2026-11-07T11:00:00+08:00")
+	f.publish(t, old, "")
+	f.clock.advance(time.Hour)
+	newer := f.writeQueued(t, "", "2026-11-07T12:00:00+08:00")
+	f.publish(t, newer, "")
+
+	f.clock.set(f.start.Add(deadlineCeiling))
+	f.pass(t)
+	st := f.status(t)
+	assert.Equal(t, newer, st.AttemptID)
+	assert.Equal(t, ir.Queued, st.Status)
+	assert.False(t, f.outstanding(t, old))
+	assert.True(t, f.outstanding(t, newer))
+}
+
+// The deadline bounds only the wait for a claim. A task claimed before it is
+// acknowledged after it, and the run it starts is never ended by it, however
+// long it runs.
+func TestUnclaimedDeadline_AClaimMadeBeforeTheDeadlineStaysAlive(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newDeadlineFixture(t, deadlineCeiling)
+	const marker = "2026-11-07T11:00:00+08:00"
+	queued := f.writeQueued(t, "", marker)
+	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+
+	f.clock.set(f.start.Add(deadlineCeiling - time.Millisecond))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p"})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	f.clock.set(f.start.Add(deadlineCeiling + time.Second))
+	f.pass(t)
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(queued),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted, "a claim made in time is acknowledged after the deadline: %s", resp.Error)
+
+	f.clock.set(f.start.Add(7 * deadlineCeiling))
+	f.pass(t)
+	assert.NotEqual(t, ir.Failed, f.status(t).Status)
+	assert.Empty(t, f.records(t))
+	_, err = f.leases.Get(t.Context(), f.attemptKey(queued))
+	require.NoError(t, err, "the lease is not expired by the deadline")
+}
+
+// A claim no worker acknowledges is released after the reservation time. Past
+// the deadline the released task is refused to the next claimant, and its
+// execution ends with a record; the first claimant's late acknowledgement is
+// refused too.
+func TestUnclaimedDeadline_AClaimReleasedPastTheDeadlineIsNotClaimedAgain(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+	f := newDeadlineFixture(t, deadlineCeiling)
+	const marker = "2026-11-07T11:00:00+08:00"
+	queued := f.writeQueued(t, "", marker)
+	_, err := f.h.Dispatch(t.Context(), f.queuedDispatch(t))
+	require.NoError(t, err)
+
+	f.clock.set(f.start.Add(deadlineCeiling - time.Millisecond))
+	claimed, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "p"})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	f.clock.set(f.start.Add(deadlineCeiling + time.Hour))
+	again, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-2", PollerID: "q"})
+	require.NoError(t, err)
+	assert.Nil(t, again, "the released task is past its deadline")
+	_, err = f.dispatches.GetClaim(t.Context(), claimed.ClaimToken)
+	require.ErrorIs(t, err, dispatch.ErrDispatchTaskNotFound, "the claim was released")
+
+	f.pass(t)
+	assert.False(t, f.outstanding(t, queued))
+	record, err := f.repository.ReadExecutionAbandonment(t.Context(), f.ref, f.ref, queued, marker)
+	require.NoError(t, err)
+	require.NotNil(t, record)
+	assert.Equal(t, ir.Failed, f.status(t).Status)
+
+	resp, err := f.h.AckTaskClaim(t.Context(), &coordinatorv1.AckTaskClaimRequest{
+		ClaimToken: claimed.ClaimToken, WorkerId: "worker-1", AttemptKey: f.attemptKey(queued),
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+}
+
+// Workers claim an unjournaled execution while the clock crosses its deadline
+// and the coordinator's pass runs: the run is either claimed and never failed,
+// or failed and never claimed.
+func TestUnclaimedDeadline_AnUnjournaledClaimRacesThePass(t *testing.T) {
+	t.Parallel()
+	const marker = "2026-11-07T11:00:00+08:00"
+	var claimedRuns, failedRuns int
+	for i := range 12 {
+		f := newDeadlineFixture(t, deadlineCeiling)
+		queued := f.writeQueued(t, "", marker)
+		f.publish(t, queued, marker)
+		f.clock.set(f.start.Add(deadlineCeiling - time.Millisecond))
+
+		var claims atomic.Int32
+		if i == 0 {
+			// One run is claimed before the clock crosses, whatever the
+			// scheduler does with the rest.
+			c, err := f.dispatches.ClaimNext(t.Context(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: "first"})
+			require.NoError(t, err)
+			require.NotNil(t, c)
+			claims.Add(1)
+		}
+		var wg sync.WaitGroup
+		for w := range 3 {
+			wg.Go(func() {
+				c, err := f.dispatches.ClaimNext(context.Background(), dispatch.DispatchTaskClaim{WorkerID: "worker-1", PollerID: string(rune('a' + w))})
+				if err == nil && c != nil {
+					claims.Add(1)
+				}
+			})
+		}
+		wg.Go(func() {
+			f.clock.advance(time.Millisecond)
+			f.h.expireUnclaimedDispatches(context.Background(), f.clock.Now())
+		})
+		wg.Wait()
+		f.h.expireUnclaimedDispatches(t.Context(), f.clock.Now())
+
+		require.LessOrEqual(t, claims.Load(), int32(1), "iteration %d", i)
+		st := f.status(t)
+		if claims.Load() == 1 {
+			claimedRuns++
+			assert.Equal(t, ir.Queued, st.Status, "iteration %d: a claimed run is never failed", i)
+		} else {
+			failedRuns++
+			assert.Equal(t, ir.Failed, st.Status, "iteration %d: an unclaimed run is failed", i)
+			assert.False(t, f.outstanding(t, queued), "iteration %d", i)
+		}
+	}
+	t.Logf("claimed %d, failed %d", claimedRuns, failedRuns)
+	assert.Positive(t, claimedRuns)
+	assert.Positive(t, failedRuns)
 }

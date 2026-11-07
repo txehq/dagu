@@ -65,9 +65,15 @@ behaviour the fork depends on, the fork keeps its own:
   - any other attempt is failed first, then loses its task.
 
   Neither path ends an attempt a worker holds (worker, lease or active-run record) or one that is
-  not its run's latest. A held task ends when its wait passes, as upstream does. Rolled back to
-  txe-v2.18.2-19, a coordinator ignores the field and expires unheld tasks after the reservation
-  time, as it always did.
+  not its run's latest. The deadline bounds only the wait for a claim: a task claimed before it,
+  even if acknowledged after, and the run it starts are never ended by it, however long they run,
+  and schedules are not affected. A held task ends when its wait passes, as upstream does.
+
+  **Rollback does not keep this wait.** A txe-v2.18.2-19 coordinator ignores the new fields and
+  expires an unheld pending task after the 90s reservation time, as it always did. So after a
+  rollback, a task that was waiting for a busy worker ends as not dispatched. Drain pending
+  dispatches before rolling back (a gate, not a lossless rollback); claimed and running work is
+  not affected.
 - **Access.** The owner filters for whole-hub lists and queues apply inside upstream's new list
   paths. Upstream's run-outputs and step-sample endpoints use the per-DAG owner check.
 - **Credentials.** `DAGU_COORDINATOR_AUTH_HUB_KEY_FILE` and `DAGU_WORKER_AUTH_CREDENTIAL_FILE` count

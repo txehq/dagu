@@ -821,8 +821,10 @@ type Coordinator struct {
 	// UnclaimedDispatchTimeout bounds how long a dispatched task no worker
 	// has claimed waits for one (TXE-5923). Each task gets its deadline once,
 	// when first enqueued; past it the task is no longer handed out and its
-	// attempt ends. Default: 24h; 0 means no ceiling. A held dispatch waits
-	// for WorkerWaitTimeout instead.
+	// attempt ends. It bounds only the wait for a claim: a claimed task and
+	// the run it starts are never ended by it, however long they run.
+	// Default: 24h; 0 means no ceiling. A held dispatch waits for
+	// WorkerWaitTimeout instead.
 	UnclaimedDispatchTimeout time.Duration
 	// WorkerChannel is the route that carries workers' calls over HTTPS.
 	WorkerChannel CoordinatorWorkerChannel

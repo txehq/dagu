@@ -1304,7 +1304,7 @@
         },
         "unclaimed_dispatch_timeout": {
           "type": "string",
-          "description": "How long a dispatched task that no worker has claimed waits for one, such as while every matching worker is busy. Each task gets its deadline once, when it is first enqueued; a coordinator restart, a released claim or a republication of the same execution does not move it, and changing this setting does not move a deadline already given. Past it the task is no longer handed out and its run's attempt ends as not dispatched. Default: '24h' (also when empty or absent). Set to '0' for no ceiling: the task then waits until a worker claims it or its run moves on. A negative, malformed or overflowing value refuses to load the configuration. A held dispatch (worker_wait_timeout) waits for that instead."
+          "description": "How long a dispatched task that no worker has claimed waits for one, such as while every matching worker is busy. Each task gets its deadline once, when it is first enqueued; a coordinator restart, a released claim or a republication of the same execution does not move it, and changing this setting does not move a deadline already given. Past it the task is no longer handed out and its run's attempt ends as not dispatched. It bounds only the wait for a claim: a task a worker has claimed, and the run it starts, are never ended by it, however long they run, and a schedule's own timing is not affected. Default: '24h' (also when empty or absent). Set to '0' for no ceiling: the task then waits until a worker claims it or its run moves on. A negative, malformed or overflowing value refuses to load the configuration. A held dispatch (worker_wait_timeout) waits for that instead."
         }
       }
     },
