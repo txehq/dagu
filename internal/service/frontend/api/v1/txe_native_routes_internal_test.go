@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"github.com/dagucloud/dagu/v2/internal/intake"
 	"net/http"
 	"testing"
 
@@ -32,15 +33,15 @@ func TestTxeWebhookTriggerOfAnOwnersDAG(t *testing.T) {
 			// machine's DAG all the same.
 			alias := &ir.DAG{Name: "nightly", Location: "/dags/" + txeauth.MachineDAGs(w.machineA)[0] + ".yaml"}
 
-			require.NoError(t, w.api.txeWebhookTrigger(ctx, ownerless), "an ownerless DAG")
+			require.NoError(t, webhookErr(w.api.txeWebhookTrigger(ctx, ownerless)), "an ownerless DAG")
 			if mode == "enforce" {
-				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, machineDAG)))
-				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, jobDAG)))
-				assert.Equal(t, http.StatusNotFound, statusOf(w.api.txeWebhookTrigger(ctx, alias)), "an alias of A's machine DAG")
+				assert.Equal(t, http.StatusNotFound, statusOf(webhookErr(w.api.txeWebhookTrigger(ctx, machineDAG))))
+				assert.Equal(t, http.StatusNotFound, statusOf(webhookErr(w.api.txeWebhookTrigger(ctx, jobDAG))))
+				assert.Equal(t, http.StatusNotFound, statusOf(webhookErr(w.api.txeWebhookTrigger(ctx, alias))), "an alias of A's machine DAG")
 				return
 			}
-			assert.NoError(t, w.api.txeWebhookTrigger(ctx, machineDAG))
-			assert.Error(t, w.api.txeWebhookTrigger(ctx, jobDAG), "a job not ready is not admitted")
+			assert.NoError(t, webhookErr(w.api.txeWebhookTrigger(ctx, machineDAG)))
+			assert.Error(t, webhookErr(w.api.txeWebhookTrigger(ctx, jobDAG)), "a job not ready is not admitted")
 		})
 	}
 }
@@ -66,3 +67,5 @@ func TestTxeOwnedIdentity(t *testing.T) {
 		})
 	}
 }
+
+func webhookErr(_ intake.UnboundTrigger, err error) error { return err }

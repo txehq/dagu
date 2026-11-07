@@ -166,28 +166,34 @@ function CustomDateTimeInput({
 
   return (
     <div className="relative flex items-center">
-      <I18nProps><Input
-        ref={inputRef}
-        id={id}
-        type="text"
-        value={displayValue}
-        onChange={handleInputChange}
-        onKeyDown={handleKeyDown}
-        onClick={() => setCursorPosition(inputRef.current?.selectionStart || 0)}
-        placeholder="YYYY-MM-DD HH:mm:ss"
-        className={cn(
-          className,
-          'w-44 font-mono text-foreground placeholder:text-muted-foreground/60 pt-1'
-        )}
-      /></I18nProps>
-      <I18nProps><button
-        type="button"
-        onClick={openDatePicker}
-        className="px-1 hover:bg-accent rounded-sm transition-colors"
-        aria-label="Open date picker"
-      >
-        <Calendar className="h-4 w-4 text-muted-foreground" />
-      </button></I18nProps>
+      <I18nProps>
+        <Input
+          ref={inputRef}
+          id={id}
+          type="text"
+          value={displayValue}
+          onChange={handleInputChange}
+          onKeyDown={handleKeyDown}
+          onClick={() =>
+            setCursorPosition(inputRef.current?.selectionStart || 0)
+          }
+          placeholder="YYYY-MM-DD HH:mm:ss"
+          className={cn(
+            className,
+            'w-44 font-mono text-foreground placeholder:text-muted-foreground pt-1'
+          )}
+        />
+      </I18nProps>
+      <I18nProps>
+        <button
+          type="button"
+          onClick={openDatePicker}
+          className="px-1 hover:bg-accent rounded-sm transition-colors"
+          aria-label="Open date picker"
+        >
+          <Calendar className="h-4 w-4 text-muted-foreground" />
+        </button>
+      </I18nProps>
       <input
         ref={hiddenDateInputRef}
         type="datetime-local"

@@ -20,7 +20,7 @@ interface Props {
   toStr: string;
   isLive: boolean;
   filters?: KanbanFilters;
-  onCardClick: (run: DAGRunSummary) => void;
+  onCardClick: (run: DAGRunSummary, event?: React.MouseEvent) => void;
   onArtifactsClick: (run: DAGRunSummary) => void;
   visibleColumns?: readonly ViewColumn[];
 }
@@ -67,23 +67,25 @@ export function BucketKanbanSection({
       </div>
       {isLoading ? (
         <div className="px-1 py-3 text-xs text-muted-foreground">
-          <I18nText text={"Loading runs..."} />
+          <I18nText text={'Loading runs...'} />
         </div>
       ) : error ? (
         <div className="px-1 py-3 flex items-center gap-3 text-xs">
           <span className="text-destructive">
-            {error.message || <I18nText text={"Failed to load runs"} />}
+            {error.message || <I18nText text={'Failed to load runs'} />}
           </span>
           <button
             type="button"
             onClick={() => void retry()}
             className="rounded border border-border px-2 py-1 text-muted-foreground hover:text-foreground"
           >
-            <I18nText text={"Retry"} />
+            <I18nText text={'Retry'} />
           </button>
         </div>
       ) : isEmpty ? (
-        <div className="px-1 py-3 text-xs text-muted-foreground"><I18nText text={"No runs"} /></div>
+        <div className="px-1 py-3 text-xs text-muted-foreground">
+          <I18nText text={'No runs'} />
+        </div>
       ) : (
         <KanbanBoard
           columns={columns}

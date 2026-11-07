@@ -28,6 +28,14 @@ type fakeBrowser struct {
 	writeMu sync.Mutex
 	mu      sync.Mutex
 
+	// exitsSlowly keeps the pipe open after Browser.close, as Chrome does
+	// while it finishes writing its profile.
+	exitsSlowly bool
+	// refuseTargetSetup answers Fetch.enable and a target session's
+	// Target.setAutoAttach with an error, as a target that takes neither
+	// does.
+	refuseTargetSetup bool
+
 	nextTarget  int
 	nextSession int
 	targets     map[string]*fakeTarget
@@ -191,12 +199,19 @@ func (f *fakeBrowser) handle(data []byte) {
 		})
 	case "Browser.close":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+		if f.exitsSlowly {
+			return
+		}
 		// Chrome exits; the pipe closes with it, and so does the process.
 		f.closing = true
 		if closer, ok := f.out.(io.Closer); ok {
 			_ = closer.Close()
 		}
 	case "Target.setAutoAttach":
+		if cmd.SessionID != "" && f.refuseTargetSetup {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "auto-attach is not available for this target")
+			return
+		}
 		if cmd.SessionID != "" {
 			if s, ok := f.sessions[cmd.SessionID]; ok {
 				s.nestedAuto = boolean("autoAttach")
@@ -289,6 +304,10 @@ func (f *fakeBrowser) handle(data []byte) {
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Fetch.enable":
+		if f.refuseTargetSetup {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "Fetch is not available for this target")
+			return
+		}
 		s, ok := f.sessions[cmd.SessionID]
 		if !ok {
 			f.replyError(cmd.ID, cmd.SessionID, -32001, "Session with given id not found.")

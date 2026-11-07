@@ -26,6 +26,7 @@ import {
 } from '@/features/txe/identity';
 import { mayDecide } from '@/features/txe/access';
 import { buildInbox } from '@/features/txe/inbox';
+import { useClockNow } from '@/hooks/useClock';
 
 const CLOCK_TICK_MS = 15_000;
 
@@ -53,11 +54,8 @@ export default function TxeInboxPage(): React.ReactElement {
 
   // Actionability depends on time as well as data: a snoozed proposal
   // returns when its expiry passes even if the polled records are unchanged.
-  const [now, setNow] = React.useState(() => new Date());
-  React.useEffect(() => {
-    const timer = window.setInterval(() => setNow(new Date()), CLOCK_TICK_MS);
-    return () => window.clearInterval(timer);
-  }, []);
+  const nowMs = useClockNow(CLOCK_TICK_MS);
+  const now = React.useMemo(() => new Date(nowMs), [nowMs]);
   const items = React.useMemo(
     () => (data ? buildInbox(data.jobs, data.proposals, now) : []),
     [data, now]

@@ -89,3 +89,19 @@ func errStartUnconfirmed(dagRunID string, timeout time.Duration) *Error {
 			"start: read run %s before starting it again", timeout, dagRunID),
 		Details: map[string]any{"code": "start_unconfirmed", "dag_run_id": dagRunID}}
 }
+
+// startFailure answers a start of an inline spec that failed. A structured
+// answer, such as 504 start_unconfirmed with the run's id or a dispatch
+// refusal, reaches the caller as it is, as from a start of a stored DAG, so
+// the caller follows that run instead of starting another (TXE-4712,
+// TXE-5923). Any other failure is an internal error that says what failed.
+func startFailure(err error) error {
+	if apiErr, ok := errors.AsType[*Error](err); ok {
+		return apiErr
+	}
+	return &Error{
+		HTTPStatus: http.StatusInternalServerError,
+		Code:       api.ErrorCodeInternalError,
+		Message:    fmt.Sprintf("failed to start dag-run: %s", err.Error()),
+	}
+}

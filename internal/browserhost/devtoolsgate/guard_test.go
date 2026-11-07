@@ -91,6 +91,11 @@ func TestGuardOneBrowserLaunch(t *testing.T) {
 	allowedExec := map[string]bool{
 		"internal/browserhost/devtoolsgate/launch.go": true,
 		"internal/browserhost/devtoolsgate/start.go":  true,
+		// The certificate proxy and the write gate start this executable's
+		// own `browser cert-proxy` and `browser write-gate` helpers, never a
+		// browser; the browser they serve is the gate's.
+		"internal/browserhost/certproxy/start.go": true,
+		"internal/browserhost/writegate/start.go": true,
 	}
 	// The gate names the pipe flags where it builds and validates them, and
 	// nowhere else may a remote-debugging flag be spelled, whole or in part.

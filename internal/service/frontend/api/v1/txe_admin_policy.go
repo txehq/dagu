@@ -137,6 +137,18 @@ var txeAdminOperations = map[string]txeAdminOperation{
 	"ListEventLogs": {txeAdminHubRecords, "reads every owner's run events"},
 	// A DAG's settings, decided as a write to that DAG.
 	"ValidateDAGProfileUpdate": {txeAdminOwnerScoped, "sets the profile a DAG runs with"},
+	// What the v2.25.8 integration adds (TXE-5923): the installation's
+	// license and its links to Dagu Cloud, which speak for every owner, the
+	// hub's own command channels, every remote node, and the hub-wide
+	// public webhook administration.
+	"requireLicenseManagement":    {txeAdminPlatform, "binds or changes the installation's license, which speaks to Dagu Cloud for every owner"},
+	"requireCloudReport":          {txeAdminPlatform, "sends the installation's usage, every owner's, to Dagu Cloud"},
+	"licenseProxyAuthorization":   {txeAdminPlatform, "reaches Dagu Cloud's license service as the installation"},
+	"requireCloudAccess":          {txeAdminPlatform, "opens the hub to remote access through Dagu Cloud"},
+	"requireCommandChannelAccess": {txeAdminPlatform, "configures channels that run commands on the hub's host"},
+	"authorizeRemoteNode":         {txeAdminPlatform, "uses a stored credential for another hub, with that hub's authority"},
+	"requirePublicWebhookAdmin":   {txeAdminPlatform, "administers public webhooks for every owner's DAGs at once; each owner's admission at enqueue is decided on its own"},
+	"GetWorkspaceDeprecation":     {txeAdminPlatform, "reads which of every owner's workspaces use deprecated settings"},
 }
 
 // errTxePlatformAdmin refuses the hub's administration to a caller owner

@@ -85,7 +85,14 @@ func ValidateAPIBaseURL(rawURL string) error {
 }
 
 // ApplyAuth adds authentication headers to the request based on the node's auth configuration.
-func (n *RemoteNode) ApplyAuth(req *http.Request) {
+//
+// It sends the credential only for a request whose context the local
+// decision allowed (WithUseAuthorized), and otherwise refuses, so a path that
+// reaches a remote node without that decision fails closed (TXE-5923).
+func (n *RemoteNode) ApplyAuth(req *http.Request) error {
+	if !UseAuthorized(req.Context()) {
+		return ErrUseNotAuthorized
+	}
 	switch n.AuthType {
 	case AuthTypeBasic:
 		req.SetBasicAuth(n.BasicAuthUsername, n.BasicAuthPassword)
@@ -94,6 +101,7 @@ func (n *RemoteNode) ApplyAuth(req *http.Request) {
 	case AuthTypeNone:
 		// No authentication needed.
 	}
+	return nil
 }
 
 // RemoteNodeForStorage is used for JSON serialization to persistent storage.

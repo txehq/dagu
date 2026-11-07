@@ -6,9 +6,11 @@ package api_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +97,9 @@ func TestTxeHubRecordsLegacyInEnforceThroughTheRouter(t *testing.T) {
 		{"GET /dags/search", func(listsHub) string { return "/api/v1/dags/search?q=marker-of" }},
 		{"GET /artifacts", func(listsHub) string { return "/api/v1/artifacts" }},
 	}
-	records := []string{"/api/v1/event-logs", "/api/v1/audit", "/api/v1/workers"}
+	// /dag-run-activity aggregates runs, queues and schedules across the hub
+	// (upstream v2.25, TXE-5923).
+	records := []string{"/api/v1/event-logs", "/api/v1/audit", "/api/v1/workers", "/api/v1/dag-run-activity"}
 
 	t.Run("enforce", func(t *testing.T) {
 		h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
@@ -130,4 +134,192 @@ func TestTxeHubRecordsLegacyInEnforceThroughTheRouter(t *testing.T) {
 			require.NotContains(t, body, "hub_records_not_permitted", path)
 		}
 	})
+}
+
+// Upstream v2.25's foreach reads of a root run decide the run as every other
+// run read does, by its DAG's owner: under enforce a legacy credential is
+// refused before anything of the run is read, while the platform
+// administrator reaches the run, here to learn that it has no such step
+// (TXE-5923).
+func TestTxeForeachReadsDecideTheRunsOwner(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	for _, name := range h.names {
+		path := "/api/v1/dag-runs/" + name + "/run-" + strings.ReplaceAll(name, "_", "-") + "/steps/s/foreach"
+		status, body := h.send(t, path, h.legacy)
+		require.NotEqual(t, http.StatusOK, status, body)
+		require.NotContains(t, body, "step s", "a legacy credential in enforce read run %s", name)
+		_, body = h.send(t, path, h.admin)
+		require.Contains(t, body, "step s not found in DAG", "the platform administrator reads run %s", name)
+	}
+}
+
+// Upstream v2.25's calendar reads list the DAGs that use a calendar. Under
+// enforce they name only what the caller's DAG lists show it: a legacy
+// credential none, the platform administrator every DAG. A delete still
+// counts every DAG, so a calendar in use is not deleted from under DAGs the
+// caller cannot see; it names none of them (TXE-5923).
+func TestTxeCalendarUsageFollowsTheOwnerScope(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "ops"}).
+		WithBearerToken(h.admin).ExpectStatus(http.StatusCreated).Send(t)
+	users := []string{"job_01M5YYYYYYYYYYYYYYYYYYYYYY", "nightly-calendar"}
+	for _, name := range users {
+		spec := []byte("calendar: ops\nschedule: \"0 9 * * *\"\nsteps:\n  - name: s\n    run: echo hi\n")
+		h.server.CreateDAGFile(t, h.server.Config.Paths.DAGsDir, name, spec)
+	}
+	mentioned := func(body string) []string {
+		var out []string
+		for _, name := range users {
+			if strings.Contains(body, name) {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+
+	status, body := h.send(t, "/api/v1/calendars/ops", h.admin)
+	require.Equal(t, http.StatusOK, status, body)
+	require.ElementsMatch(t, users, mentioned(body), "the platform administrator")
+	status, body = h.send(t, "/api/v1/calendars/ops", h.legacy)
+	require.Equal(t, http.StatusOK, status, body)
+	require.Empty(t, mentioned(body), "a legacy credential in enforce")
+	status, body = h.send(t, "/api/v1/calendars?includeUsage=true", h.legacy)
+	require.Equal(t, http.StatusOK, status, body)
+	require.NotContains(t, body, `"dagCount":2`, "a legacy credential in enforce counts no DAG")
+
+	resp := h.server.Client().Delete("/api/v1/calendars/ops").WithBearerToken(h.legacy).Send(t)
+	if resp.Response.StatusCode() == http.StatusConflict {
+		require.Empty(t, mentioned(resp.Body), "a delete names no DAG the caller cannot see")
+	}
+	resp = h.server.Client().Delete("/api/v1/calendars/ops").WithBearerToken(h.admin).Send(t)
+	require.Equal(t, http.StatusConflict, resp.Response.StatusCode(), "a calendar in use is not deleted")
+	require.ElementsMatch(t, users, mentioned(resp.Body))
+}
+
+// A shared calendar decides when every owner's calendar-backed workflows run,
+// so in enforce only the platform administrator creates, changes or deletes
+// one; a legacy credential, even a manager, is refused before anything is
+// written.
+func TestTxeSharedCalendarWritesArePlatformOnly(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "ops"}).
+		WithBearerToken(h.admin).ExpectStatus(http.StatusCreated).Send(t)
+
+	h.server.Client().Post("/api/v1/calendars", api.CreateCalendarJSONRequestBody{Name: "rogue"}).
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+	h.server.Client().Put("/api/v1/calendars/ops", api.UpdateCalendarJSONRequestBody{Spec: "name: ops\n"}).
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+	h.server.Client().Delete("/api/v1/calendars/ops").
+		WithBearerToken(h.legacy).ExpectStatus(http.StatusForbidden).Send(t)
+
+	status, body := h.send(t, "/api/v1/calendars/ops", h.admin)
+	require.Equal(t, http.StatusOK, status, body, "the calendar is unchanged and still there")
+	status, _ = h.send(t, "/api/v1/calendars/rogue", h.admin)
+	require.Equal(t, http.StatusNotFound, status, "nothing was created")
+	h.server.Client().Delete("/api/v1/calendars/ops").
+		WithBearerToken(h.admin).ExpectStatus(http.StatusNoContent).Send(t)
+}
+
+// Under owner enforcement a request for a remote node needs the platform
+// administrator (for the builtin sign-in, an admin-role account:
+// txeauth.Classify). A legacy manager, an administrator of the hub's roles
+// but no platform administrator, is refused before any node is looked up,
+// and the refusal names no node. The platform administrator passes the
+// decision; this hub has no node of that name, so the proxy then says so
+// (TXE-5923, option A).
+func TestTxeRemoteNodeNeedsThePlatformAdministratorUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+
+	status, body := h.send(t, "/api/v1/dags?remoteNode=edge", h.legacy)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.NotContains(t, body, "edge")
+
+	status, body = h.send(t, "/api/v1/dags?remoteNode=edge", h.admin)
+	require.Equal(t, http.StatusBadRequest, status, body)
+	require.Contains(t, body, "not found", "past the decision, the proxy looks the node up")
+
+	status, _ = h.send(t, "/api/v1/dags", h.legacy)
+	require.NotEqual(t, http.StatusForbidden, status, "a request for this server is not the remote decision's")
+}
+
+// Under owner enforcement a capability that runs commands on the hub's host
+// needs the platform administrator: an admin-role API key, which the owner
+// model never takes for the platform administrator, can neither save a
+// command notification channel nor open the terminal (TXE-5923). The
+// platform administrator gets past this decision to the hub's own checks.
+func TestTxeHostExecutionNeedsThePlatformAdministratorUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	key := createAPIKeyForRole(t, h.server, h.admin, "legacy-admin-key", api.UserRoleAdmin)
+	channel := api.NotificationChannelInput{
+		Name: "host", Enabled: true, Type: api.NotificationProviderTypeCommand,
+		Command: &api.NotificationCommandTarget{Command: "id"},
+	}
+
+	// The channel's administrator check carries the platform rule
+	// (requireAdmin, TXE-6139), which refuses the key before the host
+	// execution check is asked; the decision is the same.
+	resp := h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "platform_admin_required")
+
+	resp = h.server.Client().Post("/api/v1/notification-channels", channel).WithBearerToken(h.admin).Send(t)
+	require.NotContains(t, resp.Body, "platform_admin_required", "the platform administrator is decided by the hub's own checks")
+	require.NotContains(t, resp.Body, "host_execution_not_permitted", "the platform administrator is decided by the hub's own checks")
+
+	// The terminal takes its token from the query only.
+	terminal, err := http.Get(h.base + "/api/v1/terminal/ws?token=" + key) //nolint:noctx // test request
+	require.NoError(t, err)
+	defer func() { _ = terminal.Body.Close() }()
+	terminalBody, err := io.ReadAll(terminal.Body)
+	require.NoError(t, err)
+	// An API key has no terminal surface, so authentication refuses it first;
+	// any other administrator the owner model does not take for the platform
+	// administrator meets TxeHostExecutionRefused, the same decision as the
+	// channel's above. Either way no terminal opens.
+	require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, terminal.StatusCode, string(terminalBody))
+}
+
+// Under owner enforcement the Dagu Console report, which carries every
+// owner's runs and failures, is the platform administrator's: an admin-role
+// API key can neither read it nor change what it sends (TXE-5923).
+func TestTxeCloudReportIsThePlatformAdministratorsUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+	key := createAPIKeyForRole(t, h.server, h.admin, "legacy-admin-report", api.UserRoleAdmin)
+
+	// Each route's administrator check carries the platform rule
+	// (requireAdmin, TXE-6139), which refuses the key before the hub
+	// records check is asked; the decision is the same.
+	status, body := h.send(t, "/api/v1/license/monitoring", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "platform_admin_required")
+	resp := h.server.Client().Put("/api/v1/license/monitoring", api.UpdateLicenseMonitoringJSONRequestBody{Level: "runs"}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "platform_admin_required")
+
+	status, body = h.send(t, "/api/v1/license/monitoring", h.admin)
+	require.NotContains(t, body, "hub_records_not_permitted", "the platform administrator is decided by the hub's own checks (%d)", status)
+	require.NotContains(t, body, "platform_admin_required", "the platform administrator is decided by the hub's own checks (%d)", status)
+	// The connect route's report and remote access choices, and the remote
+	// access route, are the same decision: refused before anything starts.
+	report := api.LicenseMonitoringLevel("errors")
+	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{Report: &report}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "platform_admin_required")
+	status, body = h.send(t, "/api/v1/license/remote-access", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "platform_admin_required")
+	// Opening the link at all sends whatever level is in effect, one chosen
+	// earlier included: an empty connect request is refused too.
+	resp = h.server.Client().Post("/api/v1/license/connect", api.StartLicenseConnectJSONRequestBody{}).
+		WithBearerToken(key).Send(t)
+	require.Equal(t, http.StatusForbidden, resp.Response.StatusCode(), resp.Body)
+	require.Contains(t, resp.Body, "platform_admin_required")
+	status, body = h.send(t, "/api/v1/license/connect", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	// The deprecation inventory reads every workspace's settings.
+	status, body = h.send(t, "/api/v1/workspaces/deprecation", key)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.Contains(t, body, "platform_admin_required")
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dagucloud/dagu/v2/internal/spec"
 	"net/http"
 	"net/url"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	daguapi "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/audit"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
@@ -47,6 +49,15 @@ type Service struct {
 
 	watchPollInterval time.Duration
 	watchMaxErrors    int
+
+	// remote is set on the server that takes calls from Dagu Cloud.
+	remote *remoteCalls
+}
+
+// remoteCalls is what the server that takes calls from Dagu Cloud checks.
+type remoteCalls struct {
+	// approvals reports whether calls may decide steps waiting for a person.
+	approvals func(context.Context) bool
 }
 
 type resourceWatcher struct {
@@ -56,26 +67,79 @@ type resourceWatcher struct {
 }
 
 // NewHTTPHandler returns a Streamable HTTP MCP handler backed by the Dagu API.
+// Open event streams carry periodic SSE comments so proxies keep them open.
 func NewHTTPHandler(api *frontendapi.API) http.Handler {
 	server := NewServer(api)
+	return withSSEHeartbeat(newStreamableHandler(server), sseHeartbeatInterval)
+}
+
+// newStreamableHandler serves server over Streamable HTTP. Replies to POST are
+// plain JSON, so server-initiated messages use the standalone event stream.
+func newStreamableHandler(server *mcpsdk.Server) http.Handler {
 	return mcpsdk.NewStreamableHTTPHandler(
 		func(*http.Request) *mcpsdk.Server { return server },
 		&mcpsdk.StreamableHTTPOptions{JSONResponse: true},
 	)
 }
 
+// NewCloudHandler returns the stateless MCP handler for the calls Dagu Cloud
+// carries to this server. It offers no resource subscriptions. It decides a
+// step waiting for a person only while approvals reports true, and only for
+// the attempt the call names.
+func NewCloudHandler(api *frontendapi.API, approvals func(context.Context) bool) http.Handler {
+	return newCloudHandler(newServer(api, &remoteCalls{approvals: approvals}))
+}
+
+// newCloudHandler serves server to calls from Dagu Cloud, each in a session
+// of its own, and ends the work of a call when its request ends.
+func newCloudHandler(server *mcpsdk.Server) http.Handler {
+	server.AddReceivingMiddleware(endWithRequest)
+	handler := mcpsdk.NewStreamableHTTPHandler(
+		func(*http.Request) *mcpsdk.Server { return server },
+		&mcpsdk.StreamableHTTPOptions{Stateless: true, JSONResponse: true, PropagateRequestCancellation: true},
+	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := audit.WithSourceContext(r.Context(), ensureMCPSourceContext(r.Context()))
+		ctx = context.WithValue(ctx, requestContextKey{}, r.Context())
+		handler.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// requestContextKey carries the context of the HTTP request a call came in.
+type requestContextKey struct{}
+
+// endWithRequest cancels a method's context when the request it came in ends.
+// The SDK does this itself only for protocol versions from 2026-07-28, and
+// turning remote access off must end the calls in flight whatever version a
+// call uses.
+func endWithRequest(next mcpsdk.MethodHandler) mcpsdk.MethodHandler {
+	return func(ctx context.Context, method string, req mcpsdk.Request) (mcpsdk.Result, error) {
+		request, ok := ctx.Value(requestContextKey{}).(context.Context)
+		if !ok {
+			return next(ctx, method, req)
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		stop := context.AfterFunc(request, cancel)
+		defer stop()
+		return next(ctx, method, req)
+	}
+}
+
 // NewServer builds the MCP server used by the Streamable HTTP transport.
 func NewServer(api *frontendapi.API) *mcpsdk.Server {
+	return newServer(api, nil)
+}
+
+func newServer(api *frontendapi.API, remote *remoteCalls) *mcpsdk.Server {
 	svc := &Service{
 		api:               api,
 		watchers:          make(map[string]*resourceWatcher),
 		watchPollInterval: defaultRunWatchPollInterval,
 		watchMaxErrors:    defaultRunWatchMaxErrors,
+		remote:            remote,
 	}
-	server := mcpsdk.NewServer(&mcpsdk.Implementation{
-		Name:    "dagu",
-		Version: config.Version,
-	}, &mcpsdk.ServerOptions{
+	options := &mcpsdk.ServerOptions{
 		Capabilities: &mcpsdk.ServerCapabilities{
 			Extensions: map[string]any{
 				mcpAppsExtensionURI: mcpAppsCapability(),
@@ -87,7 +151,17 @@ func NewServer(api *frontendapi.API) *mcpsdk.Server {
 		Instructions:       instructions,
 		SubscribeHandler:   svc.subscribe,
 		UnsubscribeHandler: svc.unsubscribe,
-	})
+	}
+	if remote != nil {
+		// A stateless call ends with its response, so nothing could carry
+		// an update.
+		options.Capabilities.Resources = &mcpsdk.ResourceCapabilities{}
+		options.SubscribeHandler, options.UnsubscribeHandler = nil, nil
+	}
+	server := mcpsdk.NewServer(&mcpsdk.Implementation{
+		Name:    "dagu",
+		Version: config.Version,
+	}, options)
 	svc.server = server
 
 	registerTools(server, svc)
@@ -114,7 +188,7 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 	falsePtr := new(false)
 	truePtr := new(true)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Meta:        runInspectorToolMeta(),
 		Name:        toolRead,
 		Title:       "Read Dagu state",
@@ -127,7 +201,7 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 		},
 	}, svc.readTool)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Name:        toolChange,
 		Title:       "Preview or apply Dagu changes",
 		Description: "Validate and optionally apply DAG definitions, DAG default profiles, or Markdown Wiki changes. Wiki changes are workspace-aware. Use mode=preview before mode=apply unless the user explicitly asked to write immediately.",
@@ -139,18 +213,40 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 		},
 	}, svc.changeTool)
 
-	server.AddTool(&mcpsdk.Tool{
+	addTool(server, svc, &mcpsdk.Tool{
 		Meta:        runInspectorToolMeta(),
 		Name:        toolExecute,
-		Title:       "Execute, enqueue, retry, or stop DAG-runs",
-		Description: "Run control entry point. action=start or enqueue launches a DAG or inline spec; action=retry retries a DAG-run; action=stop terminates a DAG-run. Set wait=true to wait for the run result.",
+		Title:       "Execute DAG-runs and decide waiting steps",
+		Description: "Run control entry point. action=start or enqueue launches a DAG or inline spec; action=retry retries a DAG-run; action=stop terminates a DAG-run. When dagu_read target=run shows a step waiting for a person (approval or humanTask), action=approve, reject, or push_back decides that step; pass the run's attemptId from that read so a decision based on a stale read is refused. Set wait=true to wait for the run result.",
 		InputSchema: executeToolInputSchema(),
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: truePtr,
 			OpenWorldHint:   falsePtr,
-			Title:           "Execute, enqueue, retry, or stop DAG-runs",
+			Title:           "Execute DAG-runs and decide waiting steps",
 		},
 	}, svc.executeTool)
+}
+
+// addTool offers tool on server, except on the server for Dagu Cloud when
+// cloudTools does not allow it.
+//
+// Every call is scoped for spec loading (frontendapi.API.SpecLoadContext): a
+// caller who may not read the hub's files loads no params.schema reference
+// through any tool.
+func addTool(server *mcpsdk.Server, svc *Service, tool *mcpsdk.Tool, handler mcpsdk.ToolHandler) {
+	if svc.remote != nil && !cloudTools[tool.Name] {
+		return
+	}
+	server.AddTool(tool, func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		switch {
+		case svc.remote != nil:
+			// A call from Dagu Cloud never reads this server's files.
+			ctx = spec.WithoutSchemaReferences(ctx)
+		case svc.api != nil:
+			ctx = svc.api.SpecLoadContext(ctx)
+		}
+		return handler(ctx, req)
+	})
 }
 
 func registerResources(server *mcpsdk.Server, svc *Service) {
@@ -288,6 +384,33 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 		Description: "Standard output and standard error for a child DAG-run step. Supports tail, head, offset, limit, and stream query parameters.",
 		MIMEType:    resourceMIMEJSON,
 	}, svc.readResource)
+
+	for _, prefix := range []struct{ uri, name, title, run string }{
+		{"dagu://runs/{name}/{dagRunId}", "dag_run_", "DAG-run ", "a DAG-run"},
+		{"dagu://runs/{name}/{dagRunId}/sub/{subRunId}", "sub_dag_run_", "Sub DAG-run ", "a child DAG-run"},
+	} {
+		server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+			URITemplate: prefix.uri + "/steps/{stepName}/foreach",
+			Name:        prefix.name + "foreach_items",
+			Title:       prefix.title + "foreach items",
+			Description: "Items of a foreach step in " + prefix.run + ", with the status each body run reached. Supports parent, status, page, and perPage query parameters.",
+			MIMEType:    resourceMIMEJSON,
+		}, svc.readResource)
+		server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+			URITemplate: prefix.uri + "/steps/{stepName}/foreach/{item}",
+			Name:        prefix.name + "foreach_item",
+			Title:       prefix.title + "foreach item",
+			Description: "One item of a foreach step in " + prefix.run + ", with the status of each body step.",
+			MIMEType:    resourceMIMEJSON,
+		}, svc.readResource)
+		server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+			URITemplate: prefix.uri + "/steps/{stepName}/foreach/{item}/steps/{bodyStepName}/logs",
+			Name:        prefix.name + "foreach_step_log",
+			Title:       prefix.title + "foreach step log",
+			Description: "Standard output and standard error for one body step of a foreach item in " + prefix.run + ". Supports tail, head, offset, limit, and stream query parameters.",
+			MIMEType:    resourceMIMEJSON,
+		}, svc.readResource)
+	}
 }
 
 func registerPrompts(server *mcpsdk.Server) {
@@ -819,6 +942,9 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 			}
 			return text, resourceMIMEJSON, nil
 		}
+		if foreach, ok := parseForeachResource(segments); ok {
+			return svc.readForeachResource(ctx, rawURI, foreach, parsed.RawQuery)
+		}
 		if !isRunResourceSegments(segments) && !isStepLogResourceSegments(segments) &&
 			!isSubRunResourceSegments(segments) && !isSubStepLogResourceSegments(segments) {
 			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
@@ -873,6 +999,42 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 	default:
 		return "", "", mcpsdk.ResourceNotFoundError(rawURI)
 	}
+}
+
+// readForeachResource serves the foreach item resources of a run.
+func (svc *Service) readForeachResource(ctx context.Context, rawURI string, resource runResource, rawQuery string) (string, string, error) {
+	if resource.queryTarget() == "" && rawQuery != "" {
+		return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+	}
+	if readErr := validateReadQuery(resource.queryTarget(), rawQuery, true, rawURI); readErr != nil {
+		return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+	}
+	if err := svc.requireAPI(); err != nil {
+		return "", "", err
+	}
+	ref := ir.NewDAGRunRef(resource.addr.name, resource.addr.dagRunID)
+	var (
+		data any
+		err  error
+	)
+	switch resource.kind {
+	case runResourceForeachItems:
+		data, err = svc.api.GetForeachItemsDataByRef(ctx, ref, resource.addr.subRunID, resource.stepName, foreachItemsQuery(rawQuery))
+	case runResourceForeachItem:
+		data, err = svc.api.GetForeachItemDataByRef(ctx, ref, resource.addr.subRunID, resource.stepName, resource.item)
+	case runResourceForeachStepLog:
+		data, err = svc.api.GetForeachStepLogDataByRef(ctx, ref, resource.addr.subRunID, resource.stepName, resource.item, resource.bodyStepName, stepLogReadOptions(rawQuery))
+	case runResourceOther:
+		return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	text, err := jsonText(data)
+	if err != nil {
+		return "", "", err
+	}
+	return text, resourceMIMEJSON, nil
 }
 
 func (svc *Service) subscribe(ctx context.Context, req *mcpsdk.SubscribeRequest) error {

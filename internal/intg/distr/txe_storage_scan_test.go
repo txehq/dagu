@@ -38,7 +38,13 @@ func newScanFixture(t *testing.T) *scanFixture {
 	require.NoError(t, lock.TryLock(), "take the record lock as the store does")
 	t.Cleanup(func() { _ = lock.Unlock() })
 	lockDir := filepath.Join(bucket, dirlock.LockDirectoryName)
-	owner := filepath.Join(lockDir, "owner")
+	// The owner token's file name is dirlock's to choose: a fixed "owner"
+	// before upstream v2.25, a unique "owner.<id>" since. The fixture takes
+	// the one file the live lock wrote, whatever its name.
+	entries, err := os.ReadDir(lockDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the live lock has one owner token")
+	owner := filepath.Join(lockDir, entries[0].Name())
 	require.FileExists(t, owner, "the live lock has its owner token")
 	return &scanFixture{root: root, record: record, lock: lock, lockDir: lockDir, owner: owner}
 }

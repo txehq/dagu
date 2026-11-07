@@ -1,0 +1,98 @@
+[
+  {
+    "name": "chain",
+    "spec": "type: chain\nsteps:\n  - name: a\n    run: echo a\n  - name: b\n    run: echo b\n  - name: c\n    run: echo c\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ],
+      "c": [
+        "b"
+      ]
+    }
+  },
+  {
+    "name": "chain with a parallel group",
+    "spec": "type: chain\nsteps:\n  - name: a\n    run: echo a\n  - - name: b1\n      run: echo b1\n    - name: b2\n      run: echo b2\n  - name: c\n    run: echo c\n",
+    "depends": {
+      "a": [],
+      "b1": [
+        "a"
+      ],
+      "b2": [
+        "a"
+      ],
+      "c": [
+        "b1",
+        "b2"
+      ]
+    }
+  },
+  {
+    "name": "chain with ids",
+    "spec": "type: chain\nsteps:\n  - id: first\n    name: a\n    run: echo a\n  - id: second\n    name: b\n    run: echo b\n  - name: c\n    run: echo c\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ],
+      "c": [
+        "b"
+      ]
+    }
+  },
+  {
+    "name": "graph",
+    "spec": "type: graph\nsteps:\n  - name: a\n    run: echo a\n  - name: b\n    run: echo b\n  - name: c\n    depends: [a, b]\n    run: echo c\n",
+    "depends": {
+      "a": [],
+      "b": [],
+      "c": [
+        "a",
+        "b"
+      ]
+    }
+  },
+  {
+    "name": "graph with ids",
+    "spec": "type: graph\nsteps:\n  - id: first\n    name: a\n    run: echo a\n  - id: second\n    name: b\n    depends: [first]\n    run: echo b\n  - name: c\n    depends: [second]\n    run: echo c\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ],
+      "c": [
+        "b"
+      ]
+    }
+  },
+  {
+    "name": "graph with an output reference braced",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo \"${steps.a.outputs.x}\"\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ]
+    }
+  },
+  {
+    "name": "graph with an output reference padded",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo \"${ steps.a.outputs.x }\"\n",
+    "depends": {
+      "a": [],
+      "b": [
+        "a"
+      ]
+    }
+  },
+  {
+    "name": "graph with an output reference unbraced",
+    "spec": "type: graph\nsteps:\n  - id: a\n    name: a\n    run: echo x\n  - id: b\n    name: b\n    run: echo $steps.a.outputs.x\n",
+    "depends": {
+      "a": [],
+      "b": []
+    }
+  }
+]

@@ -65,6 +65,11 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 		return err
 	}
 	m := newMux(browser.pipe)
+	if cfg.ProxyAuth != nil {
+		// Set before the mux reads the pipe: the responder must be in
+		// place for the first target the gate holds.
+		newProxyResponder(m, *cfg.ProxyAuth).install()
+	}
 	// The keeper counts admitted clients from the first one: it is on the
 	// multiplexer before the gate listens.
 	k := newKeeper(clk.Now, cfg.lifetime())
@@ -102,6 +107,11 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 		return fail(fmt.Errorf("devtools gate: %w", err))
 	}
 	defer g.close()
+	// A browser on its way out is not served any more, as it would not be
+	// on a port.
+	m.mu.Lock()
+	m.onBrowserClosing = g.stopServing
+	m.mu.Unlock()
 	writeReadyLine(stdout, readyLine{Ready: &Ready{
 		Port:             port,
 		BrowserID:        g.browserID,

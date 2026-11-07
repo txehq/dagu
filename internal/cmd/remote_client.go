@@ -13,16 +13,21 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/txe/cliauth"
 )
 
 const defaultRemoteTimeout = 30 * time.Second
+
+// maxRemoteErrorBodyBytes bounds the error body read from a remote server so a
+// misbehaving server cannot force an arbitrary allocation.
+const maxRemoteErrorBodyBytes = 64 * 1024
 
 type remoteClient struct {
 	baseURL string
@@ -155,13 +160,18 @@ func (c *remoteClient) resolveDAG(ctx context.Context, arg string) (*api.DAGFile
 }
 
 func isLikelyLocalDAGArg(arg string) bool {
-	if strings.HasSuffix(arg, ".yaml") || strings.HasSuffix(arg, ".yml") {
+	if fileutil.IsYAMLFile(arg) {
 		return true
 	}
-	if strings.ContainsRune(arg, filepath.Separator) {
+	if strings.Contains(arg, "/") {
 		return true
 	}
-	return false
+	// A bare backslash can be a valid character in a remote file ID, so only
+	// unambiguous Windows path prefixes read as local.
+	if strings.HasPrefix(arg, `\\`) {
+		return true
+	}
+	return len(arg) > 2 && arg[1] == ':' && arg[2] == '\\'
 }
 
 func (c *remoteClient) startDAG(ctx context.Context, fileName string, body api.ExecuteDAGJSONBody) (*api.DAGRunSummary, error) {
@@ -325,7 +335,7 @@ func (c *remoteClient) doWithQueryValues(ctx context.Context, method, path strin
 }
 
 func decodeRemoteError(resp *http.Response) error {
-	data, _ := io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRemoteErrorBodyBytes+1))
 	if len(data) == 0 {
 		return &remoteError{StatusCode: resp.StatusCode, Message: resp.Status}
 	}
@@ -337,5 +347,11 @@ func decodeRemoteError(resp *http.Response) error {
 		}
 		return out
 	}
-	return &remoteError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(data))}
+	msg := strings.TrimSpace(string(data))
+	if len(data) > maxRemoteErrorBodyBytes {
+		// The cap can split a UTF-8 codepoint; cut on a rune boundary and
+		// mark the message as truncated.
+		msg = stringutil.TruncUTF8Bytes(msg, maxRemoteErrorBodyBytes-len("…")) + "…"
+	}
+	return &remoteError{StatusCode: resp.StatusCode, Message: msg}
 }

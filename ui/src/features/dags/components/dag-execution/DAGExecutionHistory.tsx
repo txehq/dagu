@@ -18,7 +18,7 @@ import {
 import { useRemoteNode } from '../../../../contexts/RemoteNodeContext';
 import { useClient, useQuery } from '../../../../hooks/api';
 import { useDAGHistorySSE } from '../../../../hooks/useDAGHistorySSE';
-import { buildDAGPageURL } from '../../../dag-runs/lib/dagRunUrls';
+import { buildDAGRunPageURL } from '../../../dag-runs/lib/dagRunUrls';
 import {
   sseFallbackOptions,
   useSSECacheSync,
@@ -30,6 +30,7 @@ import { getEventHandlers } from '../../lib/getEventHandlers';
 import { updateDAGRunsNodeStatus } from '../../lib/nodeStatus';
 import { DAGStatusOverview, NodeStatusTable } from '../dag-details';
 import { StepDetailsDrawer } from '../step-details';
+import type { ForeachLogTarget } from '../../hooks/useStepLogQuery';
 import { DAGGraph } from '../visualization';
 import { HistoryTable, LogViewer, StatusUpdateModal } from './';
 import { I18nText } from '@/i18n/I18nText';
@@ -80,7 +81,11 @@ function DAGExecutionHistory({
 
   // Show message if no execution history is found
   if (!data.dagRuns?.length) {
-    return <div><I18nText text={"Execution history was not found."} /></div>;
+    return (
+      <div>
+        <I18nText text={'Execution history was not found.'} />
+      </div>
+    );
   }
 
   return (
@@ -135,6 +140,8 @@ function DAGHistoryTable({
     stepName: string;
     dagRunId: string;
     stream: Stream;
+    foreach?: ForeachLogTarget;
+    bodyStepStatus?: NodeStatus;
   }>({
     isOpen: false,
     logType: 'step',
@@ -364,8 +371,7 @@ function DAGHistoryTable({
       const subDAGRun = subRuns[0];
       if (subDAGRun && subDAGRun.dagRunId) {
         navigate(
-          buildDAGPageURL({
-            fileName,
+          buildDAGRunPageURL({
             remoteNode,
             rootDAGRunId: dagRun.rootDAGRunId,
             rootDAGRunName: dagRun.rootDAGRunName,
@@ -446,8 +452,7 @@ function DAGHistoryTable({
                 onRightClickStep={onRightClickStepOnGraph}
                 onOpenSubRun={({ dagRunId }) =>
                   navigate(
-                    buildDAGPageURL({
-                      fileName,
+                    buildDAGRunPageURL({
                       remoteNode,
                       rootDAGRunId: selectedDAGRun.rootDAGRunId,
                       rootDAGRunName: selectedDAGRun.rootDAGRunName,
@@ -537,10 +542,13 @@ function DAGHistoryTable({
                 }
                 logType={logViewer.logType}
                 dagName={selectedDAGRun.name}
+                fileName={fileName}
                 dagRunId={logViewer.dagRunId}
                 stepName={logViewer.stepName}
                 dagRun={selectedDAGRun}
                 stream={logViewer.stream}
+                foreach={logViewer.foreach}
+                bodyStepStatus={logViewer.bodyStepStatus}
               />
             </React.Fragment>
           ) : null}
@@ -557,6 +565,7 @@ function DAGHistoryTable({
             isOpen={isStepDetailsOpen}
             step={selectedDetailNode?.step}
             node={selectedDetailNode}
+            dagRun={selectedDAGRun}
             onClose={closeStepDetails}
             onViewLog={(node, stream) => {
               if (!selectedDAGRun) {
@@ -568,6 +577,25 @@ function DAGHistoryTable({
                 stepName: node.step.name,
                 dagRunId: selectedDAGRun.dagRunId,
                 stream: stream === 'stderr' ? Stream.stderr : Stream.stdout,
+              });
+            }}
+            onViewBodyStepLog={(
+              bodyStepName,
+              foreach,
+              stream,
+              bodyStepStatus
+            ) => {
+              if (!selectedDAGRun) {
+                return;
+              }
+              setLogViewer({
+                isOpen: true,
+                logType: 'step',
+                stepName: bodyStepName,
+                dagRunId: selectedDAGRun.dagRunId,
+                stream,
+                foreach,
+                bodyStepStatus,
               });
             }}
             onOpenSubRun={(node, subRunIndex) => {
@@ -583,8 +611,7 @@ function DAGHistoryTable({
                 return;
               }
               navigate(
-                buildDAGPageURL({
-                  fileName,
+                buildDAGRunPageURL({
                   remoteNode,
                   rootDAGRunId: selectedDAGRun.rootDAGRunId,
                   rootDAGRunName: selectedDAGRun.rootDAGRunName,

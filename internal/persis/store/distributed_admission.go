@@ -479,11 +479,10 @@ func (s *DispatchTaskStore) addLegacyDispatchRecords(
 		if payload.AdmissionReservationToken != "" {
 			continue
 		}
-		recordAt := dispatchRecordTimestamp(payload.EnqueuedAt, rec.CreatedAt)
-		if prefix == dispatchClaimsPrefix {
-			recordAt = dispatchRecordTimestamp(payload.ClaimedAt, rec.UpdatedAt)
-		}
-		if now.Sub(recordAt) >= staleThreshold {
+		// A pending task holds its place until it is claimed or dropped; a
+		// stale claim is about to return to pending and is counted there.
+		if prefix == dispatchClaimsPrefix &&
+			now.Sub(dispatchRecordTimestamp(payload.ClaimedAt, rec.UpdatedAt)) >= staleThreshold {
 			continue
 		}
 		key := payload.Task.AttemptKey
@@ -581,15 +580,12 @@ func (s *DispatchTaskStore) createPendingRecord(
 	task *dispatch.DispatchTask,
 	taskFingerprint string,
 ) error {
-	now := time.Now().UTC()
-	payload := dispatchTaskPayload{
-		Version:                   dispatchTaskStoreVersion,
-		Task:                      cloneDispatchTask(task),
-		TaskFileName:              attempt.PendingFileName,
-		EnqueuedAt:                now.UnixMilli(),
-		AdmissionReservationToken: attempt.ReservationToken,
+	if err := s.ensureDispatchIndex(ctx); err != nil {
+		return err
 	}
-	rec, err := s.newDispatchRecord(attempt.PendingRecordID, payload, now, now)
+	now := s.now()
+	payload := s.newPendingPayload(task, attempt.PendingFileName, attempt.ReservationToken, now)
+	rec, err := s.newDispatchRecord(attempt.PendingRecordID, &payload, now, now)
 	if err != nil {
 		return err
 	}

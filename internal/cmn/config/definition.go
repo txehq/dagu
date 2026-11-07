@@ -18,6 +18,7 @@ type Definition struct {
 	CheckUpdates       *bool        `mapstructure:"check_updates"`
 	TLS                *TLSDef      `mapstructure:"tls"`
 	CORSAllowedOrigins []string     `mapstructure:"cors_allowed_origins"`
+	AllowedHosts       []string     `mapstructure:"allowed_hosts"`
 	IPAccess           *IPAccessDef `mapstructure:"ip_access"`
 
 	// Core settings
@@ -102,6 +103,7 @@ type Definition struct {
 	Tunnel     *TunnelDef     `mapstructure:"tunnel"`
 	License    *LicenseDef    `mapstructure:"license"`
 	TXE        *TXEDef        `mapstructure:"txe"`
+	Cloud      *CloudDef      `mapstructure:"cloud"`
 }
 
 // OpenCodeDef configures the process-local managed OpenCode service.
@@ -112,7 +114,32 @@ type OpenCodeDef struct {
 
 // BrowserDef configures the browsers that browser steps start on this host.
 type BrowserDef struct {
-	Sandbox *bool `mapstructure:"sandbox"`
+	Sandbox                 *bool                         `mapstructure:"sandbox"`
+	MaxOpen                 *int                          `mapstructure:"max_open"`
+	ClientCertificates      []BrowserClientCertificateDef `mapstructure:"client_certificates"`
+	TrustedCAs              []BrowserTrustedCADef         `mapstructure:"trusted_cas"`
+	GuardClientCertificates *bool                         `mapstructure:"guard_client_certificates"`
+	WriteGate               string                        `mapstructure:"write_gate"`
+	WritePolicy             string                        `mapstructure:"write_policy"`
+}
+
+// BrowserClientCertificateDef is a TLS client certificate that browsers on
+// this host present to the hosts it names.
+type BrowserClientCertificateDef struct {
+	Hosts          []string `mapstructure:"hosts"`
+	PFXFile        string   `mapstructure:"pfx_file"`
+	CertFile       string   `mapstructure:"cert_file"`
+	KeyFile        string   `mapstructure:"key_file"`
+	CAFile         string   `mapstructure:"ca_file"`
+	Passphrase     string   `mapstructure:"passphrase"`
+	PassphraseFile string   `mapstructure:"passphrase_file"`
+}
+
+// BrowserTrustedCADef is a server certificate authority that browsers on
+// this host trust for the hosts it names.
+type BrowserTrustedCADef struct {
+	Hosts  []string `mapstructure:"hosts"`
+	CAFile string   `mapstructure:"ca_file"`
 }
 
 // DAGDiscoveryDef configures DAG definition discovery.
@@ -153,8 +180,9 @@ type AuthDef struct {
 
 // AuthBasicDef configures basic authentication credentials.
 type AuthBasicDef struct {
-	Username string `mapstructure:"username"`
-	Password string `mapstructure:"password"`
+	Username     string `mapstructure:"username"`
+	Password     string `mapstructure:"password"`
+	PasswordFile string `mapstructure:"password_file"`
 }
 
 // AuthBuiltinDef configures builtin authentication with RBAC.
@@ -167,14 +195,16 @@ type AuthBuiltinDef struct {
 
 // TokenConfigDef configures JWT token settings.
 type TokenConfigDef struct {
-	Secret string `mapstructure:"secret"`
-	TTL    string `mapstructure:"ttl"`
+	Secret     string `mapstructure:"secret"`
+	SecretFile string `mapstructure:"secret_file"`
+	TTL        string `mapstructure:"ttl"`
 }
 
 // InitialAdminDef configures the initial admin user for auto-provisioning.
 type InitialAdminDef struct {
-	Username string `mapstructure:"username"`
-	Password string `mapstructure:"password"`
+	Username     string `mapstructure:"username"`
+	Password     string `mapstructure:"password"`
+	PasswordFile string `mapstructure:"password_file"`
 }
 
 // AuthOIDCDef configures OIDC authentication.
@@ -182,8 +212,9 @@ type InitialAdminDef struct {
 type AuthOIDCDef struct {
 	// ClientID is the OAuth client identifier (Go naming: ID not Id).
 	// mapstructure tag uses lowercase "client_id" for YAML compatibility.
-	ClientID     string `mapstructure:"client_id"`
-	ClientSecret string `mapstructure:"client_secret"`
+	ClientID         string `mapstructure:"client_id"`
+	ClientSecret     string `mapstructure:"client_secret"`
+	ClientSecretFile string `mapstructure:"client_secret_file"`
 	// ClientURL is the application callback URL (Go naming: URL not Url).
 	// mapstructure tag uses lowercase "client_url" for YAML compatibility.
 	ClientURL      string              `mapstructure:"client_url"`
@@ -271,6 +302,7 @@ type PathsDef struct {
 	AdminLogsDir       string `mapstructure:"admin_logs_dir"`
 	EventStoreDir      string `mapstructure:"event_store_dir"`
 	BaseConfig         string `mapstructure:"base_config"`
+	CalendarsDir       string `mapstructure:"calendars_dir"`
 	AltDagsDir         string `mapstructure:"alt_dags_dir"`
 	DAGRunsDir         string `mapstructure:"dag_runs_dir"`
 	DAGRunWorkDir      string `mapstructure:"dag_run_work_dir"`
@@ -323,6 +355,7 @@ type AlibabaSecretsDef struct {
 type VaultSecretsDef struct {
 	Address    string `mapstructure:"address"`
 	Token      string `mapstructure:"token"`
+	TokenFile  string `mapstructure:"token_file"`
 	CACert     string `mapstructure:"ca_cert"`
 	ClientCert string `mapstructure:"client_cert"`
 	ClientKey  string `mapstructure:"client_key"`
@@ -371,15 +404,17 @@ type PeerDef struct {
 
 // RemoteNodeDef configures a remote node connection.
 type RemoteNodeDef struct {
-	Name              string `mapstructure:"name"`
-	Description       string `mapstructure:"description"`
-	APIBaseURL        string `mapstructure:"api_base_url"`
-	AuthType          string `mapstructure:"auth_type"`
-	BasicAuthUsername string `mapstructure:"basic_auth_username"`
-	BasicAuthPassword string `mapstructure:"basic_auth_password"`
-	AuthToken         string `mapstructure:"auth_token"`
-	SkipTLSVerify     bool   `mapstructure:"skip_tls_verify"`
-	Timeout           int    `mapstructure:"timeout"` // seconds; 0 = use default
+	Name                  string `mapstructure:"name"`
+	Description           string `mapstructure:"description"`
+	APIBaseURL            string `mapstructure:"api_base_url"`
+	AuthType              string `mapstructure:"auth_type"`
+	BasicAuthUsername     string `mapstructure:"basic_auth_username"`
+	BasicAuthPassword     string `mapstructure:"basic_auth_password"`
+	BasicAuthPasswordFile string `mapstructure:"basic_auth_password_file"`
+	AuthToken             string `mapstructure:"auth_token"`
+	AuthTokenFile         string `mapstructure:"auth_token_file"`
+	SkipTLSVerify         bool   `mapstructure:"skip_tls_verify"`
+	Timeout               int    `mapstructure:"timeout"` // seconds; 0 = use default
 }
 
 // -----------------------------------------------------------------------------
@@ -393,6 +428,13 @@ type CoordinatorDef struct {
 	Advertise  string `mapstructure:"advertise"` // Auto-detected if empty
 	Port       int    `mapstructure:"port"`
 	HealthPort int    `mapstructure:"health_port"`
+	// WorkerWaitTimeout is a duration string such as "2m". Default: 2m; "0"
+	// refuses a dispatch with no healthy matching worker at once.
+	WorkerWaitTimeout string `mapstructure:"worker_wait_timeout"`
+	// UnclaimedDispatchTimeout is a duration string such as "24h". Empty or
+	// absent gives the default, 24h; an explicit "0" means no ceiling; any
+	// other value that is not a non-negative duration refuses to load.
+	UnclaimedDispatchTimeout string `mapstructure:"unclaimed_dispatch_timeout"`
 
 	WorkerChannel *CoordinatorWorkerChannelDef `mapstructure:"worker_channel"`
 }
@@ -412,6 +454,9 @@ type WorkerDef struct {
 	ID                   string `mapstructure:"id"`
 	MaxActiveRuns        int    `mapstructure:"max_active_runs"`
 	HealthPort           int    `mapstructure:"health_port"`
+	// ShutdownTimeout is a duration string such as "60s". Default: 60s; 0
+	// waits without a bound.
+	ShutdownTimeout string `mapstructure:"shutdown_timeout"`
 	// Labels accepts either a string "key=value,key2=value2,..." or map[string]string.
 	// When string, parsed as comma-separated key=value pairs.
 	Labels any `mapstructure:"labels"`
@@ -446,6 +491,7 @@ type SchedulerDef struct {
 	HeartbeatInterval       string `mapstructure:"heartbeat_interval"`        // Deprecated: use proc.heartbeat_interval
 	StaleThreshold          string `mapstructure:"stale_threshold"`           // Deprecated: use proc.stale_threshold
 	FailureThreshold        int    `mapstructure:"failure_threshold"`         // Default: 3
+	WakeHold                string `mapstructure:"wake_hold"`                 // Default: 0, no hold after the host wakes
 }
 
 // QueueConfigDef configures global queue settings.
@@ -528,10 +574,12 @@ type GitSyncDef struct {
 
 // GitSyncAuthDef configures Git authentication.
 type GitSyncAuthDef struct {
-	Type          string `mapstructure:"type"` // "token" or "ssh", default: token
-	Token         string `mapstructure:"token"`
-	SSHKeyPath    string `mapstructure:"ssh_key_path"`
-	SSHPassphrase string `mapstructure:"ssh_passphrase"`
+	Type              string `mapstructure:"type"` // "token" or "ssh", default: token
+	Token             string `mapstructure:"token"`
+	TokenFile         string `mapstructure:"token_file"`
+	SSHKeyPath        string `mapstructure:"ssh_key_path"`
+	SSHPassphrase     string `mapstructure:"ssh_passphrase"`
+	SSHPassphraseFile string `mapstructure:"ssh_passphrase_file"`
 }
 
 // GitSyncAutoSyncDef configures automatic synchronization.
@@ -585,6 +633,7 @@ type TunnelRateLimitDef struct {
 type LicenseDef struct {
 	Key        string                `mapstructure:"key"`
 	CloudURL   string                `mapstructure:"cloud_url"`
+	ServerName string                `mapstructure:"server_name"`
 	ForkPolicy *LicenseForkPolicyDef `mapstructure:"fork_policy"`
 }
 
@@ -601,4 +650,13 @@ type LicenseForkPolicyDef struct {
 type TXEDef struct {
 	Authz any `mapstructure:"authz"`
 	Authn any `mapstructure:"authn"`
+}
+
+// CloudDef configures what a licensed server shares with Dagu Console.
+type CloudDef struct {
+	Report string `mapstructure:"report"` // off, health, or runs; unset reports nothing
+	// RemoteAccess is off, viewer, operator, or developer; unset is chosen in the UI.
+	RemoteAccess string `mapstructure:"remote_access"`
+	// RemoteApprovals is unset to choose in the UI.
+	RemoteApprovals *bool `mapstructure:"remote_approvals"`
 }

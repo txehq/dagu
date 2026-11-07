@@ -14,7 +14,6 @@ on:
       - "internal/**"
       - "Makefile"
       - "scripts/ci/**"
-      - "specs/**"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -32,11 +31,18 @@ on:
       - "internal/**"
       - "Makefile"
       - "scripts/ci/**"
-      - "specs/**"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  # A new commit to a pull request cancels the run of the commit it
+  # replaces. Runs for a branch share one group and always finish: one runs
+  # at a time, and a newer commit replaces the run still waiting, so a burst
+  # of merges to main tests only the latest commit.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GO_VERSION: "1.27.3"

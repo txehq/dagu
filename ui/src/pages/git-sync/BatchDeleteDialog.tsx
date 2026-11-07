@@ -37,9 +37,7 @@ export function BatchDeleteDialog({
   const { ts } = useI18n();
   const count = itemIds.length;
   const defaultMessage = ts(
-    count === 1
-      ? 'Delete {count} sync item'
-      : 'Delete {count} sync items',
+    count === 1 ? 'Delete {count} sync item' : 'Delete {count} sync items',
     { count }
   );
   const [commitMessage, setCommitMessage] = useState('');
@@ -59,7 +57,7 @@ export function BatchDeleteDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-base">
-            <I18nText text={'Delete Selected Items'} />
+            <I18nText text={'Delete selected items'} />
           </DialogTitle>
           <DialogDescription className="text-xs">
             {ts(

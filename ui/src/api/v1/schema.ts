@@ -418,7 +418,7 @@ export interface paths {
         };
         /**
          * Retrieve execution history of a DAG
-         * @description Fetches history of DAG-runs created from this DAG definition
+         * @description Fetches history of DAG-runs created from this DAG definition, newest first, one page at a time
          */
         get: operations["getDAGDAGRunHistory"];
         put?: never;
@@ -706,6 +706,33 @@ export interface paths {
          * @description Deprecated alias for /dags/labels. Retrieves all unique labels used across DAG definitions.
          */
         get: operations["getAllDAGTags"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-run-activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Summarize DAG-run activity
+         * @description Lists the DAG-runs created in a time window, newest first, one page at
+         *     a time. The first page also lists the DAGs whose latest run did not
+         *     succeed, runs still in progress (including ones created before the
+         *     window), queues with work, and the next scheduled runs. Without fromDate, the window is
+         *     the last `hours` hours, aligned to a 96th of its length. To load older
+         *     runs, pass the first page's from and to as fromDate and toDate, with
+         *     nextCursor as cursor.
+         *
+         */
+        get: operations["getDAGRunActivity"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1190,6 +1217,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/samples": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve the samples of a continuous step, in buckets
+         * @description Returns the executions of a continuous step as buckets of one tier (1 second, 1 minute, 1 hour or 24 hours). The server picks the finest tier whose retention covers `from` and whose bucket count in the window is not more than `points`. The response has at most `points` buckets and does not depend on the count of executions.
+         */
+        get: operations["getDAGRunStepSamples"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve the events of a continuous step
+         * @description Lists the events of a continuous step, the newest first: start, stop, failed and recovered.
+         */
+        get: operations["getDAGRunStepEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/availability": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve the availability of a continuous step
+         * @description Gives the availability of the last 24 hours, 7 days, 30 days and 365 days, and the current streak.
+         */
+        get: operations["getDAGRunStepAvailability"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/outputs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve outputs of a specific step in a DAG-run
+         * @description Fetches the persisted outputs and the output variable of one step in a DAG-run. The stepName parameter accepts a step name or a step id. The runtime masks secret values before it persists them. Each value is cut at 65536 bytes.
+         */
+        get: operations["getDAGRunStepOutputs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/steps/{stepName}/log/download": {
         parameters: {
             query?: never;
@@ -1202,6 +1309,90 @@ export interface paths {
          * @description Downloads the entire log file for an individual step in a DAG-run
          */
         get: operations["downloadDAGRunStepLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/foreach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the items of a foreach step in a DAG-run
+         * @description Lists the items a foreach step expanded to, with the status each item's
+         *     body run reached. Items are sorted failed first, then running, then the
+         *     rest in index order. Nested foreach items are listed by passing the
+         *     parent path a body step reports as foreachParent.
+         *
+         */
+        get: operations["getDAGRunForeachItems"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/foreach/{item}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve one item of a foreach step in a DAG-run
+         * @description Fetches an item's body run: its status and the status of each body step
+         */
+        get: operations["getDAGRunForeachItem"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/foreach/{item}/steps/{bodyStepName}/log": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve log for a body step of a foreach item in a DAG-run
+         * @description Fetches the log of one body step run for one item of a foreach step
+         */
+        get: operations["getDAGRunForeachStepLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/steps/{stepName}/foreach/{item}/steps/{bodyStepName}/log/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download log for a body step of a foreach item in a DAG-run
+         * @description Downloads the entire log file of one body step run for one item of a foreach step
+         */
+        get: operations["downloadDAGRunForeachStepLog"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1223,8 +1414,10 @@ export interface paths {
          *     DAG-run only. Logs from nested DAG-runs are not included.
          *     Returns a streaming ZIP archive with no size limit. Each available log is
          *     stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
-         *     Missing files are skipped. Each file includes only the bytes present when
-         *     it is opened; subsequent log growth is excluded.
+         *     The body logs and item records of a foreach step are stored under
+         *     <index>-<step-name>/foreach/. Missing files are skipped. Each file
+         *     includes only the bytes present when it is opened; subsequent log growth
+         *     is excluded.
          *
          */
         get: operations["downloadDAGRunStepLogs"];
@@ -1578,6 +1771,90 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/foreach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the items of a foreach step in a sub DAG-run
+         * @description Lists the items a foreach step expanded to, with the status each item's
+         *     body run reached. Items are sorted failed first, then running, then the
+         *     rest in index order. Nested foreach items are listed by passing the
+         *     parent path a body step reports as foreachParent.
+         *
+         */
+        get: operations["getSubDAGRunForeachItems"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/foreach/{item}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve one item of a foreach step in a sub DAG-run
+         * @description Fetches an item's body run: its status and the status of each body step
+         */
+        get: operations["getSubDAGRunForeachItem"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/foreach/{item}/steps/{bodyStepName}/log": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Retrieve log for a body step of a foreach item in a sub DAG-run
+         * @description Fetches the log of one body step run for one item of a foreach step
+         */
+        get: operations["getSubDAGRunForeachStepLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/{stepName}/foreach/{item}/steps/{bodyStepName}/log/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download log for a body step of a foreach item in a sub DAG-run
+         * @description Downloads the entire log file of one body step run for one item of a foreach step
+         */
+        get: operations["downloadSubDAGRunForeachStepLog"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dag-runs/{name}/{dagRunId}/sub-dag-runs/{subDAGRunId}/steps/log/download": {
         parameters: {
             query?: never;
@@ -1591,8 +1868,10 @@ export interface paths {
          *     sub DAG-run only. Logs from nested DAG-runs are not included.
          *     Returns a streaming ZIP archive with no size limit. Each available log is
          *     stored as <index>-<step-name>/stdout.log or stderr.log, in run order.
-         *     Missing files are skipped. Each file includes only the bytes present when
-         *     it is opened; subsequent log growth is excluded.
+         *     The body logs and item records of a foreach step are stored under
+         *     <index>-<step-name>/foreach/. Missing files are skipped. Each file
+         *     includes only the bytes present when it is opened; subsequent log growth
+         *     is excluded.
          *
          */
         get: operations["downloadSubDAGRunStepLogs"];
@@ -1949,7 +2228,9 @@ export interface paths {
          *     bearer token only, bearer token plus HMAC, or HMAC only.
          *
          *     The request body is passed to the DAG as the WEBHOOK_PAYLOAD environment
-         *     variable. If the DAG configures `webhook.forward_headers`, selected
+         *     variable, and as a file named by WEBHOOK_PAYLOAD_FILE. A body too large
+         *     for one environment variable is passed only as the file. If the DAG
+         *     configures `webhook.forward_headers`, selected
          *     request headers are passed as the WEBHOOK_HEADERS environment variable.
          *     For safety, the `Authorization` header is never forwarded.
          *     The DAG run is enqueued and the endpoint returns immediately with the
@@ -2528,6 +2809,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dags/{fileName}/webhook/public": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the webhook's public URL
+         * @description Returns the webhook's public URL through Dagu Cloud, the state of the
+         *     relay connection that holds it, and its latest deliveries.
+         *     Developer, manager, or admin only.
+         *
+         */
+        get: operations["getDAGWebhookPublic"];
+        put?: never;
+        /**
+         * Turn on the webhook's public URL
+         * @description Gives the webhook a public URL through Dagu Cloud. A webhook that has
+         *     one keeps it. The server must be connected to Dagu Cloud, and the plan
+         *     must allow another public URL. Admin only.
+         *
+         */
+        post: operations["enableDAGWebhookPublic"];
+        /**
+         * Turn off the webhook's public URL
+         * @description Removes the webhook's public URL and its delivery log. Dagu Cloud drops
+         *     the URL and any deliveries waiting for it. Admin only.
+         *
+         */
+        delete: operations["disableDAGWebhookPublic"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/webhook/public/regenerate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replace the webhook's public URL
+         * @description Gives the webhook a new public URL. The old URL stops working.
+         *     Requests Dagu Cloud already took through it are still delivered;
+         *     turning the URL off drops them. Admin only.
+         *
+         */
+        post: operations["regenerateDAGWebhookPublicURL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/webhook/public/sender": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set who may send to the webhook's public URL
+         * @description Sets the sender whose signature requests to the public URL must
+         *     carry, its signing secret, and the events that start runs. For
+         *     GitHub, Dagu makes the secret when none is entered, and returns it
+         *     only this once. Admin only.
+         *
+         */
+        put: operations["configureDAGWebhookPublicSender"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/webhook/public/missed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Dismiss the webhook's missed deliveries
+         * @description Clears the counts of deliveries Dagu Cloud dropped for the public URL.
+         *     Admin only.
+         *
+         */
+        delete: operations["dismissDAGWebhookPublicMissed"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dags/{fileName}/settings": {
         parameters: {
             query?: never;
@@ -2551,6 +2937,30 @@ export interface paths {
          * @description Removes server-side settings for the specified DAG. Manager or admin only.
          */
         delete: operations["deleteDAGSettings"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/dags/{fileName}/pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Pin a DAG
+         * @description Pins the DAG to the top of the DAG list for all users. Requires write access to the DAG's workspace; allowed when Git sync is read-only. Pinning an already pinned DAG succeeds.
+         */
+        put: operations["pinDAG"];
+        post?: never;
+        /**
+         * Unpin a DAG
+         * @description Removes the DAG's pin for all users. Requires write access to the DAG's workspace; allowed when Git sync is read-only. Unpinning a DAG that is not pinned succeeds.
+         */
+        delete: operations["unpinDAG"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2960,6 +3370,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/calendars": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List business calendars
+         * @description Lists the built-in calendars and the calendar files that start schedules can name.
+         */
+        get: operations["listCalendars"];
+        put?: never;
+        /**
+         * Create a business calendar
+         * @description Creates the calendar file <name>.yaml. Without spec, the file starts as Monday to Friday with no holidays. Requires the write_dags permission and the developer role or above.
+         */
+        post: operations["createCalendar"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/calendars/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a business calendar
+         * @description Returns a calendar's file content, its problems, and the calendars and DAGs that depend on it. DAGs in workspaces the caller cannot see are not listed.
+         */
+        get: operations["getCalendar"];
+        /**
+         * Update a business calendar
+         * @description Replaces a calendar file's content. Content with problems is not saved; the problems are returned instead. Requires the write_dags permission and the developer role or above.
+         */
+        put: operations["updateCalendar"];
+        post?: never;
+        /**
+         * Delete a business calendar
+         * @description Deletes a calendar file. A calendar that a DAG's start schedule uses, directly or through includes, or that another calendar includes, is not deleted. Requires the write_dags permission and the developer role or above.
+         */
+        delete: operations["deleteCalendar"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/calendars/{name}/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Preview a business calendar
+         * @description Checks unsaved calendar content and describes each date of a year under it, marking the dates that differ from the saved calendar. A built-in calendar is described as it is.
+         */
+        post: operations["previewCalendar"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings/base-config": {
         parameters: {
             query?: never;
@@ -3059,9 +3541,165 @@ export interface paths {
         put?: never;
         /**
          * Deactivate the current license
-         * @description Removes local activation data and returns to community mode. Admin only.
+         * @description Frees the server's slot in Dagu Console, removes local activation data, and returns to community mode. Admin only.
          */
         post: operations["deactivateLicense"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the Dagu Console connection request
+         * @description Returns the state of the latest request to connect this server to Dagu Console. Admin only.
+         */
+        get: operations["getLicenseConnect"];
+        put?: never;
+        /**
+         * Connect this server to Dagu Console
+         * @description Starts a request for a license from Dagu Console, or returns the pending one. Open connectUrl to approve it; the license is installed once a workspace owner approves. A report level, when given, chooses what this server reports to Dagu Console, starting once the license is installed, unless cloud.report in the configuration sets it. A remote access level, when given, chooses the highest role MCP calls through Dagu Cloud get once the license is installed, unless cloud.remote_access in the configuration sets it. Admin only.
+         */
+        post: operations["startLicenseConnect"];
+        /**
+         * Cancel the Dagu Console connection request
+         * @description Abandons the pending request to connect this server to Dagu Console. Admin only.
+         */
+        delete: operations["cancelLicenseConnect"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check in with Dagu Console now
+         * @description Refreshes the license from Dagu Console instead of waiting for the next hourly check-in. Admin only.
+         */
+        post: operations["refreshLicense"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/server-name": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Rename this server in Dagu Console
+         * @description Sets the name Dagu Console and Dagu show for this server, in place of the name it reports. An empty name shows the reported name again. Admin only.
+         */
+        put: operations["renameLicenseServer"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/monitoring": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get what this server reports to Dagu Console
+         * @description Returns how much this server reports to Dagu Console, whether configuration fixes it, and the last report sent. Admin only.
+         */
+        get: operations["getLicenseMonitoring"];
+        /**
+         * Choose what this server reports to Dagu Console
+         * @description Sets how much this server reports to Dagu Console. The change applies at once; off stops a report in flight. Admin only.
+         */
+        put: operations["updateLicenseMonitoring"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/monitoring/dismiss-notice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dismiss the notice that asks what to report
+         * @description Stops asking administrators to choose what this server reports to Dagu Console. Admin only.
+         */
+        post: operations["dismissLicenseMonitoringNotice"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/monitoring/dismiss-errors-notice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dismiss the notice that offers to send error messages
+         * @description Stops offering administrators to have this server also send the error messages of failed runs to Dagu Console. Admin only.
+         */
+        post: operations["dismissLicenseMonitoringErrorsNotice"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/license/remote-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get how far calls from Dagu Cloud may go on this server
+         * @description Returns the highest role calls from Dagu Cloud get on this server, whether they may decide steps waiting for a person, whether configuration fixes either, and whether this server process holds its connection for those calls. Admin only.
+         */
+        get: operations["getLicenseRemoteAccess"];
+        /**
+         * Choose how far calls from Dagu Cloud may go on this server
+         * @description Sets the highest role calls from Dagu Cloud get on this server, whether they may decide steps waiting for a person, or both. Changes apply at once; off closes the connection and ends the calls in flight. Admin only.
+         */
+        put: operations["updateLicenseRemoteAccess"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3750,6 +4388,26 @@ export interface paths {
         put?: never;
         /** Create a workspace */
         post: operations["createWorkspace"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/workspaces/deprecation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List workspace settings that v3.0 moves into projects
+         * @description Lists the workspace settings in use that v3.0 moves into projects. Admin only.
+         */
+        get: operations["getWorkspaceDeprecation"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4942,6 +5600,90 @@ export interface components {
             /** @description Opaque cursor for loading the next page of older DAG-runs */
             nextCursor?: string;
         };
+        /** @description One page of DAG-run activity for a time window */
+        DAGRunActivity: {
+            /**
+             * Format: int64
+             * @description Window start as Unix seconds
+             */
+            from: number;
+            /**
+             * Format: int64
+             * @description Window end as Unix seconds
+             */
+            to: number;
+            /** @description Up to 100 runs created in the window, newest first */
+            runs: components["schemas"]["DAGRunActivityRun"][];
+            /** @description Opaque cursor for loading the next page of older runs */
+            nextCursor?: string;
+            /** @description First page only: the latest run of each DAG whose latest run was created in the window and did not succeed, newest first, at most 20 */
+            attention: components["schemas"]["DAGRunActivityRun"][];
+            /** @description First page only: runs still running, waiting, or queued, oldest first, at most 100, including up to 50 live runs created before the window */
+            active: components["schemas"]["DAGRunActivityRun"][];
+            /** @description First page only: next scheduled runs, soonest first */
+            upcoming: components["schemas"]["DAGRunActivityUpcoming"][];
+            /** @description First page only: queues with runs running or waiting, the longest wait first, at most 20 */
+            queues: components["schemas"]["DAGRunActivityQueue"][];
+            /** @description First page only: how full the data directory's disk is, in percent; set only when it is at least 90 and the caller may view system status */
+            diskUsedPercent?: number;
+        };
+        /** @description A queue with runs running or waiting */
+        DAGRunActivityQueue: {
+            name: string;
+            /** @description Number of runs running; a lower bound when runningCapped is set */
+            running: number;
+            /** @description True when reading running runs stopped early, so running is a lower bound */
+            runningCapped?: boolean;
+            /** @description Maximum number of runs the queue runs at once */
+            maxConcurrency?: number;
+            /** @description Number of runs waiting; a lower bound when queuedCapped is set */
+            queued: number;
+            /** @description True when counting stopped early, so queued is a lower bound */
+            queuedCapped?: boolean;
+            /**
+             * Format: int64
+             * @description When the next run in line was queued, as Unix seconds
+             */
+            nextQueuedAt?: number;
+            blockedReason?: components["schemas"]["DAGRunActivityQueueBlockedReason"];
+        };
+        /**
+         * @description Why queued runs cannot start: no healthy worker matches their selector, no healthy worker exists, or runs cannot be handed to workers
+         * @enum {string}
+         */
+        DAGRunActivityQueueBlockedReason: DAGRunActivityQueueBlockedReason;
+        /** @description One DAG-run in an activity summary */
+        DAGRunActivityRun: {
+            /** @description DAG name */
+            name: string;
+            dagRunId: string;
+            status: components["schemas"]["Status"];
+            /**
+             * Format: int64
+             * @description Start as Unix seconds, or the queue time when the run has not started
+             */
+            startedAt?: number;
+            /**
+             * Format: int64
+             * @description Finish as Unix seconds
+             */
+            finishedAt?: number;
+            /** @description First failed step; set on attention runs */
+            failedStep?: string;
+            /** @description Error of the failed step or the run, shortened; set on attention runs */
+            error?: string;
+            /** @description Queue the run runs or waits in; set on active runs */
+            queue?: string;
+        };
+        DAGRunActivityUpcoming: {
+            name: string;
+            fileName: string;
+            /**
+             * Format: int64
+             * @description Next scheduled run as Unix seconds
+             */
+            nextRun: number;
+        };
         /** @description Request body for approving a waiting step */
         ApproveStepRequest: {
             /** @description Key-value parameters to provide. These will be available as environment variables in subsequent steps. */
@@ -5047,7 +5789,7 @@ export interface components {
             /** @description The sub-DAG run ID, present only for sub-DAG push-back operations */
             subDAGRunId?: string;
         };
-        /** @description Answer to a pending managed-agent permission or question */
+        /** @description Answer to a pending managed-agent permission or question. A browser.write permission also takes skip: the operation is not run and the step ends without failing. */
         AgentInteractionResponseRequest: {
             /** @enum {string} */
             decision?: AgentInteractionResponseRequestDecision;
@@ -5233,6 +5975,103 @@ export interface components {
              * @description When the webhook was last triggered
              */
             lastUsedAt?: string;
+            public?: components["schemas"]["WebhookPublicSettings"];
+        };
+        /**
+         * @description A service whose signed requests a public URL accepts
+         * @enum {string}
+         */
+        WebhookPublicSender: WebhookPublicSender;
+        /** @description What the webhook's public URL accepts */
+        WebhookPublicSettings: {
+            sender?: components["schemas"]["WebhookPublicSender"];
+            /** @description Whether the sender's signing secret is stored */
+            secretConfigured: boolean;
+            /** @description Events that start runs; empty takes every event */
+            events: string[];
+            /**
+             * Format: date-time
+             * @description When the public URL was turned on
+             */
+            createdAt: string;
+        };
+        /**
+         * @description Whether Dagu Cloud holds the public URL: `active` once it does,
+         *     `connecting` before then, `overLimit` when the plan allows fewer
+         *     public URLs than exist and this one is left out, and `error` when the
+         *     server cannot connect.
+         *
+         * @enum {string}
+         */
+        WebhookPublicState: WebhookPublicState;
+        /** @description The webhook's public URL, its state, and its latest deliveries */
+        WebhookPublicDetails: {
+            /** @description The public URL; absent until Dagu Cloud has given this server its address */
+            url?: string;
+            state: components["schemas"]["WebhookPublicState"];
+            /** @description Why the server cannot connect */
+            error?: string;
+            /** @description The most public URLs the plan allows, once known */
+            maxHooks?: number;
+            /** @description The latest deliveries, newest first */
+            deliveries: components["schemas"]["WebhookPublicDelivery"][];
+            missed: components["schemas"]["WebhookPublicMissed"];
+        };
+        /** @description One request Dagu Cloud handed over for the public URL */
+        WebhookPublicDelivery: {
+            /** @description The delivery's ID, which names the run it starts */
+            id: string;
+            /**
+             * Format: date-time
+             * @description When Dagu Cloud received the request
+             */
+            receivedAt: string;
+            /** @description The body's size in bytes */
+            size: number;
+            /** @description What the request is about, as its sender labels it */
+            event?: string;
+            /**
+             * @description What became of the delivery: `started` a run, `waiting` at Dagu
+             *     Cloud to be sent again, `rejected` by the sender's signature
+             *     check, `skipped` as an event that starts no run, `ignored` while
+             *     the webhook was disabled, or `failed`.
+             *
+             * @enum {string}
+             */
+            outcome: WebhookPublicDeliveryOutcome;
+            /** @description The run a started delivery started */
+            dagRunId?: string;
+            /** @description Why the delivery was rejected, skipped, waiting, or failed */
+            error?: string;
+        };
+        /** @description Deliveries Dagu Cloud dropped since they were last dismissed: those
+         *     that waited more than 7 days, and those refused while 1,000 waited.
+         *      */
+        WebhookPublicMissed: {
+            expired: number;
+            refused: number;
+            /**
+             * Format: date-time
+             * @description When the first of them was counted
+             */
+            since?: string;
+        };
+        /** @description Who may send to a public URL, and which events start runs */
+        WebhookPublicSenderRequest: {
+            sender?: components["schemas"]["WebhookPublicSender"];
+            /** @description The sender's signing secret. Empty keeps the stored secret of the
+             *     same sender, or, for GitHub, makes one.
+             *      */
+            secret?: string;
+            /** @description Make a new GitHub signing secret */
+            generateSecret?: boolean;
+            /** @description Events that start runs; empty takes every event */
+            events?: string[];
+        };
+        WebhookPublicSenderResponse: {
+            webhook: components["schemas"]["WebhookDetails"];
+            /** @description The signing secret Dagu made, shown only this once */
+            secret?: string;
         };
         /** @description Response when creating or regenerating a webhook (includes full token) */
         WebhookCreateResponse: {
@@ -5309,6 +6148,11 @@ export interface components {
          * @enum {string}
          */
         NotificationProviderType: NotificationProviderType;
+        /**
+         * @description Provider for a DAG-local notification target. Local commands are reusable channels, not inline targets.
+         * @enum {string}
+         */
+        NotificationTargetProviderType: NotificationTargetProviderType;
         /**
          * @description DAG run event that can trigger server-side notifications. Rules configured for dag.run.succeeded also match dag.run.partially_succeeded; rules configured only for dag.run.partially_succeeded do not match clean successes.
          * @enum {string}
@@ -5572,13 +6416,18 @@ export interface components {
             /** @description Optional Teams message template. When omitted, Dagu sends the default notification text. */
             messageTemplate?: string;
         };
+        /** @description Local shell command run by the Dagu server when this channel delivers a notification. */
+        NotificationCommandTarget: {
+            /** @description Shell command, run as written. Run values are exported as environment variables, including DAG_NAME, DAG_RUN_ID, STATUS, ERROR, and RUN_URL; Dagu does not substitute tokens such as {{dag.name}} into the command. EXECUTION_LOG is the path of a temporary file containing up to 1 MiB of the run log; Dagu removes that file after the command exits. Unix runs the command with sh -c and reads values as "$ERROR". Windows runs it with PowerShell and reads values as $env:ERROR. */
+            command: string;
+        };
         /** @description Notification target input */
         NotificationTargetInput: {
             /** @description Stable target ID. Omit when creating a new target. */
             id?: string;
             /** @description Human-readable target name */
             name?: string;
-            type: components["schemas"]["NotificationProviderType"];
+            type: components["schemas"]["NotificationTargetProviderType"];
             /** @description Whether this target receives notifications */
             enabled: boolean;
             /** @description Optional target-level event filter. When omitted or empty, the target inherits DAG-level events. */
@@ -5595,7 +6444,7 @@ export interface components {
             id: string;
             /** @description Human-readable target name */
             name?: string;
-            type: components["schemas"]["NotificationProviderType"];
+            type: components["schemas"]["NotificationTargetProviderType"];
             /** @description Whether this target receives notifications */
             enabled: boolean;
             /** @description Target-level event filter. Empty means the target inherits DAG-level events. */
@@ -5618,6 +6467,7 @@ export interface components {
             slack?: components["schemas"]["NotificationSlackTargetInput"];
             telegram?: components["schemas"]["NotificationTelegramTargetInput"];
             teams?: components["schemas"]["NotificationTeamsTargetInput"];
+            command?: components["schemas"]["NotificationCommandTarget"];
         };
         /** @description Notification channel. Secrets are never returned. */
         NotificationChannel: {
@@ -5633,6 +6483,7 @@ export interface components {
             slack?: components["schemas"]["NotificationSlackTarget"];
             telegram?: components["schemas"]["NotificationTelegramTarget"];
             teams?: components["schemas"]["NotificationTeamsTarget"];
+            command?: components["schemas"]["NotificationCommandTarget"];
             /** Format: date-time */
             createdAt: string;
             /** Format: date-time */
@@ -5991,6 +6842,8 @@ export interface components {
             nextRun?: string;
             /** @description Whether the DAG is suspended */
             suspended: boolean;
+            /** @description Whether the DAG is pinned to the top of the DAG list */
+            pinned: boolean;
             /** @description List of errors encountered during the request */
             errors: string[];
         };
@@ -6043,6 +6896,170 @@ export interface components {
             at?: string;
             /** @description Runtime profile name that activates this schedule entry */
             profile?: components["schemas"]["RuntimeProfileName"];
+            /** @description Calendar whose business days the schedule fires on */
+            calendar?: string;
+            /** @description Business days of the month the schedule keeps; negative values count from the end. 0 is never listed. */
+            businessDays?: number[];
+        };
+        /** @description Name of a business calendar: a built-in one, or the file <name>.yaml in paths.calendars_dir */
+        CalendarName: string;
+        /** @description A business calendar that start schedules can name */
+        CalendarSummary: {
+            name: string;
+            description?: string;
+            /**
+             * Format: date
+             * @description Last date the calendar's holidays are maintained for
+             */
+            through?: string;
+            /** @description Whether the calendar is built in rather than a file */
+            builtin: boolean;
+            /** @description Why the calendar file does not load */
+            error?: string;
+            /** @description Why the calendar needs attention, such as holidays that run out soon */
+            warning?: string;
+            /** @description Calendars whose holidays this calendar adds */
+            includes?: string[];
+            /** @description Number of DAGs whose start schedules use the calendar, directly or through calendars that include it. Set when usage is requested. */
+            dagCount?: number;
+        };
+        /** @description A business calendar with its file content and what depends on it */
+        CalendarDetails: {
+            name: components["schemas"]["CalendarName"];
+            /** @description Whether the calendar is built in rather than a file */
+            builtin: boolean;
+            description?: string;
+            /**
+             * Format: date
+             * @description Last date the calendar's holidays are maintained for
+             */
+            through?: string;
+            /** @description The calendar file's content; empty for a built-in calendar */
+            spec: string;
+            /** @description Problems of the saved file, each starting with its [line:column] in the file when it has one */
+            errors: string[];
+            warnings: string[];
+            /** @description Calendars whose holidays this calendar adds */
+            includes: string[];
+            /** @description Calendars that add this calendar's holidays, directly or through other calendars */
+            includedBy: string[];
+            /** @description DAGs whose start schedules use the calendar, directly or through calendars that include it */
+            usedBy: components["schemas"]["CalendarUser"][];
+        };
+        /** @description A DAG whose start schedules use a calendar */
+        CalendarUser: {
+            fileName: components["schemas"]["DAGFileName"];
+            /** @description Name of the DAG */
+            name: string;
+            /** @description Workspace the DAG belongs to, if any */
+            workspace?: string;
+            /** @description The calendar the DAG names, when it uses this calendar through includes */
+            via?: string;
+        };
+        CreateCalendarRequest: {
+            name: components["schemas"]["CalendarName"];
+            /** @description The calendar file's content; a template when omitted */
+            spec?: string;
+        };
+        UpdateCalendarRequest: {
+            /** @description The calendar file's content */
+            spec: string;
+        };
+        /** @description The outcome of saving a calendar. Nothing is saved when errors is not empty. */
+        CalendarSaveResult: {
+            /** @description Problems that kept the calendar from being saved, each starting with its [line:column] when it has one */
+            errors: string[];
+            warnings: string[];
+        };
+        CalendarPreviewRequest: {
+            /** @description Unsaved calendar file content; ignored for a built-in calendar */
+            spec: string;
+            /** @description Year whose dates are described */
+            year: number;
+        };
+        /** @description Unsaved calendar content checked and applied to the dates of a year */
+        CalendarPreview: {
+            /** @description Problems of the content, each starting with its [line:column] when it has one. The dates use the valid parts. */
+            errors: string[];
+            warnings: string[];
+            year: number;
+            /**
+             * Format: date
+             * @description Today in the server's time zone
+             */
+            today: string;
+            /**
+             * Format: date
+             * @description Last date the content's holidays are maintained for
+             */
+            through?: string;
+            /** @description Each date of the year, in order. Empty when the content is not a calendar document. */
+            days: components["schemas"]["CalendarDay"][];
+            changes: components["schemas"]["CalendarChanges"];
+        };
+        /**
+         * @description business: a business day by its weekday; nonBusiness: a weekday that is not a business day; holiday: a listed holiday; extraBusinessDay: a business day only because the calendar lists it
+         * @enum {string}
+         */
+        CalendarDayStatus: CalendarDayStatus;
+        /** @description One date of a calendar */
+        CalendarDay: {
+            /** Format: date */
+            date: string;
+            status: components["schemas"]["CalendarDayStatus"];
+            /** @description Name of the holiday listed on the date */
+            holidayName?: string;
+            /** @description Position among the month's business days, where 1 is the first. Set on business days only. */
+            ordinal?: number;
+            /** @description Position among the month's business days from the end, where -1 is the last. Set on business days only. */
+            ordinalFromEnd?: number;
+            /** @description Whether the saved calendar describes the date differently */
+            changed: boolean;
+        };
+        /** @description How unsaved content differs from the saved calendar */
+        CalendarChanges: {
+            weekdaysAdded: components["schemas"]["CalendarWeekday"][];
+            weekdaysRemoved: components["schemas"]["CalendarWeekday"][];
+            /** @description Listed dates, in order, whose status or holiday name changes */
+            dates: components["schemas"]["CalendarDateChange"][];
+        };
+        /** @enum {string} */
+        CalendarWeekday: CalendarWeekday;
+        CalendarDateChange: {
+            /** Format: date */
+            date: string;
+            before: components["schemas"]["CalendarDayStatus"];
+            after: components["schemas"]["CalendarDayStatus"];
+            beforeHolidayName?: string;
+            afterHolidayName?: string;
+        };
+        Holiday: {
+            /** Format: date */
+            date: string;
+            name?: string;
+        };
+        /**
+         * @description Why none of the upcoming runs will start: the scheduler is paused, or the DAG is suspended
+         * @enum {string}
+         */
+        UpcomingRunsHold: UpcomingRunsHold;
+        /** @description A time at which a start schedule fires */
+        UpcomingRun: {
+            /**
+             * Format: date-time
+             * @description Fire time, with the offset of the zone the schedule is evaluated in
+             */
+            time: string;
+            /** @description Position of the firing entry in the DAG's schedule list */
+            scheduleIndex: number;
+            /** @description Name of the zone the schedule is evaluated in */
+            timezone: string;
+            /** @description Holidays since the previous fire on which the cron expression fired but the calendar did not */
+            skippedHolidays?: components["schemas"]["Holiday"][];
+            /** @description Listed business-day position the fire matched; negative counts from the end */
+            businessDay?: number;
+            /** @description Whether the fire falls on a business day only because the calendar lists it */
+            extraBusinessDay?: boolean;
         };
         /**
          * @description Numeric status code indicating current DAG-run state:
@@ -6119,6 +7136,8 @@ export interface components {
             pausedBy?: string;
             /** @description Operator-facing explanation shown while paused */
             reason?: string;
+            /** @description Whether a scheduler instance is running. Omitted when the server cannot tell. */
+            schedulerRunning?: boolean;
         };
         /** @description Response containing status of all coordinator instances */
         CoordinatorStatusResponse: {
@@ -6191,6 +7210,9 @@ export interface components {
              * @description Scheduler-aware next planned run time. Pending overdue one-offs remain visible until consumed.
              */
             nextRun?: string;
+            /** @description Next fire times of the start schedules, earliest first. Derived from the definition alone: suspension, scheduler pauses, and runtime profiles do not filter it. */
+            upcomingRuns?: components["schemas"]["UpcomingRun"][];
+            upcomingRunsHold?: components["schemas"]["UpcomingRunsHold"];
             /** @description Logical grouping of related DAGs for organizational purposes */
             group?: string;
             /** @description Unique identifier for the DAG within its group */
@@ -6263,6 +7285,94 @@ export interface components {
              */
             class?: ValueReferenceNoticeClass;
         };
+        /** @description One structured validation result of a DAG spec. */
+        ValidationIssue: {
+            /**
+             * @description Severity of the issue.
+             * @enum {string}
+             */
+            severity: ValidationIssueSeverity;
+            /**
+             * @description Stage that produced the issue.
+             * @enum {string}
+             */
+            source: ValidationIssueSource;
+            /** @description Human-readable message. For errors, the same text as the matching errors entry. */
+            message: string;
+            /** @description Normalized name of the step, when known. */
+            stepName?: string;
+            /** @description Step key such as steps[3] or handler_on.failure, when known. */
+            stepPath?: string;
+            /** @description DAG field path such as steps[3].with.url or consts.image, when known. */
+            fieldPath?: string;
+            /** @description 1-based line in the spec, when known. */
+            line?: number;
+            /** @description 1-based column in the spec, when known. */
+            column?: number;
+            /** @description Machine-readable reason, for value-reference notices. */
+            reason?: string;
+        };
+        /** @description Values that a step of the DAG can reference. */
+        ReferenceScope: {
+            params: components["schemas"]["ReferenceScopeVariable"][];
+            consts: components["schemas"]["ReferenceScopeVariable"][];
+            /** @description Environment variable names. Values are not included. */
+            env: components["schemas"]["ReferenceScopeVariable"][];
+            /** @description Secret names. Values are not included. */
+            secrets: components["schemas"]["ReferenceScopeVariable"][];
+            steps: components["schemas"]["ReferenceScopeStep"][];
+        };
+        /** @description A named value that a step can reference. */
+        ReferenceScopeVariable: {
+            name: string;
+            /** @description Canonical reference token, such as ${params.region}. */
+            reference: string;
+            description?: string;
+            /** @description Default value. Set only for params and consts. */
+            defaultValue?: string;
+        };
+        /** @description A step and the outputs that other steps can reference. */
+        ReferenceScopeStep: {
+            name: string;
+            id?: string;
+            /** @description Step key such as steps[3] or handler_on.exit. */
+            stepPath: string;
+            /** @description Names of all ancestor steps. */
+            upstream: string[];
+            outputs: components["schemas"]["ReferenceScopeOutput"][];
+            /**
+             * @description static when the outputs are known from the spec, runtime when only a run gives them.
+             * @enum {string}
+             */
+            outputsKnown: ReferenceScopeStepOutputsKnown;
+        };
+        /** @description An output of a step that other steps can reference. */
+        ReferenceScopeOutput: {
+            name: string;
+            /** @description Reference token, such as ${steps.fetch.outputs.body} or ${RESULT} for an output variable. */
+            reference: string;
+            /** @enum {string} */
+            source: ReferenceScopeOutputSource;
+            type?: string;
+        };
+        /** @description Persisted outputs of one step in a DAG-run. */
+        StepOutputs: {
+            stepName: string;
+            stepId?: string;
+            status: components["schemas"]["NodeStatus"];
+            statusLabel: components["schemas"]["NodeStatusLabel"];
+            outputs: components["schemas"]["StepOutputValue"][];
+            outputVariable?: components["schemas"]["StepOutputValue"];
+        };
+        /** @description One output value of a step. The value is cut at 65536 bytes. */
+        StepOutputValue: {
+            name: string;
+            value: string;
+            /** @description True when the value was cut. */
+            truncated: boolean;
+            /** @description Size of the value in bytes before the cut. */
+            size: number;
+        };
         /** @description Editor-only metadata used to synthesize per-document schema hints */
         DAGEditorHints: {
             /** @description Deprecated legacy execution definitions inherited from base config and available to the current DAG */
@@ -6308,6 +7418,8 @@ export interface components {
         ParamDef: {
             /** @description Parameter name. Omitted for positional parameters. */
             name?: string;
+            /** @description Human-readable label for forms. The name remains the parameter identifier. */
+            title?: string;
             /**
              * @description Parameter type
              * @enum {string}
@@ -6465,16 +7577,20 @@ export interface components {
             autoRetryLimit?: number | null;
             /** @description RFC 3339 timestamp of when the DAG-run was scheduled to run */
             scheduleTime?: string;
-            /** @description RFC 3339 timestamp when the DAG-run started */
+            /** @description RFC 3339 timestamp with millisecond precision when the DAG-run started. A run that an older version stored has second precision. */
             startedAt: string;
-            /** @description RFC 3339 timestamp when the DAG-run finished */
+            /** @description RFC 3339 timestamp with millisecond precision when the DAG-run finished. A run that an older version stored has second precision. */
             finishedAt: string;
             /** @description Whether artifact files are available for this DAG-run */
             artifactsAvailable: boolean;
             /** @description Whether reuse of prior build materializations was disabled for this DAG-run */
             noReuse?: boolean;
+            /** @description True for an ephemeral run (a test run that leaves no trace). Absent or false for other runs. Only the DAG history with includeEphemeral and the run by ID return such a run. */
+            ephemeral?: boolean;
             /** @description Runtime parameters passed to the DAG-run in JSON format */
             params?: string;
+            /** @description The run's parameters, one NAME=value (or a bare positional value) per item, exactly as the run received them. Absent when the run's record does not keep them as a list; params then only shows a joined, unquoted listing. */
+            paramsList?: string[];
             /** @description Runtime profile selected for this DAG-run. */
             profileName?: components["schemas"]["RuntimeProfileName"];
             /** @description ID of the worker that executed this DAG-run ('local' for local execution) */
@@ -6492,6 +7608,29 @@ export interface components {
              * @description Deprecated alias for labels. List of labels for categorizing and filtering DAG runs
              */
             tags?: string[];
+        };
+        /** @description The run that a step's supplied outputs were captured from. */
+        ReusedOutputSource: {
+            runId: components["schemas"]["DAGRunId"];
+            /** @description RFC 3339 timestamp of when the outputs were captured. Optional. */
+            capturedAt?: string;
+        };
+        /** @description Provenance of the outputs that a skipped step of a selected-steps run carries. */
+        ReusedInput: {
+            /** @description Name of the skipped step */
+            step: string;
+            runId: components["schemas"]["DAGRunId"];
+            /** @description RFC 3339 timestamp of when the outputs were captured. Absent when unknown. */
+            capturedAt?: string;
+            /** @description RFC 3339 timestamp with millisecond precision of when the step started in the source run. Present for via run; absent for via cache. */
+            startedAt?: string;
+            /** @description RFC 3339 timestamp with millisecond precision of when the step finished in the source run. Present for via run; absent for via cache. */
+            finishedAt?: string;
+            /**
+             * @description run: the outputs were carried from the run named by outputsFromRunId, or by outputsFromRuns for this step. cache: a client that is not the web UI supplied the outputs and named the run they were captured from in outputsSources.
+             * @enum {string}
+             */
+            via: ReusedInputVia;
         };
         /** @description Detailed status of a DAG-run including sub DAG-run nodes */
         DAGRunDetails: components["schemas"]["DAGRunSummary"] & {
@@ -6511,6 +7650,7 @@ export interface components {
             onFailure?: components["schemas"]["Node"];
             onAbort?: components["schemas"]["Node"];
             onWait?: components["schemas"]["Node"];
+            modelUsage?: components["schemas"]["RunModelUsage"];
             /** @description List of preconditions that must be met before the DAG-run can start */
             preconditions?: components["schemas"]["Condition"][];
             /** @description Top-level error recorded for the DAG-run, such as a definition build failure that prevented the run from starting */
@@ -6528,6 +7668,10 @@ export interface components {
             humanTaskResumePending?: boolean;
             /** @description Whether a root run has a saved approval and ready work whose resume still needs to be accepted */
             approvalResumePending?: boolean;
+            /** @description Identifier of the attempt this status belongs to. Each retry of the DAG-run, including a resume after manual action, records a new attempt. */
+            attemptId?: string;
+            /** @description Where the carried outputs of the skipped steps of a selected-steps run come from, one entry per skipped step, in DAG step order. Absent when the run carried no outputs. */
+            reusedInputs?: components["schemas"]["ReusedInput"][];
         };
         /** @description One file within a DAG-run's artifact directory */
         ArtifactListFile: {
@@ -6655,9 +7799,9 @@ export interface components {
             attempt?: number;
             /** @description Agent's justification, or why the call was rejected */
             reason?: string;
-            /** @description RFC3339 timestamp when the step started */
+            /** @description RFC 3339 timestamp with millisecond precision when the step started */
             startedAt?: string;
-            /** @description RFC3339 timestamp when the step finished */
+            /** @description RFC 3339 timestamp with millisecond precision when the step finished */
             finishedAt?: string;
             /** @description Child DAG-run this action produced, for linking to its run page. Absent for steps that run no child DAG. */
             childDagRunId?: string;
@@ -6705,9 +7849,9 @@ export interface components {
             stdout: string;
             /** @description Path to the standard error log file for this step */
             stderr: string;
-            /** @description RFC3339 timestamp when the step started */
+            /** @description RFC 3339 timestamp with millisecond precision when the step started. A step that an older version stored has second precision. */
             startedAt: string;
-            /** @description RFC3339 timestamp when the step finished */
+            /** @description RFC 3339 timestamp with millisecond precision when the step finished. A step that an older version stored has second precision. */
             finishedAt: string;
             status: components["schemas"]["NodeStatus"];
             statusLabel: components["schemas"]["NodeStatusLabel"];
@@ -6715,6 +7859,8 @@ export interface components {
             retryCount: number;
             /** @description Number of successful completions for repeating steps */
             doneCount: number;
+            /** @description True for a continuous step: a step that repeats without a limit. Its executions are recorded as samples (see the samples, events and availability endpoints). */
+            continuous?: boolean;
             /** @description List of sub DAG-runs associated with this step */
             subRuns?: components["schemas"]["SubDAGRun"][];
             /** @description List of repeated sub DAG-runs when using repeatPolicy */
@@ -6753,6 +7899,7 @@ export interface components {
             /** @description Chronological push-back history for this step */
             pushBackHistory?: components["schemas"]["PushBackHistoryEntry"][];
             agentSession?: components["schemas"]["AgentSession"];
+            modelUsage?: components["schemas"]["StepModelUsage"];
         };
         /** @description Durable state for a managed coding-agent session */
         AgentSession: {
@@ -6782,6 +7929,65 @@ export interface components {
             totalTokens?: number;
             /** Format: double */
             cost?: number;
+        };
+        /** @description What calls to one model used: their number, tokens, and the cost the provider reported */
+        ModelUsage: {
+            /** @description Provider of the model, such as openai or openrouter */
+            provider: string;
+            /** @description Model the calls named */
+            model: string;
+            /**
+             * Format: int64
+             * @description Number of calls
+             */
+            calls: number;
+            /**
+             * Format: int64
+             * @description Prompt tokens, cached and cache-write tokens included
+             */
+            inputTokens?: number;
+            /**
+             * Format: int64
+             * @description Prompt tokens read from the provider's prompt cache
+             */
+            cachedInputTokens?: number;
+            /**
+             * Format: int64
+             * @description Prompt tokens written to the provider's prompt cache
+             */
+            cacheWriteTokens?: number;
+            /**
+             * Format: int64
+             * @description Completion tokens, reasoning tokens included
+             */
+            outputTokens?: number;
+            /**
+             * Format: int64
+             * @description Completion tokens spent on reasoning
+             */
+            reasoningTokens?: number;
+            /**
+             * Format: double
+             * @description Cost in US dollars the provider reported for costReportedCalls of the calls
+             */
+            cost?: number;
+            /**
+             * Format: int64
+             * @description Number of calls whose cost the provider reported; cost is whole only when it equals calls
+             */
+            costReportedCalls?: number;
+        };
+        /** @description What a step's calls to models used, over every attempt of the step in its run */
+        StepModelUsage: {
+            /** @description Usage of each model: the step's own calls and what the tools it ran, such as a coding agent, reported */
+            models?: components["schemas"]["ModelUsage"][];
+            /** @description A tool the step ran whose model usage could not be read, such as a coding agent's command line */
+            notReported?: string;
+        };
+        /** @description What every step of a DAG-run, its handlers included, used on models. A run recorded by an engine that records model usage always has it, with no models when the run used none; a run recorded before has it only when its steps report usage. */
+        RunModelUsage: {
+            /** @description Usage of each model the run called */
+            models?: components["schemas"]["ModelUsage"][];
         };
         AgentInteraction: {
             id: string;
@@ -6824,6 +8030,20 @@ export interface components {
             name?: string;
             status?: string;
             files?: string[];
+            /** @description The operation's place in the step's list, from 1; absent for an event that is not one operation */
+            position?: number;
+            /** @description How an operation ran: screen for a replayed recording, model for a model request; absent for one that decides nothing */
+            via?: string;
+            /**
+             * Format: int64
+             * @description How long the operation took, in milliseconds; absent when under one
+             */
+            durationMs?: number;
+            /**
+             * Format: int64
+             * @description Model tokens the operation used; absent when none
+             */
+            tokens?: number;
         };
         /** @description One push-back event recorded for an approval step or a human task */
         PushBackHistoryEntry: {
@@ -6860,9 +8080,9 @@ export interface components {
             dagName?: string;
             status: components["schemas"]["Status"];
             statusLabel: components["schemas"]["StatusLabel"];
-            /** @description RFC 3339 timestamp when the sub DAG-run started */
+            /** @description RFC 3339 timestamp with millisecond precision when the sub DAG-run started */
             startedAt: string;
-            /** @description RFC 3339 timestamp when the sub DAG-run finished */
+            /** @description RFC 3339 timestamp with millisecond precision when the sub DAG-run finished */
             finishedAt?: string;
         };
         /** @description One named value output or build file output */
@@ -7180,6 +8400,170 @@ export interface components {
             path: string;
             error: string;
         };
+        /**
+         * @description Status of a foreach item's body run
+         * @enum {string}
+         */
+        ForeachItemStatusFilter: ForeachItemStatusFilter;
+        /** @description Number of items per body run status */
+        ForeachItemCounts: {
+            notStarted: number;
+            running: number;
+            succeeded: number;
+            failed: number;
+            aborted: number;
+        };
+        /** @description One page of a foreach step's items */
+        ForeachItemList: {
+            /** @description Number of items the step expanded to, before any status filter */
+            total: number;
+            counts: components["schemas"]["ForeachItemCounts"];
+            items: components["schemas"]["ForeachItemSummary"][];
+        };
+        /** @description One item of a foreach step and the status its body run reached */
+        ForeachItemSummary: {
+            /** @description Path that addresses the item in the foreach item routes */
+            item: string;
+            index: number;
+            key: string;
+            status: components["schemas"]["NodeStatus"];
+            statusLabel: components["schemas"]["NodeStatusLabel"];
+            /** @description Error the body run reported, when it failed */
+            error?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body run started */
+            startedAt?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body run finished */
+            finishedAt?: string;
+        };
+        /** @description One item of a foreach step with the status of each body step */
+        ForeachItem: {
+            /** @description Path that addresses the item in the foreach item routes */
+            item: string;
+            index: number;
+            key: string;
+            status: components["schemas"]["NodeStatus"];
+            statusLabel: components["schemas"]["NodeStatusLabel"];
+            error?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body run started */
+            startedAt?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body run finished */
+            finishedAt?: string;
+            /** @description Body steps in execution order */
+            steps: components["schemas"]["ForeachBodyStep"][];
+        };
+        /** @description Status of one body step within a foreach item */
+        ForeachBodyStep: {
+            name: string;
+            id?: string;
+            status: components["schemas"]["NodeStatus"];
+            statusLabel: components["schemas"]["NodeStatusLabel"];
+            error?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body step started */
+            startedAt?: string;
+            /** @description RFC 3339 timestamp with millisecond precision when the body step finished */
+            finishedAt?: string;
+            retryCount?: number;
+            /** @description Whether a stdout log file was recorded for the step */
+            hasStdout: boolean;
+            /** @description Whether a stderr log file was recorded for the step */
+            hasStderr: boolean;
+            /** @description For a body step that is itself a foreach, the parent path that lists its items */
+            foreachParent?: string;
+            agentSession?: components["schemas"]["AgentSession"];
+            modelUsage?: components["schemas"]["StepModelUsage"];
+        };
+        /** @description The samples of one time bucket of a continuous step */
+        SampleBucket: {
+            /**
+             * Format: date-time
+             * @description Start of the bucket, in UTC
+             */
+            time: string;
+            /**
+             * Format: int64
+             * @description Count of samples in the bucket
+             */
+            count: number;
+            /**
+             * Format: int64
+             * @description Count of failed samples (exit code not 0)
+             */
+            failures: number;
+            /** Format: int64 */
+            minMs: number;
+            /** Format: int64 */
+            maxMs: number;
+            /** Format: int64 */
+            p50Ms: number;
+            /** Format: int64 */
+            p95Ms: number;
+        };
+        StepSamples: {
+            /** @description Width of the tier that the buckets come from: 1, 60, 3600 or 86400 */
+            resolutionSeconds: number;
+            /** Format: date-time */
+            from: string;
+            /** Format: date-time */
+            to: string;
+            /** @description Buckets in time order. A bucket with no sample is not listed. */
+            buckets: components["schemas"]["SampleBucket"][];
+        };
+        /** @enum {string} */
+        StepEventKind: StepEventKind;
+        StepEvent: {
+            /** Format: date-time */
+            time: string;
+            kind: components["schemas"]["StepEventKind"];
+            exitCode?: number;
+            /** @description Last line of the standard error of a failed execution, 256 bytes at most */
+            message?: string;
+            /**
+             * Format: int64
+             * @description For `recovered` and for a repeated `failed` event: count of failed samples of the outage
+             */
+            failedCount?: number;
+            /**
+             * Format: int64
+             * @description For `recovered`: length of the outage
+             */
+            outageSeconds?: number;
+        };
+        StepEvents: {
+            events: components["schemas"]["StepEvent"][];
+            /** @description Cursor for the next page. Absent when there are no more events. */
+            nextCursor?: string;
+        };
+        AvailabilityWindow: {
+            /** @enum {string} */
+            window: AvailabilityWindowWindow;
+            /** Format: int64 */
+            count: number;
+            /** Format: int64 */
+            failures: number;
+            /**
+             * Format: double
+             * @description From 0 to 1. Absent when `count` is 0.
+             */
+            availability?: number;
+        };
+        StepAvailability: {
+            windows: components["schemas"]["AvailabilityWindow"][];
+            /**
+             * Format: int64
+             * @description Count of samples since the last failed sample. A lower bound once the raw tier no longer holds that sample.
+             */
+            streak: number;
+            /**
+             * Format: date-time
+             * @description Time of the last failed sample, or the start of its aggregate bucket once the raw tier no longer holds it. Absent when none failed.
+             */
+            lastFailureAt?: string;
+            /**
+             * Format: int64
+             * @description Count of all executions
+             */
+            totalCount: number;
+        };
         /** @description Log information for the execution */
         Log: {
             /** @description Log content */
@@ -7453,6 +8837,86 @@ export interface components {
             warningCode: string;
             /** @description User-facing explanation when a configured license is unusable */
             error: string;
+            /** @description Name Dagu Console shows for this server: the one a person gave it, else reportedName */
+            serverName?: string;
+            /** @description Name this server reports to Dagu Console: license.server_name, else the hostname */
+            reportedName?: string;
+            /** @description Identifier of the loaded license */
+            licenseId?: string;
+            /** @description Dagu Console workspace that owns the license */
+            workspace?: string;
+            /**
+             * @description How the license reached this server
+             * @enum {string}
+             */
+            connectedVia?: LicenseStatusResponseConnectedVia;
+            /** @description Identifier of this server in Dagu Console, for licenses that check in */
+            serverId?: string;
+            /** @description Last time Dagu Console accepted this server's check-in */
+            lastCheckIn?: string;
+            /** @description Dagu Console page for this server */
+            consoleUrl?: string;
+        };
+        /** @description Request to connect this server to Dagu Console */
+        LicenseConnectStatus: {
+            /**
+             * @description Progress of the request
+             * @enum {string}
+             */
+            state: LicenseConnectStatusState;
+            /** @description Dagu Console page that approves the request. Its report query parameter names what this server reports once connected, and is absent when it reports nothing */
+            connectUrl?: string;
+            /** @description Short code Dagu Console shows so the approver can confirm the request */
+            code?: string;
+            /** @description When the request expires unless approved */
+            expiresAt?: string;
+            /** @description Why the request failed */
+            error?: string;
+        };
+        /**
+         * @description How much this server reports to Dagu Console: off sends nothing but one report saying so after health, runs, or errors, health sends its version and which services run, runs also sends the status of finished DAG runs and the runs in progress, and errors also sends the error messages of failed runs
+         * @enum {string}
+         */
+        LicenseMonitoringLevel: LicenseMonitoringLevel;
+        /** @description What this server reports to Dagu Console */
+        LicenseMonitoring: {
+            level: components["schemas"]["LicenseMonitoringLevel"];
+            /** @description Whether cloud.report in the configuration fixes the level */
+            configured: boolean;
+            /** @description Whether an administrator chose the level on this server */
+            chosen: boolean;
+            /** @description Whether an administrator dismissed the notice that asks what to report */
+            noticeDismissed: boolean;
+            /** @description Whether an administrator was offered to send error messages: they chose a level on this server, or dismissed the notice that offers them */
+            errorsOffered: boolean;
+            /** @description When Dagu Console accepted the last report this server sent */
+            lastReportAt?: string;
+            /** @description JSON body of the last report, as sent, with heartbeat_secret replaced by "[redacted]" */
+            lastReport?: string;
+            /**
+             * Format: date-time
+             * @description When Dagu Console stores this server's finished runs again, after its workspace reached the daily limit; absent when the last accepted report was not told of a pause
+             */
+            runsPausedUntil?: string;
+        };
+        /**
+         * @description The highest role calls from Dagu Cloud get on this server: off refuses them, viewer reads DAGs, runs, and logs, operator also starts, enqueues, retries, and stops runs of existing DAGs, and developer also changes DAG definitions and runs inline specs
+         * @enum {string}
+         */
+        LicenseRemoteAccessLevel: LicenseRemoteAccessLevel;
+        /** @description How far calls from Dagu Cloud may go on this server, and whether they reach it */
+        LicenseRemoteAccess: {
+            level: components["schemas"]["LicenseRemoteAccessLevel"];
+            /** @description Whether cloud.remote_access in the configuration fixes the level */
+            levelConfigured: boolean;
+            /** @description Whether calls from Dagu Cloud may approve, reject, or push back steps waiting for a person */
+            approvals: boolean;
+            /** @description Whether cloud.remote_approvals in the configuration fixes approvals */
+            approvalsConfigured: boolean;
+            /** @description Whether this server process holds its connection to the relay, so calls from Dagu Cloud reach it */
+            connected: boolean;
+            /** @description Why the last connection failed or Dagu Cloud refused it, such as a workspace without a plan or a trial */
+            error?: string;
         };
         /** @description Request body for changing password */
         ChangePasswordRequest: {
@@ -7927,6 +9391,10 @@ export interface components {
         RuntimeProfileName: string;
         /** @description Runtime profile override. Empty string means no profile. */
         RuntimeProfileOverride: string;
+        /** @description Worker labels this DAG-run requires. Replaces the DAG-level worker_selector for this run, including its "local" value, and is kept with the run so retries, reschedules, and queued dispatch route the same way. Not allowed for DAGs with approval steps. */
+        WorkerSelectorOverride: {
+            [key: string]: string;
+        };
         /** @description Environment variable key stored in a runtime profile. Keys with the DAGU_ prefix are reserved. */
         RuntimeProfileKey: string;
         /** @enum {string} */
@@ -8198,6 +9666,16 @@ export interface components {
         };
         WorkspaceListResponse: {
             workspaces: components["schemas"]["WorkspaceResponse"][];
+        };
+        WorkspaceDeprecationResponse: {
+            /** @description Workspace settings in use, ordered by kind and name */
+            items: components["schemas"]["WorkspaceDeprecationItem"][];
+        };
+        WorkspaceDeprecationItem: {
+            /** @enum {string} */
+            kind: WorkspaceDeprecationItemKind;
+            /** @description The setting, such as a workspace, a secret and its workspace, or a username */
+            name: string;
         };
         /**
          * @description unknown is an answer that neither confirms nor denies the resource (for example a lookup that returns nothing where absence cannot be proven). It cannot be authoritative and never changes the lifecycle or admission. For a dependent whose matching target has existence_check pre_run it sets availability target_unconfirmed and opens an exception of kind target_unknown for that target; for other targets it is only recorded. A later present of that target resolves that target's exceptions only; the job stays unavailable while any other condition is open.
@@ -9366,10 +10844,25 @@ export interface components {
         SearchMatchLimit: number;
         /** @description the name of the DAG file */
         DAGFileName: components["schemas"]["DAGFileName"];
+        /** @description name of the calendar */
+        CalendarName: components["schemas"]["CalendarName"];
         /** @description name of the DAG */
         DAGName: components["schemas"]["DAGName"];
         /** @description name of the step */
         StepName: string;
+        /** @description Path of a foreach item: the item index, or for an item of a nested
+         *     foreach the parent path reported as foreachParent followed by a dot
+         *     and the item index, such as 2.inner.0.
+         *      */
+        ForeachItemPath: string;
+        /** @description name or ID of a body step of the foreach item */
+        BodyStepName: string;
+        /** @description Lists the items of a nested foreach instead of the step's own items.
+         *     The value is the foreachParent a body step reports, such as 2.inner.
+         *      */
+        ForeachParent: string;
+        /** @description only list items whose body run reached this status */
+        ForeachItemStatusFilter: components["schemas"]["ForeachItemStatusFilter"];
         /** @description explicit ID of the human-task step */
         HumanTaskStepId: string;
         /** @description Relative artifact file path within the DAG-run artifact directory. Must not start with '/' or '\' or contain '..'. */
@@ -9410,9 +10903,9 @@ export interface components {
         DAGRunName: string;
         /** @description status of the DAG-run. Repeat the parameter to match multiple statuses. */
         StatusList: components["schemas"]["Status"][];
-        /** @description start datetime for filtering DAG-runs in ISO 8601 format with timezone */
+        /** @description start of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
         DateTimeFrom: components["schemas"]["UnixTimestamp"];
-        /** @description end datetime for filtering DAG-runs in ISO 8601 format with timezone */
+        /** @description end of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
         DateTimeTo: components["schemas"]["UnixTimestamp"];
         /** @description Number of lines to return from the end of the file */
         Tail: number;
@@ -10492,6 +11985,12 @@ export interface operations {
                 /** @description Field to sort by:
                  *     - `name`: Sort alphabetically by DAG name (case-insensitive)
                  *     - `nextRun`: Sort by next scheduled run time. DAGs with earlier next run times appear first in ascending order. DAGs without schedules appear last.
+                 *     - `status`: Sort by the status of the latest run. Ascending order is running, waiting, queued, failed, rejected, aborted, partially succeeded, succeeded. DAGs without a latest run sort by name after the rest; the sort reads every matching DAG so it is accurate across pages. It is limited to 300 matching DAGs after filtering; above that the list is sorted by `name` instead and `errors` explains why.
+                 *     - `lastRun`: Sort by the start time of the latest run. DAGs without a latest run sort by name after the rest; the sort reads every matching DAG so it is accurate across pages. It is limited to 300 matching DAGs after filtering; above that the list is sorted by `name` instead and `errors` explains why.
+                 *
+                 *     DAGs without a latest run when sorting by `status` or `lastRun` come last in both ascending and descending order.
+                 *
+                 *     Pinned DAGs are listed before all others; `sort` and `order` apply within the pinned and unpinned parts.
                  *      */
                 sort?: PathsDagsGetParametersQuerySort;
                 /** @description Sort order (ascending or descending) */
@@ -10616,6 +12115,11 @@ export interface operations {
                         errors: string[];
                         /** @description Non-fatal spec warnings; these do not affect valid */
                         warnings?: string[];
+                        /** @description Structured errors, warnings and defect value-reference notices of the spec, with step and location data when known. Runtime-only notices are listed only in valueReferenceNotices. */
+                        issues: components["schemas"]["ValidationIssue"][];
+                        /** @description Passive value-reference notices produced while loading this spec. These notices are not persisted. */
+                        valueReferenceNotices: components["schemas"]["ValueReferenceNotice"][];
+                        referenceScope?: components["schemas"]["ReferenceScope"];
                     };
                 };
             };
@@ -10658,6 +12162,8 @@ export interface operations {
                         latestDAGRun: components["schemas"]["DAGRunDetails"];
                         /** @description Whether the DAG is suspended */
                         suspended: boolean;
+                        /** @description Whether the DAG is pinned to the top of the DAG list */
+                        pinned: boolean;
                         /** @description List of errors encountered during the request */
                         errors: string[];
                         /** @description Non-fatal spec warnings */
@@ -10742,6 +12248,7 @@ export interface operations {
                     dagRunId?: components["schemas"]["DAGRunId"] & unknown;
                     /** @description Optional DAG name override to use for the created dag-run */
                     dagName?: string;
+                    workerSelector?: components["schemas"]["WorkerSelectorOverride"];
                     /** @description Runtime profile override. Omit to use the DAG default profile, set to an empty string to run without a profile, or set to a profile name to override the DAG default. */
                     profile?: components["schemas"]["RuntimeProfileOverride"];
                     /**
@@ -10759,12 +12266,25 @@ export interface operations {
                     /** @description Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs. */
                     steps?: string[];
                     outputsFromRunId?: components["schemas"]["DAGRunId"] & unknown;
-                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps. */
+                    /** @description The run that each skipped step carries its outputs from, keyed by step name or ID. A step named here takes its outputs from that run in place of outputsFromRunId; the work directory still comes only from outputsFromRunId. Each run must exist for the same DAG (a normal or an ephemeral run), be finished, and hold a node of the step that succeeded or that carries copied outputs; otherwise the request returns 400 with a message that names the step and the run. A step selected to run cannot be a key. The web UI names the run of each reused step with this field and never sends values. Requires steps. */
+                    outputsFromRuns?: {
+                        [key: string]: components["schemas"]["DAGRunId"];
+                    };
+                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps. */
                     outputs?: {
                         [key: string]: {
                             [key: string]: string;
                         };
                     };
+                    /** @description Optional. The run each step of outputs was captured from, keyed by step name or ID. Dagu records it in the reusedInputs of the new run; a step of outputs without an entry has no entry there. An entry for a step not in outputs returns 400. The run is not required to exist any more. Requires steps. */
+                    outputsSources?: {
+                        [key: string]: components["schemas"]["ReusedOutputSource"];
+                    };
+                    /**
+                     * @description If true, the run leaves no trace. It runs like any run and is readable by its ID (details, step logs, step outputs, spec, SSE) while it exists, but it is not listed anywhere by default (run lists, DAG history unless includeEphemeral is set, last run, queues, dashboard, artifacts, events and notifications), it does not count in retention, and it cannot be retried, rescheduled or edited (409). The server removes it 10 minutes after it ends and at server start. Allowed only together with steps; a request for the whole DAG with ephemeral true returns 400. The audit log keeps the request, marked ephemeral.
+                     * @default false
+                     */
+                    ephemeral?: boolean;
                     /**
                      * @deprecated
                      * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
@@ -10835,6 +12355,7 @@ export interface operations {
                     dagRunId?: components["schemas"]["DAGRunId"] & unknown;
                     /** @description Optional DAG name override to use for the created dag-run */
                     dagName?: string;
+                    workerSelector?: components["schemas"]["WorkerSelectorOverride"];
                     /** @description Runtime profile override. Omit to use the DAG default profile, set to an empty string to run without a profile, or set to a profile name to override the DAG default. */
                     profile?: components["schemas"]["RuntimeProfileOverride"];
                     /**
@@ -10934,6 +12455,7 @@ export interface operations {
                     profile?: components["schemas"]["RuntimeProfileOverride"];
                     /** @description Override the DAG-level queue definition */
                     queue?: string;
+                    workerSelector?: components["schemas"]["WorkerSelectorOverride"];
                     /**
                      * @description If true, prevent enqueuing if DAG is already running or queued (returns 409 conflict)
                      * @default false
@@ -11000,6 +12522,12 @@ export interface operations {
             query?: {
                 /** @description name of the remote node */
                 remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description If true, the first page also contains the ephemeral runs of this DAG that are not older than its oldest run, merged by start time. Each carries ephemeral true. Pages read with a cursor and other lists never return them. */
+                includeEphemeral?: boolean;
+                /** @description Maximum number of DAG-runs per page, not counting ephemeral runs */
+                limit?: number;
+                /** @description Opaque cursor for loading the next page of older DAG-runs */
+                cursor?: components["parameters"]["DAGRunListCursor"];
             };
             header?: never;
             path: {
@@ -11021,6 +12549,8 @@ export interface operations {
                         dagRuns: components["schemas"]["DAGRunDetails"][];
                         /** @description Grid data for visualization */
                         gridData: components["schemas"]["DAGGridItem"][];
+                        /** @description Opaque cursor for loading the next page of older DAG-runs */
+                        nextCursor?: string;
                     };
                 };
             };
@@ -11099,6 +12629,8 @@ export interface operations {
                         dag?: components["schemas"]["DAGDetails"];
                         /** @description The DAG spec in YAML format */
                         spec: string;
+                        /** @description Lowercase hex SHA-256 of the file bytes that spec holds */
+                        sha256?: string;
                         /** @description List of errors in the spec */
                         errors: string[];
                         /** @description Non-fatal spec warnings */
@@ -11137,6 +12669,8 @@ export interface operations {
                 "application/json": {
                     /** @description The new DAG spec in YAML format */
                     spec: string;
+                    /** @description Lowercase hex SHA-256 of the file that the client edited. When set and different from the current file, the server writes nothing and returns 409. */
+                    expectedSha256?: string;
                 };
             };
         };
@@ -11150,7 +12684,18 @@ export interface operations {
                     "application/json": {
                         /** @description List of errors in the spec */
                         errors: string[];
+                        /** @description Lowercase hex SHA-256 of the bytes written */
+                        sha256: string;
                     };
+                };
+            };
+            /** @description The current file does not match expectedSha256 */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Generic error response */
@@ -11646,9 +13191,9 @@ export interface operations {
                 remoteNode?: components["parameters"]["RemoteNode"];
                 /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
                 workspace?: components["parameters"]["Workspace"];
-                /** @description start datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description start of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 fromDate?: components["parameters"]["DateTimeFrom"];
-                /** @description end datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description end of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 toDate?: components["parameters"]["DateTimeTo"];
                 /** @description Filter by DAG names containing this value */
                 name?: components["parameters"]["ArtifactDAGName"];
@@ -11762,14 +13307,67 @@ export interface operations {
             };
         };
     };
+    getDAGRunActivity: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Workspace selector. For list and search APIs, use all, default, or a workspace name. Omitted means all. */
+                workspace?: components["parameters"]["Workspace"];
+                /** @description start of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
+                fromDate?: components["parameters"]["DateTimeFrom"];
+                /** @description end of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
+                toDate?: components["parameters"]["DateTimeTo"];
+                /** @description Length of a window that ends now. Ignored when fromDate is set. */
+                hours?: number;
+                /** @description Only include runs of DAGs that have ALL these comma-separated labels */
+                labels?: string;
+                /** @description Opaque cursor for loading the next page of older DAG-runs */
+                cursor?: components["parameters"]["DAGRunListCursor"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DAGRunActivity"];
+                };
+            };
+            /** @description The window, filters, or cursor are invalid */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     listDAGRuns: {
         parameters: {
             query?: {
                 /** @description status of the DAG-run. Repeat the parameter to match multiple statuses. */
                 status?: components["parameters"]["StatusList"];
-                /** @description start datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description start of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 fromDate?: components["parameters"]["DateTimeFrom"];
-                /** @description end datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description end of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 toDate?: components["parameters"]["DateTimeTo"];
                 /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
                 dagRunId?: components["parameters"]["DAGRunIdSearch"];
@@ -11845,6 +13443,7 @@ export interface operations {
                     name?: string;
                     /** @description Runtime profile to apply to this DAG-run. Set to an empty string or omit to run without a profile. */
                     profile?: components["schemas"]["RuntimeProfileOverride"];
+                    workerSelector?: components["schemas"]["WorkerSelectorOverride"];
                     /** @description Parameters to pass to the DAG-run in JSON format */
                     params?: string;
                     dagRunId?: components["schemas"]["DAGRunId"] & unknown;
@@ -11863,12 +13462,25 @@ export interface operations {
                     /** @description Run only these steps, by step name or ID, in a new DAG-run of the current definition. Every other step is recorded as skipped and does not run. Not supported for agent DAGs. */
                     steps?: string[];
                     outputsFromRunId?: components["schemas"]["DAGRunId"] & unknown;
-                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId. Requires steps. */
+                    /** @description The run that each skipped step carries its outputs from, keyed by step name or ID. A step named here takes its outputs from that run in place of outputsFromRunId; the work directory still comes only from outputsFromRunId. Each run must exist for the same DAG (a normal or an ephemeral run), be finished, and hold a node of the step that succeeded or that carries copied outputs; otherwise the request returns 400 with a message that names the step and the run. A step selected to run cannot be a key. The web UI names the run of each reused step with this field and never sends values. Requires steps. */
+                    outputsFromRuns?: {
+                        [key: string]: components["schemas"]["DAGRunId"];
+                    };
+                    /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps. */
                     outputs?: {
                         [key: string]: {
                             [key: string]: string;
                         };
                     };
+                    /** @description Optional. The run each step of outputs was captured from, keyed by step name or ID. Dagu records it in the reusedInputs of the new run; a step of outputs without an entry has no entry there. An entry for a step not in outputs returns 400. The run is not required to exist any more. Requires steps. */
+                    outputsSources?: {
+                        [key: string]: components["schemas"]["ReusedOutputSource"];
+                    };
+                    /**
+                     * @description If true, the run leaves no trace. It runs like any run and is readable by its ID (details, step logs, step outputs, spec, SSE) while it exists, but it is not listed anywhere by default (run lists, DAG history unless includeEphemeral is set, last run, queues, dashboard, artifacts, events and notifications), it does not count in retention, and it cannot be retried, rescheduled or edited (409). The server removes it 10 minutes after it ends and at server start. Allowed only together with steps; a request for the whole DAG with ephemeral true returns 400. The audit log keeps the request, marked ephemeral.
+                     * @default false
+                     */
+                    ephemeral?: boolean;
                     /**
                      * @deprecated
                      * @description Deprecated alias for `labels`; mutually exclusive with `labels`.
@@ -11942,6 +13554,7 @@ export interface operations {
                     dagRunId?: components["schemas"]["DAGRunId"] & unknown;
                     /** @description Override the queue to use for this DAG-run */
                     queue?: string;
+                    workerSelector?: components["schemas"]["WorkerSelectorOverride"];
                     /**
                      * @description If true, prevent enqueuing if DAG is already running or queued (returns 409 conflict)
                      * @default false
@@ -12008,9 +13621,9 @@ export interface operations {
             query?: {
                 /** @description status of the DAG-run. Repeat the parameter to match multiple statuses. */
                 status?: components["parameters"]["StatusList"];
-                /** @description start datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description start of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 fromDate?: components["parameters"]["DateTimeFrom"];
-                /** @description end datetime for filtering DAG-runs in ISO 8601 format with timezone */
+                /** @description end of the time range for filtering DAG-runs, as a Unix timestamp in seconds */
                 toDate?: components["parameters"]["DateTimeTo"];
                 /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
                 dagRunId?: components["parameters"]["DAGRunIdSearch"];
@@ -12269,7 +13882,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Conflict (run ID already exists) */
+            /** @description Conflict (run ID already exists, or the historic run is ephemeral) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -12342,6 +13955,15 @@ export interface operations {
                     };
                 };
             };
+            /** @description Conflict: the DAG-run is ephemeral */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description Generic error response */
             default: {
                 headers: {
@@ -12395,6 +14017,15 @@ export interface operations {
                         skippedSteps: string[];
                         startedSteps: string[];
                     };
+                };
+            };
+            /** @description Conflict: the DAG-run is ephemeral */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Generic error response */
@@ -12842,6 +14473,15 @@ export interface operations {
                     "application/json": components["schemas"]["RetryDAGRunAdmission"];
                 };
             };
+            /** @description Conflict: the DAG-run is ephemeral */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description Generic error response */
             default: {
                 headers: {
@@ -13237,6 +14877,230 @@ export interface operations {
             };
         };
     };
+    getDAGRunStepSamples: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Start of the window (RFC 3339). Default: 24 hours before `to`. */
+                from?: string;
+                /** @description End of the window (RFC 3339). Default: now. */
+                to?: string;
+                /** @description Most buckets to return. */
+                points?: number;
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepSamples"];
+                };
+            };
+            /** @description A query parameter is not valid or out of its range, or from is after to */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run or step not found, or the step is not a continuous step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunStepEvents: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Start of the window (RFC 3339), inclusive. Default: no bound. */
+                from?: string;
+                /** @description End of the window (RFC 3339), exclusive. Default: no bound. */
+                to?: string;
+                /** @description Most events to return. */
+                limit?: number;
+                /** @description Opaque cursor from `nextCursor` of a previous response. */
+                before?: string;
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepEvents"];
+                };
+            };
+            /** @description A query parameter is not valid or out of its range, from is after to, or before is not a cursor that the server gave */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG-run or step not found, or the step is not a continuous step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunStepAvailability: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepAvailability"];
+                };
+            };
+            /** @description DAG-run or step not found, or the step is not a continuous step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunStepOutputs: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepOutputs"];
+                };
+            };
+            /** @description DAG-run or step not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     downloadDAGRunStepLog: {
         parameters: {
             query?: {
@@ -13253,6 +15117,241 @@ export interface operations {
                 dagRunId: components["parameters"]["DAGRunId"];
                 /** @description name of the step */
                 stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Log file content */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Log file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunForeachItems: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Lists the items of a nested foreach instead of the step's own items.
+                 *     The value is the foreachParent a body step reports, such as 2.inner.
+                 *      */
+                parent?: components["parameters"]["ForeachParent"];
+                /** @description only list items whose body run reached this status */
+                status?: components["parameters"]["ForeachItemStatusFilter"];
+                /** @description page number of items to fetch (default is 1) */
+                page?: components["parameters"]["Page"];
+                /** @description number of items per page (default is 30, max is 100) */
+                perPage?: components["parameters"]["PerPage"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForeachItemList"];
+                };
+            };
+            /** @description DAG-run or step not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunForeachItem: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForeachItem"];
+                };
+            };
+            /** @description DAG-run, step, or item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getDAGRunForeachStepLog: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Number of lines to return from the end of the file */
+                tail?: components["parameters"]["Tail"];
+                /** @description Number of lines to return from the beginning of the file */
+                head?: components["parameters"]["Head"];
+                /** @description Line number to start reading from (1-based) */
+                offset?: components["parameters"]["Offset"];
+                /** @description Maximum number of lines to return */
+                limit?: components["parameters"]["Limit"];
+                /** @description Whether to return stdout or stderr logs */
+                stream?: components["parameters"]["Stream"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+                /** @description name or ID of a body step of the foreach item */
+                bodyStepName: components["parameters"]["BodyStepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Log"];
+                };
+            };
+            /** @description Log file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    downloadDAGRunForeachStepLog: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Whether to return stdout or stderr logs */
+                stream?: components["parameters"]["Stream"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+                /** @description name or ID of a body step of the foreach item */
+                bodyStepName: components["parameters"]["BodyStepName"];
             };
             cookie?: never;
         };
@@ -14344,6 +16443,249 @@ export interface operations {
                 subDAGRunId: string;
                 /** @description name of the step */
                 stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Log file content */
+            200: {
+                headers: {
+                    /** @description Attachment filename */
+                    "Content-Disposition"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+            /** @description Log file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSubDAGRunForeachItems: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Lists the items of a nested foreach instead of the step's own items.
+                 *     The value is the foreachParent a body step reports, such as 2.inner.
+                 *      */
+                parent?: components["parameters"]["ForeachParent"];
+                /** @description only list items whose body run reached this status */
+                status?: components["parameters"]["ForeachItemStatusFilter"];
+                /** @description page number of items to fetch (default is 1) */
+                page?: components["parameters"]["Page"];
+                /** @description number of items per page (default is 30, max is 100) */
+                perPage?: components["parameters"]["PerPage"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run */
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForeachItemList"];
+                };
+            };
+            /** @description DAG-run or step not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSubDAGRunForeachItem: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run */
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ForeachItem"];
+                };
+            };
+            /** @description DAG-run, step, or item not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSubDAGRunForeachStepLog: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Number of lines to return from the end of the file */
+                tail?: components["parameters"]["Tail"];
+                /** @description Number of lines to return from the beginning of the file */
+                head?: components["parameters"]["Head"];
+                /** @description Line number to start reading from (1-based) */
+                offset?: components["parameters"]["Offset"];
+                /** @description Maximum number of lines to return */
+                limit?: components["parameters"]["Limit"];
+                /** @description Whether to return stdout or stderr logs */
+                stream?: components["parameters"]["Stream"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run */
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+                /** @description name or ID of a body step of the foreach item */
+                bodyStepName: components["parameters"]["BodyStepName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A successful response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Log"];
+                };
+            };
+            /** @description Log file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    downloadSubDAGRunForeachStepLog: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Whether to return stdout or stderr logs */
+                stream?: components["parameters"]["Stream"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the DAG */
+                name: components["parameters"]["DAGName"];
+                /** @description ID of the DAG-run or 'latest' to get the most recent DAG-run */
+                dagRunId: components["parameters"]["DAGRunId"];
+                /** @description ID of the sub DAG-run */
+                subDAGRunId: string;
+                /** @description name of the step */
+                stepName: components["parameters"]["StepName"];
+                /** @description Path of a foreach item: the item index, or for an item of a nested
+                 *     foreach the parent path reported as foreachParent followed by a dot
+                 *     and the item index, such as 2.inner.0.
+                 *      */
+                item: components["parameters"]["ForeachItemPath"];
+                /** @description name or ID of a body step of the foreach item */
+                bodyStepName: components["parameters"]["BodyStepName"];
             };
             cookie?: never;
         };
@@ -17304,6 +19646,299 @@ export interface operations {
             };
         };
     };
+    getDAGWebhookPublic: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The public URL and its deliveries */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookPublicDetails"];
+                };
+            };
+            /** @description No webhook, or no public URL, for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    enableDAGWebhookPublic: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The webhook with its public URL turned on */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDetails"];
+                };
+            };
+            /** @description The server is not connected to Dagu Cloud, or the plan allows no more public URLs */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No webhook configured for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Public URLs need encrypted storage, which is not available on this node */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    disableDAGWebhookPublic: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The webhook with its public URL turned off */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDetails"];
+                };
+            };
+            /** @description No webhook configured for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    regenerateDAGWebhookPublicURL: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The webhook with its new public URL */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookDetails"];
+                };
+            };
+            /** @description No webhook, or no public URL, for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    configureDAGWebhookPublicSender: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WebhookPublicSenderRequest"];
+            };
+        };
+        responses: {
+            /** @description The webhook with its new sender settings */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WebhookPublicSenderResponse"];
+                };
+            };
+            /** @description Invalid sender, secret, or events */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No webhook, or no public URL, for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    dismissDAGWebhookPublicMissed: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Missed deliveries dismissed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No webhook, or no public URL, for this DAG */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getDAGSettings: {
         parameters: {
             query?: {
@@ -17435,6 +20070,108 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description DAG not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    pinDAG: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description DAG pinned */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden - insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description DAG not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    unpinDAG: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description DAG unpinned */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Forbidden - insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
             };
             /** @description DAG not found */
             404: {
@@ -17928,7 +20665,7 @@ export interface operations {
                 remoteNode?: components["parameters"]["RemoteNode"];
                 /** @description Filter by event kind (e.g., dag_run, llm_usage) */
                 kind?: string;
-                /** @description Filter by event type (e.g., dag.run.failed, llm.usage.recorded) */
+                /** @description Filter by event type (e.g., dag.run.failed, llm.usage.recorded). Without it, dag.run.updated entries are omitted. */
                 type?: string;
                 /** @description Filter by DAG name */
                 dagName?: string;
@@ -18690,6 +21427,325 @@ export interface operations {
             };
         };
     };
+    listCalendars: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+                /** @description Count the DAGs whose start schedules use each calendar, directly or through calendars that include it. Counting reads the DAG catalog. */
+                includeUsage?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Calendars, sorted by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        calendars: components["schemas"]["CalendarSummary"][];
+                    };
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createCalendar: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCalendarRequest"];
+            };
+        };
+        responses: {
+            /** @description Calendar created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        name: components["schemas"]["CalendarName"];
+                    };
+                };
+            };
+            /** @description Reserved name, or content that is not a valid calendar */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Calendar writes are not permitted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description A calendar file has the name */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getCalendar: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the calendar */
+                name: components["parameters"]["CalendarName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The calendar */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CalendarDetails"];
+                };
+            };
+            /** @description No calendar has the name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateCalendar: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the calendar */
+                name: components["parameters"]["CalendarName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateCalendarRequest"];
+            };
+        };
+        responses: {
+            /** @description The calendar was saved when errors is empty */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CalendarSaveResult"];
+                };
+            };
+            /** @description The calendar is built in */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Calendar writes are not permitted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No calendar file has the name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    deleteCalendar: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the calendar */
+                name: components["parameters"]["CalendarName"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Calendar deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The calendar is built in */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Calendar writes are not permitted */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description No calendar file has the name */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The calendar is in use */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    previewCalendar: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description name of the calendar */
+                name: components["parameters"]["CalendarName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CalendarPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description The preview */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CalendarPreview"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     getBaseConfig: {
         parameters: {
             query?: {
@@ -19082,6 +22138,8 @@ export interface operations {
                 content: {
                     "application/json": {
                         message?: string;
+                        /** @description Dagu Console could not be told, so the server's slot stays in use until it is disconnected there */
+                        releaseFailed?: boolean;
                     };
                 };
             };
@@ -19096,6 +22154,611 @@ export interface operations {
             };
             /** @description Insufficient permissions */
             403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getLicenseConnect: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current connection request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseConnectStatus"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    startLicenseConnect: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    report?: components["schemas"]["LicenseMonitoringLevel"];
+                    remoteAccess?: components["schemas"]["LicenseRemoteAccessLevel"];
+                };
+            };
+        };
+        responses: {
+            /** @description Current connection request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseConnectStatus"];
+                };
+            };
+            /** @description Unknown report or remote access level */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The license is set outside Dagu or the server already has a license */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    cancelLicenseConnect: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current connection request */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseConnectStatus"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    refreshLicense: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description License status after the check-in */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseStatusResponse"];
+                };
+            };
+            /** @description The license does not check in with Dagu Console */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Dagu Console could not be reached */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    renameLicenseServer: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Name to show, at most 100 characters; empty clears it */
+                    name: string;
+                };
+            };
+        };
+        responses: {
+            /** @description License status after the rename */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseStatusResponse"];
+                };
+            };
+            /** @description The name is too long, the license does not check in with Dagu Console, or Dagu Console refused the name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Dagu Console could not be reached */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getLicenseMonitoring: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What this server reports */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseMonitoring"];
+                };
+            };
+            /** @description License management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateLicenseMonitoring: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    level: components["schemas"]["LicenseMonitoringLevel"];
+                };
+            };
+        };
+        responses: {
+            /** @description What this server reports after the change */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseMonitoring"];
+                };
+            };
+            /** @description Unknown level, or license management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description cloud.report in the configuration fixes the level */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    dismissLicenseMonitoringNotice: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What this server reports */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseMonitoring"];
+                };
+            };
+            /** @description License management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    dismissLicenseMonitoringErrorsNotice: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What this server reports */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseMonitoring"];
+                };
+            };
+            /** @description License management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getLicenseRemoteAccess: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Remote access on this server */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseRemoteAccess"];
+                };
+            };
+            /** @description License management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Unexpected error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    updateLicenseRemoteAccess: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    level?: components["schemas"]["LicenseRemoteAccessLevel"];
+                    /** @description Whether calls from Dagu Cloud may approve, reject, or push back steps waiting for a person */
+                    approvals?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Remote access on this server after the change */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LicenseRemoteAccess"];
+                };
+            };
+            /** @description Unknown level, nothing to change, or license management is not available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Insufficient permissions */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description cloud.remote_access or cloud.remote_approvals in the configuration fixes the setting */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -22062,6 +25725,38 @@ export interface operations {
             };
             /** @description Name already exists */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getWorkspaceDeprecation: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Workspace settings in use */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceDeprecationResponse"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -26088,7 +29783,9 @@ export interface operations {
 }
 export enum PathsDagsGetParametersQuerySort {
     name = "name",
-    nextRun = "nextRun"
+    nextRun = "nextRun",
+    status = "status",
+    lastRun = "lastRun"
 }
 export enum PathsDagsGetParametersQueryOrder {
     asc = "asc",
@@ -26107,6 +29804,11 @@ export enum PathsTxeJobsJobIdDecisionsGetParametersQueryOrder {
     asc = "asc",
     desc = "desc"
 }
+export enum DAGRunActivityQueueBlockedReason {
+    noMatchingWorker = "noMatchingWorker",
+    noAvailableWorker = "noAvailableWorker",
+    workerDispatchUnavailable = "workerDispatchUnavailable"
+}
 export enum ChatMessageRole {
     system = "system",
     user = "user",
@@ -26116,7 +29818,8 @@ export enum ChatMessageRole {
 export enum AgentInteractionResponseRequestDecision {
     once = "once",
     session = "session",
-    reject = "reject"
+    reject = "reject",
+    skip = "skip"
 }
 export enum ErrorCode {
     forbidden = "forbidden",
@@ -26147,11 +29850,39 @@ export enum WebhookHMACEnforcementMode {
     strict = "strict",
     observe = "observe"
 }
+export enum WebhookPublicSender {
+    github = "github",
+    stripe = "stripe",
+    slack = "slack",
+    standard = "standard"
+}
+export enum WebhookPublicState {
+    active = "active",
+    connecting = "connecting",
+    overLimit = "overLimit",
+    error = "error"
+}
+export enum WebhookPublicDeliveryOutcome {
+    started = "started",
+    waiting = "waiting",
+    rejected = "rejected",
+    skipped = "skipped",
+    ignored = "ignored",
+    failed = "failed"
+}
 export enum WebhookHMACConfigureRequestAuthMode {
     token_and_hmac = "token_and_hmac",
     hmac_only = "hmac_only"
 }
 export enum NotificationProviderType {
+    email = "email",
+    webhook = "webhook",
+    slack = "slack",
+    telegram = "telegram",
+    teams = "teams",
+    command = "command"
+}
+export enum NotificationTargetProviderType {
     email = "email",
     webhook = "webhook",
     slack = "slack",
@@ -26208,6 +29939,25 @@ export enum ScheduleKind {
     cron = "cron",
     at = "at"
 }
+export enum CalendarDayStatus {
+    business = "business",
+    nonBusiness = "nonBusiness",
+    holiday = "holiday",
+    extraBusinessDay = "extraBusinessDay"
+}
+export enum CalendarWeekday {
+    MON = "MON",
+    TUE = "TUE",
+    WED = "WED",
+    THU = "THU",
+    FRI = "FRI",
+    SAT = "SAT",
+    SUN = "SUN"
+}
+export enum UpcomingRunsHold {
+    schedulerPaused = "schedulerPaused",
+    suspended = "suspended"
+}
 export enum Status {
     NotStarted = 0,
     Running = 1,
@@ -26237,7 +29987,8 @@ export enum TriggerType {
     webhook = "webhook",
     subdag = "subdag",
     retry = "retry",
-    catchup = "catchup"
+    catchup = "catchup",
+    file = "file"
 }
 export enum NodeStatus {
     NotStarted = 0,
@@ -26307,6 +30058,27 @@ export enum ValueReferenceNoticeClass {
     defect = "defect",
     runtime_only = "runtime_only"
 }
+export enum ValidationIssueSeverity {
+    error = "error",
+    warning = "warning",
+    notice = "notice"
+}
+export enum ValidationIssueSource {
+    load = "load",
+    build = "build",
+    warning = "warning",
+    valueReference = "valueReference"
+}
+export enum ReferenceScopeStepOutputsKnown {
+    static = "static",
+    runtime = "runtime"
+}
+export enum ReferenceScopeOutputSource {
+    declared = "declared",
+    stdoutField = "stdoutField",
+    outputVariable = "outputVariable",
+    action = "action"
+}
 export enum ParamDefType {
     string = "string",
     integer = "integer",
@@ -26321,6 +30093,10 @@ export enum DAGRunConditionStatus {
     True = "True",
     False = "False",
     Unknown = "Unknown"
+}
+export enum ReusedInputVia {
+    run = "run",
+    cache = "cache"
 }
 export enum ArtifactNodeType {
     directory = "directory",
@@ -26387,6 +30163,25 @@ export enum WikiPageTreeNodeResponseType {
     file = "file",
     directory = "directory"
 }
+export enum ForeachItemStatusFilter {
+    not_started = "not_started",
+    running = "running",
+    succeeded = "succeeded",
+    failed = "failed",
+    aborted = "aborted"
+}
+export enum StepEventKind {
+    started = "started",
+    stopped = "stopped",
+    failed = "failed",
+    recovered = "recovered"
+}
+export enum AvailabilityWindowWindow {
+    Value24h = "24h",
+    Value7d = "7d",
+    Value30d = "30d",
+    Value365d = "365d"
+}
 export enum RepeatMode {
     While = "while",
     Until = "until"
@@ -26406,6 +30201,32 @@ export enum UserAuthProvider {
     builtin = "builtin",
     oidc = "oidc",
     proxy = "proxy"
+}
+export enum LicenseStatusResponseConnectedVia {
+    console = "console",
+    key = "key",
+    env = "env",
+    config = "config",
+    file = "file"
+}
+export enum LicenseConnectStatusState {
+    idle = "idle",
+    pending = "pending",
+    granted = "granted",
+    failed = "failed",
+    expired = "expired"
+}
+export enum LicenseMonitoringLevel {
+    off = "off",
+    health = "health",
+    runs = "runs",
+    errors = "errors"
+}
+export enum LicenseRemoteAccessLevel {
+    off = "off",
+    viewer = "viewer",
+    operator = "operator",
+    developer = "developer"
 }
 export enum APIKeyAllowedSurfaces {
     rest_api = "rest_api",
@@ -26449,7 +30270,8 @@ export enum SyncItemKind {
     dag = "dag",
     doc = "doc",
     doc_asset = "doc-asset",
-    file = "file"
+    file = "file",
+    calendar = "calendar"
 }
 export enum SyncAuthConfigType {
     token = "token",
@@ -26516,7 +30338,9 @@ export enum ViewWorkspaceScope {
 }
 export enum ViewSortField {
     name = "name",
-    nextRun = "nextRun"
+    nextRun = "nextRun",
+    status = "status",
+    lastRun = "lastRun"
 }
 export enum ViewSortOrder {
     asc = "asc",
@@ -26546,6 +30370,17 @@ export enum ViewSpecType {
     workflow = "workflow",
     run = "run",
     artifact = "artifact"
+}
+export enum WorkspaceDeprecationItemKind {
+    baseConfig = "baseConfig",
+    secret = "secret",
+    profileEntry = "profileEntry",
+    notificationRoute = "notificationRoute",
+    incidentPolicy = "incidentPolicy",
+    configKey = "configKey",
+    user = "user",
+    apiKey = "apiKey",
+    wikiDirectory = "wikiDirectory"
 }
 export enum TxeResourceObservation {
     deleted = "deleted",

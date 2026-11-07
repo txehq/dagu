@@ -40,9 +40,13 @@ func buildManagedDAGRunEnvs(
 		envs[runenv.EnvKeyDAGRunArtifactsDir] = options.artifactDir
 	}
 	maps.Copy(envs, retryProvenanceEnvs(options))
-	if dag.ParamsJSON != "" {
-		envs[runenv.EnvKeyDAGParamsJSON] = dag.ParamsJSON
-		envs[runenv.EnvKeyDAGParamsJSONCompat] = dag.ParamsJSON
+	paramsJSON := dag.ParamsJSON
+	if options.paramsJSON != nil {
+		paramsJSON = *options.paramsJSON
+	}
+	if paramsJSON != "" {
+		envs[runenv.EnvKeyDAGParamsJSON] = paramsJSON
+		envs[runenv.EnvKeyDAGParamsJSONCompat] = paramsJSON
 	}
 	return envs
 }

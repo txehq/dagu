@@ -187,6 +187,33 @@ var errTxeHubRecords = &Error{
 	Details:    map[string]any{"code": "hub_records_not_permitted"},
 }
 
+// errTxePlatformResource refuses a change to a resource the whole hub shares.
+var errTxePlatformResource = &Error{
+	HTTPStatus: http.StatusForbidden,
+	Code:       api.ErrorCodeForbidden,
+	Message:    "under owner enforcement only the platform administrator changes what the whole hub shares",
+	Details:    map[string]any{"code": "platform_resource_not_permitted"},
+}
+
+// txePlatformResourceWrite decides a change to a resource that belongs to no
+// owner and affects every owner's workflows, such as a shared calendar
+// (TXE-5923). Like a DAG with no owner, it is the platform's: in enforce only
+// the platform administrator changes it, and in observe and off the hub's
+// roles decide, as before. A failure to decide refuses.
+func (a *API) txePlatformResourceWrite(ctx context.Context) error {
+	if a.txeAuth == nil {
+		return nil
+	}
+	reserved, err := a.txePlatformReserved(ctx)
+	if err != nil {
+		return err
+	}
+	if reserved {
+		return errTxePlatformResource
+	}
+	return nil
+}
+
 // txeHubHidden reports whether the hub's whole-hub reads that are not
 // decided DAG by DAG are hidden from the caller (TXE-4752): DAG search, the
 // artifact list, event and audit logs, and workers. A caller held to its

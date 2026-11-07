@@ -23,9 +23,7 @@ type Props = {
 export function AgentSpecOverview({ dag }: Props) {
   const tasks = dag.tasks ?? [];
   const steps = dag.steps ?? [];
-  const actions = steps.filter(
-    (step) => !AGENT_SYSTEM_STEPS.has(step.name)
-  );
+  const actions = steps.filter((step) => !AGENT_SYSTEM_STEPS.has(step.name));
   const [selectedActionName, setSelectedActionName] = React.useState(
     actions[0]?.name ?? null
   );
@@ -37,7 +35,7 @@ export function AgentSpecOverview({ dag }: Props) {
       <section className="rounded-md border border-border bg-card px-5 py-4 shadow-sm">
         <h2 className="flex items-center gap-2 text-base font-semibold text-foreground">
           <Target className="h-4 w-4 text-primary" />
-          <I18nText text={"Tasks"} />
+          <I18nText text={'Tasks'} />
         </h2>
 
         {tasks.length > 0 ? (
@@ -59,61 +57,63 @@ export function AgentSpecOverview({ dag }: Props) {
           </div>
         ) : (
           <div className="mt-3 text-sm text-foreground">
-            <I18nText text={"No tasks are defined."} />
+            <I18nText text={'No tasks are defined.'} />
           </div>
         )}
       </section>
 
       <section className="overflow-hidden rounded-md border border-border bg-card shadow-sm lg:grid lg:h-[clamp(32rem,calc(100vh-22rem),48rem)] lg:grid-cols-[minmax(280px,0.75fr)_minmax(0,1.25fr)]">
-        <I18nProps><div
-          role="group"
-          className="min-w-0 border-b border-border lg:overflow-y-auto lg:border-b-0 lg:border-r"
-          aria-label="Available actions"
-        >
-          {actions.length > 0 ? (
-            <div className="divide-y divide-border">
-              {actions.map((step) => {
-                const isSelected = selectedAction?.name === step.name;
+        <I18nProps>
+          <div
+            role="group"
+            className="min-w-0 border-b border-border lg:overflow-y-auto lg:border-b-0 lg:border-r"
+            aria-label="Available actions"
+          >
+            {actions.length > 0 ? (
+              <div className="divide-y divide-border">
+                {actions.map((step) => {
+                  const isSelected = selectedAction?.name === step.name;
 
-                return (
-                  <button
-                    key={step.name}
-                    type="button"
-                    aria-pressed={isSelected}
-                    className={cn(
-                      'relative block min-h-[76px] w-full px-5 py-3 text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary',
-                      isSelected &&
-                        'bg-primary/[0.08] before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-primary'
-                    )}
-                    onClick={() => setSelectedActionName(step.name)}
-                  >
-                    <div className="min-w-0">
-                      <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                        <span className="whitespace-normal break-words text-sm font-semibold text-foreground">
-                          {step.name}
-                        </span>
-                        {step.id && step.id !== step.name ? (
-                          <span className="truncate font-mono text-xs text-foreground">
-                            {step.id}
+                  return (
+                    <button
+                      key={step.name}
+                      type="button"
+                      aria-pressed={isSelected}
+                      className={cn(
+                        'relative block min-h-[76px] w-full px-5 py-3 text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+                        isSelected &&
+                          'bg-primary/[0.08] before:absolute before:inset-y-0 before:left-0 before:w-0.5 before:bg-primary'
+                      )}
+                      onClick={() => setSelectedActionName(step.name)}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                          <span className="whitespace-normal break-words text-sm font-semibold text-foreground">
+                            {step.name}
                           </span>
+                          {step.id && step.id !== step.name ? (
+                            <span className="truncate font-mono text-xs text-foreground">
+                              {step.id}
+                            </span>
+                          ) : null}
+                        </div>
+                        {step.description ? (
+                          <p className="mt-1 line-clamp-1 whitespace-normal break-words text-sm leading-5 text-foreground">
+                            {step.description}
+                          </p>
                         ) : null}
                       </div>
-                      {step.description ? (
-                        <p className="mt-1 line-clamp-1 whitespace-normal break-words text-sm leading-5 text-foreground">
-                          {step.description}
-                        </p>
-                      ) : null}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="px-5 py-6 text-sm text-foreground">
-              <I18nText text={"No actions are defined."} />
-            </div>
-          )}
-        </div></I18nProps>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="px-5 py-6 text-sm text-foreground">
+                <I18nText text={'No actions are defined.'} />
+              </div>
+            )}
+          </div>
+        </I18nProps>
 
         <ActionDetails step={selectedAction} />
       </section>
@@ -125,7 +125,7 @@ function ActionDetails({ step }: { step?: Step }) {
   if (!step) {
     return (
       <div className="flex min-h-64 items-center justify-center px-6 py-10 text-sm text-foreground">
-        <I18nText text={"Select an action to inspect its configuration."} />
+        <I18nText text={'Select an action to inspect its configuration.'} />
       </div>
     );
   }
@@ -143,7 +143,7 @@ function ActionDetails({ step }: { step?: Step }) {
           </h2>
           {step.id ? (
             <div className="mt-1 font-mono text-sm text-foreground">
-              <I18nText text={"ID:"} /> {step.id}
+              <I18nText text={'ID:'} /> {step.id}
             </div>
           ) : null}
           {step.description ? (
@@ -154,73 +154,83 @@ function ActionDetails({ step }: { step?: Step }) {
         </div>
       </div>
 
-      <I18nProps><DetailSection title="Execution" className="mt-5">
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
-          <Badge variant={step.call ? 'primary' : 'outline'}>
-            {step.call ? <GitBranch className="h-3 w-3" /> : null}
-            {execution.label}
-          </Badge>
-          {execution.detail ? (
-            <code className="break-all text-sm text-foreground">
-              {execution.detail}
-            </code>
+      <I18nProps>
+        <DetailSection title="Execution" className="mt-5">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <Badge variant={step.call ? 'primary' : 'outline'}>
+              {step.call ? <GitBranch className="h-3 w-3" /> : null}
+              {execution.label}
+            </Badge>
+            {execution.detail ? (
+              <code className="break-all text-sm text-foreground">
+                {execution.detail}
+              </code>
+            ) : null}
+          </div>
+
+          {step.script ? <CodePreview value={step.script} /> : null}
+          {step.commands?.length ? (
+            <CodePreview
+              value={step.commands
+                .map((command) =>
+                  [command.command, ...(command.args ?? [])].join(' ')
+                )
+                .join('\n')}
+            />
           ) : null}
-        </div>
+          {executorConfig.length > 0 ? (
+            <KeyValueGrid
+              items={executorConfig.map(([name, value]) => ({
+                name,
+                value: formatValue(value),
+              }))}
+            />
+          ) : null}
+        </DetailSection>
+      </I18nProps>
 
-        {step.script ? <CodePreview value={step.script} /> : null}
-        {step.commands?.length ? (
-          <CodePreview
-            value={step.commands
-              .map((command) =>
-                [command.command, ...(command.args ?? [])].join(' ')
-              )
-              .join('\n')}
-          />
-        ) : null}
-        {executorConfig.length > 0 ? (
-          <KeyValueGrid
-            items={executorConfig.map(([name, value]) => ({
-              name,
-              value: formatValue(value),
-            }))}
-          />
-        ) : null}
-      </DetailSection></I18nProps>
-
-      <I18nProps><DetailSection title="Parameters">
-        {parameters.length > 0 ? (
-          <KeyValueGrid
-            items={parameters.map((parameter, index) => ({
-              name: parameter.Name ?? `Argument ${index + 1}`,
-              value: parameter.Value,
-            }))}
-          />
-        ) : (
-          <EmptyValue><I18nText text={"No parameters"} /></EmptyValue>
-        )}
-      </DetailSection></I18nProps>
+      <I18nProps>
+        <DetailSection title="Parameters">
+          {parameters.length > 0 ? (
+            <KeyValueGrid
+              items={parameters.map((parameter, index) => ({
+                name: parameter.Name ?? `Argument ${index + 1}`,
+                value: parameter.Value,
+              }))}
+            />
+          ) : (
+            <EmptyValue>
+              <I18nText text={'No parameters'} />
+            </EmptyValue>
+          )}
+        </DetailSection>
+      </I18nProps>
 
       <AdditionalSettings step={step} />
 
       <div className="pt-5">
-        <I18nProps><InfoCard title="Conditions">
-          {step.preconditions?.length ? (
-            <div className="space-y-2">
-              {step.preconditions.map((condition, index) => (
-                <div
-                  key={`${condition.condition}-${index}`}
-                  className="text-sm leading-relaxed text-foreground"
-                >
-                  <code className="break-all">{condition.condition}</code>
-                  <span className="px-1.5 text-foreground">→</span>
-                  <code className="break-all">{condition.expected}</code>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <EmptyValue><I18nText text={"None"} /></EmptyValue>
-          )}
-        </InfoCard></I18nProps>
+        <I18nProps>
+          <InfoCard title="Conditions">
+            {step.preconditions?.length ? (
+              <div className="space-y-2">
+                {step.preconditions.map((condition, index) => (
+                  <div
+                    key={`${condition.condition}-${index}`}
+                    className="text-sm leading-relaxed text-foreground"
+                  >
+                    <code className="break-all">{condition.condition}</code>
+                    <span className="px-1.5 text-foreground">→</span>
+                    <code className="break-all">{condition.expected}</code>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyValue>
+                <I18nText text={'None'} />
+              </EmptyValue>
+            )}
+          </InfoCard>
+        </I18nProps>
       </div>
     </div>
   );
@@ -303,9 +313,11 @@ function AdditionalSettings({ step }: { step: Step }) {
   }
 
   return (
-    <I18nProps><DetailSection title="Configuration">
-      <KeyValueGrid items={settings} />
-    </DetailSection></I18nProps>
+    <I18nProps>
+      <DetailSection title="Configuration">
+        <KeyValueGrid items={settings} />
+      </DetailSection>
+    </I18nProps>
   );
 }
 

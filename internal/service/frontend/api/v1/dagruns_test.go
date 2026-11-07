@@ -384,6 +384,78 @@ func TestLogPageLimits(t *testing.T) {
 	}
 }
 
+func TestStepLogStream(t *testing.T) {
+	for _, strict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("strict=%t", strict), func(t *testing.T) {
+			server := test.SetupServer(t, test.WithConfigMutator(func(cfg *config.Config) {
+				cfg.Server.StrictValidation = strict
+			}))
+			logDir := t.TempDir()
+			stdout := filepath.Join(logDir, "stdout.log")
+			stderr := filepath.Join(logDir, "stderr.log")
+			require.NoError(t, os.WriteFile(stdout, []byte("stdout"), 0o600))
+			require.NoError(t, os.WriteFile(stderr, []byte("stderr"), 0o600))
+
+			dag := &ir.DAG{Name: "step-log-stream", Steps: []ir.Step{{Name: "main"}}}
+			root := ir.NewDAGRunRef(dag.Name, "root")
+			for _, runID := range []string{root.ID, "child"} {
+				opts := persis.DAGRunCreateAttemptOptions{}
+				if runID != root.ID {
+					opts.RootDAGRun = root
+				}
+				attempt, err := server.DAGRunRepository.CreateAttempt(server.Context, dag, time.Now(), runID, opts)
+				require.NoError(t, err)
+				status := ir.InitialStatus(dag)
+				status.DAGRunID = runID
+				status.AttemptID = attempt.ID()
+				status.Root = root
+				status.Nodes[0].Stdout = stdout
+				status.Nodes[0].Stderr = stderr
+				if runID == root.ID {
+					status.Nodes[0].SubRuns = []ir.SubDAGRun{{DAGRunID: "child", DAGName: dag.Name}}
+				}
+				require.NoError(t, attempt.Open(server.Context))
+				require.NoError(t, attempt.Write(server.Context, status))
+				require.NoError(t, attempt.Close(server.Context))
+			}
+
+			for _, path := range []string{
+				"/steps/main/log",
+				"/sub-dag-runs/child/steps/main/log",
+			} {
+				t.Run(path, func(t *testing.T) {
+					for _, tc := range []struct {
+						name    string
+						query   string
+						content string
+					}{
+						{name: "omitted", content: "stdout"},
+						{name: "stdout", query: "?stream=stdout", content: "stdout"},
+						{name: "stderr", query: "?stream=stderr", content: "stderr"},
+						{name: "false", query: "?stream=false", content: "stdout"},
+					} {
+						t.Run(tc.name, func(t *testing.T) {
+							want := http.StatusOK
+							// Strict validation rejects values outside the stream enum.
+							if strict && tc.name == "false" {
+								want = http.StatusBadRequest
+							}
+							resp := server.Client().Get(fmt.Sprintf(
+								"/api/v1/dag-runs/%s/%s%s%s", dag.Name, root.ID, path, tc.query,
+							)).ExpectStatus(want).Send(t)
+							if want == http.StatusOK {
+								var body api.GetDAGRunStepLog200JSONResponse
+								resp.Unmarshal(t, &body)
+								assert.Equal(t, tc.content, body.Content)
+							}
+						})
+					}
+				})
+			}
+		})
+	}
+}
+
 func readLogArchive(t *testing.T, body string) map[string]string {
 	t.Helper()
 	archive, err := zip.NewReader(strings.NewReader(body), int64(len(body)))
@@ -3311,20 +3383,20 @@ func TestListDAGRunsFilterByPartialName(t *testing.T) {
 		)
 	}
 
-	resp := server.Client().Get("/api/v1/dag-runs?name=test").
-		ExpectStatus(http.StatusOK).Send(t)
+	require.Eventually(t, func() bool {
+		resp := server.Client().Get("/api/v1/dag-runs?name=test").
+			ExpectStatus(http.StatusOK).Send(t)
 
-	var body api.ListDAGRuns200JSONResponse
-	resp.Unmarshal(t, &body)
+		var body api.ListDAGRuns200JSONResponse
+		resp.Unmarshal(t, &body)
 
-	names := make(map[string]bool)
-	for _, run := range body.DagRuns {
-		names[run.Name] = true
-	}
+		names := make(map[string]bool)
+		for _, run := range body.DagRuns {
+			names[run.Name] = true
+		}
 
-	require.True(t, names["test-params-flag"])
-	require.True(t, names["alpha-test-case"])
-	require.False(t, names["other-dag"])
+		return names["test-params-flag"] && names["alpha-test-case"] && !names["other-dag"]
+	}, dagRunEventuallyTimeout(5*time.Second), 200*time.Millisecond)
 }
 
 func TestListDAGRunsByNameRemainsExact(t *testing.T) {
@@ -3349,16 +3421,23 @@ func TestListDAGRunsByNameRemainsExact(t *testing.T) {
 		)
 	}
 
-	resp := server.Client().Get("/api/v1/dag-runs/test-params-flag").
-		ExpectStatus(http.StatusOK).Send(t)
+	require.Eventually(t, func() bool {
+		resp := server.Client().Get("/api/v1/dag-runs/test-params-flag").
+			ExpectStatus(http.StatusOK).Send(t)
 
-	var body api.ListDAGRunsByName200JSONResponse
-	resp.Unmarshal(t, &body)
+		var body api.ListDAGRunsByName200JSONResponse
+		resp.Unmarshal(t, &body)
 
-	require.NotEmpty(t, body.DagRuns)
-	for _, run := range body.DagRuns {
-		require.Equal(t, "test-params-flag", run.Name)
-	}
+		if len(body.DagRuns) == 0 {
+			return false
+		}
+		for _, run := range body.DagRuns {
+			if run.Name != "test-params-flag" {
+				return false
+			}
+		}
+		return true
+	}, dagRunEventuallyTimeout(5*time.Second), 200*time.Millisecond)
 }
 
 func TestGetDAGRunDetailsExposesLocalProcessWhileRunning(t *testing.T) {

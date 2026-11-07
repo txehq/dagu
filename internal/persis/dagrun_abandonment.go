@@ -120,6 +120,22 @@ type AttemptAbandonment struct {
 	Evidence           AbandonmentEvidence `json:"evidence"`
 }
 
+// AttemptNeverStarted reports whether an attempt's status says it never
+// started: no worker took it, and it is NotStarted, or Queued as a direct
+// start the coordinator held for a worker, with the empty queued-at marker
+// it was prepared with. The scheduler's queue always marks the attempts it
+// queues, so a held direct start is told apart from a queued one by the
+// marker. It is one rule for the coordinator's evidence and the store's
+// guard: a held attempt whose task was never stored is abandoned like one
+// that never left NotStarted. Absence of any task, lease or active run is
+// the caller's to prove; the status alone never proves it.
+func AttemptNeverStarted(status *ir.DAGRunStatus) bool {
+	if status == nil || status.WorkerID != "" {
+		return false
+	}
+	return status.Status == ir.NotStarted || (status.Status == ir.Queued && status.QueuedAt == "")
+}
+
 // Attributable reports whether the record can be attributed to a caller's
 // request. Without a correlation it cannot: another caller may have abandoned
 // an attempt for the same predecessor.

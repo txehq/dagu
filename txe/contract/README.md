@@ -10,7 +10,9 @@ upstream files untouched unless a change cannot live here, so the fork stays a s
 
 ## Pinned Dagu facts this contract relies on
 
-Read from v2.18.2-13 (9bb941da0a31). Re-read them before relying on a newer pin.
+Read from v2.18.2-13 (9bb941da0a31). Re-read them before relying on a newer pin; for v2.25.8 see
+[Upstream v2.25.8](#upstream-v2258-txe-5923), which changes the direct-start answer in `off` and
+`observe`.
 
 - A worker connects to the coordinator; the coordinator never connects to a worker. The worker
   returns status, logs and artifacts over gRPC, and their durable copies live on the server.
@@ -35,6 +37,58 @@ any older fork build reads what this fork writes. A fork build before it silentl
 referenced outputs, so no release before TXE-5795 is a rollback target once an upstream-format
 writer has run. The fixtures in `internal/ir/testdata/upstream_v2.25.2_stored_status.jsonl` were
 produced by that upstream version's own writer.
+
+## Upstream v2.25.8 (TXE-5923)
+
+The fork's source is merged with upstream v2.25.8 (28022fee38b5). Where upstream changed
+behaviour the fork depends on, the fork keeps its own:
+
+- **Status outputs.** The writer and compaction keep every output field inline and never call
+  `ir.StoredStatus`, so a fork build before TXE-5795 still reads every output. Compaction, now
+  also triggered by size, always reads the last record under the status file's lock.
+- **No matching worker.** Upstream holds such a dispatch as Queued for
+  `coordinator.worker_wait_timeout` (default 2m) instead of refusing it. With machines pinned
+  (`enforce`) the fork never holds: the dispatch is refused at once with FailedPrecondition, the
+  same answer whether no worker or only other owners' machines are connected. In `off` and
+  `observe` the hold applies. A held dispatch keeps the queuedAt it was prepared with, so its
+  execution identity (attempt id, execution marker) does not change.
+- **Unclaimed tasks.** Upstream keeps an unclaimed pending task until its run moves on, however
+  long. The fork keeps it the same way, so a task waits while every matching worker is busy, but
+  only until its claim deadline: `coordinator.unclaimed_dispatch_timeout`, default 24h; an explicit
+  `0` means no ceiling; any other value that is not a non-negative duration refuses to load. The
+  deadline is set once, when the task is first enqueued, and is stored with it. A restart, a
+  released claim, a republication of the same execution or a later change of the setting never
+  moves it; a new attempt gets its own. A record from before the field takes its deadline from its
+  stored enqueue time, and fails closed without one. From the deadline the task is never handed
+  out. The coordinator removes that exact record on its next pass and settles the attempt. The
+  deadline is the cutoff for a claim, not the moment the run's status changes: a journaled
+  attempt is abandoned only once it is at least 10 minutes old (abandonedPreparationMinAge).
+  Measured with a 2m ceiling: removal at about 126 s, abandonment at about 620 s. The two paths:
+  - a journaled attempt is abandoned with the usual record;
+  - any other attempt is failed first, then loses its task.
+
+  Neither path ends an attempt a worker holds (worker, lease or active-run record) or one that is
+  not its run's latest. The deadline bounds only the wait for a claim: a task claimed before it,
+  even if acknowledged after, and the run it starts are never ended by it, however long they run,
+  and schedules are not affected. A held task ends when its wait passes, as upstream does.
+
+  **Rollback does not keep this wait.** A txe-v2.18.2-19 coordinator ignores the new fields and
+  expires an unheld pending task after the 90s reservation time, as it always did. So after a
+  rollback, a task that was waiting for a busy worker ends as not dispatched. Drain pending
+  dispatches before rolling back (a gate, not a lossless rollback); claimed and running work is
+  not affected. The rollout's rollback procedure must enforce the drain with a check, TXE-6057.
+
+  The deadline is made in one place: every new pending task's payload comes from
+  `newPendingPayload`, every task record is encoded by `newDispatchRecord` (which stamps a missing
+  deadline), and only `claimNextPending` turns a task into a claim, refusing one past its deadline.
+  `TestDispatchTaskPayloadsHaveOneMaker` fails a writer or claimer added anywhere else.
+- **Access.** The owner filters for whole-hub lists and queues apply inside upstream's new list
+  paths. Upstream's run-outputs and step-sample endpoints use the per-DAG owner check.
+- **Credentials.** `DAGU_COORDINATOR_AUTH_HUB_KEY_FILE` and `DAGU_WORKER_AUTH_CREDENTIAL_FILE` count
+  as Dagu credentials, so workflow steps no longer inherit them (upstream's credential env filter).
+- **UI.** Upstream replaced the DAG and run pages with the workflow workspace. A person's tab
+  limits and the hidden incident feature apply there now, and so do the job-access Start button and
+  the unconfirmed-start handling.
 
 ## Identities
 

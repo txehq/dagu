@@ -47,11 +47,26 @@ func remoteReturning(t *testing.T, status int) *httptest.Server {
 func TestTestNodeConnection(t *testing.T) {
 	t.Parallel()
 
-	t.Run("ValidTokenSucceeds", func(t *testing.T) {
+	// The connection test runs after the local decision (authorizeRemoteNode),
+	// which TestRemoteNodeAuthorizationCoversEveryFamily covers; without it no
+	// credential is sent and the test fails (TXE-5923).
+	t.Run("WithoutTheLocalDecisionNoCredentialIsSent", func(t *testing.T) {
 		t.Parallel()
 
 		srv := guardedRemote(t, "good-token")
 		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+			APIBaseURL: srv.URL + "/api/v1",
+			AuthType:   remotenode.AuthTypeToken,
+			AuthToken:  "good-token",
+		})
+		assert.False(t, result.Success)
+	})
+
+	t.Run("ValidTokenSucceeds", func(t *testing.T) {
+		t.Parallel()
+
+		srv := guardedRemote(t, "good-token")
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "good-token",
@@ -67,7 +82,7 @@ func TestTestNodeConnection(t *testing.T) {
 		t.Parallel()
 
 		srv := guardedRemote(t, "good-token")
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "wrong-token",
@@ -83,7 +98,7 @@ func TestTestNodeConnection(t *testing.T) {
 		t.Parallel()
 
 		srv := guardedRemote(t, "good-token")
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeNone,
 		})
@@ -97,7 +112,7 @@ func TestTestNodeConnection(t *testing.T) {
 		t.Parallel()
 
 		srv := remoteReturning(t, http.StatusForbidden)
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "good-token",
@@ -113,7 +128,7 @@ func TestTestNodeConnection(t *testing.T) {
 		t.Parallel()
 
 		srv := remoteReturning(t, http.StatusInternalServerError)
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "good-token",
@@ -128,7 +143,7 @@ func TestTestNodeConnection(t *testing.T) {
 		t.Parallel()
 
 		srv := guardedRemote(t, "")
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: srv.URL + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "never-checked",
@@ -146,7 +161,7 @@ func TestTestNodeConnection(t *testing.T) {
 		url := srv.URL
 		srv.Close()
 
-		result := testNodeConnection(context.Background(), &remotenode.RemoteNode{
+		result := testNodeConnection(allowedRemoteContext(), &remotenode.RemoteNode{
 			APIBaseURL: url + "/api/v1",
 			AuthType:   remotenode.AuthTypeToken,
 			AuthToken:  "good-token",
@@ -156,4 +171,9 @@ func TestTestNodeConnection(t *testing.T) {
 		require.NotNil(t, result.Error)
 		assert.Contains(t, *result.Error, "Connection failed")
 	})
+}
+
+// allowedRemoteContext is a context the local remote-node decision allowed.
+func allowedRemoteContext() context.Context {
+	return remotenode.WithUseAuthorized(context.Background())
 }

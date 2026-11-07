@@ -25,11 +25,12 @@ import (
 // rolling replacement, may still be about to publish. The claim check below
 // refuses such a publication anyway.
 //
-// It also stays above the longest an unacknowledged dispatch can remain
-// reserved: a pending task expires after the reservation TTL, and a claim
-// never acknowledged is released to pending after one TTL and then expires
-// after another. Both TTLs are dagrun.DefaultStaleLeaseThreshold, so the bound
-// is derived from it and grows with it.
+// It also stays above the longest an unacknowledged claim can remain reserved
+// before its release to pending, two reservation TTLs at most. Both TTLs are
+// dagrun.DefaultStaleLeaseThreshold, so the bound is derived from it and grows
+// with it. A pending task keeps its attempt in flight until its claim deadline
+// (coordinator.unclaimed_dispatch_timeout), when expireUnclaimedDispatches
+// removes it and this reconciliation abandons the attempt.
 const abandonedPreparationMinAge = max(10*time.Minute, 2*dagrun.DefaultStaleLeaseThreshold+time.Minute)
 
 // errAttemptAbandoned refuses a claim of an attempt that has an abandonment
@@ -48,7 +49,8 @@ func (h *Handler) canAbandonPreparations() bool {
 // errDispatchInFlight means the attempt may be with a worker: a task is pending
 // or claimed, or a lease or active-run record exists. The attempt is not
 // abandoned, and its entry stays until the attempt settles: a worker that has
-// acknowledged its claim reports progress, and an unacknowledged task expires.
+// acknowledged its claim reports progress, and an unclaimed task is removed at
+// its claim deadline.
 var errDispatchInFlight = errors.New("dispatch may be in flight")
 
 // errAbandonmentUnavailable means this coordinator is not configured to
@@ -68,13 +70,20 @@ var errQueueUnknown = fmt.Errorf("%w: this coordinator has no queue store, so wh
 //
 // queuedAt names one execution of a reused attempt (empty for a newly created
 // attempt): its status may then still read Queued, with exactly that marker.
+// A newly created attempt is judged by persis.AttemptNeverStarted: it reads
+// Queued, with its empty marker, once Dispatch held it for a worker
+// (markPreparedAttemptHeld) before its task is stored, and one whose task
+// was then never stored, because publishing it failed or the coordinator
+// stopped in between, is never dispatched either, and is abandoned like one
+// that never left NotStarted. A held attempt whose task was stored is not:
+// the task is pending, and expires through failHeldDispatch.
 func (h *Handler) neverDispatchedEvidence(ctx context.Context, attemptKey, queuedAt string, status *ir.DAGRunStatus) (persis.AbandonmentEvidence, error) {
 	var evidence persis.AbandonmentEvidence
 	if h.dispatchTaskStore == nil || h.dagRunLeaseStore == nil {
 		return evidence, errAbandonmentUnavailable
 	}
-	waiting := status != nil && (status.Status == ir.NotStarted ||
-		(queuedAt != "" && status.Status == ir.Queued && status.QueuedAt == queuedAt))
+	waiting := status != nil && ((queuedAt == "" && persis.AttemptNeverStarted(status)) ||
+		(queuedAt != "" && (status.Status == ir.NotStarted || status.Status == ir.Queued && status.QueuedAt == queuedAt)))
 	if status != nil && (status.WorkerID != "" || !waiting) {
 		return evidence, fmt.Errorf("%w: attempt is %s with worker %q",
 			persis.ErrAttemptNotAbandonable, status.Status, status.WorkerID)

@@ -266,7 +266,8 @@ func ReadLogLines(filePath string, options LogReadOptions) (*LogResult, error) {
 		if err != nil {
 			return nil, err
 		}
-		result.IsEstimate = isEstimate
+		// A tail that reaches the start of the file has counted every line.
+		result.IsEstimate = isEstimate && result.HasMore
 		return result, nil
 	}
 
@@ -398,6 +399,7 @@ func countLinesExact(filePath string) (int, error) {
 	}()
 
 	scanner := bufio.NewScanner(file)
+	ConfigureScanner(scanner)
 	lineCount := 0
 	for scanner.Scan() {
 		lineCount++
@@ -421,6 +423,7 @@ func readFirstLines(filePath string, n int, totalLines int, decoder lineDecoder)
 	}()
 
 	scanner := bufio.NewScanner(decoder.reader(file))
+	ConfigureScanner(scanner)
 	lines := make([]string, 0, n)
 	lineCount := 0
 
@@ -447,7 +450,9 @@ func readFirstLines(filePath string, n int, totalLines int, decoder lineDecoder)
 	}, nil
 }
 
-// readLastLines reads the last n lines from a file
+// readLastLines reads the last n lines from a file. HasMore reports exactly
+// whether earlier lines exist; TotalLines is exact when it is false and
+// otherwise at least one more than the lines returned.
 func readLastLines(filePath string, n int, totalLines int, decoder lineDecoder) (*LogResult, error) {
 	// If n is 0, return empty result
 	if n <= 0 {
@@ -468,14 +473,100 @@ func readLastLines(filePath string, n int, totalLines int, decoder lineDecoder) 
 		_ = file.Close()
 	}()
 
-	// If n is greater than or equal to total lines, read all lines
-	if n >= totalLines {
-		return readFirstLines(filePath, totalLines, totalLines, decoder)
+	// Stream decoders cannot split raw bytes on newlines, so they scan the
+	// whole file.
+	if decoder.stream != nil {
+		return readLastLinesForward(file, n, totalLines, decoder)
 	}
 
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	start, err := tailStart(file, info.Size(), n)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+
+	scanner := bufio.NewScanner(file)
+	ConfigureScanner(scanner)
+	lines := make([]string, 0, n)
+	for scanner.Scan() {
+		lines = append(lines, decoder.text(scanner.Bytes()))
+	}
+	if err := scanner.Err(); err != nil {
+		if errors.Is(err, bufio.ErrTooLong) {
+			return &LogResult{
+				Lines: []string{"Error: Line too long to read."},
+			}, nil
+		}
+		return nil, err
+	}
+
+	// A file that grew after tailStart yields extra lines; keep the newest.
+	hasMore := start > 0 || len(lines) > n
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	total := len(lines)
+	if hasMore {
+		total = max(totalLines, len(lines)+1)
+	}
+
+	return &LogResult{
+		Lines:      lines,
+		LineCount:  len(lines),
+		TotalLines: total,
+		HasMore:    hasMore,
+		IsEstimate: false, // Will be set by the caller
+	}, nil
+}
+
+// tailStart returns the offset where the last n lines of a file of the given
+// size begin. A newline that ends the file closes the last line rather than
+// starting an empty one, matching bufio.ScanLines.
+func tailStart(file *os.File, size int64, n int) (int64, error) {
+	buf := make([]byte, backwardChunkSize)
+	end := size
+	if end > 0 {
+		if _, err := file.ReadAt(buf[:1], end-1); err != nil {
+			return 0, err
+		}
+		if buf[0] == '\n' {
+			end--
+		}
+	}
+
+	found := 0
+	for end > 0 {
+		chunk := min(int64(len(buf)), end)
+		begin := end - chunk
+		if _, err := file.ReadAt(buf[:chunk], begin); err != nil {
+			return 0, err
+		}
+		for i := chunk - 1; i >= 0; i-- {
+			if buf[i] != '\n' {
+				continue
+			}
+			found++
+			if found == n {
+				return begin + i + 1, nil
+			}
+		}
+		end = begin
+	}
+	return 0, nil
+}
+
+// readLastLinesForward keeps the last n lines of a full forward scan.
+func readLastLinesForward(file *os.File, n int, totalLines int, decoder lineDecoder) (*LogResult, error) {
 	// Use a ring buffer to keep the last n lines
 	ring := make([]string, n)
 	scanner := bufio.NewScanner(decoder.reader(file))
+	ConfigureScanner(scanner)
 	lineCount := 0
 	ringIndex := 0
 
@@ -505,11 +596,17 @@ func readLastLines(filePath string, n int, totalLines int, decoder lineDecoder) 
 		result = append(result, ring[:ringIndex]...)
 	}
 
+	hasMore := lineCount > n
+	total := lineCount
+	if hasMore {
+		total = max(totalLines, len(result)+1)
+	}
+
 	return &LogResult{
 		Lines:      result,
 		LineCount:  len(result),
-		TotalLines: totalLines,
-		HasMore:    len(result) < totalLines,
+		TotalLines: total,
+		HasMore:    hasMore,
 		IsEstimate: false, // Will be set by the caller
 	}, nil
 }
@@ -539,6 +636,7 @@ func readLinesRange(filePath string, offset, limit int, totalLines int, decoder 
 	}
 
 	scanner := bufio.NewScanner(decoder.reader(file))
+	ConfigureScanner(scanner)
 	lineNum := 1
 	lines := make([]string, 0, limit)
 

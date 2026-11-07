@@ -242,6 +242,7 @@ func newCoordinator(
 		ProfileStore:              profileStore,
 		AgentSessionCleanupQueue:  persistence.AgentSessionCleanupQueue,
 		QueueStore:                persistence.QueueStore,
+		WorkerWaitTimeout:         cfg.Coordinator.WorkerWaitTimeout,
 		EventService:              ctx.event,
 		EventSourceInstance:       ctx.EventSourceInstance,
 		// A machine worker is handed only tasks pinned to it when owner

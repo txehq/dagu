@@ -6,12 +6,7 @@ import { WikiPageMarkdownPreview } from '@/components/ui/wiki-page-markdown-prev
 import { useClient } from '@/hooks/api';
 import { downloadBlob } from '@/lib/download';
 import { cn } from '@/lib/utils';
-import {
-  AlertCircle,
-  Check,
-  ClipboardCopy,
-  Download,
-} from 'lucide-react';
+import { AlertCircle, Check, ClipboardCopy, Download } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import { components } from '../../../../api/v1/schema';
 import { fetchArtifactDownload as fetchArtifact } from './artifactDownload';
@@ -167,12 +162,7 @@ export function ArtifactFilePreview({
   }, [client, dagRunId, dagRunName, path, remoteNode, subDAGRunId, version]);
 
   useEffect(() => {
-    if (
-      !preview ||
-      preview.kind !== 'image' ||
-      preview.tooLarge ||
-      !path
-    ) {
+    if (!preview || preview.kind !== 'image' || preview.tooLarge || !path) {
       setImageUrl(null);
       return;
     }
@@ -298,7 +288,7 @@ export function ArtifactFilePreview({
                     );
                   });
                 }}
-                className="flex items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted-foreground transition-all hover:bg-muted hover:text-foreground"
+                className="flex items-center gap-1 rounded-md px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                 title="Copy content"
               >
                 {copiedContent ? (

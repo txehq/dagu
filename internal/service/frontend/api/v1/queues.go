@@ -4,10 +4,13 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
@@ -69,9 +73,17 @@ func (b *scanBudget) consume() {
 	}
 }
 
+// limit caps n at the entries left in the budget.
+func (b *scanBudget) limit(n int) int {
+	if b == nil {
+		return n
+	}
+	return min(n, b.remaining)
+}
+
 // ListQueues implements api.StrictServerInterface.
 func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (api.ListQueuesResponseObject, error) {
-	queueMap, err := a.collectQueues(ctx, "")
+	queueMap, err := a.collectQueues(ctx, "", queuesPageScan())
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +137,7 @@ func (a *API) ListQueues(ctx context.Context, _ api.ListQueuesRequestObject) (ap
 
 // GetQueue implements api.StrictServerInterface.
 func (a *API) GetQueue(ctx context.Context, req api.GetQueueRequestObject) (api.GetQueueResponseObject, error) {
-	queueMap, err := a.collectQueues(ctx, req.Name)
+	queueMap, err := a.collectQueues(ctx, req.Name, queuesPageScan())
 	if err != nil {
 		return nil, err
 	}
@@ -203,6 +215,14 @@ type queueInfo struct {
 	// queuedCountCapped reports that queuedCount hit queuedCountScanCap and is
 	// therefore a lower bound rather than an exact total.
 	queuedCountCapped bool
+	// runningCapped reports that running runs were left unread, so running
+	// is a lower bound.
+	runningCapped bool
+	// nextQueuedAt is when the next run in line was queued.
+	nextQueuedAt time.Time
+	// workerBlockReason is why a counted queued run cannot start for want
+	// of a worker, or empty when none it read says so.
+	workerBlockReason string
 }
 
 // getOrCreateQueue returns an existing queue from the map or creates a new one.
@@ -248,7 +268,39 @@ func normalizeQueueListLimit(raw *int) int {
 	return *raw
 }
 
-func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*queueInfo, error) {
+// queueScan bounds and narrows the runs one queue collection reads.
+type queueScan struct {
+	// total bounds the queued entries read across all queues and perQueue
+	// bounds them for one queue; past either, counts are lower bounds.
+	total    int
+	perQueue int
+	// running, when set, bounds the running runs read across all queues;
+	// past it, running counts are lower bounds.
+	running int
+	// matches, when set, counts only the runs it accepts.
+	matches func(api.DAGRunSummary) bool
+}
+
+// queuesPageScan reads queues the way the Queues page shows them.
+func queuesPageScan() queueScan {
+	return queueScan{total: queuedCountRequestScanCap, perQueue: queuedCountScanCap}
+}
+
+func (s queueScan) accepts(summary api.DAGRunSummary) bool {
+	return s.matches == nil || s.matches(summary)
+}
+
+// runningBudget returns the budget for reading running runs, or nil when
+// every running run is read.
+func (s queueScan) runningBudget() *scanBudget {
+	if s.running == 0 {
+		return nil
+	}
+	return newScanBudget(s.running)
+}
+
+// collectQueues gathers running runs and queued counts per queue.
+func (a *API) collectQueues(ctx context.Context, onlyQueue string, scan queueScan) (map[string]*queueInfo, error) {
 	queueMap := make(map[string]*queueInfo)
 
 	if a.config != nil && a.config.Queues.Enabled && a.config.Queues.Config != nil {
@@ -279,13 +331,22 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 		}
 	}
 
+	runningReads := scan.runningBudget()
 	localRunningIDs := make(map[string]struct{})
-	for groupName, dagRuns := range runningByGroup {
+	for _, groupName := range slices.Sorted(maps.Keys(runningByGroup)) {
 		if onlyQueue != "" && groupName != onlyQueue {
 			continue
 		}
 		var queue *queueInfo
-		for _, dagRun := range dagRuns {
+		for _, dagRun := range runningByGroup[groupName] {
+			if runningReads.exhausted() {
+				// Left unread, the run still counts as local, so no lease
+				// counts it again.
+				localRunningIDs[dagRun.ID] = struct{}{}
+				getOrCreateQueue(queueMap, groupName, a.config).runningCapped = true
+				continue
+			}
+			runningReads.consume()
 			attempt, err := a.dagRunRepository.FindAttempt(ctx, dagRun)
 			if err != nil {
 				continue
@@ -297,25 +358,36 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			if a.requireDAGRunStatusVisible(ctx, runStatus) != nil {
 				continue
 			}
+			localRunningIDs[dagRun.ID] = struct{}{}
+			summary := toDAGRunSummary(*runStatus)
+			if !scan.accepts(summary) {
+				continue
+			}
 			if queue == nil {
 				queue = getOrCreateQueue(queueMap, groupName, a.config)
 			}
-			queue.running = append(queue.running, toDAGRunSummary(*runStatus))
-			localRunningIDs[dagRun.ID] = struct{}{}
+			queue.running = append(queue.running, summary)
 		}
 	}
 
-	for queueName, summaries := range a.activeDistributedRunningSummaries(ctx, onlyQueue, localRunningIDs) {
+	distributed, unread := a.activeDistributedRunningSummaries(ctx, onlyQueue, localRunningIDs, runningReads)
+	for queueName := range unread {
+		getOrCreateQueue(queueMap, queueName, a.config).runningCapped = true
+	}
+	for queueName, summaries := range distributed {
+		var accepted []api.DAGRunSummary
+		for _, summary := range summaries {
+			if scan.accepts(summary) {
+				accepted = append(accepted, summary)
+			}
+		}
+		if len(accepted) == 0 {
+			continue
+		}
 		queue := getOrCreateQueue(queueMap, queueName, a.config)
-		queue.running = append(queue.running, summaries...)
+		queue.running = append(queue.running, accepted...)
 	}
 
-	if a.queueStore == nil {
-		return queueMap, nil
-	}
-
-	// One budget shared by every queue counted in this request.
-	budget := newScanBudget(queuedCountRequestScanCap)
 	ownerOnly := a.txeNativeOwnerOnly(ctx)
 	// A caller held to its owner is counted only the queues it may see: the
 	// configured ones, those of its running runs (already listed), and those
@@ -328,6 +400,23 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			return nil, err
 		}
 	}
+	if ownerOnly {
+		// A running read left undone names its queue whoever's run it is.
+		// To a caller held to its owner only the queues it may see are
+		// named; the flag itself is settled below.
+		for name, queue := range queueMap {
+			if queue.queueType != "global" && len(queue.running) == 0 && !own[name] && name != onlyQueue {
+				delete(queueMap, name)
+			}
+		}
+	}
+
+	if a.queueStore == nil {
+		return ownerOnlyCapped(queueMap, ownerOnly), nil
+	}
+
+	// One budget shared by every queue counted in this request.
+	budget := newScanBudget(scan.total)
 	admitted := func(name string) bool {
 		if !ownerOnly {
 			return true
@@ -338,17 +427,15 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 	// setQueuedCount records a queue's count, listing the queue. To others
 	// than a caller held to its owner, a queue not yet listed is listed when
 	// the scan shows it holds something, as before.
-	setQueuedCount := func(name string, count int, capped, listEmpty bool) {
-		if _, listed := queueMap[name]; !listed && !ownerOnly && count == 0 && !capped && !listEmpty {
+	setQueuedCount := func(name string, queued visibleQueued, listEmpty bool) {
+		if _, listed := queueMap[name]; !listed && !ownerOnly && queued.count == 0 && !queued.capped && !listEmpty {
 			return
 		}
-		queue := getOrCreateQueue(queueMap, name, a.config)
-		queue.queuedCount = count
-		queue.queuedCountCapped = capped
+		queued.applyTo(getOrCreateQueue(queueMap, name, a.config))
 	}
 
 	if onlyQueue != "" {
-		count, capped, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget)
+		queued, err := a.countVisibleQueuedItems(ctx, onlyQueue, budget, scan)
 		if err != nil {
 			return nil, &Error{
 				Code:       api.ErrorCodeInternalError,
@@ -362,14 +449,13 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			// answered the same whatever it holds, and whether or not it
 			// exists: the caller's own count, a lower bound, so the
 			// caller's items are within reach and nothing else is told.
-			queue := getOrCreateQueue(queueMap, onlyQueue, a.config)
-			queue.queuedCount = count
-			queue.queuedCountCapped = true
-			return queueMap, nil
+			queued.capped = true
+			queued.applyTo(getOrCreateQueue(queueMap, onlyQueue, a.config))
+			return ownerOnlyCapped(queueMap, ownerOnly), nil
 		}
 		// A capped scan proves entries exist even when none seen so far were
 		// visible, so the queue must still surface rather than read as absent.
-		setQueuedCount(onlyQueue, count, capped, false)
+		setQueuedCount(onlyQueue, queued, false)
 	} else {
 		queueNames, err := a.queueStore.QueueList(ctx)
 		if err != nil {
@@ -383,31 +469,36 @@ func (a *API) collectQueues(ctx context.Context, onlyQueue string) (map[string]*
 			if !admitted(queueName) {
 				continue
 			}
-			count, capped, err := a.countVisibleQueuedItems(ctx, queueName, budget)
+			queued, err := a.countVisibleQueuedItems(ctx, queueName, budget, scan)
 			if err != nil {
 				logger.Warn(ctx, "Failed to get queue length",
 					tag.Queue(queueName),
 					tag.Error(err))
 				continue
 			}
-			setQueuedCount(queueName, count, capped, true)
+			setQueuedCount(queueName, queued, true)
 		}
 	}
 
-	if ownerOnly {
-		// Whether a scan of a shared queue was capped says how much of it
-		// is other owners'. To a caller held to its owner, a shared queue's
-		// count is always a lower bound: the flag is the same whatever the
-		// queue holds, and it keeps the queued items, which list only the
-		// caller's own runs, within reach.
-		for _, queue := range queueMap {
-			if queue.queueType == "global" {
-				queue.queuedCountCapped = true
-			}
+	return ownerOnlyCapped(queueMap, ownerOnly), nil
+}
+
+// ownerOnlyCapped settles the capped flags a caller held to its owner sees.
+// Whether a scan of a shared queue was capped says how much of it is other
+// owners'. To such a caller a shared queue's counts are always lower bounds:
+// the flags are the same whatever the queue holds, and they keep the queued
+// items, which list only the caller's own runs, within reach.
+func ownerOnlyCapped(queueMap map[string]*queueInfo, ownerOnly bool) map[string]*queueInfo {
+	if !ownerOnly {
+		return queueMap
+	}
+	for _, queue := range queueMap {
+		if queue.queueType == "global" {
+			queue.queuedCountCapped = true
+			queue.runningCapped = true
 		}
 	}
-
-	return queueMap, nil
+	return queueMap
 }
 
 func (a *API) toQueueResource(_ context.Context, q *queueInfo) (api.Queue, error) {
@@ -493,14 +584,34 @@ func (a *API) listVisibleQueuedItems(ctx context.Context, queueName string, limi
 	return items, currentCursor, nil
 }
 
+// visibleQueued is the queued backlog of one queue as far as its scan reached.
+type visibleQueued struct {
+	count int
+	// capped reports that the scan stopped early, so count is a lower bound.
+	capped bool
+	// nextQueuedAt is when the first visible entry with a queue time, which
+	// is normally the next to run, was queued.
+	nextQueuedAt time.Time
+	// workerBlockReason is the first worker reason a visible entry records
+	// for not starting.
+	workerBlockReason string
+}
+
+func (v visibleQueued) applyTo(queue *queueInfo) {
+	queue.queuedCount = v.count
+	queue.queuedCountCapped = v.capped
+	queue.nextQueuedAt = v.nextQueuedAt
+	queue.workerBlockReason = v.workerBlockReason
+}
+
 // countVisibleQueuedItems counts queued items that are not already running.
 //
-// The scan is bounded twice: by queuedCountScanCap for this queue, and by the
+// The scan is bounded twice: by the scan's per-queue bound, and by the
 // caller's shared budget for the request as a whole. Counting requires a status
 // read per entry to exclude entries whose run has already started, so without
 // both bounds the cost grows with queue depth and with the number of queues.
-// When either bound is reached, counting stops and the returned bool reports
-// that the count is a lower bound.
+// When either bound is reached, counting stops and the result is marked as a
+// lower bound.
 // txeOwnQueueNames returns the queues the DAGs a caller held to its owner may
 // see run in: each job and per-machine DAG it may see, by the queue its
 // definition names (ProcGroup: its queue, else its name). It is read from
@@ -539,28 +650,29 @@ func (a *API) txeOwnQueueNames(ctx context.Context) (map[string]bool, error) {
 	return out, nil
 }
 
-func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, budget *scanBudget) (int, bool, error) {
+// When either bound is reached, counting stops and the result is marked as a
+// lower bound.
+func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, budget *scanBudget, scan queueScan) (visibleQueued, error) {
+	var result visibleQueued
 	if a.queueStore == nil {
-		return 0, false, nil
+		return result, nil
 	}
 	if budget.exhausted() {
 		// Earlier queues already consumed the request budget. Report zero as a
 		// lower bound rather than spending more reads on this one.
-		return 0, true, nil
+		result.capped = true
+		return result, nil
 	}
-	count := 0
 	scanned := 0
 	cursor := ""
 	for {
-		page, err := a.queueStore.ListCursor(ctx, queueName, cursor, queueCursorScanBatch)
+		// Load only the entries this queue and the request may still scan.
+		limit := budget.limit(min(queueCursorScanBatch, scan.perQueue-scanned))
+		page, err := a.queueStore.ListCursor(ctx, queueName, cursor, limit)
 		if err != nil {
-			return 0, false, err
+			return visibleQueued{}, err
 		}
-		for i, queuedItem := range page.Items {
-			if budget.exhausted() {
-				// This entry and everything after it stays unscanned.
-				return count, true, nil
-			}
+		for _, queuedItem := range page.Items {
 			budget.consume()
 
 			// Every entry costs a status read, whether or not it ends up visible,
@@ -572,22 +684,61 @@ func (a *API) countVisibleQueuedItems(ctx context.Context, queueName string, bud
 			dagRunRef, err := queuedItem.Data()
 			if err == nil {
 				summary, err := a.fetchDAGRunSummary(ctx, *dagRunRef)
-				if err == nil && summary.Status != api.StatusRunning {
-					count++
+				if err == nil && summary.Status != api.StatusRunning && scan.accepts(summary) {
+					if result.nextQueuedAt.IsZero() {
+						result.nextQueuedAt = parseQueuedAt(summary.QueuedAt)
+					}
+					if result.workerBlockReason == "" {
+						result.workerBlockReason = workerBlockReason(summary)
+					}
+					result.count++
 				}
 			}
 
-			if scanned >= queuedCountScanCap {
+			if scanned >= scan.perQueue {
 				// Only a lower bound if entries actually remain unscanned.
-				remaining := i+1 < len(page.Items) || page.HasMore
-				return count, remaining, nil
+				result.capped = page.HasMore
+				return result, nil
 			}
 		}
 		if !page.HasMore {
-			return count, false, nil
+			return result, nil
+		}
+		if budget.exhausted() {
+			// The entries left stay unscanned.
+			result.capped = true
+			return result, nil
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// workerBlockReason returns the reason a queued run records for not starting
+// when no worker can take it, or empty when it records none.
+func workerBlockReason(summary api.DAGRunSummary) string {
+	for _, condition := range valueOf(summary.Conditions) {
+		if condition.Type != ir.DAGRunConditionRunnable || condition.Status == api.DAGRunConditionStatusTrue {
+			continue
+		}
+		switch condition.Reason {
+		case ir.DAGRunReasonNoMatchingWorker,
+			ir.DAGRunReasonNoAvailableWorker,
+			ir.DAGRunReasonWorkerDispatchUnavailable:
+			return condition.Reason
+		}
+	}
+	return ""
+}
+
+func parseQueuedAt(value *string) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	queuedAt, err := stringutil.ParseTime(*value)
+	if err != nil {
+		return time.Time{}
+	}
+	return queuedAt
 }
 
 // GetQueuesListData returns queue list for SSE.
@@ -611,16 +762,20 @@ func (a *API) effectiveLeaseStaleThreshold() time.Duration {
 	return dagrun.DefaultStaleLeaseThreshold
 }
 
-func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName string, excludeRunIDs map[string]struct{}) map[string][]api.DAGRunSummary {
+// activeDistributedRunningSummaries returns the runs held by fresh leases, by
+// queue. Once reads is exhausted, leases are left unread, and the queues they
+// belong to are returned as unread.
+func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName string, excludeRunIDs map[string]struct{}, reads *scanBudget) (map[string][]api.DAGRunSummary, map[string]struct{}) {
 	result := make(map[string][]api.DAGRunSummary)
+	unread := make(map[string]struct{})
 	if a.dagRunLeaseStore == nil {
-		return result
+		return result, unread
 	}
 
 	leases, err := a.dagRunLeaseStore.ListAll(ctx)
 	if err != nil {
 		logger.Warn(ctx, "Failed to list distributed running leases", tag.Error(err))
-		return result
+		return result, unread
 	}
 
 	now := time.Now().UTC()
@@ -631,6 +786,11 @@ func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName s
 		if _, ok := excludeRunIDs[lease.DAGRun.ID]; ok {
 			continue
 		}
+		if reads.exhausted() {
+			unread[cmp.Or(lease.QueueName, lease.DAGRun.Name)] = struct{}{}
+			continue
+		}
+		reads.consume()
 		summary, ok := a.runningSummaryFromLease(ctx, lease)
 		if !ok {
 			continue
@@ -645,7 +805,7 @@ func (a *API) activeDistributedRunningSummaries(ctx context.Context, queueName s
 		result[groupName] = append(result[groupName], summary)
 	}
 
-	return result
+	return result, unread
 }
 
 func (a *API) runningSummaryFromLease(ctx context.Context, lease dispatch.DAGRunLease) (api.DAGRunSummary, bool) {

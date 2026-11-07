@@ -4,10 +4,10 @@
 package worker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"log/slog"
 	"maps"
 	"math"
@@ -21,11 +21,15 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
+	"github.com/dagucloud/dagu/v2/internal/cmn/stringutil"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/opencodehost"
+	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/sql"
 	"github.com/dagucloud/dagu/v2/internal/service/coordinator"
 	"github.com/dagucloud/dagu/v2/internal/service/healthcheck"
+	"github.com/dagucloud/dagu/v2/internal/service/resource"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"google.golang.org/grpc/codes"
@@ -41,6 +45,10 @@ type Worker struct {
 	labels         map[string]string
 	labelErr       error
 	cfg            *config.Config
+	// host names the machine the worker runs on; empty when unknown.
+	host string
+	// machine samples that machine for heartbeats; nil sends no sample.
+	machine Machine
 
 	// For tracking poller states and heartbeats
 	pollersMu    sync.Mutex
@@ -118,9 +126,27 @@ const (
 	RefusedCallsStopAfter = 60 * time.Second
 )
 
+// Machine samples the resources of the machine a worker runs on, or of its
+// container when that has limits.
+type Machine interface {
+	// Since returns the latest sample with CPU use averaged, and its peak
+	// taken, over the samples after since; false before a sample.
+	Since(since time.Time) (resource.Sample, bool)
+}
+
+// machineCPUWindow is how far back a heartbeat averages the machine's CPU
+// use.
+const machineCPUWindow = time.Minute
+
 // SetHandler sets a custom task executor for testing or custom execution logic
 func (w *Worker) SetHandler(executor TaskHandler) {
 	w.handler = executor
+}
+
+// SetMachine makes heartbeats carry the latest sample of the worker's
+// machine. Call it before Start.
+func (w *Worker) SetMachine(machine Machine) {
+	w.machine = machine
 }
 
 // SetAfterTaskAckHook installs a hook that runs after a task claim has been
@@ -140,13 +166,13 @@ func NewWorker(
 	labels map[string]string,
 	cfg *config.Config,
 ) *Worker {
+	host, err := os.Hostname()
+	if err != nil {
+		host = ""
+	}
 	// Generate default worker ID if not provided
 	if workerID == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			hostname = "unknown"
-		}
-		workerID = fmt.Sprintf("%s@%d", hostname, os.Getpid())
+		workerID = fmt.Sprintf("%s@%d", cmp.Or(host, "unknown"), os.Getpid())
 	}
 
 	healthPort := 0
@@ -164,6 +190,7 @@ func NewWorker(
 		labels:         labels,
 		labelErr:       labelErr,
 		cfg:            cfg,
+		host:           host,
 		runningTasks:   make(map[string]*runningTaskState),
 		pollerTasks:    make(map[string]string),
 		cancelFuncs:    make(map[string]context.CancelCauseFunc),
@@ -396,14 +423,24 @@ func cleanupErrorMessage(err error) string {
 	if err == nil {
 		return ""
 	}
-	message := err.Error()
-	if len(message) > 1024 {
-		message = message[:1024]
-	}
-	return message
+	return stringutil.TruncUTF8Bytes(err.Error(), 1024)
 }
 
-// Stop gracefully shuts down the worker.
+const (
+	// stopCanceledRunsTimeout bounds the wait for canceled runs to exit and
+	// report their final status once the Stop context is done.
+	stopCanceledRunsTimeout = 10 * time.Second
+	// stopCleanupTimeout bounds closing the coordinator client, health server
+	// and OpenCode host once the Stop context is done.
+	stopCleanupTimeout = 5 * time.Second
+)
+
+// Stop gracefully shuts down the worker. It stops polling, sends SIGTERM to
+// running tasks and waits until they finish their cleanup window and lifecycle
+// handlers, or until ctx is done. Without a deadline on ctx, Stop can wait
+// indefinitely for a task that does not exit. When ctx is done first, Stop
+// cancels the remaining tasks, waits up to stopCanceledRunsTimeout for them to
+// exit, then up to stopCleanupTimeout to release its resources.
 func (w *Worker) Stop(ctx context.Context) error {
 	var err error
 	w.stopOnce.Do(func() {
@@ -430,6 +467,12 @@ func (w *Worker) Stop(ctx context.Context) error {
 			w.stopCancel()
 		}
 
+		// An expired ctx would fail the remaining steps at once, and the
+		// canceled tasks still need time to report their final status.
+		var cancelWait context.CancelFunc
+		ctx, cancelWait = liveStopContext(ctx, stopCanceledRunsTimeout)
+		defer cancelWait()
+
 		// Wait for all goroutines to complete (with timeout from ctx)
 		if w.stopDone != nil {
 			select {
@@ -440,6 +483,10 @@ func (w *Worker) Stop(ctx context.Context) error {
 					tag.WorkerID(w.id))
 			}
 		}
+
+		var cancelCleanup context.CancelFunc
+		ctx, cancelCleanup = liveStopContext(ctx, stopCleanupTimeout)
+		defer cancelCleanup()
 
 		// Close the global PostgreSQL pool manager if initialized
 		if w.poolManager != nil {
@@ -473,6 +520,15 @@ func (w *Worker) Stop(ctx context.Context) error {
 	})
 
 	return err
+}
+
+// liveStopContext returns ctx while it is live. Once ctx is done, it returns a
+// context that keeps ctx's values and expires after timeout.
+func liveStopContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
 }
 
 // WaitReady blocks until the worker appears in coordinator registration.
@@ -921,6 +977,8 @@ func (w *Worker) sendHeartbeat(ctx context.Context) error {
 			BusyPollers:  busyCount32,
 			RunningTasks: runningTasks,
 		},
+		Host:    w.host,
+		Machine: convert.MachineSampleToProto(w.machineSample()),
 	}
 
 	resp, err := w.coordinatorCli.Heartbeat(ctx, req)
@@ -934,6 +992,40 @@ func (w *Worker) sendHeartbeat(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// machineSample is the worker's machine as a heartbeat reports it, with CPU
+// use over the last machineCPUWindow; nil without a sampler or before its
+// first sample.
+func (w *Worker) machineSample() *dispatch.MachineSample {
+	if w.machine == nil {
+		return nil
+	}
+	sample, ok := w.machine.Since(time.Now().Add(-machineCPUWindow))
+	if !ok {
+		return nil
+	}
+	out := &dispatch.MachineSample{
+		CPUs:           sample.CPUs,
+		CPULimit:       sample.CPULimit,
+		CPUPercent:     sample.CPUPercent,
+		CPUPeakPercent: sample.CPUPeak,
+		Memory:         machineUsageOf(sample.Memory),
+		Disk:           machineUsageOf(sample.Disk),
+		LogDisk:        machineUsageOf(sample.LogDisk),
+	}
+	if l := sample.Load; l != nil {
+		out.Load = &dispatch.MachineLoad{Load1: l.Load1, Load5: l.Load5, Load15: l.Load15}
+	}
+	return out
+}
+
+func machineUsageOf(u *resource.Usage) *dispatch.MachineUsage {
+	if u == nil {
+		return nil
+	}
+	return &dispatch.MachineUsage{UsedPercent: u.UsedPercent, UsedBytes: u.UsedBytes, TotalBytes: u.TotalBytes,
+		Limited: u.Limited, InodesUsedPercent: u.InodesUsedPercent}
 }
 
 // runSignal forwards a worker shutdown signal to the run started for a task.

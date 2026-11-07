@@ -124,8 +124,8 @@ func wakeTopicsForDAGRunEvent(mux *Multiplexer, event *eventstore.Event) []ir.St
 
 	affectedStatuses := affectedDAGRunListStatuses(event.Type, snapshot.Status)
 	if snapshot.DAGFile != "" {
-		mux.WakeTopic(TopicTypeDAG, snapshot.DAGFile)
-		mux.WakeTopic(TopicTypeDAGHistory, snapshot.DAGFile)
+		mux.wakeDAGFileTopics(TopicTypeDAG, snapshot.DAGFile)
+		mux.wakeDAGFileTopics(TopicTypeDAGHistory, snapshot.DAGFile)
 		return affectedStatuses
 	}
 
@@ -168,7 +168,11 @@ func wakeDAGRunListTopics(mux *Multiplexer, affectedStatuses map[ir.Status]struc
 	mux.mu.RLock()
 	topics := make([]*multiplexTopic, 0, len(mux.topics))
 	for _, topic := range mux.topics {
-		if topic != nil && topic.topicType == TopicTypeDAGRuns && dagRunListTopicMatchesStatuses(topic.identifier, affectedStatuses) {
+		if topic == nil {
+			continue
+		}
+		if topic.topicType == TopicTypeDAGRunActivity ||
+			topic.topicType == TopicTypeDAGRuns && dagRunListTopicMatchesStatuses(topic.identifier, affectedStatuses) {
 			topics = append(topics, topic)
 		}
 	}

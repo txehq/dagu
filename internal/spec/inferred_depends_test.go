@@ -195,12 +195,61 @@ handler_on:
 			},
 		},
 		{
+			name: "JSScriptCreatesNoEdge",
+			yaml: inferredDependsProducer + `
+  - id: shape
+    action: js.run
+    with:
+      script: return "${steps.read.outputs.rows}"
+`,
+			wantInferred: map[string][]ir.InferredDependency{"shape": nil},
+		},
+		{
+			name: "JSInputCreatesEdge",
+			yaml: inferredDependsProducer + `
+  - id: shape
+    action: js.run
+    with:
+      script: return input.rows
+      input:
+        rows: ${steps.read.outputs.rows}
+`,
+			wantInferred: map[string][]ir.InferredDependency{
+				"shape": {{Step: "read", Field: "steps[1].with.input.rows"}},
+			},
+		},
+		{
 			name: "EscapedTextCreatesNoEdge",
 			yaml: inferredDependsProducer + `
   - id: show
     run: echo '\${steps.read.outputs.rows}'
 `,
 			wantInferred: map[string][]ir.InferredDependency{"show": nil},
+		},
+		{
+			// A backslash in a path input is a separator, not an escape.
+			name: "PathInputAfterBackslashCreatesEdge",
+			yaml: inferredDependsProducer + `
+  - id: copy
+    action: file.copy
+    with:
+      source: in.txt
+      destination: out\${steps.read.outputs.rows}
+`,
+			wantInferred: map[string][]ir.InferredDependency{
+				"copy": {{Step: "read", Field: "steps[1].with.destination"}},
+			},
+		},
+		{
+			name: "EscapedTextInNonPathInputCreatesNoEdge",
+			yaml: inferredDependsProducer + `
+  - id: write
+    action: file.write
+    with:
+      path: out.txt
+      content: \${steps.read.outputs.rows}
+`,
+			wantInferred: map[string][]ir.InferredDependency{"write": nil},
 		},
 		{
 			name: "UnsupportedBracedTextCreatesNoEdge",

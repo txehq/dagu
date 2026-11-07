@@ -121,7 +121,7 @@ func (w *referenceFieldWalker) walkStep(path string, step ir.Step) {
 		w.add(base.withPathValue(fieldPath, arg).withField(cmnvalue.StepShellField(fieldPath)))
 	}
 
-	w.walkStringLeaves(path+".with", step.ExecutorConfig.Config, base.withField(cmnvalue.ExecutorConfigField(path+".with")))
+	w.walkStringLeaves(path+".with", step.ExecutorConfig.Config, base.withField(registry.ConfigField(step, path+".with")))
 	if step.HumanTask != nil {
 		fieldPath := path + ".with.prompt"
 		w.add(base.withPathValue(fieldPath, step.HumanTask.Prompt).withField(cmnvalue.WorkflowField(fieldPath)))
@@ -190,7 +190,7 @@ func (w *referenceFieldWalker) walkStepCommands(path string, step ir.Step, base 
 }
 
 func scriptReferenceField(path string, step ir.Step, command cmnvalue.CommandContext) cmnvalue.Field {
-	if step.ExecutorConfig.Type == "template" {
+	if step.ExecutorConfig.IsVerbatimScript() {
 		return cmnvalue.TemplateScriptField(path)
 	}
 	if step.ExecutorConfig.IsCommand() {
@@ -410,11 +410,11 @@ func (w *referenceFieldWalker) walkStringLeaves(path string, raw any, base Refer
 		}
 	case map[string]any:
 		for _, key := range sortedStringKeys(value) {
-			w.walkStringLeaves(path+"."+key, value[key], base)
+			w.walkStringLeaves(path+"."+key, value[key], base.withField(base.Field.Key(key)))
 		}
 	case map[string]string:
 		for _, key := range sortedStringKeys(value) {
-			w.add(base.withPathValue(path+"."+key, value[key]))
+			w.add(base.withField(base.Field.Key(key)).withPathValue(path+"."+key, value[key]))
 		}
 	default:
 		w.walkReflectStringLeaves(path, raw, base)

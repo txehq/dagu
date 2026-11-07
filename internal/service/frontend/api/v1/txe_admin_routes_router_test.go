@@ -212,6 +212,17 @@ type adminRoute struct {
 	// a legacy caller is refused by that decision, as not found, before the
 	// platform rule is asked.
 	dagFirst bool
+	// remoteNode marks a request for a remote node, which every route
+	// family meets first at RemoteNodeAuthorization (TXE-5923): only a
+	// local administrator the platform rule lets through passes, and every
+	// other caller is refused there, with that refusal, before the route's
+	// own role check.
+	remoteNode bool
+	// roleFirst marks a route whose own role check runs before the
+	// administrator's, such as webhook management before a public
+	// webhook's: a caller with no hub role is refused there, as
+	// insufficient.
+	roleFirst bool
 }
 
 const (
@@ -259,8 +270,20 @@ func (h adminHub) adminRoutes() []adminRoute {
 		p("TestRemoteNodeConnection", http.MethodPost, "/api/v1/remote-nodes/nope/test-connection", none),
 		p("SyncTestConnection", http.MethodPost, "/api/v1/sync/test-connection", none),
 		p("UpdateSyncConfig", http.MethodPut, "/api/v1/sync/config", none),
-		p("syncProxyAuthorization", http.MethodPut, "/api/v1/sync/config?remoteNode=nope", none),
-		p("syncProxyAuthorization", http.MethodPost, "/api/v1/sync/test-connection?remoteNode=nope", none),
+		{handler: "syncProxyAuthorization", method: http.MethodPut, path: "/api/v1/sync/config?remoteNode=nope", body: none, class: classPlatform, remoteNode: true},
+		{handler: "syncProxyAuthorization", method: http.MethodPost, path: "/api/v1/sync/test-connection?remoteNode=nope", body: none, class: classPlatform, remoteNode: true},
+		// What the v2.25.8 integration adds (TXE-5923). Every one reads, or
+		// is refused before anything leaves the hub.
+		{handler: "authorizeRemoteNode", method: http.MethodGet, path: "/api/v1/dags?remoteNode=nope", body: none, class: classPlatform, remoteNode: true},
+		{handler: "licenseProxyAuthorization", method: http.MethodPost, path: "/api/v1/license/refresh?remoteNode=nope", body: none, class: classPlatform, remoteNode: true},
+		p("requireLicenseManagement", http.MethodGet, "/api/v1/license/connect", none),
+		p("requireCloudReport", http.MethodGet, "/api/v1/license/monitoring", none),
+		p("requireCloudAccess", http.MethodGet, "/api/v1/license/remote-access", none),
+		p("GetWorkspaceDeprecation", http.MethodGet, "/api/v1/workspaces/deprecation", none),
+		p("requireCommandChannelAccess", http.MethodPost, "/api/v1/notification-channels", func(c string) any {
+			return map[string]any{"name": "command-of-" + slug(c), "type": "command", "command": map[string]any{"command": "true"}}
+		}),
+		{handler: "requirePublicWebhookAdmin", method: http.MethodDelete, path: "/api/v1/dags/ownerless/webhook/public", body: none, class: classPlatform, roleFirst: true},
 		p("UpdateSchedulerPauseState", http.MethodPost, "/api/v1/services/scheduler/pause", func(string) any { return map[string]any{"paused": false} }),
 		p("requireRuntimeProfileView", http.MethodGet, "/api/v1/profiles/"+h.protected, none),
 		// Writes to a protected profile: the administrator role, as before.
@@ -312,6 +335,10 @@ func (h adminHub) adminRoutes() []adminRoute {
 	}
 }
 
+// commandChannelsAdminOnly is how a command channel words the hub's own
+// role refusal (errCommandChannelsAdminOnly).
+const commandChannelsAdminOnly = "Only admins can change or test local command channels"
+
 // An outcome of one call at the guard.
 type guardOutcome string
 
@@ -334,6 +361,18 @@ const (
 // expected is the policy (TXE-6139): what each caller meets at each class
 // of route in each mode.
 func expected(caller, mode string, route adminRoute) guardOutcome {
+	if route.remoteNode {
+		outcome := expectedAtRoute(caller, mode, route)
+		if outcome == insufficient || outcome == platformAdminRequired {
+			return refused
+		}
+		return outcome
+	}
+	return expectedAtRoute(caller, mode, route)
+}
+
+// expectedAtRoute is expected for a request the route itself decides.
+func expectedAtRoute(caller, mode string, route adminRoute) guardOutcome {
 	enforce := mode == config.TXEAuthzModeEnforce
 	switch caller {
 	case callerPlatformAdmin, callerSecondAdmin:
@@ -395,7 +434,7 @@ func expected(caller, mode string, route adminRoute) guardOutcome {
 		if route.dagFirst {
 			return ownerNotFound
 		}
-		if route.class == classOwner && !route.managerPasses {
+		if route.roleFirst || route.class == classOwner && !route.managerPasses {
 			return insufficient
 		}
 		return refused
@@ -420,7 +459,8 @@ func (h adminHub) outcome(t *testing.T, caller string, route adminRoute) (guardO
 		return platformAdminRequired, answer
 	case status == http.StatusForbidden && (code == string(hubRecordsHidden) || e.Message == "under owner enforcement only the platform administrator reads the hub's records"):
 		return hubRecordsHidden, answer
-	case status == http.StatusForbidden && e.Message == string(insufficient):
+	case status == http.StatusForbidden && (e.Message == string(insufficient) || e.Message == commandChannelsAdminOnly):
+		// A command channel words the hub's own role refusal its own way.
 		return insufficient, answer
 	case status == http.StatusNotFound && e.Message == "not found":
 		return ownerNotFound, answer

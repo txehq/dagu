@@ -16,6 +16,8 @@ import (
 	authservice "github.com/dagucloud/dagu/v2/internal/service/auth"
 )
 
+// communityAPIKeyLimit caps the API keys of a server without a license that
+// unlocks paid features, which includes the free plan.
 const communityAPIKeyLimit = 2
 
 // ListAPIKeys returns a list of all API keys. Requires admin role.
@@ -384,10 +386,14 @@ func (a *API) requireCommunityAPIKeyLimit(ctx context.Context) error {
 			HTTPStatus: http.StatusForbidden,
 		}
 	}
+	message := "Community edition supports up to 2 API keys. " +
+		"Delete an existing key or configure a license to create more."
+	if a.isFreeLicense() {
+		message = "The Free plan supports up to 2 API keys. Team and Pro remove the limit."
+	}
 	return &Error{
-		Code: api.ErrorCodeForbidden,
-		Message: "Community edition supports up to 2 API keys. " +
-			"Delete an existing key or configure a license to create more.",
+		Code:       api.ErrorCodeForbidden,
+		Message:    message,
 		HTTPStatus: http.StatusForbidden,
 	}
 }
@@ -408,6 +414,10 @@ func (a *API) isCommunityLicense() bool {
 		return true
 	}
 	return !license.HasActiveLicense(a.licenseManager.Checker())
+}
+
+func (a *API) isFreeLicense() bool {
+	return a.licenseManager != nil && a.licenseManager.Checker().Claims().IsFree()
 }
 
 func invalidAPIKeySurfaceError() *Error {

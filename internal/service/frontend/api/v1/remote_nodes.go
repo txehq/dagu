@@ -283,6 +283,10 @@ func (a *API) TestRemoteNodeConnection(ctx context.Context, request api.TestRemo
 		return nil, fmt.Errorf("failed to get remote node: %w", err)
 	}
 
+	ctx, err = a.authorizeRemoteNode(ctx)
+	if err != nil {
+		return nil, err
+	}
 	result := testNodeConnection(ctx, node)
 	return api.TestRemoteNodeConnection200JSONResponse(result), nil
 }
@@ -371,7 +375,9 @@ func probeRemoteNode(ctx context.Context, client *http.Client, url string, node 
 	}
 
 	if node != nil {
-		node.ApplyAuth(req)
+		if err := node.ApplyAuth(req); err != nil {
+			return 0, err
+		}
 	}
 
 	resp, err := client.Do(req)

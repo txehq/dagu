@@ -366,20 +366,25 @@ func TestCoordinatorSignalShutdown(t *testing.T) {
 	}
 }
 
+// SIGHUP and SIGQUIT end a process that hosts the scheduler without signaling
+// its runs. start-all must exit as a whole instead of serving on with a
+// stopped scheduler.
 func TestSchedulerUnsupportedSignal(t *testing.T) {
-	for _, shutdownSignal := range []os.Signal{syscall.SIGHUP, syscall.SIGQUIT} {
-		t.Run(shutdownSignal.String(), func(t *testing.T) {
-			run := startSignalRun(t, "scheduler", 10)
-			require.NoError(t, run.command.Process.Signal(shutdownSignal))
-			require.NoError(t, run.wait(t))
-			before, err := os.Stat(run.progress)
-			require.NoError(t, err)
-			require.Eventually(t, func() bool {
-				after, err := os.Stat(run.progress)
-				return err == nil && after.Size() > before.Size()
-			}, time.Second, 20*time.Millisecond, "run stopped after unsupported signal")
-			run.assertStatus(t, ir.Running)
-		})
+	for _, commandName := range []string{"scheduler", "start-all"} {
+		for _, shutdownSignal := range []os.Signal{syscall.SIGHUP, syscall.SIGQUIT} {
+			t.Run(commandName+"/"+shutdownSignal.String(), func(t *testing.T) {
+				run := startSignalRun(t, commandName, 10)
+				require.NoError(t, run.command.Process.Signal(shutdownSignal))
+				require.NoError(t, run.wait(t))
+				before, err := os.Stat(run.progress)
+				require.NoError(t, err)
+				require.Eventually(t, func() bool {
+					after, err := os.Stat(run.progress)
+					return err == nil && after.Size() > before.Size()
+				}, time.Second, 20*time.Millisecond, "run stopped after unsupported signal")
+				run.assertStatus(t, ir.Running)
+			})
+		}
 	}
 }
 
@@ -501,15 +506,19 @@ steps:
 	run.waitCh = waitCh
 	go func() { waitCh <- run.command.Wait() }()
 	t.Cleanup(func() {
-		releaseHoldFile(t, run.release)
+		// Teardown runs first and never stops early. A failed assertion ends
+		// a cleanup function, and the supervisor, the runner and the probe,
+		// which ignores TERM until the release file appears, would outlive
+		// the test once the temporary directories are gone.
+		_ = os.WriteFile(run.release, []byte("release"), 0o600)
 		_ = th.DAGRunMgr.Stop(th.Context, run.dag.DAG, "")
-		if status, err := th.DAGRunMgr.GetLatestStatus(th.Context, run.dag.DAG); err == nil && status.Status.IsActive() {
-			run.dag.AssertLatestStatus(t, ir.Aborted)
-		}
 		if !run.exited {
 			terminateTestCommand(run.command, waitCh)
 		}
 		run.waitForProbeExit()
+		if status, err := th.DAGRunMgr.GetLatestStatus(th.Context, run.dag.DAG); err == nil && status.Status.IsActive() {
+			run.dag.AssertLatestStatus(t, ir.Aborted)
+		}
 	})
 	require.Eventually(t, func() bool {
 		return strings.Contains(run.output(), startupLog)

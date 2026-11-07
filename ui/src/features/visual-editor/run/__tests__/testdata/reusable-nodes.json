@@ -1,0 +1,338 @@
+[
+  {
+    "name": "not_started",
+    "status": 0,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "not_started, finished",
+    "status": 0,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "not_started, carried",
+    "status": 0,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "not_started, carried, finished",
+    "status": 0,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "running",
+    "status": 1,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "running, finished",
+    "status": 1,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "running, carried",
+    "status": 1,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "running, carried, finished",
+    "status": 1,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "failed",
+    "status": 2,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "failed, finished",
+    "status": 2,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "failed, carried",
+    "status": 2,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "failed, carried, finished",
+    "status": 2,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "aborted",
+    "status": 3,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "aborted, finished",
+    "status": 3,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "aborted, carried",
+    "status": 3,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "aborted, carried, finished",
+    "status": 3,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "succeeded",
+    "status": 4,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "succeeded, finished",
+    "status": 4,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "succeeded, carried",
+    "status": 4,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "succeeded, carried, finished",
+    "status": 4,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "skipped",
+    "status": 5,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "skipped, finished",
+    "status": 5,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "skipped, carried, recorded",
+    "status": 5,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": true,
+    "reusable": true
+  },
+  {
+    "name": "skipped, carried",
+    "status": 5,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "skipped, carried, finished, recorded",
+    "status": 5,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": true,
+    "reusable": true
+  },
+  {
+    "name": "skipped, carried, finished",
+    "status": 5,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "partially_succeeded",
+    "status": 6,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "partially_succeeded, finished",
+    "status": 6,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "partially_succeeded, carried",
+    "status": 6,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "partially_succeeded, carried, finished",
+    "status": 6,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": true
+  },
+  {
+    "name": "waiting",
+    "status": 7,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "waiting, finished",
+    "status": 7,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "waiting, carried",
+    "status": 7,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "waiting, carried, finished",
+    "status": 7,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "rejected",
+    "status": 8,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "rejected, finished",
+    "status": 8,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "rejected, carried",
+    "status": 8,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "rejected, carried, finished",
+    "status": 8,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "retrying",
+    "status": 9,
+    "skippedByRetry": false,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "retrying, finished",
+    "status": 9,
+    "skippedByRetry": false,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "retrying, carried",
+    "status": 9,
+    "skippedByRetry": true,
+    "finished": false,
+    "recorded": false,
+    "reusable": false
+  },
+  {
+    "name": "retrying, carried, finished",
+    "status": 9,
+    "skippedByRetry": true,
+    "finished": true,
+    "recorded": false,
+    "reusable": false
+  }
+]

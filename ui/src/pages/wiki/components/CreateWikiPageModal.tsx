@@ -125,29 +125,37 @@ export function CreateWikiPageModal({
       <DialogContent className="sm:max-w-[425px]">
         <form onSubmit={handleSubmit}>
           <DialogHeader>
-            <DialogTitle><I18nText text={"Create New Wiki page"} /></DialogTitle>
+            <DialogTitle>
+              <I18nText text={'Create New Wiki page'} />
+            </DialogTitle>
             <DialogDescription>
-              <I18nText text={"Enter a path for the new Wiki page. Use / for directories."} />
+              <I18nText
+                text={
+                  'Enter a path for the new Wiki page. Use / for directories.'
+                }
+              />
             </DialogDescription>
           </DialogHeader>
           <div className="grid gap-3 py-3">
             <div className="grid grid-cols-4 items-center gap-3">
               <Label htmlFor="wiki-page-path" className="text-right">
-                <I18nText text={"Path"} />
+                <I18nText text={'Path'} />
               </Label>
-              <I18nProps><Input
-                id="wiki-page-path"
-                value={path}
-                onChange={handlePathChange}
-                className="col-span-3 font-mono"
-                placeholder="runbooks/deployment"
-                autoFocus
-                disabled={busy}
-              /></I18nProps>
+              <I18nProps>
+                <Input
+                  id="wiki-page-path"
+                  value={path}
+                  onChange={handlePathChange}
+                  className="col-span-3 font-mono"
+                  placeholder="runbooks/deployment"
+                  autoFocus
+                  disabled={busy}
+                />
+              </I18nProps>
             </div>
             <div className="grid grid-cols-4 items-center gap-3">
               <Label htmlFor="page-template" className="text-right">
-                <I18nText text={"Template"} />
+                <I18nText text={'Template'} />
               </Label>
               <Select
                 value={templateId}
@@ -159,14 +167,18 @@ export function CreateWikiPageModal({
                   size="sm"
                   className="col-span-3 h-7"
                 >
-                  <I18nProps><SelectValue placeholder="Blank" /></I18nProps>
+                  <I18nProps>
+                    <SelectValue placeholder="Blank" />
+                  </I18nProps>
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value={BLANK_TEMPLATE_ID}><I18nText text={"Blank"} /></SelectItem>
+                  <SelectItem value={BLANK_TEMPLATE_ID}>
+                    <I18nText text={'Blank'} />
+                  </SelectItem>
                   {templates.map((template) => (
                     <SelectItem key={template.id} value={template.id}>
                       {template.name}
-                      {!template.builtIn && <I18nText text={" (custom)"} />}
+                      {!template.builtIn && <I18nText text={' (custom)'} />}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -178,7 +190,11 @@ export function CreateWikiPageModal({
               </div>
             )}
             <div className="text-xs text-muted-foreground px-4">
-              <I18nText text={"Relative path without .md extension. Use / for directories."} />
+              <I18nText
+                text={
+                  'Relative path without .md extension. Use / for directories.'
+                }
+              />
             </div>
             {currentError && (
               <div className="text-destructive text-sm px-4">
@@ -194,11 +210,15 @@ export function CreateWikiPageModal({
               disabled={busy}
             >
               <X className="h-4 w-4" />
-              <I18nText text={"Cancel"} />
+              <I18nText text={'Cancel'} />
             </Button>
-            <Button type="submit" disabled={busy}>
+            <Button type="submit" variant="primary" disabled={busy}>
               <Plus className="h-4 w-4" />
-              {busy ? <I18nText text={"Creating..."} /> : <I18nText text={"Create"} />}
+              {busy ? (
+                <I18nText text={'Creating...'} />
+              ) : (
+                <I18nText text={'Create'} />
+              )}
             </Button>
           </DialogFooter>
         </form>

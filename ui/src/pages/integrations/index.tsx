@@ -49,7 +49,7 @@ export default function IntegrationsPage(): React.ReactElement {
       </Title>
 
       {!person && (
-        <div className="grid gap-3 md:grid-cols-2">
+        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
           {integrationLinks.map((link) => (
             <Link
               key={link.to}

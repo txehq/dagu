@@ -1,7 +1,7 @@
 import { Clock, Copy, ExternalLink, Globe, Lock } from 'lucide-react';
-import React from 'react';
 import type { components } from '../../../api/v1/schema';
 import { Button } from '@/components/ui/button';
+import { useCopyFeedback } from '@/hooks/useCopyFeedback';
 import { cn } from '../../../lib/utils';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
@@ -15,7 +15,7 @@ interface TunnelStatusCardProps {
 }
 
 function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
-  const [copied, setCopied] = React.useState(false);
+  const { copied, copy } = useCopyFeedback();
 
   const getStatusColor = (status: string | undefined) => {
     switch (status) {
@@ -63,11 +63,9 @@ function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
     return `${minutes}m`;
   };
 
-  const handleCopyUrl = async () => {
+  const handleCopyUrl = () => {
     if (data?.publicUrl) {
-      await navigator.clipboard.writeText(data.publicUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      void copy(data.publicUrl);
     }
   };
 
@@ -95,16 +93,24 @@ function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
             <Lock className="h-4 w-4" />
           )}
         </div>
-        <h3 className="text-sm font-medium"><I18nText text={"Tunnel Service"} /></h3>
+        <h2 className="text-sm font-medium">
+          <I18nText text={'Tunnel Service'} />
+        </h2>
         <span className="text-xs text-muted-foreground ml-auto">
-          {data?.isPublic ? <I18nText text={"Public"} /> : <I18nText text={"Private"} />}
+          {data?.isPublic ? (
+            <I18nText text={'Public'} />
+          ) : (
+            <I18nText text={'Private'} />
+          )}
         </span>
       </div>
 
       {/* Content */}
       <div className="px-3 py-2">
         {isLoading && !data && (
-          <div className="text-xs text-muted-foreground"><I18nText text={"Loading..."} /></div>
+          <div className="text-xs text-muted-foreground">
+            <I18nText text={'Loading...'} />
+          </div>
         )}
 
         {error && <div className="text-xs text-error">{error}</div>}
@@ -157,26 +163,32 @@ function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
                 <code className="text-xs font-mono text-foreground bg-muted px-1.5 py-0.5 rounded flex-1 truncate">
                   {data.publicUrl}
                 </code>
-                <I18nProps><Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-6 w-6"
-                  onClick={handleCopyUrl}
-                  title="Copy URL"
-                >
-                  <Copy className="h-3 w-3" />
-                </Button></I18nProps>
-                <I18nProps><Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-6 w-6"
-                  onClick={handleOpenUrl}
-                  title="Open in new tab"
-                >
-                  <ExternalLink className="h-3 w-3" />
-                </Button></I18nProps>
+                <I18nProps>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-6 w-6"
+                    onClick={handleCopyUrl}
+                    title="Copy URL"
+                  >
+                    <Copy className="h-3 w-3" />
+                  </Button>
+                </I18nProps>
+                <I18nProps>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-6 w-6"
+                    onClick={handleOpenUrl}
+                    title="Open in new tab"
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                  </Button>
+                </I18nProps>
                 {copied && (
-                  <span className="text-xs text-success"><I18nText text={"Copied!"} /></span>
+                  <span className="text-xs text-success">
+                    <I18nText text={'Copied!'} />
+                  </span>
                 )}
               </div>
             )}
@@ -191,7 +203,11 @@ function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
             {/* Disabled State */}
             {data.status === 'disabled' && !data.enabled && (
               <div className="text-xs text-muted-foreground">
-                <I18nText text={"Tunnel is not enabled. Start the server with --tunnel flag to enable."} />
+                <I18nText
+                  text={
+                    'Tunnel is not enabled. Start the server with --tunnel flag to enable.'
+                  }
+                />
               </div>
             )}
           </div>
@@ -199,7 +215,7 @@ function TunnelStatusCard({ data, isLoading, error }: TunnelStatusCardProps) {
 
         {!error && !data && !isLoading && (
           <div className="text-xs text-muted-foreground">
-            <I18nText text={"Tunnel status unavailable"} />
+            <I18nText text={'Tunnel status unavailable'} />
           </div>
         )}
       </div>
