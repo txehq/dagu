@@ -341,6 +341,8 @@ func (r *run) startSession(ctx context.Context) (int, error) {
 		Profile:         r.cfg.Browser.Profile,
 		DownloadsDir:    opts.DownloadsDir,
 		BrowserPID:      handle.BrowserPID,
+		GatePID:         handle.GatePID,
+		GateStartedAt:   handle.GateStartedAt,
 	}
 	r.record.BrowserStartedAt, _ = procutil.StartTime(handle.BrowserPID)
 	if err := r.saveRunningRecord(); err != nil {

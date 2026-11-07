@@ -31,9 +31,9 @@ type downloadEvent struct {
 func serveDownloads(t *testing.T, events []downloadEvent) string {
 	t.Helper()
 	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server = httptest.NewServer(http.StripPrefix("/"+testToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/json/version" {
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/devtools/browser/test"
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/" + testToken + "/devtools/browser/test"
 			_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": wsURL})
 			return
 		}
@@ -54,9 +54,9 @@ func serveDownloads(t *testing.T, events []downloadEvent) string {
 			_ = conn.Write(ctx, websocket.MessageText, data)
 		}
 		<-ctx.Done()
-	}))
+	})))
 	t.Cleanup(server.Close)
-	return server.URL
+	return server.URL + "/" + testToken
 }
 
 func begin(guid, name string) downloadEvent {

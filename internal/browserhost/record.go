@@ -54,6 +54,10 @@ type Record struct {
 	// Deadline bounds how long a detached browser waits to be resumed.
 	Deadline time.Time `json:"deadline,omitzero"`
 
+	// CDPURL is the browser's DevTools address behind its gate,
+	// http://127.0.0.1:<port>/<token>. The token is the credential, which
+	// is why records are private files and the URL is kept out of logs,
+	// outputs and errors.
 	CDPURL          string `json:"cdpUrl"`
 	ExtensionID     string `json:"extensionId,omitempty"`
 	ExtensionDir    string `json:"extensionDir,omitempty"`
@@ -66,6 +70,12 @@ type Record struct {
 	// be ended when it no longer answers on its DevTools address.
 	BrowserPID       int   `json:"browserPid,omitempty"`
 	BrowserStartedAt int64 `json:"browserStartedAt,omitempty"`
+
+	// GatePID and GateStartedAt identify the gate process that owns the
+	// browser's DevTools pipe. Ending it closes the pipe, and the browser
+	// closes itself.
+	GatePID       int   `json:"gatePid,omitempty"`
+	GateStartedAt int64 `json:"gateStartedAt,omitempty"`
 
 	// OwnerPID and OwnerStartedAt identify the process driving a running
 	// browser, so a crashed owner can be detected even after PID reuse.

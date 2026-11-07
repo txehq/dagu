@@ -19,6 +19,8 @@ import (
 
 	stagehand "github.com/browserbase/stagehand/packages/sdk-go/v4"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
+	cmnconfig "github.com/dagucloud/dagu/v2/internal/cmn/config"
 )
 
 // extractBatchSource runs an extract with a schema chosen at run time. The
@@ -108,46 +110,65 @@ func (stagehandLauncher) Launch(ctx context.Context, opts launchOptions) (engine
 		return nil, fmt.Errorf("launch browser: the browser sandbox is on, but the browser runtime turns it off %s; "+
 			"set browser.sandbox: false in the Dagu config or DAGU_BROWSER_SANDBOX=false to run without it", reason)
 	}
-	port, err := freeLoopbackPort()
+	executable, err := devtoolsgate.FindBrowser(opts.Executable)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("launch browser: %w", err)
 	}
-	launch := &stagehand.LocalBrowserLaunchOptions{
-		ExecutablePath: opts.Executable,
-		Headless:       opts.Headless,
-		Port:           port,
-		UserDataDir:    opts.UserDataDir,
-		KeepAlive:      true,
+	launch := devtoolsgate.LaunchOptions{
+		UserDataDir: opts.UserDataDir,
+		Headless:    opts.Headless,
+		ProxyServer: opts.Proxy,
+		NoSandbox:   opts.NoSandbox,
 	}
-	launch.ChromiumSandbox = new(!opts.NoSandbox)
 	if opts.Viewport != nil {
-		launch.Viewport = &stagehand.LocalViewport{Width: opts.Viewport.Width, Height: opts.Viewport.Height}
+		launch.Viewport = &devtoolsgate.Viewport{Width: opts.Viewport.Width, Height: opts.Viewport.Height}
 	}
-	if opts.Proxy != "" {
-		launch.Proxy = &stagehand.LocalProxyConfig{Server: opts.Proxy}
-	}
-	cdpURL := fmt.Sprintf("http://127.0.0.1:%d", port)
-	browser, err := stagehand.LaunchLocalBrowser(ctx, launch)
+	// The browser listens on no port: the gate owns its DevTools pipe and
+	// serves it behind a token only this process and the record know.
+	gate, err := devtoolsgate.Start(ctx, daguExecutable(ctx), devtoolsgate.Config{
+		Token:      devtoolsgate.NewToken(),
+		Executable: executable,
+		Args:       devtoolsgate.ChromeArgs(launch),
+	})
 	if err != nil {
-		launchErr := fmt.Errorf("launch browser: %w%s", err, sandboxHint(opts.NoSandbox))
-		return nil, errors.Join(launchErr, endUnstartedBrowser(ctx, nil, cdpURL, opts.UserDataDir))
+		return nil, fmt.Errorf("launch browser: %w%s", err, sandboxHint(opts.NoSandbox))
+	}
+	cdpURL := gate.URL
+	browser, err := stagehand.ConnectLocalBrowser(ctx, stagehand.LocalBrowserConnectOptions{CDPURL: cdpURL})
+	if err != nil {
+		launchErr := fmt.Errorf("launch browser: %w%s", devtoolsgate.Redact(err, cdpURL), sandboxHint(opts.NoSandbox))
+		return nil, errors.Join(launchErr, endUnstartedBrowser(ctx, nil, gate))
 	}
 	eng, err := startEngine(ctx, browser, cdpURL, opts)
 	if err != nil {
-		return nil, errors.Join(err, endUnstartedBrowser(ctx, browser, cdpURL, opts.UserDataDir))
+		return nil, errors.Join(devtoolsgate.Redact(err, cdpURL), endUnstartedBrowser(ctx, browser, gate))
 	}
+	eng.handle.BrowserPID = gate.BrowserPID
+	eng.handle.GatePID = gate.PID
+	eng.handle.GateStartedAt = gate.StartedAt
 	extension, err := browserhost.StagehandExtension(ctx, cdpURL)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("locate browser runtime extension: %w", err), eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(fmt.Errorf("locate browser runtime extension: %w", devtoolsgate.Redact(err, cdpURL)), eng.Close(context.WithoutCancel(ctx)))
 	}
 	eng.handle.ExtensionID = extension.ID
 	eng.handle.ExtensionDir = extension.Path
-	// Without a process ID, a browser that stops answering cannot be ended.
-	eng.handle.BrowserPID, _ = browserhost.BrowserProcessID(ctx, cdpURL)
 	if err := eng.handleDownloads(ctx, opts.DownloadsDir); err != nil {
-		return nil, errors.Join(err, eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, cdpURL), eng.Close(context.WithoutCancel(ctx)))
 	}
 	return eng, nil
+}
+
+// daguExecutable is the binary whose `browser devtools-gate` command runs
+// the gate: the configured one, else this process's.
+func daguExecutable(ctx context.Context) string {
+	if cfg := cmnconfig.GetConfig(ctx); cfg != nil && cfg.Paths.Executable != "" {
+		return cfg.Paths.Executable
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "dagu"
+	}
+	return executable
 }
 
 func (stagehandLauncher) Reattach(ctx context.Context, handle browserHandle, opts launchOptions) (engine, error) {
@@ -156,49 +177,44 @@ func (stagehandLauncher) Reattach(ctx context.Context, handle browserHandle, opt
 		ExtensionID: handle.ExtensionID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("reattach browser: %w", err)
+		return nil, fmt.Errorf("reattach browser: %w", devtoolsgate.Redact(err, handle.CDPURL))
 	}
 	eng, err := startEngine(ctx, browser, handle.CDPURL, opts)
 	if err != nil {
-		return nil, errors.Join(err, browser.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, handle.CDPURL), browser.Close(context.WithoutCancel(ctx)))
 	}
 	eng.handle.ExtensionID = handle.ExtensionID
 	eng.handle.ExtensionDir = handle.ExtensionDir
+	// Closing ends the browser through its gate, which the record identifies.
+	eng.handle.BrowserPID = handle.BrowserPID
+	eng.handle.GatePID = handle.GatePID
+	eng.handle.GateStartedAt = handle.GateStartedAt
 	if err := eng.handleDownloads(ctx, opts.DownloadsDir); err != nil {
-		return nil, errors.Join(err, eng.Close(context.WithoutCancel(ctx)))
+		return nil, errors.Join(devtoolsgate.Redact(err, handle.CDPURL), eng.Close(context.WithoutCancel(ctx)))
 	}
 	return eng, nil
 }
 
-// endUnstartedBrowser ends the browser launched with profileDir at cdpURL
-// after its runtime failed to start. The SDK leaves a kept-alive browser
-// running then, and browser, when known, may no longer reach it, so the
-// browser is asked to exit over DevTools. The debugging port was only free
-// when chosen, so the browser is closed only when it uses profileDir.
-func endUnstartedBrowser(ctx context.Context, browser *stagehand.Browser, cdpURL, profileDir string) error {
+// endUnstartedBrowser ends the browser behind gate after its runtime failed
+// to start. The browser is the gate's own, so it is asked to exit over
+// DevTools and, failing that, its gate is ended, which closes the pipe the
+// browser lives on.
+func endUnstartedBrowser(ctx context.Context, browser *stagehand.Browser, gate *devtoolsgate.Handle) error {
 	ctx = context.WithoutCancel(ctx)
-	var err error
-	if profileDir != "" {
-		owned, ownErr := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (bool, error) {
-			return browserhost.UsesProfile(ctx, cdpURL, profileDir)
-		})
-		switch {
-		case errors.Is(ownErr, browserhost.ErrUnreachable):
-		case ownErr != nil:
-			err = fmt.Errorf("identify browser: %w", ownErr)
-		case owned:
-			_, err = boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
-				return struct{}{}, browserhost.CloseBrowser(ctx, cdpURL)
-			})
-		}
-	}
+	var errs []error
 	if browser != nil {
 		_, closeErr := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
 			return struct{}{}, browser.Close(ctx)
 		})
-		err = errors.Join(err, closeErr)
+		errs = append(errs, devtoolsgate.Redact(closeErr, gate.URL))
 	}
-	return err
+	_, err := boundCall(ctx, unstartedCallTimeout, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, browserhost.CloseBrowser(ctx, gate.URL)
+	})
+	if err != nil {
+		errs = append(errs, devtoolsgate.Redact(err, gate.URL), gate.Kill())
+	}
+	return errors.Join(errs...)
 }
 
 func startEngine(ctx context.Context, browser *stagehand.Browser, cdpURL string, opts launchOptions) (*stagehandEngine, error) {
@@ -550,7 +566,20 @@ func (e *stagehandEngine) Detach(ctx context.Context) error {
 }
 
 func (e *stagehandEngine) Close(ctx context.Context) error {
-	return errors.Join(e.release(ctx), closeBrowser(ctx, e.handle.BrowserPID, e.browser.Close))
+	return errors.Join(e.release(ctx), closeBrowser(ctx, e.handle.BrowserPID, e.closeRuntime))
+}
+
+// closeRuntime disconnects the SDK and ends the browser: over DevTools
+// through its gate, or, when the browser does not answer, by ending the
+// gate, which closes the pipe the browser lives on.
+func (e *stagehandEngine) closeRuntime(ctx context.Context) error {
+	err := devtoolsgate.Redact(e.browser.Close(ctx), e.handle.CDPURL)
+	closeErr := browserhost.CloseBrowser(ctx, e.handle.CDPURL)
+	if closeErr != nil {
+		gate := &devtoolsgate.Handle{URL: e.handle.CDPURL, PID: e.handle.GatePID, StartedAt: e.handle.GateStartedAt}
+		closeErr = errors.Join(devtoolsgate.Redact(closeErr, e.handle.CDPURL), gate.Kill())
+	}
+	return errors.Join(err, closeErr)
 }
 
 // closeBrowser terminates a launched browser with closeRuntime. Besides the
@@ -710,15 +739,6 @@ func messageText(content stagehand.LLMMessageContent) (string, error) {
 		}
 	}
 	return text.String(), nil
-}
-
-func freeLoopbackPort() (int, error) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return 0, fmt.Errorf("reserve browser debugging port: %w", err)
-	}
-	defer func() { _ = listener.Close() }()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
 // telemetrySink accepts and discards trace exports on loopback.

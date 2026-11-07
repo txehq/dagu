@@ -55,10 +55,11 @@ func Release(ctx context.Context, store *Store, record Record) error {
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
 	defer cancel()
 	// A browser that did not close keeps its record and files, so a later
-	// sweep can try again.
+	// sweep can try again. The address is a credential, so the error names
+	// the session instead.
 	if record.CDPURL != "" {
 		if err := closeRecordedBrowser(closeCtx, record); err != nil {
-			return fmt.Errorf("close browser at %s: %w", record.CDPURL, err)
+			return fmt.Errorf("close the browser of session %s: %w", record.ID, RedactError(err, record.CDPURL))
 		}
 	}
 	var errs []error
@@ -73,17 +74,42 @@ func Release(ctx context.Context, store *Store, record Record) error {
 }
 
 // closeRecordedBrowser closes the browser over DevTools. When the browser
-// does not answer, it ends the recorded browser process instead, provided
-// the process ID still belongs to that browser.
+// does not answer, it ends the recorded gate, whose pipe the browser lives
+// on, and then the recorded browser process, each provided the process ID
+// still belongs to the process the record saw.
 func closeRecordedBrowser(ctx context.Context, record Record) error {
 	err := CloseBrowser(ctx, record.CDPURL)
 	if err == nil {
 		return nil
 	}
-	if endProcess(record.BrowserPID, record.BrowserStartedAt) && waitForExit(ctx, record.CDPURL) {
+	if endProcess(record.GatePID, record.GateStartedAt) && waitForRecordedExit(ctx, record) {
+		return nil
+	}
+	if endProcess(record.BrowserPID, record.BrowserStartedAt) && waitForRecordedExit(ctx, record) {
 		return nil
 	}
 	return err
+}
+
+// waitForRecordedExit waits for the recorded browser to be gone: its address
+// stops answering, or, for a record from before browsers had gates, its
+// process exits.
+func waitForRecordedExit(ctx context.Context, record Record) bool {
+	if TokenOf(record.CDPURL) != "" {
+		return waitForExit(ctx, record.CDPURL)
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exitTimeout)
+	defer cancel()
+	for {
+		if record.BrowserPID <= 0 || !procutil.IsAlive(record.BrowserPID) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(exitPollInterval):
+		}
+	}
 }
 
 // endProcess ends pid when it is still the process that started at

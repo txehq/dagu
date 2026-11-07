@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 
 	stagehand "github.com/browserbase/stagehand/packages/sdk-go/v4"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -652,11 +654,12 @@ func TestStagehandFailedLaunchEndsBrowser(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits out the runtime's fixed startup minute")
 	}
-	// The wrapper records the browser's arguments and disables extensions,
-	// so the runtime extension never starts.
+	// The wrapper records the browser's arguments and its process ID, which
+	// exec makes the browser's, and disables extensions, so the runtime
+	// extension never starts.
 	wrapper := filepath.Join(t.TempDir(), "chrome")
 	chrome := "'" + strings.ReplaceAll(chromePath(), "'", `'\''`) + "'"
-	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > \"$0.args\"\nexec %s \"$@\" --disable-extensions\n", chrome)
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > \"$0.args\"\nprintf '%%s' \"$$\" > \"$0.pid\"\nexec %s \"$@\" --disable-extensions\n", chrome)
 	require.NoError(t, os.WriteFile(wrapper, []byte(script), 0o700))
 
 	err := withStartupSlot(func() error {
@@ -673,9 +676,13 @@ func TestStagehandFailedLaunchEndsBrowser(t *testing.T) {
 
 	args, err := os.ReadFile(wrapper + ".args")
 	require.NoError(t, err, "the browser started")
-	port := regexp.MustCompile(`--remote-debugging-port=(\d+)`).FindSubmatch(args)
-	require.NotNil(t, port, string(args))
+	assert.Contains(t, string(args), "--remote-debugging-pipe", "the browser is driven over its pipe")
+	assert.NotContains(t, string(args), "--remote-debugging-port", "the browser opens no port")
+	pidText, err := os.ReadFile(wrapper + ".pid")
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+	require.NoError(t, err)
 	require.Eventually(t, func() bool {
-		return errors.Is(browserhost.Probe(context.Background(), "http://127.0.0.1:"+string(port[1])), browserhost.ErrUnreachable)
-	}, 10*time.Second, 200*time.Millisecond, "the failed launch ends the browser")
+		return !procutil.IsAlive(pid)
+	}, 15*time.Second, 200*time.Millisecond, "the failed launch ends the browser")
 }

@@ -33,11 +33,15 @@ const hungBrowserEnv = "BROWSERHOST_TEST_HUNG_BROWSER"
 // hungBrowserLifetime bounds a helper browser process the test failed to end.
 const hungBrowserLifetime = time.Minute
 
+// testToken is the gate token the fakes serve under: every browser address
+// the package accepts carries one.
+const testToken = "TESTTOKEN0000000000000000A"
+
 func TestMain(m *testing.M) {
 	if os.Getenv(hungBrowserEnv) != "" {
 		fake := &fakeBrowser{hung: true}
 		fake.start()
-		fmt.Println(fake.server.URL)
+		fmt.Println(fake.url())
 		time.Sleep(hungBrowserLifetime)
 		return
 	}
@@ -73,12 +77,17 @@ func newHungBrowser(t *testing.T) *fakeBrowser {
 }
 
 func (f *fakeBrowser) start() {
-	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
+	f.server = httptest.NewServer(http.StripPrefix("/"+testToken, http.HandlerFunc(f.serve)))
+}
+
+// url is the browser's address as a gate would serve it.
+func (f *fakeBrowser) url() string {
+	return f.server.URL + "/" + testToken
 }
 
 func (f *fakeBrowser) serve(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/json/version" {
-		wsURL := "ws" + strings.TrimPrefix(f.server.URL, "http") + "/devtools/browser/test"
+		wsURL := "ws" + strings.TrimPrefix(f.url(), "http") + "/devtools/browser/test"
 		_ = json.NewEncoder(w).Encode(map[string]string{"webSocketDebuggerUrl": wsURL})
 		return
 	}
@@ -122,7 +131,21 @@ func (f *fakeBrowser) calls() []string {
 
 // unreachableURL is a DevTools URL nothing can listen on. A port freed by a
 // closed server is not used, since a concurrent test may bind it again.
-const unreachableURL = "http://127.0.0.1:0"
+const unreachableURL = "http://127.0.0.1:0/" + testToken
+
+// A browser address without a gate token is refused before anything is
+// dialed: it would name a browser any local account could reach.
+func TestUntokenizedAddressRefused(t *testing.T) {
+	t.Parallel()
+	for _, address := range []string{"http://127.0.0.1:9222", "http://127.0.0.1:9222/"} {
+		assert.ErrorIs(t, browserhost.Probe(context.Background(), address), browserhost.ErrUntokenizedAddress, address)
+		assert.ErrorIs(t, browserhost.CloseBrowser(context.Background(), address), browserhost.ErrUntokenizedAddress, address)
+		_, err := browserhost.StagehandExtension(context.Background(), address)
+		assert.ErrorIs(t, err, browserhost.ErrUntokenizedAddress, address)
+	}
+	assert.Equal(t, testToken, browserhost.TokenOf(unreachableURL))
+	assert.Equal(t, "browser at http://127.0.0.1:0/<token> is gone", browserhost.RedactCDPURL("browser at "+unreachableURL+" is gone", unreachableURL))
+}
 
 func TestStoreRoundTrip(t *testing.T) {
 	t.Parallel()
@@ -177,13 +200,13 @@ func TestStagehandExtension(t *testing.T) {
 		browserhost.Extension{ID: "disabled", Name: browserhost.StagehandExtensionName, Path: "/y", Enabled: false},
 		browserhost.Extension{ID: "runtime", Name: browserhost.StagehandExtensionName, Path: "/z", Enabled: true},
 	)
-	extension, err := browserhost.StagehandExtension(context.Background(), fake.server.URL)
+	extension, err := browserhost.StagehandExtension(context.Background(), fake.url())
 	require.NoError(t, err)
 	assert.Equal(t, "runtime", extension.ID)
 	assert.Equal(t, "/z", extension.Path)
 
 	empty := newFakeBrowser(t)
-	_, err = browserhost.StagehandExtension(context.Background(), empty.server.URL)
+	_, err = browserhost.StagehandExtension(context.Background(), empty.url())
 	assert.ErrorIs(t, err, browserhost.ErrExtensionNotFound)
 }
 
@@ -191,9 +214,9 @@ func TestProbeAndClose(t *testing.T) {
 	t.Parallel()
 
 	fake := newFakeBrowser(t)
-	require.NoError(t, browserhost.Probe(context.Background(), fake.server.URL))
+	require.NoError(t, browserhost.Probe(context.Background(), fake.url()))
 	// CloseBrowser returns nil only after the browser stops accepting connections.
-	require.NoError(t, browserhost.CloseBrowser(context.Background(), fake.server.URL))
+	require.NoError(t, browserhost.CloseBrowser(context.Background(), fake.url()))
 	assert.Equal(t, []string{"Browser.close"}, fake.calls())
 
 	assert.ErrorIs(t, browserhost.Probe(context.Background(), unreachableURL), browserhost.ErrUnreachable)
@@ -213,7 +236,7 @@ func TestUsesProfile(t *testing.T) {
 		"/tmp/profile":       false,
 		"/tmp/profile-2":     false,
 	} {
-		got, err := browserhost.UsesProfile(context.Background(), fake.server.URL, dir)
+		got, err := browserhost.UsesProfile(context.Background(), fake.url(), dir)
 		require.NoError(t, err)
 		assert.Equal(t, want, got, dir)
 	}
@@ -269,7 +292,7 @@ func TestSweep(t *testing.T) {
 			userDataDir := t.TempDir()
 			record := tc.record
 			record.ID = "session"
-			record.CDPURL = fake.server.URL
+			record.CDPURL = fake.url()
 			record.ExtensionDir = extensionDir
 			record.UserDataDir = userDataDir
 			record.OwnsUserDataDir = true
@@ -299,7 +322,7 @@ func TestReleaseKeepsHungBrowser(t *testing.T) {
 
 	fake := newHungBrowser(t)
 	store := browserhost.NewStore(t.TempDir())
-	record := ownedRecord(t, fake.server.URL)
+	record := ownedRecord(t, fake.url())
 	require.NoError(t, store.Save(record))
 
 	assert.Error(t, browserhost.Release(context.Background(), store, record))

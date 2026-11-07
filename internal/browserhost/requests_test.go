@@ -69,7 +69,7 @@ func TestBlockedRequestWatcherCountsBlockedHosts(t *testing.T) {
 	t.Parallel()
 
 	fake := newScriptedBrowser(t, requestScript)
-	watcher, err := browserhost.WatchBlockedRequests(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchBlockedRequests(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 
@@ -100,7 +100,7 @@ func TestBlockedRequestWatcherReportsLostConnection(t *testing.T) {
 	t.Parallel()
 
 	fake := newScriptedBrowser(t, requestScript)
-	watcher, err := browserhost.WatchBlockedRequests(context.Background(), fake.server.URL)
+	watcher, err := browserhost.WatchBlockedRequests(context.Background(), fake.url())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = watcher.Close() })
 
