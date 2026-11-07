@@ -218,3 +218,25 @@ func TestTxeSharedCalendarWritesArePlatformOnly(t *testing.T) {
 	h.server.Client().Delete("/api/v1/calendars/ops").
 		WithBearerToken(h.admin).ExpectStatus(http.StatusNoContent).Send(t)
 }
+
+// Under owner enforcement a request for a remote node needs the platform
+// administrator (for the builtin sign-in, an admin-role account:
+// txeauth.Classify). A legacy manager, an administrator of the hub's roles
+// but no platform administrator, is refused before any node is looked up,
+// and the refusal names no node. The platform administrator passes the
+// decision; this hub has no node of that name, so the proxy then says so
+// (TXE-5923, option A).
+func TestTxeRemoteNodeNeedsThePlatformAdministratorUnderEnforce(t *testing.T) {
+	h := newHubRecordsHub(t, config.TXEAuthzModeEnforce)
+
+	status, body := h.send(t, "/api/v1/dags?remoteNode=edge", h.legacy)
+	require.Equal(t, http.StatusForbidden, status, body)
+	require.NotContains(t, body, "edge")
+
+	status, body = h.send(t, "/api/v1/dags?remoteNode=edge", h.admin)
+	require.Equal(t, http.StatusBadRequest, status, body)
+	require.Contains(t, body, "not found", "past the decision, the proxy looks the node up")
+
+	status, _ = h.send(t, "/api/v1/dags", h.legacy)
+	require.NotEqual(t, http.StatusForbidden, status, "a request for this server is not the remote decision's")
+}

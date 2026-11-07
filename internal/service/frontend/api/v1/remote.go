@@ -35,9 +35,23 @@ const remoteProxyTimeout = 30 * time.Second
 func WithRemoteNode(resolver *remotenode.Resolver, apiBasePath string) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		fn := func(w http.ResponseWriter, r *http.Request) {
-			remoteNodeName := r.URL.Query().Get("remoteNode")
-			if remoteNodeName == "" || remoteNodeName == "local" {
+			remoteNodeName, remote, err := remotenode.Selected(r)
+			if err != nil {
+				WriteErrorResponse(w, &Error{
+					HTTPStatus: http.StatusBadRequest,
+					Code:       api.ErrorCodeBadRequest,
+					Message:    err.Error(),
+				})
+				return
+			}
+			if !remote {
 				next.ServeHTTP(w, r)
+				return
+			}
+			// The local decision runs before this middleware; without it the
+			// node's credential is never sent (TXE-5923).
+			if !remotenode.UseAuthorized(r.Context()) {
+				WriteErrorResponse(w, errRemoteNodeRefused)
 				return
 			}
 			// Local permission checks match the path as written, and the proxy
@@ -279,8 +293,11 @@ func (h *remoteNodeProxy) doRequest(body io.Reader, r *http.Request) (*http.Resp
 	}
 	req.ContentLength = r.ContentLength
 
-	// Apply authentication from node configuration
-	h.remoteNode.ApplyAuth(req)
+	// Apply authentication from node configuration, which the node does only
+	// for a request the local decision allowed (RemoteNodeAuthorization).
+	if err := h.remoteNode.ApplyAuth(req); err != nil {
+		return nil, errRemoteNodeRefused
+	}
 
 	// Copy headers from the original request (skip Authorization since we set it above)
 	for k, v := range r.Header {

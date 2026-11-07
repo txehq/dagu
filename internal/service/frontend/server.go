@@ -1553,6 +1553,8 @@ func (srv *Server) setupSSERoute(ctx context.Context, r *chi.Mux, apiV1BasePath 
 		r.Use(srv.apiV1.TxePlatformAdminSession)
 		r.Use(srv.apiV1.TxePersonRefused())
 		r.Use(srv.injectDefaultStreamUserMiddleware())
+		// The local decision for a remote node, as on the API (TXE-5923).
+		r.Use(srv.apiV1.RemoteNodeAuthorization())
 
 		// The stream stays open, so it is closed when its OIDC session ends.
 		r.With(srv.sessionWatch().Middleware(authOpts)).Get("/stream", multiplexHandler.HandleStream)

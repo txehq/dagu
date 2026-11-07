@@ -45,8 +45,11 @@ func (h *MultiplexHandler) HandleStream(w http.ResponseWriter, r *http.Request) 
 	rc := http.NewResponseController(w)
 	_ = rc.SetWriteDeadline(time.Time{})
 
-	remoteNode := r.URL.Query().Get("remoteNode")
-	if remoteNode != "" && remoteNode != "local" {
+	remoteNode, remote, err := h.remoteSelection(w, r)
+	if err != nil {
+		return
+	}
+	if remote {
 		h.proxyStreamToRemoteNode(w, r, remoteNode)
 		return
 	}
@@ -73,8 +76,11 @@ func (h *MultiplexHandler) HandleStream(w http.ResponseWriter, r *http.Request) 
 
 // HandleTopicMutation adds and removes topics for an existing stream.
 func (h *MultiplexHandler) HandleTopicMutation(w http.ResponseWriter, r *http.Request) {
-	remoteNode := r.URL.Query().Get("remoteNode")
-	if remoteNode != "" && remoteNode != "local" {
+	remoteNode, remote, err := h.remoteSelection(w, r)
+	if err != nil {
+		return
+	}
+	if remote {
 		h.proxyTopicMutationToRemoteNode(w, r, remoteNode)
 		return
 	}
@@ -146,7 +152,10 @@ func (h *MultiplexHandler) proxyStreamToRemoteNode(w http.ResponseWriter, r *htt
 	if lastEventID := strings.TrimSpace(r.Header.Get("Last-Event-ID")); lastEventID != "" {
 		req.Header.Set("Last-Event-ID", lastEventID)
 	}
-	node.ApplyAuth(req)
+	if err := node.ApplyAuth(req); err != nil {
+		http.Error(w, remoteNodeRefusedMessage, http.StatusForbidden)
+		return
+	}
 
 	resp, err := doRemoteEventRequest(newProxyHTTPClient(node.SkipTLSVerify), req)
 	if err != nil {
@@ -184,7 +193,10 @@ func (h *MultiplexHandler) proxyTopicMutationToRemoteNode(w http.ResponseWriter,
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	node.ApplyAuth(req)
+	if err := node.ApplyAuth(req); err != nil {
+		http.Error(w, remoteNodeRefusedMessage, http.StatusForbidden)
+		return
+	}
 
 	resp, err := doRemoteEventRequest(newProxyHTTPClient(node.SkipTLSVerify), req)
 	if err != nil {
@@ -197,6 +209,26 @@ func (h *MultiplexHandler) proxyTopicMutationToRemoteNode(w http.ResponseWriter,
 	defer func() { _ = resp.Body.Close() }()
 
 	copyJSONResponse(w, resp)
+}
+
+// remoteNodeRefusedMessage answers a remote-node request the local decision
+// did not allow. It names no node and no address.
+const remoteNodeRefusedMessage = "a request for a remote node needs a local administrator"
+
+// remoteSelection reads which node the request is for, as the REST proxy
+// does (remotenode.Selected), and refuses a remote node the local decision
+// did not allow before the node is resolved. It writes the refusal itself.
+func (h *MultiplexHandler) remoteSelection(w http.ResponseWriter, r *http.Request) (string, bool, error) {
+	name, remote, err := remotenode.Selected(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return "", false, err
+	}
+	if remote && !remotenode.UseAuthorized(r.Context()) {
+		http.Error(w, remoteNodeRefusedMessage, http.StatusForbidden)
+		return "", false, remotenode.ErrUseNotAuthorized
+	}
+	return name, remote, nil
 }
 
 func (h *MultiplexHandler) resolveNode(w http.ResponseWriter, r *http.Request, nodeName string) (*remotenode.RemoteNode, bool) {

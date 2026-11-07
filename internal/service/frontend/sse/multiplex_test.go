@@ -974,6 +974,8 @@ func TestMultiplexHandlerProxyStreamForwardsLastEventID(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/api/v1/events/stream?remoteNode=remote1&topic=dag%3Atest.yaml", nil)
 	req.Header.Set("Last-Event-ID", "47")
+	// The local decision (api.RemoteNodeAuthorization) allowed the request.
+	req = req.WithContext(remotenode.WithUseAuthorized(req.Context()))
 	recorder := httptest.NewRecorder()
 
 	handler.proxyStreamToRemoteNode(recorder, req, "remote1")
@@ -1295,4 +1297,31 @@ func TestMultiplexTopicSurvivesFetchPanic(t *testing.T) {
 		return result.session.popNext() != nil
 	}, 5*time.Second, 10*time.Millisecond)
 	assert.Equal(t, int32(2), fetches.Load())
+}
+
+// A remote-node stream or topic change the local decision did not allow is
+// refused before the node is resolved, and its credential is never sent; the
+// refusal names no node (TXE-5923).
+func TestMultiplexHandlerRefusesAnUnallowedRemoteNode(t *testing.T) {
+	var called atomic.Bool
+	remote := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called.Store(true) }))
+	t.Cleanup(remote.Close)
+	resolver := remotenode.NewResolver([]config.RemoteNode{{Name: "remote1", APIBaseURL: remote.URL + "/api/v1", AuthType: "token", AuthToken: "remote-secret"}}, nil)
+	handler := NewMultiplexHandler(nil, resolver)
+
+	stream := httptest.NewRecorder()
+	handler.HandleStream(stream, httptest.NewRequest("GET", "/api/v1/events/stream?remoteNode=remote1", nil))
+	topics := httptest.NewRecorder()
+	handler.HandleTopicMutation(topics, httptest.NewRequest("POST", "/api/v1/events/stream/topics?remoteNode=remote1", nil))
+	twice := httptest.NewRecorder()
+	handler.HandleStream(twice, httptest.NewRequest("GET", "/api/v1/events/stream?remoteNode=local&remoteNode=remote1", nil))
+
+	assert.Equal(t, http.StatusForbidden, stream.Code)
+	assert.Equal(t, http.StatusForbidden, topics.Code)
+	assert.Equal(t, http.StatusBadRequest, twice.Code, "a node named twice is refused")
+	assert.False(t, called.Load(), "the remote node was never called")
+	for _, body := range []string{stream.Body.String(), topics.Body.String()} {
+		assert.NotContains(t, body, "remote1")
+		assert.NotContains(t, body, remote.URL)
+	}
 }
