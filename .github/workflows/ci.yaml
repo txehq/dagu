@@ -565,8 +565,12 @@ jobs:
             -NoPrompt -DryRun -ServiceOnly -Service yes -OpenBrowser no `
             -InstallDir $serviceOnlyDir
 
+      # Restores the Windows test cache that main saves on every push. The
+      # build below uses the same flags as the Windows test job's build of
+      # ./cmd, so it is a cache hit; -trimpath would change every action ID
+      # and compile from scratch. This binary only feeds the installer test.
       - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        uses: ./.github/actions/setup-go-cache
         with:
           go-version: ${{ env.GO_VERSION }}
 
@@ -574,7 +578,7 @@ jobs:
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          go build -trimpath -o dist\dagu-windows-amd64.exe .\cmd
+          go build -o dist\dagu-windows-amd64.exe .\cmd
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
             Write-Host "Inno Setup 6 is not preinstalled on this image; installing it."
