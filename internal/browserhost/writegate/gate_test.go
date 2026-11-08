@@ -4,7 +4,10 @@
 package writegate_test
 
 import (
+	"bytes"
+	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,8 +15,11 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -39,6 +45,9 @@ type site struct {
 	writes map[string]int
 	reads  map[string]int
 	socket atomic.Int64
+	// startSocket counts the sockets a worker's first statement opened that
+	// reached the site, apart from what the gate records.
+	startSocket atomic.Int64
 }
 
 const sitePage = `<!doctype html><html><head><title>Ledger</title><script>
@@ -89,6 +98,9 @@ func (s *site) serve(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(io.Discard, r.Body)
 	switch {
 	case r.URL.Path == "/ws":
+		if r.URL.Query().Get("from") == "start" {
+			s.startSocket.Add(1)
+		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
 			return
@@ -254,15 +266,38 @@ func guard(t *testing.T, b *browser, policy writegate.Policy, secrets map[string
 // guardIn runs a gate in mode on the browser until the test ends.
 func guardIn(t *testing.T, b *browser, mode string, policy writegate.Policy, secrets map[string]string) (string, context.CancelFunc, <-chan error) {
 	t.Helper()
+	g := guardRecorded(t, b, mode, policy, secrets)
+	return g.controls, g.stop, g.done
+}
+
+// guarded is a gate a test runs: where its controls are, how to stop it,
+// what it returned, and the timeline of its DevTools traffic, which is nil
+// when the gate runs without the relay.
+type guarded struct {
+	controls string
+	stop     context.CancelFunc
+	done     <-chan error
+	timeline *timeline
+}
+
+// guardRecorded is guardIn, also giving the gate's timeline.
+func guardRecorded(t *testing.T, b *browser, mode string, policy writegate.Policy, secrets map[string]string) guarded {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan writegate.Ready, 1)
 	done := make(chan error, 1)
+	served := make(chan struct{})
 	token := "test-token"
+	// The gate reaches the browser through a relay that records its traffic
+	// as metadata, printed if the test fails (TXE-6223).
+	cdpURL, tl := relayDevTools(t, b.cdpURL, served)
 	go func() {
-		done <- writegate.Serve(ctx, writegate.Config{
-			Token: token, CDPURL: b.cdpURL, Mode: mode, Policy: policy, Secrets: secrets,
+		err := writegate.Serve(ctx, writegate.Config{
+			Token: token, CDPURL: cdpURL, Mode: mode, Policy: policy, Secrets: secrets,
 			ExtensionDir: filepath.Join(b.profile, "DaguWriteGate"),
 		}, func(r writegate.Ready) { readyCh <- r })
+		close(served)
+		done <- err
 	}()
 	t.Cleanup(cancel)
 	// The gate bounds its own startup, waiting up to 30 seconds for the
@@ -271,13 +306,13 @@ func guardIn(t *testing.T, b *browser, mode string, policy writegate.Policy, sec
 	// what a slow start shows.
 	select {
 	case r := <-readyCh:
-		return fmt.Sprintf("http://127.0.0.1:%d/%s", r.Port, token), cancel, done
+		return guarded{controls: fmt.Sprintf("http://127.0.0.1:%d/%s", r.Port, token), stop: cancel, done: done, timeline: tl}
 	case err := <-done:
 		t.Fatalf("the gate did not start: %v", err)
 	case <-time.After(2 * time.Minute):
 		t.Fatal("the gate did not start in time")
 	}
-	return "", cancel, done
+	return guarded{stop: cancel, done: done, timeline: tl}
 }
 
 // page is a DevTools session on the browser's first page.
@@ -679,10 +714,19 @@ func TestGateSeesASocketAWorkerOpensAtStart(t *testing.T) {
 	p.goTo(s.URL + "/")
 
 	p.eval(`navigator.serviceWorker.register('/sw-start.js').then(() => navigator.serviceWorker.ready).then(() => 'ready')`)
-	require.Eventually(t, func() bool {
+	if !assert.Eventually(t, func() bool {
 		_, ok := find(events(t, controls), "/ws?from=start")
 		return ok
-	}, 10*time.Second, 50*time.Millisecond)
+	}, 10*time.Second, 50*time.Millisecond) {
+		// The site counts the worker's socket itself, so a failure tells a
+		// worker that ran unwatched from one whose socket never left it.
+		arrived := s.startSocket.Load()
+		verdict := "the worker ran unwatched, or the gate never got its event"
+		if arrived == 0 {
+			verdict = "the worker's socket did not reach the site either"
+		}
+		t.Fatalf("the gate recorded no socket from the worker's first statement; the site received %d: %s", arrived, verdict)
+	}
 	socket, _ := find(events(t, controls), "/ws?from=start")
 	assert.Equal(t, writegate.KindSocket, socket.Kind)
 }
@@ -886,4 +930,473 @@ func TestAttendedBrowserOutlivesTheUnattendedCap(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return errors.Is(browserhost.Probe(context.Background(), b.cdpURL), browserhost.ErrUnreachable)
 	}, shortUnattended+30*time.Second, 200*time.Millisecond, "the cap runs once the last client left")
+}
+
+// ---- the DevTools timeline printed when a test fails (TXE-6223) ----
+//
+// A writegate test that times out on a loaded host says only that a
+// condition was never met. The relay below sits between the gate and the
+// browser's DevTools gate, passes every message on unchanged and in order,
+// and records each one in a timeline that is printed when the test fails.
+// The timeline keeps metadata only, by allowlist: the fields of
+// timelineEntry. Params, results, URLs, headers, bodies and error text never
+// enter it, since they carry what a page sent. Method names are written by
+// the gate and Chrome, never by a page, and one not shaped like a DevTools
+// method is kept as "?".
+
+const (
+	// timelineEntries bounds the messages a timeline keeps; older ones are
+	// dropped first.
+	timelineEntries = 1024
+	// timelineSessions bounds the sessions given a pseudonym; later ones
+	// share the pseudonym s0.
+	timelineSessions = 4096
+	// timelineMaxBytes bounds the printed timeline.
+	timelineMaxBytes = 160 << 10
+	// relayDrain bounds how long the relay outlives the test, so the gate
+	// can still close its browser through it as it would directly.
+	relayDrain = 20 * time.Second
+)
+
+// relayOffEnv set to "off" runs the gates without the relay, to measure what
+// it costs.
+const relayOffEnv = "DAGU_WRITEGATE_TEST_RELAY"
+
+// timelineMethod is the shape of a DevTools method name.
+var timelineMethod = regexp.MustCompile(`^[A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,31}$`)
+
+// timelineEntry is one message, as metadata.
+type timelineEntry struct {
+	at        time.Duration
+	conn      int
+	toBrowser bool
+	// kind is 'c' for a command, 'r' for a reply, 'e' for an event and '?'
+	// for a message that could not be read.
+	kind     byte
+	id       int64
+	method   string
+	session  int
+	attached int
+	errCode  int
+	failed   bool
+	took     time.Duration
+}
+
+type sentCommand struct {
+	at      time.Duration
+	method  string
+	session int
+}
+
+// timeline is a bounded, metadata-only record of DevTools messages.
+type timeline struct {
+	start time.Time
+
+	mu       sync.Mutex
+	ring     [timelineEntries]timelineEntry
+	recorded int
+	conns    int
+	sessions map[string]int
+	sent     map[[2]int64]sentCommand
+	unsent   int
+}
+
+func newTimeline() *timeline {
+	return &timeline{start: time.Now(), sessions: map[string]int{}, sent: map[[2]int64]sentCommand{}}
+}
+
+// newConn numbers a relayed connection.
+func (tl *timeline) newConn() int {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	tl.conns++
+	return tl.conns
+}
+
+// pseudonym returns the session's pseudonym; tl.mu is held.
+func (tl *timeline) pseudonym(session string) int {
+	if session == "" {
+		return 0
+	}
+	if n, ok := tl.sessions[session]; ok {
+		return n
+	}
+	if len(tl.sessions) >= timelineSessions {
+		return 0
+	}
+	n := len(tl.sessions) + 1
+	tl.sessions[session] = n
+	return n
+}
+
+// record keeps the metadata of one message on connection conn.
+func (tl *timeline) record(conn int, toBrowser bool, data []byte) {
+	var m struct {
+		ID        *int64          `json:"id"`
+		Method    string          `json:"method"`
+		SessionID string          `json:"sessionId"`
+		Params    json.RawMessage `json:"params"`
+		Error     *struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	readable := json.Unmarshal(data, &m) == nil
+	at := time.Since(tl.start)
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	e := timelineEntry{at: at, conn: conn, toBrowser: toBrowser, kind: '?'}
+	if readable {
+		e.session = tl.pseudonym(m.SessionID)
+		e.method = "?"
+		if timelineMethod.MatchString(m.Method) {
+			e.method = m.Method
+		}
+		switch {
+		case m.ID != nil && m.Method != "":
+			e.kind, e.id = 'c', *m.ID
+			key := [2]int64{int64(conn), *m.ID}
+			if len(tl.sent) < timelineEntries {
+				tl.sent[key] = sentCommand{at: at, method: e.method, session: e.session}
+			} else {
+				tl.unsent++
+			}
+		case m.ID != nil:
+			e.kind, e.id, e.method = 'r', *m.ID, ""
+			key := [2]int64{int64(conn), *m.ID}
+			if sent, ok := tl.sent[key]; ok {
+				e.took = at - sent.at
+				e.method = sent.method
+				delete(tl.sent, key)
+			}
+			if m.Error != nil {
+				e.failed, e.errCode = true, m.Error.Code
+			}
+		case m.Method != "":
+			e.kind = 'e'
+			if m.Method == "Target.attachedToTarget" || m.Method == "Target.detachedFromTarget" {
+				var p struct {
+					SessionID string `json:"sessionId"`
+				}
+				if json.Unmarshal(m.Params, &p) == nil {
+					e.attached = tl.pseudonym(p.SessionID)
+				}
+			}
+		default:
+			e.kind, e.method = '?', ""
+		}
+	}
+	tl.ring[tl.recorded%timelineEntries] = e
+	tl.recorded++
+}
+
+// render prints the timeline, oldest first, then the commands that never got
+// a reply.
+func (tl *timeline) render() string {
+	tl.mu.Lock()
+	defer tl.mu.Unlock()
+	var b strings.Builder
+	kept := min(tl.recorded, timelineEntries)
+	fmt.Fprintf(&b, "DevTools timeline of the write gate (metadata only): %d messages, %d dropped, %d connections\n",
+		tl.recorded, tl.recorded-kept, tl.conns)
+	session := func(n int) string {
+		if n == 0 {
+			return ""
+		}
+		return fmt.Sprintf(" s%d", n)
+	}
+	for i := tl.recorded - kept; i < tl.recorded; i++ {
+		if b.Len() > timelineMaxBytes {
+			fmt.Fprintf(&b, "... cut at %d bytes\n", timelineMaxBytes)
+			break
+		}
+		e := tl.ring[i%timelineEntries]
+		arrow := "<-"
+		if e.toBrowser {
+			arrow = "->"
+		}
+		fmt.Fprintf(&b, "%9.3fs c%d %s ", e.at.Seconds(), e.conn, arrow)
+		switch e.kind {
+		case 'c':
+			fmt.Fprintf(&b, "#%d %s%s\n", e.id, e.method, session(e.session))
+		case 'r':
+			outcome := "ok"
+			if e.failed {
+				outcome = fmt.Sprintf("error %d", e.errCode)
+			}
+			fmt.Fprintf(&b, "#%d %s %s after %.3fs%s\n", e.id, e.method, outcome, e.took.Seconds(), session(e.session))
+		case 'e':
+			fmt.Fprintf(&b, "%s%s", e.method, session(e.session))
+			if e.attached != 0 {
+				fmt.Fprintf(&b, " names s%d", e.attached)
+			}
+			b.WriteString("\n")
+		default:
+			b.WriteString("unreadable message\n")
+		}
+	}
+	waiting := slices.Collect(maps.Keys(tl.sent))
+	slices.SortFunc(waiting, func(a, c [2]int64) int { return cmp.Compare(tl.sent[a].at, tl.sent[c].at) })
+	fmt.Fprintf(&b, "waiting for a reply: %d command(s)", len(waiting))
+	if tl.unsent > 0 {
+		fmt.Fprintf(&b, ", %d more not tracked", tl.unsent)
+	}
+	b.WriteString("\n")
+	for _, key := range waiting {
+		if b.Len() > timelineMaxBytes {
+			break
+		}
+		sent := tl.sent[key]
+		fmt.Fprintf(&b, "  c%d #%d %s%s sent at %.3fs\n", key[0], key[1], sent.method, session(sent.session), sent.at.Seconds())
+	}
+	return b.String()
+}
+
+// relayDevTools starts a relay to the DevTools gate at cdpURL for the test
+// and returns the address the write gate should use, with the timeline the
+// relay records; the timeline is printed if the test fails. The relay closes
+// once served is closed, or relayDrain after the test ends. A relay that
+// cannot start leaves the gate on cdpURL itself, with no timeline.
+func relayDevTools(t *testing.T, cdpURL string, served <-chan struct{}) (string, *timeline) {
+	t.Helper()
+	if os.Getenv(relayOffEnv) == "off" {
+		return cdpURL, nil
+	}
+	upstream, err := url.Parse(cdpURL)
+	if err != nil {
+		t.Logf("no DevTools timeline: %v", err)
+		return cdpURL, nil
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Logf("no DevTools timeline: %v", err)
+		return cdpURL, nil
+	}
+	tl := newTimeline()
+	r := &devToolsRelay{upstream: upstream, own: listener.Addr().String(), listener: listener, tl: tl, stops: map[*context.CancelFunc]struct{}{}}
+	r.proxy = &httputil.ReverseProxy{
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) { r.unreachable(w, err) },
+		Rewrite:      func(pr *httputil.ProxyRequest) { pr.SetURL(&url.URL{Scheme: upstream.Scheme, Host: upstream.Host}) },
+		// The browser's address in the DevTools gate's answers becomes the
+		// relay's, so the write gate's sockets come through the relay too.
+		ModifyResponse: func(response *http.Response) error {
+			data, err := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if err != nil {
+				return err
+			}
+			data = bytes.ReplaceAll(data, []byte("//"+upstream.Host+"/"), []byte("//"+r.own+"/"))
+			response.Body = io.NopCloser(bytes.NewReader(data))
+			response.ContentLength = int64(len(data))
+			response.Header.Del("Content-Length")
+			return nil
+		},
+	}
+	server := &http.Server{Handler: r, ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = server.Serve(listener) }()
+	// Registered first, so it runs last: printing reads only the timeline.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		defer func() {
+			if p := recover(); p != nil {
+				t.Logf("the DevTools timeline could not be printed: %v", p)
+			}
+		}()
+		t.Log(tl.render())
+	})
+	t.Cleanup(func() {
+		select {
+		case <-served:
+		case <-time.After(relayDrain):
+		}
+		_ = server.Close()
+		r.stopAll()
+	})
+	return "http://" + r.own + upstream.Path, tl
+}
+
+// devToolsRelay passes HTTP requests and WebSockets to the DevTools gate
+// unchanged. Paths and the helper handshake go through as they are, so the
+// DevTools gate checks the token and counts attendance as it would.
+type devToolsRelay struct {
+	upstream *url.URL
+	own      string
+	listener net.Listener
+	tl       *timeline
+	proxy    *httputil.ReverseProxy
+
+	mu    sync.Mutex
+	stops map[*context.CancelFunc]struct{}
+}
+
+func (r *devToolsRelay) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		r.proxy.ServeHTTP(w, req)
+		return
+	}
+	header := http.Header{}
+	if value := req.Header.Get(devtoolsgate.HelperHeader); value != "" {
+		header.Set(devtoolsgate.HelperHeader, value)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The browser side first: a socket the DevTools gate refuses is refused
+	// to the write gate with the same status.
+	up, response, err := websocket.Dial(ctx, "ws://"+r.upstream.Host+req.URL.RequestURI(), &websocket.DialOptions{HTTPHeader: header})
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		if response != nil {
+			http.Error(w, http.StatusText(response.StatusCode), response.StatusCode)
+			return
+		}
+		r.unreachable(w, err)
+		return
+	}
+	down, err := websocket.Accept(w, req, nil)
+	if err != nil {
+		_ = up.CloseNow()
+		return
+	}
+	r.mu.Lock()
+	r.stops[&cancel] = struct{}{}
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.stops, &cancel)
+		r.mu.Unlock()
+	}()
+	up.SetReadLimit(-1)
+	down.SetReadLimit(-1)
+	conn := r.tl.newConn()
+	var wg sync.WaitGroup
+	pump := func(from, to *websocket.Conn, toBrowser bool) {
+		defer wg.Done()
+		defer cancel()
+		for {
+			kind, data, err := from.Read(ctx)
+			if err != nil {
+				return
+			}
+			r.tl.record(conn, toBrowser, data)
+			if err := to.Write(ctx, kind, data); err != nil {
+				return
+			}
+		}
+	}
+	wg.Add(2)
+	go pump(down, up, true)
+	go pump(up, down, false)
+	wg.Wait()
+	_ = up.CloseNow()
+	_ = down.CloseNow()
+}
+
+// unreachable fails a request the DevTools gate could not be reached for as
+// it would fail without the relay: the connection is dropped without an
+// answer, and once the DevTools gate refuses connections the relay stops
+// listening too, so the write gate sees its browser gone as it would.
+func (r *devToolsRelay) unreachable(w http.ResponseWriter, err error) {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		_ = r.listener.Close()
+	}
+	if hijacker, ok := w.(http.Hijacker); ok {
+		if conn, _, hijackErr := hijacker.Hijack(); hijackErr == nil {
+			_ = conn.Close()
+			return
+		}
+	}
+	w.WriteHeader(http.StatusBadGateway)
+}
+
+// stopAll ends the sockets still relayed.
+func (r *devToolsRelay) stopAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for stop := range r.stops {
+		(*stop)()
+	}
+}
+
+// The timeline keeps metadata only: a canary in a command's params, a
+// reply's result, an error's text, an event's params, a session id, a
+// method name or a frame that is not JSON never appears in what it prints,
+// and it stays bounded however much it is given.
+func TestTimelineKeepsOnlyMetadata(t *testing.T) {
+	t.Parallel()
+
+	canary := "canary-" + rand.Text()
+	tl := newTimeline()
+	conn := tl.newConn()
+	messages := []struct {
+		toBrowser bool
+		data      string
+	}{
+		{true, `{"id":1,"method":"Runtime.evaluate","sessionId":"` + canary + `","params":{"expression":"` + canary + `"}}`},
+		{false, `{"id":1,"sessionId":"` + canary + `","result":{"result":{"value":"` + canary + `"}}}`},
+		{true, `{"id":2,"method":"Fetch.continueRequest","params":{"requestId":"` + canary + `","url":"https://example.test/` + canary + `","headers":[{"name":"Cookie","value":"` + canary + `"}],"postData":"` + canary + `"}}`},
+		{false, `{"id":2,"error":{"code":-32000,"message":"` + canary + `"}}`},
+		{false, `{"method":"Target.attachedToTarget","params":{"sessionId":"` + canary + `-worker","targetInfo":{"url":"https://example.test/` + canary + `"}}}`},
+		{false, `{"method":"Fetch.requestPaused","sessionId":"` + canary + `-worker","params":{"request":{"url":"https://example.test/` + canary + `","postData":"` + canary + `"}}}`},
+		{true, `{"id":3,"method":"` + canary + `.evaluate","params":{}}`},
+		{true, `{"id":4,"method":"Network.enable` + strings.Repeat("x", 64) + `"}`},
+		{false, `not json ` + canary},
+		{true, `{"id":"` + canary + `","method":"Page.navigate"}`},
+	}
+	for _, m := range messages {
+		tl.record(conn, m.toBrowser, []byte(m.data))
+	}
+	printed := tl.render()
+	assert.NotContains(t, printed, canary)
+	for _, want := range []string{
+		"-> #1 Runtime.evaluate s1", "<- #1 Runtime.evaluate ok", "-> #2 Fetch.continueRequest",
+		"<- #2 Fetch.continueRequest error -32000", "Target.attachedToTarget names s2", "Fetch.requestPaused s2",
+		"-> #3 ?", "-> #4 ?", "unreadable message", "waiting for a reply: 2 command(s)",
+	} {
+		assert.Contains(t, printed, want)
+	}
+
+	// However much it is given, it keeps the last entries and stays small.
+	for i := range 20 * timelineEntries {
+		tl.record(conn, true, fmt.Appendf(nil, `{"id":%d,"method":"Fetch.continueRequest","params":{"requestId":"%s"}}`, 100+i, canary))
+	}
+	printed = tl.render()
+	assert.NotContains(t, printed, canary)
+	assert.LessOrEqual(t, len(printed), timelineMaxBytes+4096)
+	assert.Contains(t, printed, fmt.Sprintf("%d dropped", 20*timelineEntries+len(messages)-timelineEntries))
+	assert.Contains(t, printed, "more not tracked")
+}
+
+// Through a real browser, a canary a page sends in a write's address, body
+// and header reaches the gate, which records the write, and is nowhere in
+// the timeline of the gate's DevTools traffic.
+func TestGateTimelineKeepsNoPayload(t *testing.T) {
+	t.Parallel()
+	if os.Getenv(relayOffEnv) == "off" {
+		t.Skip("the relay is off")
+	}
+
+	canary := "canary" + strings.ToLower(rand.Text())
+	s := startSite(t)
+	b := startBrowser(t)
+	g := guardRecorded(t, b, writegate.ModeRehearse, writegate.Policy{}, nil)
+	controls, tl := g.controls, g.timeline
+	require.NotNil(t, tl, "the gate runs through the relay")
+	p := openPage(t, b)
+	p.goTo(s.URL + "/")
+
+	reply := p.eval(fmt.Sprintf(`post('/w/%s?q=%s', {body: %s, headers: {'X-Canary': %s}})`, canary, canary, quote(canary), quote(canary)))
+	assert.Contains(t, reply, "error", "the write is blocked: %s", reply)
+	require.Eventually(t, func() bool {
+		_, ok := find(events(t, controls), canary)
+		return ok
+	}, 5*time.Second, 50*time.Millisecond, "the canary reached the gate through the relay")
+
+	printed := tl.render()
+	assert.NotContains(t, printed, canary)
+	assert.Contains(t, printed, "Fetch.requestPaused")
+	assert.Contains(t, printed, "Fetch.failRequest")
 }
