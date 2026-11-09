@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -148,4 +149,58 @@ func TestContextCanBeTracedAgain(t *testing.T) {
 	assert.Zero(t, caller.total())
 	assert.Positive(t, own.getConn.Load())
 	assert.Positive(t, own.connectStart.Load())
+}
+
+// The key the trace is kept under was learned from httptrace itself, and
+// only that key is hidden: a client trace a caller keeps under a key of its
+// own is still found.
+func TestContextHidesTheTraceKeyAlone(t *testing.T) {
+	require.NotNil(t, onbehalf.TraceKey(), "the key was not learned; the type fallback is in use")
+	own := &httptrace.ClientTrace{}
+	var h hooks
+	caller := context.WithValue(httptrace.WithClientTrace(context.Background(), h.trace()), valueKey{}, own)
+	ctx := onbehalf.Context(caller)
+	assert.Same(t, own, ctx.Value(valueKey{}), "a trace under the caller's own key is the caller's value")
+	under, _ := ctx.Value(onbehalf.TraceKey()).(*httptrace.ClientTrace)
+	require.NotNil(t, under, "under httptrace's key is the package's own trace")
+	assert.Nil(t, under.GetConn, "with none of the caller's hooks")
+	assert.NotNil(t, under.ConnectStart, "and the one hook that takes the dial hooks' place")
+}
+
+// recorder is an Observer that counts, from any goroutine.
+type recorder struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *recorder) RequestOnBehalf() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+}
+
+func (r *recorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+// The observer in the caller's context is told of each request made on its
+// behalf, with or without a trace, and stays in the result for the next.
+func TestContextTellsTheObserver(t *testing.T) {
+	var r recorder
+	plain := onbehalf.WithObserver(context.Background(), &r)
+	assert.Equal(t, plain, onbehalf.Context(plain), "no hooks: the context is returned as it is")
+	assert.Equal(t, 1, r.count())
+
+	var h hooks
+	traced := onbehalf.WithObserver(httptrace.WithClientTrace(context.Background(), h.trace()), &r)
+	ctx := onbehalf.Context(traced)
+	assert.Equal(t, 2, r.count())
+	onbehalf.Context(ctx)
+	assert.Equal(t, 3, r.count(), "a further request on the same behalf is announced too")
+
+	assert.Equal(t, 3, r.count())
+	onbehalf.Context(context.Background())
+	assert.Equal(t, 3, r.count(), "no observer, nothing told")
 }

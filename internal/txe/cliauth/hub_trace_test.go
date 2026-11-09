@@ -20,6 +20,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	txeclient "github.com/dagucloud/dagu/v2/internal/txe/client"
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf/onbehalftest"
 )
 
 // BearerTransport's renewal, discovery, the token request and whatever else
@@ -34,6 +37,9 @@ import (
 type sameOriginHub struct {
 	server    *httptest.Server
 	acceptAll bool
+	// holdToken makes the token endpoint never answer.
+	holdToken bool
+	done      chan struct{}
 	mu        sync.Mutex
 	hub       []string // Authorization header of each hub request
 	tokens    int
@@ -42,7 +48,7 @@ type sameOriginHub struct {
 
 func newSameOriginHub(t *testing.T) *sameOriginHub {
 	t.Helper()
-	h := &sameOriginHub{}
+	h := &sameOriginHub{done: make(chan struct{})}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
 		h.mu.Lock()
@@ -62,6 +68,14 @@ func newSameOriginHub(t *testing.T) *sameOriginHub {
 		h.mu.Lock()
 		h.tokens++
 		h.mu.Unlock()
+		if h.holdToken {
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-r.Context().Done():
+			case <-h.done:
+			}
+			return
+		}
 		if err := r.ParseForm(); err != nil || r.PostForm.Get("grant_type") != "refresh_token" || r.PostForm.Get("refresh_token") != "refresh-1" {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_grant"})
 			return
@@ -81,7 +95,7 @@ func newSameOriginHub(t *testing.T) *sameOriginHub {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 	h.server = httptest.NewServer(mux)
-	t.Cleanup(h.server.Close)
+	t.Cleanup(func() { close(h.done); h.server.Close() })
 	return h
 }
 
@@ -199,7 +213,7 @@ func TestBearerTransportRenewalBeforeSendingStaysOffTheTrace(t *testing.T) {
 func TestBearerTransportRenewalThroughTheSameProxyStaysOffTheTrace(t *testing.T) {
 	h := newSameOriginHub(t)
 	store := h.signedInAt(t, time.Now().Add(time.Hour))
-	proxy, carried := testForwardProxy(t)
+	proxy := onbehalftest.NewProxy(t)
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
 	client := &http.Client{Transport: &BearerTransport{
@@ -213,38 +227,37 @@ func TestBearerTransportRenewalThroughTheSameProxyStaysOffTheTrace(t *testing.T)
 	assert.Len(t, hub, 2)
 	assert.Equal(t, 1, tokens)
 	assert.Equal(t, 1, discoveries)
-	assert.Equal(t, 4, carried(), "two hub attempts, the discovery and the token request went through the proxy")
+	assert.Equal(t, 4, proxy.Total(), "two hub attempts, the discovery and the token request went through the proxy")
 	assert.Equal(t, map[string]int{strings.TrimPrefix(proxy.URL, "http://"): 2}, tr.connections())
 }
 
-// testForwardProxy is a plain HTTP forward proxy on loopback that counts the
-// requests it carried.
-func testForwardProxy(t *testing.T) (*httptest.Server, func() int) {
-	t.Helper()
-	var carried atomic.Int32
-	upstream := &http.Transport{}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !r.URL.IsAbs() {
-			http.Error(w, "not a proxy request", http.StatusBadRequest)
-			return
-		}
-		carried.Add(1)
-		out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		out.Header = r.Header.Clone()
-		resp, err := upstream.RoundTrip(out)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		maps.Copy(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-	}))
-	t.Cleanup(func() { proxy.Close(); upstream.CloseIdleConnections() })
-	return proxy, func() int { return int(carried.Load()) }
+// End to end through the hub client: a renewal that never answers, at the
+// hub's own origin, is read as the phase it is, not as the hub's answer.
+func TestBearerTransportStalledRenewalIsReadAsOnBehalf(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		expiry time.Time
+	}{
+		{name: "before the first attempt, for an expired sign-in", expiry: time.Now().Add(-time.Minute)},
+		{name: "after the hub's 401", expiry: time.Now().Add(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSameOriginHub(t)
+			h.holdToken = true
+			store := h.signedInAt(t, tc.expiry)
+			client := &http.Client{Transport: &BearerTransport{
+				Base: &http.Transport{}, Store: store, Hub: h.server.URL + "/api/v1", Use: HubUseTxe,
+				Provider: &http.Client{Transport: &http.Transport{}},
+			}, Timeout: 400 * time.Millisecond}
+			err := txeclient.New(h.server.URL+"/api/v1", "", client).Do(context.Background(), http.MethodGet, "/txe/jobs", nil, nil, nil)
+			var re *txeclient.RequestError
+			require.ErrorAs(t, err, &re, "%v", err)
+			assert.Equal(t, txeclient.PhaseOnBehalf, re.Phase, "%v", err)
+			assert.False(t, re.Connected)
+			assert.Contains(t, err.Error(), "the identity provider did not answer (renewal)", "the renewal's own error is kept")
+			assert.Contains(t, err.Error(), "(the request stopped while a request made on its behalf, such as a token renewal, ran, after ")
+			_, tokens, _ := h.counts()
+			assert.Equal(t, 1, tokens)
+		})
+	}
 }

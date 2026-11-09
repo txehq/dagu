@@ -20,6 +20,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf"
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf/onbehalftest"
 	"github.com/dagucloud/dagu/v2/internal/txe/transportauth"
 )
 
@@ -110,51 +112,10 @@ func TestRenewalFiresNoneOfTheCallersHooksAtTheHubsOrigin(t *testing.T) {
 	assert.Positive(t, hooks.other.Load())
 }
 
-// forwardProxy is a plain HTTP forward proxy on loopback. It counts what it
-// carried, by destination host.
-func forwardProxy(t *testing.T) (*httptest.Server, func() map[string]int) {
-	t.Helper()
-	var mu sync.Mutex
-	carried := map[string]int{}
-	upstream := &http.Transport{}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !r.URL.IsAbs() {
-			http.Error(w, "not a proxy request", http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		carried[r.URL.Host]++
-		mu.Unlock()
-		out, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), r.Body)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		out.Header = r.Header.Clone()
-		resp, err := upstream.RoundTrip(out)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-		maps.Copy(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-	}))
-	t.Cleanup(func() { proxy.Close(); upstream.CloseIdleConnections() })
-	return proxy, func() map[string]int {
-		mu.Lock()
-		defer mu.Unlock()
-		out := map[string]int{}
-		maps.Copy(out, carried)
-		return out
-	}
-}
-
 func TestRenewalFiresNoneOfTheCallersHooksThroughTheSameProxy(t *testing.T) {
 	endpoint := &tokenEndpoint{}
 	server := sameOrigin(t, endpoint)
-	proxy, carried := forwardProxy(t)
+	proxy := onbehalftest.NewProxy(t)
 	proxyURL, err := url.Parse(proxy.URL)
 	require.NoError(t, err)
 	viaProxy := func() *http.Transport { return &http.Transport{Proxy: http.ProxyURL(proxyURL)} }
@@ -165,7 +126,7 @@ func TestRenewalFiresNoneOfTheCallersHooksThroughTheSameProxy(t *testing.T) {
 	_, err = source.Token(ctx)
 	require.NoError(t, err)
 	origin := strings.TrimPrefix(server.URL, "http://")
-	assert.Equal(t, map[string]int{origin: 1}, carried(), "the renewal went through the proxy")
+	assert.Equal(t, map[string]int{origin: 1}, proxy.Carried(), "the renewal went through the proxy")
 	assert.Empty(t, hooks.connections())
 	assert.Zero(t, hooks.other.Load())
 
@@ -173,7 +134,7 @@ func TestRenewalFiresNoneOfTheCallersHooksThroughTheSameProxy(t *testing.T) {
 	// the proxy's address.
 	get(t, ctx, viaProxy(), server.URL+"/api/v1/ping")
 	assert.Equal(t, map[string]int{strings.TrimPrefix(proxy.URL, "http://"): 1}, hooks.connections())
-	assert.Equal(t, map[string]int{origin: 2}, carried())
+	assert.Equal(t, map[string]int{origin: 2}, proxy.Carried())
 }
 
 // The renewal keeps the caller's deadline and cancellation, and its errors
@@ -274,4 +235,25 @@ func TestConcurrentRenewalsStayOffEveryCallersTrace(t *testing.T) {
 		assert.Empty(t, h.connections(), "caller %d", i)
 		assert.Zero(t, h.other.Load(), "caller %d", i)
 	}
+}
+
+// announced counts what a caller's observer was told.
+type announced struct{ n atomic.Int32 }
+
+func (a *announced) RequestOnBehalf() { a.n.Add(1) }
+
+// The caller's observer is told that the renewal runs on its behalf, once
+// per request the renewal makes; a token held in memory tells it nothing.
+func TestRenewalTellsTheCallersObserver(t *testing.T) {
+	endpoint := &tokenEndpoint{}
+	server := sameOrigin(t, endpoint)
+	source := sourceAt(t, server)
+	var a announced
+	ctx := onbehalf.WithObserver(context.Background(), &a)
+	_, err := source.Token(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), a.n.Load(), "the one token request")
+	_, err = source.Token(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), a.n.Load(), "the held token was given; no request was made")
 }

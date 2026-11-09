@@ -25,9 +25,10 @@ import (
 )
 
 // A step's read of the hub with the machine's credential names where it
-// stopped: a renewal that never ends stops before the request is sent, and a
-// hub that never answers stops after it is written. net/http reports both as
-// a client timeout (TXE-6337).
+// stopped: a renewal that never ends stops while the request made on the hub
+// request's behalf ran (TXE-6352), and a hub that never answers stops after
+// the request is written. net/http reports both as a client timeout
+// (TXE-6337).
 func TestTXEStepRequestNamesWhetherTheRenewalOrTheHubStalled(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("a machine credential is refused on Windows")
@@ -61,7 +62,7 @@ func TestTXEStepRequestNamesWhetherTheRenewalOrTheHubStalled(t *testing.T) {
 		idpHolds, hubHolds bool
 		want               txeclient.RequestPhase
 	}{
-		{name: "the renewal stalls", idpHolds: true, want: txeclient.PhaseNotStarted},
+		{name: "the renewal stalls", idpHolds: true, want: txeclient.PhaseOnBehalf},
 		{name: "the hub stalls after the token", hubHolds: true, want: txeclient.PhaseRequestWritten},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -109,7 +110,7 @@ func TestTXEStepRequestNamesWhetherTheRenewalOrTheHubStalled(t *testing.T) {
 			// not depend on that.
 			assert.Equal(t, tc.want, re.Phase, "%v", err)
 			assert.Contains(t, err.Error(), "(the request stopped "+tc.want.String())
-			if tc.want == txeclient.PhaseNotStarted {
+			if tc.want == txeclient.PhaseOnBehalf {
 				assert.Contains(t, err.Error(), "renew this machine's access token: ")
 			}
 		})
