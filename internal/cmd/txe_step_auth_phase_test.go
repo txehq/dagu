@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -28,6 +29,9 @@ import (
 // hub that never answers stops after it is written. net/http reports both as
 // a client timeout (TXE-6337).
 func TestTXEStepRequestNamesWhetherTheRenewalOrTheHubStalled(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a machine credential is refused on Windows")
+	}
 	const (
 		issuer  = "https://issuer.invalid/realms/txe"
 		client  = "txe-worker-test"

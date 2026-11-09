@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -213,6 +214,33 @@ func TestRequestPhaseIgnoresARequestAWrapperMakesFirst(t *testing.T) {
 		assert.True(t, re.Connected)
 		assert.False(t, re.Reused, "the hub's connection is new; the identity provider's is not counted")
 	})
+}
+
+// Through a proxy, a request a wrapper makes first reaches the same address
+// as the hub request, so its events cannot be told apart. The error says the
+// connection was to a proxy instead of claiming the phase is the hub's.
+func TestRequestPhaseSaysWhenAProxyHidesWhoseEventsTheyAre(t *testing.T) {
+	hub := phaseHub(t)
+	idp := phaseHub(t)
+	proxy, err := url.Parse(idp.URL)
+	require.NoError(t, err)
+	saved := phaseProxy
+	phaseProxy = func(*http.Request) (*url.URL, error) { return proxy, nil }
+	t.Cleanup(func() { phaseProxy = saved })
+
+	err = phaseClient(hub, nestedTransport{newTransport(), idp.URL + "/api/v1/hold"}, 300*time.Millisecond).
+		Do(context.Background(), http.MethodGet, "/fast", nil, nil, nil)
+	re := requestError(t, err)
+	assert.True(t, re.Proxied)
+	assert.Contains(t, re.Describe(), "to a proxy, which an earlier request on the same context may also have used")
+
+	// Negative control: without a proxy the same request is not proxied.
+	phaseProxy = func(*http.Request) (*url.URL, error) { return nil, nil }
+	err = phaseClient(hub, nestedTransport{newTransport(), idp.URL + "/api/v1/hold"}, 300*time.Millisecond).
+		Do(context.Background(), http.MethodGet, "/fast", nil, nil, nil)
+	re = requestError(t, err)
+	assert.False(t, re.Proxied)
+	assert.Equal(t, PhaseNotStarted, re.Phase)
 }
 
 func TestRequestPhaseIsPerRequest(t *testing.T) {

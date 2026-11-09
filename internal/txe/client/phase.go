@@ -69,6 +69,11 @@ type RequestError struct {
 	// request had.
 	Connected bool
 	Reused    bool
+	// Proxied says the connection was to a proxy, not to the hub. A request
+	// that a transport wrapper makes first on the same context, such as a
+	// token renewal, reaches the same proxy, and its events cannot be told
+	// apart from the hub request's: the phase may be that request's.
+	Proxied bool
 	// Elapsed is how long the request ran, to the hundredth of a second.
 	Elapsed time.Duration
 	Err     error
@@ -91,6 +96,9 @@ func (e *RequestError) Describe() string {
 	default:
 		connection = ", on a new connection"
 	}
+	if e.Proxied {
+		connection += " to a proxy, which an earlier request on the same context may also have used"
+	}
 	return fmt.Sprintf("%s%s, after %s", e.Phase, connection, e.Elapsed)
 }
 
@@ -102,25 +110,38 @@ func (e *RequestError) Describe() string {
 // provider, and those fire the same hooks. So the trace counts only events
 // that follow its own request asking for a connection: one to the request's
 // own host and port, or to the proxy the environment names for it. Until
-// then the request has not started. The address is compared here and kept
-// nowhere else.
+// then the request has not started. The addresses are compared here and
+// kept nowhere else.
+//
+// Through a proxy the comparison cannot separate the requests: an identity
+// provider reached through the same proxy is asked for by the same address.
+// Such events are counted and the error says so (RequestError.Proxied)
+// rather than claim a phase it cannot attribute.
 type phaseTrace struct {
-	start   time.Time
-	targets map[string]bool
+	start time.Time
+	own   string
+	proxy string
 
 	mu        sync.Mutex
 	ours      bool
+	proxied   bool
 	phase     RequestPhase
 	connected bool
 	reused    bool
 }
 
+// phaseProxy is the proxy a request is sent through. Tests replace it:
+// net/http reads the environment once per process.
+var phaseProxy = http.ProxyFromEnvironment
+
 func newPhaseTrace(req *http.Request) *phaseTrace {
-	targets := map[string]bool{canonicalAddr(req.URL): true}
-	if proxy, err := http.ProxyFromEnvironment(req); err == nil && proxy != nil {
-		targets[canonicalAddr(proxy)] = true
+	t := &phaseTrace{start: time.Now(), own: canonicalAddr(req.URL)}
+	if proxy, err := phaseProxy(req); err == nil && proxy != nil {
+		if addr := canonicalAddr(proxy); addr != t.own {
+			t.proxy = addr
+		}
 	}
-	return &phaseTrace{start: time.Now(), targets: targets}
+	return t
 }
 
 // canonicalAddr is the "host:port" net/http asks a connection for.
@@ -145,7 +166,8 @@ func (t *phaseTrace) with(ctx context.Context) context.Context {
 		// each event sets the phase, and the last one is kept.
 		GetConn: func(hostPort string) {
 			t.mu.Lock()
-			t.ours = t.targets[hostPort]
+			t.proxied = t.proxy != "" && hostPort == t.proxy
+			t.ours = hostPort == t.own || t.proxied
 			t.mu.Unlock()
 			t.set(PhaseConnecting, nil)
 		},
@@ -183,7 +205,7 @@ func (t *phaseTrace) fail(err error, at RequestPhase) *RequestError {
 	defer t.mu.Unlock()
 	phase := max(at, t.phase)
 	return &RequestError{
-		Phase: phase, Connected: t.connected, Reused: t.reused,
+		Phase: phase, Connected: t.connected, Reused: t.reused, Proxied: t.ours && t.proxied,
 		Elapsed: time.Since(t.start).Round(10 * time.Millisecond), Err: err,
 	}
 }
