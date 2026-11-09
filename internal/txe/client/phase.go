@@ -5,6 +5,7 @@ package txeclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -116,7 +117,12 @@ func (e *RequestError) Describe() string {
 // Through a proxy the comparison cannot separate the requests: an identity
 // provider reached through the same proxy is asked for by the same address.
 // Such events are counted and the error says so (RequestError.Proxied)
-// rather than claim a phase it cannot attribute.
+// rather than claim a phase it cannot attribute. Nor can it separate a
+// wrapper's request to the hub's own host and port, such as an identity
+// provider served at the same origin.
+//
+// A redirect that Do follows moves the trace to the redirect's destination
+// (see redirects).
 type phaseTrace struct {
 	start time.Time
 	own   string
@@ -135,13 +141,48 @@ type phaseTrace struct {
 var phaseProxy = http.ProxyFromEnvironment
 
 func newPhaseTrace(req *http.Request) *phaseTrace {
-	t := &phaseTrace{start: time.Now(), own: canonicalAddr(req.URL)}
-	if proxy, err := phaseProxy(req); err == nil && proxy != nil {
-		if addr := canonicalAddr(proxy); addr != t.own {
-			t.proxy = addr
+	t := &phaseTrace{start: time.Now()}
+	t.retarget(req)
+	return t
+}
+
+// retarget makes req, the request itself or a redirect it follows, the one
+// whose events count. A redirect starts again: nothing of the hop before it
+// is its phase.
+func (t *phaseTrace) retarget(req *http.Request) {
+	own, proxy := canonicalAddr(req.URL), ""
+	if p, err := phaseProxy(req); err == nil && p != nil {
+		if addr := canonicalAddr(p); addr != own {
+			proxy = addr
 		}
 	}
-	return t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.own, t.proxy = own, proxy
+	t.ours, t.proxied = false, false
+	t.phase, t.connected, t.reused = PhaseNotStarted, false, false
+}
+
+// redirects returns client with a redirect policy that retargets this trace
+// at each redirect it follows, and is otherwise client's own: its
+// CheckRedirect, or net/http's default of at most 10 redirects.
+func (t *phaseTrace) redirects(client *http.Client) *http.Client {
+	policy := client.CheckRedirect
+	out := *client
+	out.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		var err error
+		switch {
+		case policy != nil:
+			err = policy(req, via)
+		case len(via) >= 10:
+			err = errors.New("stopped after 10 redirects")
+		}
+		if err == nil {
+			t.retarget(req)
+		}
+		return err
+	}
+	return &out
 }
 
 // canonicalAddr is the "host:port" net/http asks a connection for.

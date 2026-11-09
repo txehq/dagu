@@ -125,7 +125,7 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := trace.redirects(c.HTTP).Do(req)
 	if err != nil {
 		return fmt.Errorf("%s %s: %w", method, path, trace.fail(err, PhaseNotStarted))
 	}

@@ -243,6 +243,31 @@ func TestRequestPhaseSaysWhenAProxyHidesWhoseEventsTheyAre(t *testing.T) {
 	assert.Equal(t, PhaseNotStarted, re.Phase)
 }
 
+// A redirect Do follows is the request from then on: a stall at the
+// redirect's destination, another host, is that hop's phase, not the first
+// hop's answered one.
+func TestRequestPhaseFollowsARedirect(t *testing.T) {
+	elsewhere := phaseHub(t)
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/api/v1/hold", http.StatusFound)
+	}))
+	t.Cleanup(hub.Close)
+
+	err := phaseClient(hub, newTransport(), 300*time.Millisecond).Do(context.Background(), http.MethodGet, "/fast", nil, nil, nil)
+	re := requestError(t, err)
+	assert.Equal(t, PhaseRequestWritten, re.Phase, "%v", err)
+	assert.True(t, re.Connected)
+	assert.False(t, re.Reused, "the redirect's destination is a new connection")
+
+	// The client's own redirect policy is still the one applied.
+	client := phaseClient(hub, newTransport(), time.Second)
+	client.HTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	err = client.Do(context.Background(), http.MethodGet, "/fast", nil, nil, nil)
+	var refusal *Error
+	require.ErrorAs(t, err, &refusal, "the 302 itself is the answer")
+	assert.Equal(t, http.StatusFound, refusal.Status)
+}
+
 func TestRequestPhaseIsPerRequest(t *testing.T) {
 	hub := phaseHub(t)
 	client := phaseClient(hub, newTransport(), 500*time.Millisecond)
