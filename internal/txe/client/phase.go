@@ -237,6 +237,12 @@ func (t *phaseTrace) with(ctx context.Context) context.Context {
 			t.mu.Lock()
 			t.proxied = t.proxy != "" && hostPort == t.proxy
 			t.ours = hostPort == t.own || t.proxied
+			if !t.ours {
+				// Another request on the same context, such as a renewal
+				// after the hub answered 401: whatever this request's last
+				// attempt reached is over, and its next has not started.
+				t.phase, t.connected, t.reused = PhaseNotStarted, false, false
+			}
 			t.mu.Unlock()
 			t.set(PhaseConnecting, nil)
 		},

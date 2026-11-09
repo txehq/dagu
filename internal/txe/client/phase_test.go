@@ -357,6 +357,36 @@ func TestRequestPhaseMatchesAUnicodeHost(t *testing.T) {
 	assert.Equal(t, PhaseRequestWritten, requestError(t, err).Phase, "%v", err)
 }
 
+// retryTransport stands for cliauth.BearerTransport after a 401: it sends
+// the request, reads the hub's whole answer, renews at another server on the
+// same context, and only then would send the request again.
+type retryTransport struct {
+	base http.RoundTripper
+	idp  string
+}
+
+func (r retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := r.base.RoundTrip(req.Clone(req.Context()))
+	if err != nil {
+		return nil, err
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return nestedTransport(r).RoundTrip(req)
+}
+
+// A renewal after an answered attempt is not that attempt: the request reads
+// as not started, not as stopped before the headers it had already had.
+func TestRequestPhaseResetsWhenAnotherRequestFollowsAnAnsweredAttempt(t *testing.T) {
+	hub := phaseHub(t)
+	idp := phaseHub(t)
+	err := phaseClient(hub, retryTransport{newTransport(), idp.URL + "/api/v1/hold"}, 300*time.Millisecond).
+		Do(context.Background(), http.MethodGet, "/fast", nil, nil, nil)
+	re := requestError(t, err)
+	assert.Equal(t, PhaseNotStarted, re.Phase, "%v", err)
+	assert.False(t, re.Connected)
+}
+
 func TestRequestPhaseIsPerRequest(t *testing.T) {
 	hub := phaseHub(t)
 	client := phaseClient(hub, newTransport(), 500*time.Millisecond)
