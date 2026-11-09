@@ -13,6 +13,9 @@ import (
 	"net/url"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 )
 
 // RequestPhase is how far a request to the hub got before it failed. It is
@@ -185,18 +188,43 @@ func (t *phaseTrace) redirects(client *http.Client) *http.Client {
 	return &out
 }
 
-// canonicalAddr is the "host:port" net/http asks a connection for.
+// canonicalAddr is the "host:port" net/http asks a connection for: the host
+// in IDNA ASCII, and the scheme's default port when there is none. It does
+// what net/http's own canonicalAddr does.
 func canonicalAddr(u *url.URL) string {
-	port := u.Port()
-	if port == "" {
-		switch u.Scheme {
-		case "https":
-			port = "443"
-		default:
-			port = "80"
+	host := u.Hostname()
+	if !isASCII(host) {
+		if v, err := idna.Lookup.ToASCII(host); err == nil {
+			host = v
 		}
 	}
-	return net.JoinHostPort(u.Hostname(), port)
+	port := u.Port()
+	if port == "" {
+		port = schemePort(u.Scheme)
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func schemePort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	case "socks5", "socks5h":
+		return "1080"
+	default:
+		return ""
+	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
 }
 
 // with returns ctx carrying this trace's hooks. A trace already in ctx keeps

@@ -323,6 +323,40 @@ func TestRequestPhaseKeepsAnEarlyFirstByte(t *testing.T) {
 	assert.Equal(t, PhaseFirstByte, requestError(t, err).Phase, "%v", err)
 }
 
+// The address a request's events are matched by is the one net/http asks a
+// connection for.
+func TestRequestPhaseCanonicalAddrIsNetHTTPs(t *testing.T) {
+	for raw, want := range map[string]string{
+		"http://hub.invalid/x":        "hub.invalid:80",
+		"https://hub.invalid/x":       "hub.invalid:443",
+		"http://hub.invalid:18080/x":  "hub.invalid:18080",
+		"http://[::1]:18080/x":        "[::1]:18080",
+		"http://bücher.invalid/x":     "xn--bcher-kva.invalid:80",
+		"socks5://proxy.invalid":      "proxy.invalid:1080",
+		"socks5h://proxy.invalid":     "proxy.invalid:1080",
+		"socks5://proxy.invalid:9050": "proxy.invalid:9050",
+	} {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.Equal(t, want, canonicalAddr(u), raw)
+	}
+}
+
+// A Unicode hub name is asked for in IDNA ASCII, and its events still count.
+func TestRequestPhaseMatchesAUnicodeHost(t *testing.T) {
+	hub := phaseHub(t)
+	addr := strings.TrimPrefix(hub.URL, "http://")
+	tr := newTransport()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	_, port, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	client := New("http://bücher.invalid:"+port+"/api/v1", "", &http.Client{Transport: tr, Timeout: 300 * time.Millisecond})
+	err = client.Do(context.Background(), http.MethodGet, "/hold", nil, nil, nil)
+	assert.Equal(t, PhaseRequestWritten, requestError(t, err).Phase, "%v", err)
+}
+
 func TestRequestPhaseIsPerRequest(t *testing.T) {
 	hub := phaseHub(t)
 	client := phaseClient(hub, newTransport(), 500*time.Millisecond)
