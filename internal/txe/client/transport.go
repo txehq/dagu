@@ -88,6 +88,15 @@ func IsCode(err error, code string) bool {
 
 // Do sends one request. in, when not nil, is the JSON body; out, when not
 // nil, receives the JSON response. A response outside 2xx is returned as *Error.
+//
+// A request that gets no complete response returns "<method> <path>: " and a
+// *RequestError: the transport's own error, unchanged, then the phase the
+// request had reached, whether its connection was new or reused, and how long
+// it ran, such as
+//
+//	GET /txe/machines/mch_1: Get "http://127.0.0.1:18080/api/v1/txe/machines/mch_1": context deadline exceeded (Client.Timeout exceeded while awaiting headers) (the request stopped after the request was written, before any response, on a new connection, after 30s)
+//
+// The text a caller saw before is still a prefix of the error.
 func (c *Client) Do(ctx context.Context, method, path string, query url.Values, in, out any) error {
 	target := c.BaseURL + path
 	if encoded := query.Encode(); encoded != "" {
@@ -106,6 +115,8 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 	if err != nil {
 		return err
 	}
+	trace := newPhaseTrace(req)
+	req = req.WithContext(trace.with(req.Context()))
 	req.Header.Set("Accept", "application/json")
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -116,13 +127,13 @@ func (c *Client) Do(ctx context.Context, method, path string, query url.Values, 
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("%s %s: %w", method, path, err)
+		return fmt.Errorf("%s %s: %w", method, path, trace.fail(err, PhaseNotStarted))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("%s %s: read response: %w", method, path, err)
+		return fmt.Errorf("%s %s: read response: %w", method, path, trace.fail(err, PhaseBody))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return decodeError(resp.StatusCode, resp.Status, data)
