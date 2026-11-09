@@ -16,19 +16,27 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/net/idna"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf"
 )
 
 // RequestPhase is how far a request to the hub got before it failed. It is
-// read from the request's own connection events, so it says on which side a
-// request that timed out was waiting: a request that never asked for a
-// connection failed before the transport (a credential renewal, for one), one
-// that was written and never answered waited on the network path or the hub.
+// read from the request's own connection events, and from what a wrapper of
+// the transport announces, so it says on which side a request that timed out
+// was waiting: a request that never asked for a connection failed before the
+// transport, one that stopped while a request on its behalf ran waited on
+// the identity provider, one that was written and never answered waited on
+// the network path or the hub.
 type RequestPhase int
 
 const (
 	// PhaseNotStarted: no connection was asked for. Whatever wraps the
-	// transport, such as a token renewal, failed or was still running.
+	// transport failed or was still running, and did not say so.
 	PhaseNotStarted RequestPhase = iota
+	// PhaseOnBehalf: a request made on this request's behalf, such as a
+	// token renewal at the identity provider, had started and this request
+	// had not asked for a connection since (onbehalf).
+	PhaseOnBehalf
 	// PhaseConnecting: a connection was asked for and none was had.
 	PhaseConnecting
 	// PhaseConnected: a connection was had and the request was not written.
@@ -47,6 +55,8 @@ func (p RequestPhase) String() string {
 	switch p {
 	case PhaseNotStarted:
 		return "before a connection was asked for"
+	case PhaseOnBehalf:
+		return "while a request made on its behalf, such as a token renewal, ran"
 	case PhaseConnecting:
 		return "while connecting"
 	case PhaseConnected:
@@ -74,9 +84,9 @@ type RequestError struct {
 	Connected bool
 	Reused    bool
 	// Proxied says the connection was to a proxy, not to the hub. A request
-	// that a transport wrapper makes first on the same context, such as a
-	// token renewal, reaches the same proxy, and its events cannot be told
-	// apart from the hub request's: the phase may be that request's.
+	// that a transport wrapper makes on the same context without announcing
+	// itself (onbehalf) reaches the same proxy, and its events cannot be
+	// told apart from the hub request's: the phase may be that request's.
 	Proxied bool
 	// Elapsed is how long the request ran, to the hundredth of a second.
 	Elapsed time.Duration
@@ -106,23 +116,28 @@ func (e *RequestError) Describe() string {
 	return fmt.Sprintf("%s%s, after %s", e.Phase, connection, e.Elapsed)
 }
 
-// phaseTrace records one request's phase from its connection events. The
-// events may come from the transport's own goroutines.
+// phaseTrace records one request's phase from its connection events, and
+// from what a wrapper of the transport announces. The events may come from
+// the transport's own goroutines.
 //
 // A request's context also reaches any request a wrapper of the transport
-// makes on its behalf first, such as a token renewal at the identity
-// provider, and those fire the same hooks. So the trace counts only events
-// that follow its own request asking for a connection: one to the request's
-// own host and port, or to the proxy the environment names for it. Until
-// then the request has not started. The addresses are compared here and
-// kept nowhere else.
+// makes on its behalf, such as a token renewal at the identity provider,
+// before the request is sent or after the hub refused its token. Every such
+// request this repository makes (transportauth, cliauth) goes through
+// onbehalf.Context: it fires none of this trace's hooks, and it announces
+// itself to the trace (RequestOnBehalf), which then reads as PhaseOnBehalf
+// until the request's own next connection is asked for. A wrapper that
+// does not announce itself fires the hooks, and the trace falls back to
+// counting only events that follow its own request asking for a connection:
+// one to the request's own host and port, or to the proxy the environment
+// names for it. The addresses are compared here and kept nowhere else.
 //
-// Through a proxy the comparison cannot separate the requests: an identity
-// provider reached through the same proxy is asked for by the same address.
-// Such events are counted and the error says so (RequestError.Proxied)
-// rather than claim a phase it cannot attribute. Nor can it separate a
-// wrapper's request to the hub's own host and port, such as an identity
-// provider served at the same origin.
+// For such an unannounced wrapper the fallback cannot separate the requests
+// through a proxy: an identity provider reached through the same proxy is
+// asked for by the same address. Such events are counted and the error says
+// so (RequestError.Proxied) rather than claim a phase it cannot attribute.
+// Nor can it separate an unannounced wrapper's request to the hub's own
+// host and port.
 //
 // A redirect that Do follows moves the trace to the redirect's destination
 // (see redirects).
@@ -227,9 +242,11 @@ func isASCII(s string) bool {
 	return true
 }
 
-// with returns ctx carrying this trace's hooks. A trace already in ctx keeps
-// its hooks: httptrace calls both.
+// with returns ctx carrying this trace's hooks and this trace as the
+// observer of requests made on the request's behalf. A trace already in ctx
+// keeps its hooks: httptrace calls both.
 func (t *phaseTrace) with(ctx context.Context) context.Context {
+	ctx = onbehalf.WithObserver(ctx, t)
 	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
 		// A request may ask for a connection again after one failed, so
 		// each event sets the phase, and the last one is kept.
@@ -254,6 +271,18 @@ func (t *phaseTrace) with(ctx context.Context) context.Context {
 		},
 		GotFirstResponseByte: func() { t.set(PhaseFirstByte, nil) },
 	})
+}
+
+// RequestOnBehalf implements onbehalf.Observer: a request on this request's
+// behalf has started. Whatever this request's last attempt reached is over,
+// and its next attempt has not started; the request reads as PhaseOnBehalf
+// until its own next connection is asked for. The request on its behalf
+// fires none of this trace's hooks.
+func (t *phaseTrace) RequestOnBehalf() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.ours, t.proxied = false, false
+	t.phase, t.connected, t.reused = PhaseOnBehalf, false, false
 }
 
 // set records an event of this trace's own request. Events of another

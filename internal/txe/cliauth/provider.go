@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf"
 )
 
 // Provider is the public client the CLI signs in with. It has no secret.
@@ -187,6 +189,9 @@ func discover(ctx context.Context, p Provider, client *http.Client) (*endpoints,
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
+	// go-oidc keeps this context for the signing-key reads it makes later,
+	// so a renewal's whole path to the provider is made on ctx's behalf.
+	ctx = onbehalf.Context(ctx)
 	provider, err := oidc.NewProvider(oidc.ClientContext(ctx, client), p.Issuer)
 	if err != nil {
 		// A provider that answers with another issuer is answering, and

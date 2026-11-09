@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/coreos/go-oidc"
+
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf"
 )
 
 // Tokens is what one sign-in or renewal returned.
@@ -89,7 +91,13 @@ type tokenResponse struct {
 // postToken sends one form request to the token endpoint and classifies the
 // answer. A 2xx is decoded; a 400 or 401 with a JSON "error" is a
 // *RefusedError; anything else is an *UnverifiableError.
+//
+// The request is made on behalf of whatever asked for the token (a hub
+// request through BearerTransport, or a command), so it carries ctx's
+// deadline, cancellation and values and none of its httptrace hooks
+// (TXE-6352). The same holds for every request to the provider here.
 func postToken(ctx context.Context, client *http.Client, tokenURL, op string, form url.Values) (*tokenResponse, error) {
+	ctx = onbehalf.Context(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, err
@@ -346,6 +354,7 @@ type idClaims struct {
 // its exact issuer, its audience, its expiry, its authorized party when it
 // names one, and, when nonce is not empty, its nonce.
 func verifyIDToken(ctx context.Context, e *endpoints, p Provider, client *http.Client, raw, nonce string) (*idClaims, error) {
+	ctx = onbehalf.Context(ctx)
 	verifier := e.provider.Verifier(&oidc.Config{ClientID: p.ClientID})
 	token, err := verifier.Verify(oidc.ClientContext(ctx, client), raw)
 	if err != nil {
@@ -383,6 +392,7 @@ func Revoke(ctx context.Context, p Provider, refreshToken string, client *http.C
 	if refreshToken == "" {
 		return false, nil
 	}
+	ctx = onbehalf.Context(ctx)
 	client = providerClient(client)
 	e, err := discover(ctx, p, client)
 	if err != nil {

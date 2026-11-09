@@ -157,6 +157,10 @@ func (e *HubProviderUnavailableError) Error() string {
 // first attempt did nothing. A request whose body cannot be read again is
 // not resent. A second refusal is ErrHubRefusedSignIn, and nothing renews
 // again. A 503 provider_unavailable is a *HubProviderUnavailableError.
+//
+// A renewal's requests to the provider are made on the hub request's behalf:
+// they end with its context and keep its values, and httptrace hooks in it
+// fire for the hub request's own attempts only (TXE-6352).
 type BearerTransport struct {
 	// Base sends the requests. Nil means http.DefaultTransport.
 	Base http.RoundTripper
