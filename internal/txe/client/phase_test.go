@@ -4,6 +4,7 @@
 package txeclient
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -266,6 +267,60 @@ func TestRequestPhaseFollowsARedirect(t *testing.T) {
 	var refusal *Error
 	require.ErrorAs(t, err, &refusal, "the 302 itself is the answer")
 	assert.Equal(t, http.StatusFound, refusal.Status)
+}
+
+// net/http reads while it writes: a first response byte reported before the
+// write completes is not undone by the write.
+func TestRequestPhaseOnlyMovesForwardWithinAnAttempt(t *testing.T) {
+	tr := newPhaseTrace(httptest.NewRequest(http.MethodPost, "http://hub.invalid/api/v1/x", nil))
+	hooks := httptrace.ContextClientTrace(tr.with(context.Background()))
+	hooks.GetConn("hub.invalid:80")
+	hooks.GotConn(httptrace.GotConnInfo{})
+	hooks.GotFirstResponseByte()
+	hooks.WroteRequest(httptrace.WroteRequestInfo{})
+	assert.Equal(t, PhaseFirstByte, tr.fail(errors.New("x"), PhaseNotStarted).Phase)
+
+	// A new attempt starts again.
+	hooks.GetConn("hub.invalid:80")
+	assert.Equal(t, PhaseConnecting, tr.fail(errors.New("x"), PhaseNotStarted).Phase)
+	hooks.GotConn(httptrace.GotConnInfo{Reused: true})
+	hooks.WroteRequest(httptrace.WroteRequestInfo{})
+	re := tr.fail(errors.New("x"), PhaseNotStarted)
+	assert.Equal(t, PhaseRequestWritten, re.Phase)
+	assert.True(t, re.Reused)
+}
+
+// The reported race end to end: a server that sends its first byte, drains
+// the body and then holds the rest of its headers.
+func TestRequestPhaseKeepsAnEarlyFirstByte(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		// The request's headers first, so the byte answers a request; the
+		// body, far larger than the socket buffers, is still being written.
+		var seen []byte
+		buf := make([]byte, 1)
+		for !bytes.HasSuffix(seen, []byte("\r\n\r\n")) {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+			seen = append(seen, buf[0])
+		}
+		_, _ = conn.Write([]byte("H"))
+		go func() { _, _ = io.Copy(io.Discard, conn) }()
+		<-done
+	}()
+	client := New("http://"+ln.Addr().String()+"/api/v1", "", &http.Client{Transport: newTransport(), Timeout: 2 * time.Second})
+	err = client.Do(context.Background(), http.MethodPost, "/x", nil, map[string]string{"body": strings.Repeat("x", 8<<20)}, nil)
+	assert.Equal(t, PhaseFirstByte, requestError(t, err).Phase, "%v", err)
 }
 
 func TestRequestPhaseIsPerRequest(t *testing.T) {

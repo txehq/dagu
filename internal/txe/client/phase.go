@@ -230,6 +230,13 @@ func (t *phaseTrace) set(phase RequestPhase, reused *bool) {
 	if !t.ours {
 		return
 	}
+	// Within one connection attempt the phase only moves forward: net/http
+	// writes and reads at once, so a server that answers before a body is
+	// fully written has its first byte reported before the write. A new
+	// attempt (GetConn) starts again.
+	if phase != PhaseConnecting && phase < t.phase {
+		return
+	}
 	t.phase = phase
 	if reused != nil {
 		t.connected, t.reused = true, *reused
