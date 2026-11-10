@@ -8,11 +8,15 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/goccy/go-yaml"
 
 	gen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/crypto"
@@ -252,7 +256,14 @@ func TestCheckDAGReuseRuntimeRunsNothingOfADraft(t *testing.T) {
 	rig := newReuseRuntimeRig(t)
 	ctx := context.Background()
 	marker := filepath.Join(t.TempDir(), "evaluated")
-	draft := "params:\n  - name: TAG\n    eval: \"`touch " + marker + "`\"\nsteps:\n  - name: build\n    run: echo $TAG\n"
+	// Serialized, not interpolated: a Windows path holds backslashes that a
+	// quoted YAML scalar would read as escapes.
+	data, err := yaml.Marshal(map[string]any{
+		"params": []map[string]string{{"name": "TAG", "eval": "`" + writeMarkerCommand(marker) + "`"}},
+		"steps":  []map[string]string{{"name": "build", "run": "echo $TAG"}},
+	})
+	require.NoError(t, err)
+	draft := string(data)
 	name := rig.dag.Name
 	resp, err := rig.api.CheckDAGReuseRuntime(ctx, gen.CheckDAGReuseRuntimeRequestObject{
 		FileName: rig.dag.Name,
@@ -262,4 +273,12 @@ func TestCheckDAGReuseRuntimeRunsNothingOfADraft(t *testing.T) {
 	assert.Equal(t, gen.ReuseRuntimeCheckRunsRuntimeUnknown, resp.(gen.CheckDAGReuseRuntime200JSONResponse).Runs[0].Runtime)
 	_, statErr := os.Stat(marker)
 	assert.ErrorIs(t, statErr, os.ErrNotExist, "the comparison ran a command of the draft")
+}
+
+// writeMarkerCommand is a shell command that creates the file at path.
+func writeMarkerCommand(path string) string {
+	if runtime.GOOS == "windows" {
+		return "Set-Content -Path '" + strings.ReplaceAll(path, "'", "''") + "' -Value x"
+	}
+	return "touch '" + strings.ReplaceAll(path, "'", `'\''`) + "'"
 }
