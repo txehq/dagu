@@ -3,6 +3,11 @@
 FROM --platform=$BUILDPLATFORM node:26-alpine AS ui-builder
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+# The runner's npm cache when the build passes one (.github/image-build/, TXE-6359); unset,
+# the install uses registry.npmjs.org. An ARG ends with its stage. pnpm before 11 reads the
+# first name, pnpm 11 only the second.
+ARG npm_config_registry
+ARG pnpm_config_registry
 RUN rm -f /usr/local/bin/yarn /usr/local/bin/yarnpkg && \
     npm install -g corepack@latest && corepack enable
 
