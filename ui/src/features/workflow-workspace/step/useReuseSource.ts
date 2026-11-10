@@ -41,6 +41,7 @@ import {
 } from '@/features/visual-editor/run/reuseRuntime';
 import type { StepRunRef } from '@/features/visual-editor/run/inputProvenance';
 import { useClient } from '@/hooks/api';
+import { useClock } from '@/hooks/useClock';
 import { useWorkspaceData } from '../data/context';
 import { useRunHistory } from '../data/useRunHistory';
 
@@ -188,14 +189,9 @@ export function useReuseSource(p: {
   // answers are made again, while the current choice stays shown: a profile
   // that changed since is seen within one period. The server checks again
   // when the step run starts in any case.
-  const [runtimeEpoch, setRuntimeEpoch] = useState(0);
-  useEffect(() => {
-    const timer = setInterval(
-      () => setRuntimeEpoch((epoch) => epoch + 1),
-      RUNTIME_ANSWER_TTL_MS
-    );
-    return () => clearInterval(timer);
-  }, []);
+  const runtimeEpoch = useClock(RUNTIME_ANSWER_TTL_MS, (now) =>
+    Math.floor(now / RUNTIME_ANSWER_TTL_MS)
+  );
   const runtimeAsked = useRef({
     epoch: 0,
     answers: new Map<string, Promise<RuntimeMatch>>(),
