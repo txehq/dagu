@@ -69,6 +69,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # BuildKit runs a Dockerfile's RUN steps without the job's environment, so the build
+      # passes the runner's npm cache, when it has one that answers (TXE-6359).
+      - name: Route the image build's Node fetches to the runner's npm cache
+        id: npm-routes
+        # A ref from before this helper has neither it nor the Dockerfile ARGs, so there is nothing to route.
+        if: ${{ hashFiles('.github/image-build/npm-registry-build-args.sh') != '' }}
+        run: bash .github/image-build/npm-registry-build-args.sh
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -84,6 +92,7 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
           build-args: |
             LDFLAGS=-X 'main.version=${{ env.VERSION }}'
+            ${{ steps.npm-routes.outputs.build-args }}
 
       - name: Verify the pushed image reports its version
         env:

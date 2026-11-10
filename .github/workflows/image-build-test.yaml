@@ -1,0 +1,36 @@
+name: image-build-test
+
+# Tests for .github/image-build (TXE-6359): the npm registry build arguments, and that every
+# Node Dockerfile and image build uses them. The workflows are in the path list because a new
+# image build there is what the test catches.
+
+on:
+  pull_request:
+    paths:
+      - '.github/image-build/**'
+      - '.github/workflows/*.yaml'
+      - '.github/workflows/*.yml'
+      - 'Dockerfile*'
+  push:
+    branches: [main]
+    paths:
+      - '.github/image-build/**'
+      - '.github/workflows/*.yaml'
+      - '.github/workflows/*.yml'
+      - 'Dockerfile*'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Shellcheck
+        run: shellcheck .github/image-build/*.sh
+      - name: The npm registry build arguments
+        run: bash .github/image-build/npm-registry-build-args_test.sh
