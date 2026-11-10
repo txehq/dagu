@@ -33,6 +33,13 @@ export interface StepRunOptions {
   reused?: readonly InputProvenance[];
   /** The run leaves no trace. The server allows it only with `steps`. */
   ephemeral?: boolean;
+  /**
+   * The reused steps whose run the editor chose on its own (the cache, or
+   * the automatic source), not the user (`automaticReuse`). The server
+   * refuses the run unless each comes from a run of the runtime profile
+   * state the new run takes, and the run checks that state before any step.
+   */
+  automaticReuse?: readonly string[];
 }
 
 export function buildStartBody(step?: StepRunOptions) {
@@ -68,6 +75,9 @@ function stepFields(step?: StepRunOptions) {
       ? { outputsFromRuns: { ...step.outputsFromRuns } }
       : {}),
     ...(step.ephemeral ? { ephemeral: true } : {}),
+    ...(step.automaticReuse && step.automaticReuse.length > 0
+      ? { automaticReuse: [...step.automaticReuse] }
+      : {}),
   };
 }
 

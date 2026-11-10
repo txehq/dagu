@@ -193,16 +193,13 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 		}
 	}
 
-	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.OutputsFromRuns, request.Body.Outputs, request.Body.OutputsSources, request.Body.Ephemeral)
+	selection, err := selectedStepsFromBody(request.Body.Steps, request.Body.OutputsFromRunId, request.Body.OutputsFromRuns, request.Body.Outputs, request.Body.OutputsSources, request.Body.Ephemeral, request.Body.AutomaticReuse)
 	if err != nil {
 		return nil, err
 	}
 
 	labels, err := extractLabelsParam(request.Body.Labels, request.Body.Tags)
 	if err != nil {
-		return nil, err
-	}
-	if err := a.requireDAGWriteForWorkspace(ctx, submittedSpecRuntimeWorkspaceName(request.Body.Spec, labels)); err != nil {
 		return nil, err
 	}
 
@@ -229,12 +226,8 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 		singleton = *request.Body.Singleton
 	}
 
-	dag, cleanup, err := a.loadInlineDAG(ctx, request.Body.Spec, request.Body.Name, dagRunId)
+	dag, cleanup, err := a.loadDraftRunDAG(ctx, request.Body.Spec, request.Body.Name, labels, dagRunId)
 	if err != nil {
-		return nil, err
-	}
-	if err := txeRefuseInlineJobDAG(dag.Name); err != nil {
-		cleanup()
 		return nil, err
 	}
 	cleanupOnReturn := true
@@ -243,13 +236,6 @@ func (a *API) ExecuteDAGRunFromSpec(ctx context.Context, request api.ExecuteDAGR
 			cleanup()
 		}
 	}()
-
-	// An inline spec runs a definition that is not stored: it is decided
-	// as a write to the DAG it runs as.
-	if err := a.txeNativeWriteClosed(ctx, func() error { return a.requireDAGWriteForWorkspace(ctx, runtimeWorkspaceName(dag, labels)) },
-		[]byte(request.Body.Spec), dag.Name); err != nil {
-		return nil, err
-	}
 	workerSelector, err := a.applyWorkerSelectorOverride(ctx, dag, request.Body.WorkerSelector)
 	if err != nil {
 		return nil, err
@@ -670,8 +656,7 @@ func (a *API) restoreDAGRunSnapshot(ctx context.Context, dag *ir.DAG, status *ir
 	runtimeParams := append([]string(nil), status.ParamsList...)
 	dag.Params = runtimeParams
 	resolvedEnv, err := runtimeenv.Resolve(ctx, dag)
-	dag.Env = resolvedEnv.Env
-	dag.RuntimeResolved = true
+	runtimeenv.Apply(dag, resolvedEnv)
 	for _, warning := range resolvedEnv.Warnings {
 		logger.Warn(ctx, warning)
 	}
@@ -4609,14 +4594,13 @@ func (a *API) prepareRetryDAGForSubprocess(ctx context.Context, dag *ir.DAG, sta
 	}
 
 	prepared := dag.Clone()
-	prepared.Env = result.Env
+	runtimeenv.Apply(prepared, result)
 	if status.ParallelItem != "" {
 		prepared.Env = append(prepared.Env,
 			ir.ParallelItemVariable+"="+status.ParallelItem,
 			runenv.EnvKeyParallelItem+"="+status.ParallelItem,
 		)
 	}
-	prepared.RuntimeResolved = true
 	return prepared, nil
 }
 

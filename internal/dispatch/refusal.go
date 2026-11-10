@@ -29,6 +29,10 @@ const (
 	// AcceptFailedPrerequisitesLabel: the worker runs a step retry's
 	// AcceptFailedPrerequisites option (TXE-5067).
 	AcceptFailedPrerequisitesLabel = "dagu.capability.accept-failed-prerequisites"
+	// RuntimeIdentityCheckLabel: the worker stops a seeded run before any
+	// step when its runtime identity is not the one its reused outputs were
+	// checked against (TXE-6145).
+	RuntimeIdentityCheckLabel = "dagu.capability.runtime-identity-check"
 	// CapabilityLabelValue is the value of a capability label.
 	CapabilityLabelValue = "true"
 )

@@ -186,6 +186,22 @@ func WithRuntimeProfile(name, resolvedAt string, entries []RuntimeProfileEntry) 
 	}
 }
 
+// WithRuntimeIdentity records the runtime identity of the run (see
+// DAGRunStatus.RuntimeIdentity).
+func WithRuntimeIdentity(identity string) StatusOption {
+	return func(status *DAGRunStatus) {
+		status.RuntimeIdentity = identity
+	}
+}
+
+// WithExpectedRuntimeIdentity records the identity a run's automatically
+// reused outputs were admitted for (see DAGRunStatus.ExpectedRuntimeIdentity).
+func WithExpectedRuntimeIdentity(identity string) StatusOption {
+	return func(status *DAGRunStatus) {
+		status.ExpectedRuntimeIdentity = identity
+	}
+}
+
 // WithDAGDefinitionID records the stable identity of the persisted DAG definition.
 func WithDAGDefinitionID(id string) StatusOption {
 	return func(status *DAGRunStatus) {

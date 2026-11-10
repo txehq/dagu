@@ -20,6 +20,9 @@ const PresolvedEnvFileKey = "_DAGU_PRESOLVED_BUILD_ENV_FILE"
 type Snapshot struct {
 	Env             map[string]string `json:"env,omitempty"`
 	RuntimeResolved bool              `json:"runtimeResolved,omitempty"`
+	// DotenvLoaded reports that a dotenv file was read into Env (see
+	// ir.DAG.DotenvLoaded).
+	DotenvLoaded bool `json:"dotenvLoaded,omitempty"`
 }
 
 // NewSnapshot creates a snapshot from KEY=value entries.

@@ -177,6 +177,12 @@ export interface StepRunPick {
   outputsFromRuns: Record<string, string> | null;
   /** Where the outputs of the previous steps that the request skips come from. */
   reused: InputProvenance[];
+  /**
+   * The reused steps whose run the editor chose on its own (the cache, or the
+   * automatic source), not the user (`automaticReuse`): the server reuses
+   * them only from a run of the step run's runtime profile state.
+   */
+  automaticReuse: string[];
 }
 
 /**
@@ -221,6 +227,7 @@ export function StepRunReuseDialog({
     reads,
     followedUpstreamRunId,
     ...(liveText !== undefined ? { liveText } : {}),
+    unsaved,
   });
   const { source, waitingFor, stale, missing, loading } = reuse;
   const { cached } = reuse;
@@ -254,22 +261,28 @@ export function StepRunReuseDialog({
     );
     const reuseFrom = choice === 'run' ? null : (source?.dagRunId ?? null);
     const sending = choice !== 'run' && Object.keys(fromRuns).length > 0;
+    const reused =
+      choice === 'run'
+        ? []
+        : reusedInputs({
+            previous,
+            steps,
+            fromRuns: sending ? pickRefs(reuse.stepRuns, fromRuns) : {},
+            source: reuseFrom !== null ? source : null,
+            stale,
+            missing,
+          });
     onPick({
       choice,
       steps,
       reuseFrom,
       outputsFromRuns: sending ? fromRuns : null,
-      reused:
-        choice === 'run'
-          ? []
-          : reusedInputs({
-              previous,
-              steps,
-              fromRuns: sending ? pickRefs(reuse.stepRuns, fromRuns) : {},
-              source: reuseFrom !== null ? source : null,
-              stale,
-              missing,
-            }),
+      reused,
+      // The cache always is the editor's choice; the source run is, unless
+      // the user chose it.
+      automaticReuse: reused
+        .filter((r) => r.step in fromRuns || reuse.automaticSource)
+        .map((r) => r.step),
     });
   };
 
@@ -349,6 +362,13 @@ export function StepRunReuseDialog({
         </span>
       );
     }
+    if (reuse.otherRuntime.includes(name)) {
+      return (
+        <span data-testid="run-step-other-runtime" className="text-warning">
+          {ts('cached under another runtime profile')}
+        </span>
+      );
+    }
     if (sourceId === null) return null;
     if (missing.includes(name)) {
       return (
@@ -390,6 +410,18 @@ export function StepRunReuseDialog({
           readsOutputs={reads.length > 0}
           onSelectRun={onSelectRun}
         />
+        {reuse.runtimeDiffers && sourceId !== null ? (
+          <p
+            data-testid="run-source-other-runtime"
+            className="text-warning"
+            title={sourceId}
+          >
+            {ts(
+              'Run {id} ran under another runtime profile, or one that is not known. The step runs with the profile it takes now.',
+              { id: shortRunId(sourceId) }
+            )}
+          </p>
+        ) : null}
         {reuse.paramsDiffer && sourceId !== null ? (
           <p className="text-warning" title={sourceId}>
             {ts(

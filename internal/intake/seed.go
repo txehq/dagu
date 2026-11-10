@@ -44,6 +44,12 @@ type SeedRequest struct {
 	ProfileName  string
 	DefinitionID string
 	NoReuse      bool
+	// RuntimeIdentity is the runtime identity that every carried node was
+	// verified to share with the new run; empty when that is not known.
+	RuntimeIdentity string
+	// ExpectedRuntimeIdentity is set when outputs were reused automatically:
+	// the run stops before any step unless it resolves this identity.
+	ExpectedRuntimeIdentity string
 	// Ephemeral stores the run apart from the history and marks it so that it
 	// leaves no trace.
 	Ephemeral bool
@@ -108,6 +114,8 @@ func SeedRun(ctx context.Context, req SeedRequest) (dagrun.Attempt, *ir.DAGRunSt
 	)
 	status.Params = req.Params
 	status.ParamsList = dag.Params
+	status.RuntimeIdentity = req.RuntimeIdentity
+	status.ExpectedRuntimeIdentity = req.ExpectedRuntimeIdentity
 	targetWorkDirRef := dagrun.WorkDirRef{DAGRun: ir.NewDAGRunRef(dag.Name, req.DAGRunID)}
 	targetWorkDir, err := repo.MaterializeWorkDir(ctx, targetWorkDirRef)
 	if err != nil {

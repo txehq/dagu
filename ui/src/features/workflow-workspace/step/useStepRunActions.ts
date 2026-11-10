@@ -466,18 +466,20 @@ export function useStepRunActions(
     async (
       pick: Pick<
         StepRunPick,
-        'steps' | 'reuseFrom' | 'outputsFromRuns' | 'reused'
+        'steps' | 'reuseFrom' | 'outputsFromRuns' | 'reused' | 'automaticReuse'
       >
     ) => {
       const pending = confirm;
       setConfirm(null);
       if (pending === null) return;
       const { kind, step } = pending;
-      const { steps, reuseFrom, outputsFromRuns, reused } = pick;
+      const { steps, reuseFrom, outputsFromRuns, reused, automaticReuse } =
+        pick;
       const inputs = {
         ...(reuseFrom !== null ? { reuseOutputsFrom: reuseFrom } : {}),
         ...(outputsFromRuns !== null ? { outputsFromRuns } : {}),
         ...(reused.length > 0 ? { reused } : {}),
+        ...(automaticReuse.length > 0 ? { automaticReuse } : {}),
       };
       const id = await editorActions.runSteps(
         steps,
@@ -622,6 +624,7 @@ export function useStepRunActions(
                     reuseFrom: null,
                     outputsFromRuns: null,
                     reused: [],
+                    automaticReuse: [],
                   }),
               },
             ],

@@ -48,13 +48,20 @@ type stepSelection struct {
 	// ephemeral runs leave no trace: the run is stored apart from the history,
 	// listed nowhere, and removed shortly after it ends.
 	ephemeral bool
+	// automaticReuse names the skipped steps whose outputs the client reuses
+	// on its own choice: each must come from a run of the new run's runtime
+	// identity (TXE-6145).
+	automaticReuse []string
 }
 
 // selectedStepsFromBody validates the step selection fields of a start
 // request body. It returns no steps when the request runs the whole DAG.
-func selectedStepsFromBody(steps *[]string, outputsFromRunID *string, outputsFromRuns *map[string]string, outputs *map[string]map[string]string, outputsSources *map[string]api.ReusedOutputSource, ephemeral *bool) (stepSelection, error) {
+func selectedStepsFromBody(steps *[]string, outputsFromRunID *string, outputsFromRuns *map[string]string, outputs *map[string]map[string]string, outputsSources *map[string]api.ReusedOutputSource, ephemeral *bool, automaticReuse *[]string) (stepSelection, error) {
 	outputsFrom := strings.TrimSpace(valueOf(outputsFromRunID))
 	if steps == nil {
+		if automaticReuse != nil {
+			return stepSelection{}, badSelectedStepsRequest("automaticReuse requires steps")
+		}
 		if valueOf(ephemeral) {
 			return stepSelection{}, badSelectedStepsRequest("ephemeral requires steps: a run that leaves no trace is for steps")
 		}
@@ -93,7 +100,15 @@ func selectedStepsFromBody(steps *[]string, outputsFromRunID *string, outputsFro
 	if err != nil {
 		return stepSelection{}, err
 	}
-	return stepSelection{steps: *steps, outputsFrom: outputsFrom, outputsFromRuns: fromRuns, outputs: valueOf(outputs), outputsSources: sources, ephemeral: valueOf(ephemeral)}, nil
+	automatic := make([]string, 0, len(valueOf(automaticReuse)))
+	for _, step := range valueOf(automaticReuse) {
+		step = strings.TrimSpace(step)
+		if step == "" {
+			return stepSelection{}, badSelectedStepsRequest("automaticReuse must name steps")
+		}
+		automatic = append(automatic, step)
+	}
+	return stepSelection{steps: *steps, outputsFrom: outputsFrom, outputsFromRuns: fromRuns, outputs: valueOf(outputs), outputsSources: sources, ephemeral: valueOf(ephemeral), automaticReuse: automatic}, nil
 }
 
 // outputSourcesFromBody validates the run IDs and times of outputsSources. A
@@ -172,6 +187,18 @@ func (a *API) startSelectedSteps(ctx context.Context, dag *ir.DAG, req selectedS
 	if err != nil {
 		return badSelectedStepsRequest(err.Error())
 	}
+	admission, err := intake.AdmitReuseRuntime(intake.ReuseRuntimeRequest{
+		DAG:             dag,
+		Automatic:       req.selection.automaticReuse,
+		Identity:        a.prospectiveRuntimeIdentity(ctx, dag, req.profileName),
+		Source:          source,
+		FromRuns:        fromRuns,
+		Reused:          reused,
+		SuppliedOutputs: len(req.selection.outputs) > 0,
+	})
+	if err != nil {
+		return reuseRuntimeAPIError(err)
+	}
 
 	skipHandlers, err := intake.SelectionSkipsHandlers(dag, req.selection.steps)
 	if err != nil {
@@ -191,6 +218,7 @@ func (a *API) startSelectedSteps(ctx context.Context, dag *ir.DAG, req selectedS
 		noReuse:      req.noReuse,
 		ephemeral:    req.selection.ephemeral,
 		triggerType:  ir.TriggerTypeManual,
+		reuse:        admission,
 	})
 	return err
 }
@@ -248,6 +276,9 @@ func addSelectedStepsAudit(details map[string]any, selection stepSelection) {
 	}
 	if len(selection.outputsFromRuns) > 0 {
 		details["outputs_from_runs"] = selection.outputsFromRuns
+	}
+	if len(selection.automaticReuse) > 0 {
+		details["automatic_reuse"] = selection.automaticReuse
 	}
 	if len(selection.outputsSources) > 0 {
 		sources := make(map[string]string, len(selection.outputsSources))

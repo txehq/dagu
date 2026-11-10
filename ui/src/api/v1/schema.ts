@@ -341,6 +341,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/dags/{fileName}/reuse-runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Compare the runtime profile identity of runs with a new step run
+         * @description Answers, for each named run of the DAG, whether it ran under the same runtime profile identity as a step run of the DAG started now: the same stored state of the global and workspace profile defaults and of the profile the run selects, including the version of each profile secret. The server decides which profile the step run takes (the DAG default; none for a draft) and never returns an identity. A run that does not exist, is not of this DAG, or that the caller may not reuse, answers unknown, the same as a run whose identity was never recorded or a run, or a DAG, with context that has no version (DAG secrets, dotenv, base configuration, sub-DAG steps). Only same may be reused automatically.
+         */
+        post: operations["checkDAGReuseRuntime"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/dags/{fileName}/start": {
         parameters: {
             query?: never;
@@ -7609,6 +7629,16 @@ export interface components {
              */
             tags?: string[];
         };
+        ReuseRuntimeCheck: {
+            runs: {
+                dagRunId: components["schemas"]["DAGRunId"];
+                /**
+                 * @description same: the run's outputs may be reused automatically. different: the run took another state of the runtime profiles. unknown: no automatic reuse.
+                 * @enum {string}
+                 */
+                runtime: ReuseRuntimeCheckRunsRuntime;
+            }[];
+        };
         /** @description The run that a step's supplied outputs were captured from. */
         ReusedOutputSource: {
             runId: components["schemas"]["DAGRunId"];
@@ -12227,6 +12257,61 @@ export interface operations {
             };
         };
     };
+    checkDAGReuseRuntime: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                /** @description the name of the DAG file */
+                fileName: components["parameters"]["DAGFileName"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Runs of the DAG to compare, at most 50; duplicates count once. */
+                    runIds: components["schemas"]["DAGRunId"][];
+                    /** @description The unsaved draft whose steps would run (as with POST /dag-runs); omit for the saved DAG. */
+                    spec?: string;
+                    /** @description With spec: the DAG name the draft runs as. */
+                    name?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The answer for each named run, in the order of runIds without duplicates */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReuseRuntimeCheck"];
+                };
+            };
+            /** @description Invalid run IDs, more than 50 runs, or an invalid draft */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     executeDAG: {
         parameters: {
             query?: {
@@ -12270,6 +12355,8 @@ export interface operations {
                     outputsFromRuns?: {
                         [key: string]: components["schemas"]["DAGRunId"];
                     };
+                    /** @description Skipped steps, by step name or ID, whose outputs the client reuses on its own choice (from its cache or its automatic pick of a run), not because the user named the run. For each, the run in outputsFromRuns, or else outputsFromRunId, must have run under the same runtime profile identity as this run (see POST /dags/{fileName}/reuse-runtime); otherwise, or when either identity is unknown, the request returns 409 naming the step and nothing starts. The run records the identity it was admitted for and fails before any step when its own resolve of the runtime profiles differs. A step not listed is reused as the request names it. A step listed must be a skipped step whose outputs come from a run. Requires steps. */
+                    automaticReuse?: string[];
                     /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps. */
                     outputs?: {
                         [key: string]: {
@@ -13466,6 +13553,8 @@ export interface operations {
                     outputsFromRuns?: {
                         [key: string]: components["schemas"]["DAGRunId"];
                     };
+                    /** @description Skipped steps, by step name or ID, whose outputs the client reuses on its own choice (from its cache or its automatic pick of a run), not because the user named the run. For each, the run in outputsFromRuns, or else outputsFromRunId, must have run under the same runtime profile identity as this run (see POST /dags/{fileName}/reuse-runtime); otherwise, or when either identity is unknown, the request returns 409 naming the step and nothing starts. The run records the identity it was admitted for and fails before any step when its own resolve of the runtime profiles differs. A step not listed is reused as the request names it. A step listed must be a skipped step whose outputs come from a run. Requires steps. */
+                    automaticReuse?: string[];
                     /** @description Outputs of skipped steps, keyed by step name or ID and then by output name. For clients that are not the web UI; the web UI sends no values. A declared output, or any name when the step declares none, resolves through ${steps.<id>.outputs.<name>}; the name of the step's string-form output variable sets that variable. Takes precedence over outputs from outputsFromRunId and outputsFromRuns, and works without them: the caller can supply every value itself, and can name the run the values of each step come from in outputsSources. A reference to an output that nobody supplied stays unresolved text in the step. Requires steps. */
                     outputs?: {
                         [key: string]: {
@@ -30093,6 +30182,11 @@ export enum DAGRunConditionStatus {
     True = "True",
     False = "False",
     Unknown = "Unknown"
+}
+export enum ReuseRuntimeCheckRunsRuntime {
+    same = "same",
+    different = "different",
+    unknown = "unknown"
 }
 export enum ReusedInputVia {
     run = "run",

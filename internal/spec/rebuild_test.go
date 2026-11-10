@@ -424,3 +424,24 @@ steps:
 	assert.Contains(t, restored.Env, "DECLARED=from-yaml")
 	assert.Contains(t, restored.Env, "SNAPSHOT_ONLY=kept")
 }
+
+// A DAG whose environment took a dotenv file keeps that mark through a
+// rebuild, and so does one rebuilt in a process the mark was sent to
+// (TXE-6145).
+func TestRebuildFromYAML_KeepsTheDotenvMark(t *testing.T) {
+	dag := &ir.DAG{
+		Name:            "test-dag",
+		YamlData:        []byte("steps:\n  - name: test\n    command: echo hello"),
+		RuntimeResolved: true,
+		DotenvLoaded:    true,
+	}
+	result, err := spec.RebuildFromYAML(context.Background(), dag)
+	require.NoError(t, err)
+	assert.True(t, result.DotenvLoaded)
+	assert.True(t, result.RuntimeResolved)
+
+	plain := &ir.DAG{Name: "test-dag", YamlData: []byte("steps:\n  - name: test\n    command: echo hello")}
+	result, err = spec.RebuildFromYAML(context.Background(), plain)
+	require.NoError(t, err)
+	assert.False(t, result.DotenvLoaded)
+}

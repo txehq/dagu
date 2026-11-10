@@ -53,10 +53,12 @@ func RebuildFromYAML(ctx context.Context, dag *ir.DAG, paramsOverride ...[]strin
 		SkipSchemaValidation(),
 	}
 	runtimeResolved := dag.RuntimeResolved || presolvedBuildEnv.RuntimeResolved
-	if len(buildEnvMap) > 0 || runtimeResolved {
+	dotenvLoaded := dag.DotenvLoaded || presolvedBuildEnv.DotenvLoaded
+	if len(buildEnvMap) > 0 || runtimeResolved || dotenvLoaded {
 		loadOpts = append(loadOpts, WithBuildEnvSnapshot(buildenv.Snapshot{
 			Env:             buildEnvMap,
 			RuntimeResolved: runtimeResolved,
+			DotenvLoaded:    dotenvLoaded,
 		}))
 	}
 	if len(dag.BaseConfigData) > 0 {

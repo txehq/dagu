@@ -164,6 +164,12 @@ steps:
 	require.NoError(t, err)
 	require.Len(t, resp.GetSelected().GetEntries(), 2)
 	assert.Equal(t, "before", runtimeProfileEntryValue(resp.GetSelected(), "ROTATED_SECRET"))
+	// The worker gets the identity of the coordinator's own resolve, the same
+	// one the hub computes from metadata (TXE-6145).
+	expected, err := profilepkg.NewResolver(profileStore, secretStore).RuntimeIdentity(ctx, profilepkg.RuntimeRequest{ProfileName: "prod", Workspace: "payments"})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.GetRuntimeIdentity())
+	assert.Equal(t, expected, resp.GetRuntimeIdentity())
 	lease, err := leaseStore.Get(ctx, attemptKey)
 	require.NoError(t, err)
 	assert.Equal(t, "prod", lease.ProfileName)
@@ -173,6 +179,7 @@ steps:
 	rotated, err := handler.ResolveRuntimeProfile(ctx, valid)
 	require.NoError(t, err)
 	assert.Equal(t, "after", runtimeProfileEntryValue(rotated.GetSelected(), "ROTATED_SECRET"))
+	assert.NotEqual(t, resp.GetRuntimeIdentity(), rotated.GetRuntimeIdentity(), "a rotated secret is another state")
 
 	nestedAttemptKey := attemptKey + "-nested"
 	require.NoError(t, leaseStore.Upsert(ctx, dispatch.DAGRunLease{
@@ -269,4 +276,20 @@ func runtimeProfileEntryValue(layer *coordinatorv1.RuntimeProfileLayer, key stri
 		}
 	}
 	return ""
+}
+
+// An older coordinator sends no identity: the worker's run is unknown, never
+// the same as anything (TXE-6145).
+func TestRuntimeProfileResponseWithoutIdentityIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	owner := serviceregistry.HostInfo{}
+	for name, identity := range map[string]string{"current coordinator": "rp1:x", "older coordinator": ""} {
+		client := runtimeProfileClientFunc(func(context.Context, serviceregistry.HostInfo, profilepkg.RuntimeRequest, coordinator.RuntimeProfileRun) (*profilepkg.RuntimeResolved, error) {
+			return &profilepkg.RuntimeResolved{Identity: identity}, nil
+		})
+		resolved, err := coordinator.NewRuntimeProfileResolver(client, owner, coordinator.RuntimeProfileRun{}, nil).ResolveRuntime(context.Background(), profilepkg.RuntimeRequest{})
+		require.NoError(t, err, name)
+		assert.Equal(t, identity, resolved.Identity, name)
+	}
 }

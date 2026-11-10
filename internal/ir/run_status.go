@@ -196,6 +196,11 @@ type StartupFailureCode string
 // read from its source when the run started.
 const StartupFailureSecretUnavailable StartupFailureCode = "secret_unavailable"
 
+// StartupFailureRuntimeIdentityChanged means a run seeded with automatically
+// reused outputs resolved another runtime identity than the one the reuse was
+// admitted for, or one that cannot be known (TXE-6145).
+const StartupFailureRuntimeIdentityChanged StartupFailureCode = "runtime_identity_changed"
+
 // StartupFailure is recorded on a dag-run that failed before any step
 // started, for a cause the runtime itself identified. It is never derived
 // from a step's output or error, so a script cannot produce it.
@@ -214,6 +219,8 @@ type StartupFailure struct {
 // Message describes the failure for a person, with no more than the fields say.
 func (f StartupFailure) Message() string {
 	switch {
+	case f.Code == StartupFailureRuntimeIdentityChanged:
+		return "runtime profile changed since the reuse of outputs was checked; run the steps again"
 	case f.Code != StartupFailureSecretUnavailable:
 		return "startup failed: " + string(f.Code)
 	case f.Provider == "":
@@ -269,23 +276,34 @@ type DAGRunStatus struct {
 	ProcGroup            string        `json:"procGroup,omitempty"`
 	DefinitionID         string        `json:"definitionId,omitempty"`
 	// SuspendFlagName is retained for histories written before DefinitionID was introduced.
-	SuspendFlagName    string                `json:"suspendFlagName,omitempty"`
-	Log                string                `json:"log,omitempty"`
-	WorkingDir         string                `json:"workingDir,omitempty"`
-	ArchiveDir         string                `json:"archiveDir,omitempty"`
-	Error              string                `json:"error,omitempty"`
-	StartupFailure     *StartupFailure       `json:"startupFailure,omitempty"`
-	Params             string                `json:"params,omitempty"`
-	ParamsList         []string              `json:"paramsList,omitempty"`
-	ParallelItem       string                `json:"parallelItem,omitempty"`
-	ProfileName        string                `json:"profileName,omitempty"`
-	ProfileResolvedAt  string                `json:"profileResolvedAt,omitempty"`
-	ProfileEntries     []RuntimeProfileEntry `json:"profileEntries,omitempty"`
-	NoReuse            bool                  `json:"noReuse,omitempty"`
-	PendingStepRetries []PendingStepRetry    `json:"pendingStepRetries"`
-	Preconditions      []ConditionResult     `json:"preconditions,omitempty"`
-	Labels             []string              `json:"labels,omitempty"`
-	LeaseAt            int64                 `json:"leaseAt,omitempty"` // Unix millis; stamped by coordinator on observed run liveness
+	SuspendFlagName   string                `json:"suspendFlagName,omitempty"`
+	Log               string                `json:"log,omitempty"`
+	WorkingDir        string                `json:"workingDir,omitempty"`
+	ArchiveDir        string                `json:"archiveDir,omitempty"`
+	Error             string                `json:"error,omitempty"`
+	StartupFailure    *StartupFailure       `json:"startupFailure,omitempty"`
+	Params            string                `json:"params,omitempty"`
+	ParamsList        []string              `json:"paramsList,omitempty"`
+	ParallelItem      string                `json:"parallelItem,omitempty"`
+	ProfileName       string                `json:"profileName,omitempty"`
+	ProfileResolvedAt string                `json:"profileResolvedAt,omitempty"`
+	ProfileEntries    []RuntimeProfileEntry `json:"profileEntries,omitempty"`
+	// RuntimeIdentity names the stored state of the runtime profile layers
+	// whose variables and secrets every executed or carried node of the run
+	// took (see profile.RuntimeResolved.Identity). Empty is unknown: a
+	// record from before it existed, context without a server-side version,
+	// or nodes carried from runs of another or unknown state. Outputs of a
+	// run are reused automatically only for a run of the same identity.
+	RuntimeIdentity string `json:"runtimeIdentity,omitempty"`
+	// ExpectedRuntimeIdentity is set on a seeded run whose outputs were
+	// reused automatically: the identity the hub checked them against. The
+	// run fails before any step when its own resolve differs (TXE-6145).
+	ExpectedRuntimeIdentity string             `json:"expectedRuntimeIdentity,omitempty"`
+	NoReuse                 bool               `json:"noReuse,omitempty"`
+	PendingStepRetries      []PendingStepRetry `json:"pendingStepRetries"`
+	Preconditions           []ConditionResult  `json:"preconditions,omitempty"`
+	Labels                  []string           `json:"labels,omitempty"`
+	LeaseAt                 int64              `json:"leaseAt,omitempty"` // Unix millis; stamped by coordinator on observed run liveness
 	// RetryRequest is the conditional retry that admitted this execution,
 	// set by the hub on its first status and kept on every later one.
 	RetryRequest *RetryRequest `json:"retryRequest,omitempty"`

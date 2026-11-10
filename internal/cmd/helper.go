@@ -98,8 +98,7 @@ func restoreDAGFromStatus(ctx context.Context, dag *ir.DAG, status *ir.DAGRunSta
 	runtimeParams := append([]string(nil), status.ParamsList...)
 	dag.Params = runtimeParams
 	resolvedEnv, err := runtimeenv.Resolve(ctx, dag)
-	dag.Env = resolvedEnv.Env
-	dag.RuntimeResolved = true
+	runtimeenv.Apply(dag, resolvedEnv)
 	for _, warning := range resolvedEnv.Warnings {
 		logger.Warn(ctx, warning)
 	}

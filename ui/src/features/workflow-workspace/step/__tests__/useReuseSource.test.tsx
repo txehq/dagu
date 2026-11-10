@@ -25,6 +25,12 @@ type Node = components['schemas']['Node'];
 
 const h = vi.hoisted(() => ({
   get: vi.fn(),
+  post: vi.fn(),
+  /**
+   * How the server compares each run's runtime profile state with the step
+   * run's (POST /dags/{fileName}/reuse-runtime); a run not named is the same.
+   */
+  runtime: {} as Record<string, 'same' | 'different' | 'unknown'>,
   queries: [] as { path: string; init: unknown }[],
   history: [] as unknown[],
   /** The runs that the server still has, by id, for the check of the cache. */
@@ -36,7 +42,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('@/hooks/api', () => ({
-  useClient: () => ({ GET: h.get }),
+  useClient: () => ({ GET: h.get, POST: h.post }),
   useQuery: (path: string, init: unknown) => {
     if (init !== null) h.queries.push({ path, init });
     if (init === null) return { data: undefined, isLoading: false };
@@ -173,6 +179,24 @@ function render(
 
 beforeEach(() => {
   h.get.mockReset();
+  h.post.mockReset();
+  h.runtime = {};
+  h.post.mockImplementation(
+    async (path: string, init: { body: { runIds: string[] } }) => {
+      if (path !== '/dags/{fileName}/reuse-runtime') {
+        return { data: undefined, response: { status: 404 } };
+      }
+      return {
+        data: {
+          runs: init.body.runIds.map((dagRunId) => ({
+            dagRunId,
+            runtime: h.runtime[dagRunId] ?? 'same',
+          })),
+        },
+        response: { status: 200 },
+      };
+    }
+  );
   // A request for a run answers with its details, as the server does, or 404
   // when the server dropped it.
   h.details = { r0: runOf('r0') };
@@ -349,6 +373,132 @@ describe('useReuseSource', () => {
     await waitFor(() =>
       expect(view.result.current.source?.dagRunId).toBe('second')
     );
+  });
+
+  // TXE-6145: the server compares each run's runtime profile state with the
+  // step run's; only "same" is reused without the user naming the run.
+  describe('with the runtime profile state of the runs', () => {
+    it('never picks a run of another or an unknown state by itself', async () => {
+      h.history = [runOf('new'), runOf('mid'), runOf('old')];
+      h.runtime = { new: 'different', mid: 'unknown' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      expect(view.result.current.source?.dagRunId).toBe('old');
+      expect(view.result.current.automaticSource).toBe(true);
+      expect(view.result.current.runtimeDiffers).toBe(false);
+    });
+
+    it('asks again for a run whose state was not known yet', async () => {
+      h.history = [runOf('new'), runOf('old')];
+      h.runtime = { new: 'unknown' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() =>
+        expect(view.result.current.source?.dagRunId).toBe('old')
+      );
+      // The run recorded its state; the history changes when it is listed again.
+      h.runtime = {};
+      h.history = [runOf('new'), runOf('old'), runOf('older')];
+      view.rerender();
+      await waitFor(() =>
+        expect(view.result.current.source?.dagRunId).toBe('new')
+      );
+    });
+
+    it('sees a profile change within one period, with nothing else changing', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      try {
+        h.history = [runOf('new'), runOf('old')];
+        const view = render({ liveText: SPEC });
+        await waitFor(() =>
+          expect(view.result.current.source?.dagRunId).toBe('new')
+        );
+        h.runtime = { new: 'different' };
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(30_000);
+        });
+        await waitFor(() =>
+          expect(view.result.current.source?.dagRunId).toBe('old')
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // A hub whose runs are all unknown (unversioned context) must not be
+    // asked again on every render: only a new period or a change of the runs
+    // asks again.
+    it('asks once while the runs and the period stay the same, unknown answers too', async () => {
+      h.runtime = { new: 'unknown', old: 'unknown' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      const asked = () =>
+        h.post.mock.calls.filter(
+          ([path]) => path === '/dags/{fileName}/reuse-runtime'
+        ).length;
+      const before = asked();
+      for (let i = 0; i < 5; i++) {
+        h.history = [...h.history]; // the same runs, another array
+        view.rerender();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(asked()).toBe(before);
+      expect(view.result.current.source).toBeNull();
+    });
+
+    it('has no automatic source when no run is of the same state', async () => {
+      h.runtime = { new: 'different', old: 'different' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      expect(view.result.current.source).toBeNull();
+    });
+
+    it('compares the candidates in one request, for the saved definition', async () => {
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      const calls = h.post.mock.calls.filter(
+        ([path]) => path === '/dags/{fileName}/reuse-runtime'
+      );
+      expect(calls).toHaveLength(1);
+      expect(calls[0]![1]).toEqual({
+        params: {
+          path: { fileName: 'example.yaml' },
+          query: { remoteNode: 'edge' },
+        },
+        body: { runIds: ['new', 'old'] },
+      });
+    });
+
+    it('sends the unsaved text when the step runs from it', async () => {
+      const view = render({ liveText: SPEC, unsaved: true });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      expect(h.post).toHaveBeenCalledWith('/dags/{fileName}/reuse-runtime', {
+        params: {
+          path: { fileName: 'example.yaml' },
+          query: { remoteNode: 'edge' },
+        },
+        body: { runIds: ['new', 'old'], spec: SPEC, name: 'example' },
+      });
+    });
+
+    it('takes every run as unknown when the request fails', async () => {
+      h.post.mockRejectedValue(new Error('offline'));
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      expect(view.result.current.source).toBeNull();
+    });
+
+    it('does not cover a step from a cached run of another state', async () => {
+      h.history = [];
+      cacheStep('a', SPEC);
+      cacheStep('b', SPEC, { x: '1' }, 'r1');
+      h.details = { r0: runOf('r0'), r1: runOf('r1') };
+      h.runtime = { r1: 'different' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      expect(view.result.current.cached).toEqual(['a']);
+      expect(view.result.current.otherRuntime).toEqual(['b']);
+      expect(Object.keys(view.result.current.cachedRuns)).toEqual(['a']);
+    });
   });
 
   describe('with the cache of the browser', () => {
@@ -586,6 +736,48 @@ describe('the choice of the run', () => {
       id: 'run:new',
       auto: true,
     });
+  });
+
+  // A chosen run is read from a store that gives a new object on each
+  // render; the cached answers resolve at once. Rendering must still settle.
+  it('settles after a run is chosen: no render or request without end', async () => {
+    choose('old');
+    let renders = 0;
+    const view = renderHook(
+      () => {
+        renders++;
+        return useReuseSource({
+          fileName: 'example.yaml',
+          step: 'c',
+          previous: ['a', 'b'],
+          reads: ['b'],
+          followedUpstreamRunId: null,
+          liveText: SPEC,
+        });
+      },
+      { wrapper: wrapper(null) }
+    );
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+    const asked = () =>
+      h.post.mock.calls.filter(
+        ([path]) => path === '/dags/{fileName}/reuse-runtime'
+      ).length;
+    const [rendersBefore, askedBefore] = [renders, asked()];
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(asked()).toBe(askedBefore);
+    expect(renders - rendersBefore).toBeLessThan(5);
+  });
+
+  // TXE-6145: the user may name a run of another runtime profile state; the
+  // request then reuses it as named, and the dialog warns.
+  it('uses a chosen run of another runtime profile state, and says so', async () => {
+    choose('old');
+    h.runtime = { old: 'different' };
+    const view = render({ liveText: SPEC });
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+    expect(view.result.current.source?.dagRunId).toBe('old');
+    expect(view.result.current.automaticSource).toBe(false);
+    await waitFor(() => expect(view.result.current.runtimeDiffers).toBe(true));
   });
 
   it('changes the source when the user chooses a line, and goes back with the automatic one', async () => {

@@ -55,6 +55,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/runtime/runstate"
 	"github.com/dagucloud/dagu/v2/internal/runtime/transform"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
+	"github.com/dagucloud/dagu/v2/internal/runtimeenv"
 	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
 	"github.com/dagucloud/dagu/v2/internal/secret/providers"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
@@ -272,6 +273,14 @@ type Agent struct {
 	profileResolvedAt string
 	// profileEntries records non-secret injected key metadata for status/history.
 	profileEntries []ir.RuntimeProfileEntry
+	// profileIdentity is the identity of the profile layers as this run
+	// resolved them; empty when unknown (see profile.RuntimeResolved).
+	profileIdentity string
+	// runtimeIdentity is what the run records (ir.DAGRunStatus.RuntimeIdentity).
+	runtimeIdentity string
+	// expectedRuntimeIdentity is the identity its automatically reused
+	// outputs were admitted for; kept on every status of the run.
+	expectedRuntimeIdentity string
 	// secretReferenceResolver resolves registry refs without requiring local store access.
 	secretReferenceResolver providers.ReferenceResolver
 	// secretMasker redacts resolved secret values from status/history snapshots.
@@ -626,10 +635,33 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 	a.profileName = startup.profileName
 	a.profileResolvedAt = startup.profileResolvedAt
 	a.profileEntries = startup.profileEntries
+	a.profileIdentity = startup.profileIdentity
+	// The dotenv files this process read, the mark of those an earlier one
+	// read for it (an environment resolved before the agent), and those that
+	// exist now.
+	dotenvFiles := append(append([]string(nil), resolvedEnv.DotenvFiles...), runtimeenv.DotenvFilesPresent(ctx, a.dag)...)
+	if a.dag.DotenvLoaded {
+		dotenvFiles = append(dotenvFiles, "(read before the run started)")
+	}
+	a.runtimeIdentity = recordedRuntimeIdentity(a.dag, startup.profileIdentity, dotenvFiles, a.retryTarget)
+	if a.retryTarget != nil {
+		a.expectedRuntimeIdentity = a.retryTarget.ExpectedRuntimeIdentity
+	}
 	a.secretMasker = newStatusSecretMasker(append(profileValues.allSecrets(), secretEnvs...))
 	a.lock.Unlock()
 	for _, warning := range resolvedEnv.Warnings {
 		logger.Warn(ctx, warning)
+	}
+
+	// A run whose outputs were reused automatically was admitted for one
+	// runtime identity: it stops before any step when its own differs.
+	if profileErr == nil {
+		profileErr = checkExpectedRuntimeIdentity(a.dag, startup.profileIdentity, dotenvFiles, a.retryTarget)
+		if profileErr != nil {
+			a.lock.Lock()
+			a.startupFailure = &ir.StartupFailure{Code: ir.StartupFailureRuntimeIdentityChanged}
+			a.lock.Unlock()
+		}
 	}
 
 	configVars := runtimeConfigVars(a.dag.Env, profileValues, secretEnvs)
@@ -1618,6 +1650,8 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 			ir.WithAutoRetryCount(a.currentAutoRetryCount()),
 			ir.WithPIDStartedAt(currentPIDStartedAt()),
 			ir.WithRuntimeProfile(a.profileName, a.profileResolvedAt, a.profileEntries),
+			ir.WithRuntimeIdentity(a.runtimeIdentity),
+			ir.WithExpectedRuntimeIdentity(a.expectedRuntimeIdentity),
 			ir.WithDAGDefinitionID(a.definitionID),
 			ir.WithNoReuse(a.noReuse),
 			ir.WithFinishedAt(a.startupFinishedAt),
@@ -1683,6 +1717,8 @@ func (a *Agent) Status(ctx context.Context) ir.DAGRunStatus {
 		ir.WithAutoRetryCount(a.currentAutoRetryCount()),
 		ir.WithPIDStartedAt(currentPIDStartedAt()),
 		ir.WithRuntimeProfile(a.profileName, a.profileResolvedAt, a.profileEntries),
+		ir.WithRuntimeIdentity(a.runtimeIdentity),
+		ir.WithExpectedRuntimeIdentity(a.expectedRuntimeIdentity),
 		ir.WithDAGDefinitionID(a.definitionID),
 		ir.WithNoReuse(a.noReuse),
 	}
@@ -2339,6 +2375,7 @@ func (a *Agent) resolveProfile(ctx context.Context) (resolvedProfileValues, erro
 		)
 	}
 
+	a.profileIdentity = resolved.Identity
 	if resolved.Defaults != nil || resolved.Selected != nil {
 		effective := profilepkg.MergeResolved("effective", resolved.Defaults, resolved.Selected)
 		a.profileResolvedAt = contextTimeString(time.Now())

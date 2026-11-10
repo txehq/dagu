@@ -335,6 +335,9 @@ func workerLabels(configured map[string]string) (map[string]string, error) {
 		// This build runs a step retry's AcceptFailedPrerequisites option;
 		// a task that needs it selects this label (dispatch package).
 		{key: dispatch.AcceptFailedPrerequisitesLabel, value: dispatch.CapabilityLabelValue},
+		// This build checks a seeded run's expected runtime identity before
+		// any step (TXE-6145).
+		{key: dispatch.RuntimeIdentityCheckLabel, value: dispatch.CapabilityLabelValue},
 	} {
 		if configuredValue, ok := labels[platform.key]; ok && configuredValue != platform.value {
 			return nil, fmt.Errorf(

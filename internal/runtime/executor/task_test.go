@@ -622,3 +622,23 @@ func TestCreateTaskSelectsTheAcceptFailedPrerequisitesCapability(t *testing.T) {
 	plain := executor.CreateTask("job_1", "steps: []", dispatch.DispatchOperationRetry, "run-1", executor.WithWorkerSelector(machine))
 	assert.Equal(t, machine, plain.WorkerSelector, "other tasks are unchanged")
 }
+
+// A run seeded with automatically reused outputs selects the runtime
+// identity capability, so a worker that cannot check the identity before
+// any step is never given it (TXE-6145).
+func TestCreateTaskSelectsTheRuntimeIdentityCapability(t *testing.T) {
+	machine := map[string]string{dispatch.MachineLabel: "mch_1"}
+	expecting := &ir.DAGRunStatus{ExpectedRuntimeIdentity: "rp1:x"}
+	for name, opts := range map[string][]executor.TaskOption{
+		"selector first": {executor.WithWorkerSelector(machine), executor.WithPreviousStatus(expecting)},
+		"selector last":  {executor.WithPreviousStatus(expecting), executor.WithWorkerSelector(machine)},
+	} {
+		task := executor.CreateTask("flow", "steps: []", dispatch.DispatchOperationRetry, "run-1", opts...)
+		assert.Equal(t, map[string]string{dispatch.MachineLabel: "mch_1", dispatch.RuntimeIdentityCheckLabel: dispatch.CapabilityLabelValue}, task.WorkerSelector, name)
+		older := map[string]string{dispatch.MachineLabel: "mch_1"}
+		assert.False(t, dispatch.SelectorAdmits(older, task.WorkerSelector, dispatch.MachinePinningOff), "%s: a worker without the check", name)
+	}
+	plain := executor.CreateTask("flow", "steps: []", dispatch.DispatchOperationRetry, "run-1",
+		executor.WithWorkerSelector(machine), executor.WithPreviousStatus(&ir.DAGRunStatus{RuntimeIdentity: "rp1:x"}))
+	assert.Equal(t, machine, plain.WorkerSelector, "a run with nothing reused automatically is unchanged")
+}

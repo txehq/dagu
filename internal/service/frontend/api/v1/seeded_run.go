@@ -34,6 +34,8 @@ type seededRun struct {
 	triggerType  ir.TriggerType
 	// enqueue sends the run to the DAG's queue when one is configured.
 	enqueue bool
+	// reuse is the runtime identity the run is seeded with (TXE-6145).
+	reuse intake.ReuseRuntimeAdmission
 }
 
 // launchSeededDAGRun persists run as a queued attempt and hands it to the
@@ -54,21 +56,23 @@ func (a *API) launchSeededDAGRun(ctx context.Context, run seededRun) (queued boo
 	}
 
 	_, seedStatus, err := intake.SeedRun(ctx, intake.SeedRequest{
-		DAGRunRepository: a.dagRunRepository,
-		DAG:              run.dag,
-		DAGRunID:         run.dagRunID,
-		Nodes:            run.nodes,
-		ReusedInputs:     run.reused,
-		SkipHandlers:     run.skipHandlers,
-		Source:           run.source,
-		Params:           run.params,
-		TriggerType:      run.triggerType,
-		TriggerActor:     triggerActorFromContext(ctx),
-		ProfileName:      run.profileName,
-		NoReuse:          run.noReuse,
-		Ephemeral:        run.ephemeral,
-		LogBaseDir:       a.config.Paths.LogDir,
-		ArtifactBaseDir:  a.config.Paths.ArtifactDir,
+		DAGRunRepository:        a.dagRunRepository,
+		DAG:                     run.dag,
+		DAGRunID:                run.dagRunID,
+		Nodes:                   run.nodes,
+		ReusedInputs:            run.reused,
+		SkipHandlers:            run.skipHandlers,
+		Source:                  run.source,
+		Params:                  run.params,
+		TriggerType:             run.triggerType,
+		TriggerActor:            triggerActorFromContext(ctx),
+		ProfileName:             run.profileName,
+		NoReuse:                 run.noReuse,
+		Ephemeral:               run.ephemeral,
+		RuntimeIdentity:         run.reuse.Identity,
+		ExpectedRuntimeIdentity: run.reuse.Expected,
+		LogBaseDir:              a.config.Paths.LogDir,
+		ArtifactBaseDir:         a.config.Paths.ArtifactDir,
 	})
 	if err != nil {
 		return false, err

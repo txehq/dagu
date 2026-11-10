@@ -132,3 +132,36 @@ func subprocessEnv(t *testing.T, prepared *ir.DAG) map[string]string {
 	require.NoError(t, err)
 	return buildenv.ToMap(resolved.Env)
 }
+
+// A full snapshot whose dotenv file the scheduler read here sends the mark
+// to the run with the environment: the run's identity is unknown even when
+// the file is gone by the time it starts (TXE-6145).
+func TestPrepareDAGForSubprocessMarksTheDotenvItRead(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	envFile := filepath.Join(root, "app.env")
+	require.NoError(t, os.WriteFile(envFile, []byte("FOO=bar\n"), 0o600))
+	dagPath := filepath.Join(root, "dags", "dotenv.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dagPath), 0o750))
+	require.NoError(t, os.WriteFile(dagPath, fmt.Appendf(nil, "name: dotenv\ndotenv:\n  - %q\nsteps:\n  - name: print\n    run: echo \"$FOO\"\n", envFile), 0o600))
+
+	full, err := spec.Load(ctx, dagPath)
+	require.NoError(t, err)
+	executor := NewDAGExecutor(nil, nil, config.ExecutionModeLocal, "")
+	prepared, err := executor.prepareDAGForSubprocess(ctx, full, "")
+	require.NoError(t, err)
+	require.True(t, prepared.DotenvLoaded)
+
+	require.NoError(t, os.Remove(envFile))
+	rebuilt, err := spec.RebuildFromYAML(ctx, prepared.Clone())
+	require.NoError(t, err)
+	require.True(t, rebuilt.DotenvLoaded, "the mark outlives the file")
+
+	plain, err := spec.LoadYAML(ctx, []byte("name: plain\nsteps:\n  - name: a\n    run: echo a\n"))
+	require.NoError(t, err)
+	prepared, err = executor.prepareDAGForSubprocess(ctx, plain, "")
+	require.NoError(t, err)
+	require.False(t, prepared.DotenvLoaded)
+}
