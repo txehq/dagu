@@ -183,24 +183,30 @@ export function useReuseSource(p: {
     return () => clearTimeout(timer);
   }, [draftSpec]);
   const runtimeKey = `${p.fileName}\u0001${remoteNode}\u0001${runtimeSpec ?? '\u0002saved'}`;
-  // Answers are shared within one period of RUNTIME_ANSWER_TTL_MS. One that
-  // says "unknown" is not kept (a run that had not recorded its state yet
-  // asks again). Each period starts afresh, and the choices that rest on the
-  // answers are made again, while the current choice stays shown: a profile
-  // that changed since is seen within one period. The server checks again
-  // when the step run starts in any case.
+  // Answers are shared, unknown ones too, until one of two things changes:
+  // the period of RUNTIME_ANSWER_TTL_MS (a profile that changed since is seen
+  // within one period) or the runs of the history and their status (a run
+  // that has just recorded its state). Then they are asked again, and the
+  // choices that rest on them are made again, while the current choice stays
+  // shown. Nothing else asks again: a render never does. The server checks
+  // again when the step run starts in any case.
   const runtimeEpoch = useClock(RUNTIME_ANSWER_TTL_MS, (now) =>
     Math.floor(now / RUNTIME_ANSWER_TTL_MS)
   );
+  const historyKey = useMemo(
+    () => history.runs.map((r) => `${r.dagRunId}:${r.status}`).join(','),
+    [history.runs]
+  );
+  const runtimeGeneration = `${runtimeEpoch}\u0001${historyKey}`;
   const runtimeAsked = useRef({
-    epoch: 0,
+    generation: '',
     answers: new Map<string, Promise<RuntimeMatch>>(),
   });
   const askRuntime = useCallback(
     (ids: readonly string[]): Promise<Record<string, RuntimeMatch>> => {
       const held = runtimeAsked.current;
-      if (held.epoch !== runtimeEpoch) {
-        held.epoch = runtimeEpoch;
+      if (held.generation !== runtimeGeneration) {
+        held.generation = runtimeGeneration;
         held.answers = new Map();
       }
       const cache = held.answers;
@@ -217,21 +223,24 @@ export function useReuseSource(p: {
           ...(runtimeSpec !== undefined ? { spec: runtimeSpec } : {}),
         });
         for (const id of missingIds) {
-          const key = keyOf(id);
-          const answer = batch.then((answers) => answers[id] ?? 'unknown');
-          cache.set(key, answer);
-          void answer.then((match) => {
-            if (match === 'unknown' && cache.get(key) === answer) {
-              cache.delete(key);
-            }
-          });
+          cache.set(
+            keyOf(id),
+            batch.then((answers) => answers[id] ?? 'unknown')
+          );
         }
       }
       return Promise.all(ids.map((id) => cache.get(keyOf(id))!)).then(
         (answers) => Object.fromEntries(ids.map((id, i) => [id, answers[i]!]))
       );
     },
-    [dagName, p.fileName, remoteNode, runtimeEpoch, runtimeKey, runtimeSpec]
+    [
+      dagName,
+      p.fileName,
+      remoteNode,
+      runtimeGeneration,
+      runtimeKey,
+      runtimeSpec,
+    ]
   );
 
   const selected = run.details;
@@ -425,25 +434,32 @@ export function useReuseSource(p: {
     key: string;
     answers: Record<string, RuntimeMatch>;
   }>({ key: runtimeKey, answers: {} });
+  // Keyed by the ids, not the array: the array is new on many renders, and
+  // an answer held in the cache resolves at once, so a dependency on the
+  // array would ask and render again without end, starving every event.
+  const runIdsKey = runIds.join('\u0000');
   useEffect(() => {
-    if (runIds.length === 0) return;
+    if (runIdsKey === '') return;
     let cancelled = false;
-    void askRuntime(runIds).then((answers) => {
+    void askRuntime(runIdsKey.split('\u0000')).then((answers) => {
       if (cancelled) return;
-      setRuntime((held) => ({
-        key: runtimeKey,
-        answers: {
-          ...(held.key === runtimeKey ? held.answers : {}),
-          ...answers,
-        },
-      }));
+      setRuntime((held) => {
+        const base = held.key === runtimeKey ? held.answers : {};
+        // The same answers keep the same state: no render follows.
+        if (
+          held.key === runtimeKey &&
+          Object.entries(answers).every(([id, match]) => base[id] === match)
+        ) {
+          return held;
+        }
+        return { key: runtimeKey, answers: { ...base, ...answers } };
+      });
     });
     return () => {
       cancelled = true;
     };
-    // A change of the history (a run finished) asks again for what is not
-    // fresh or not known.
-  }, [askRuntime, runIds, runtimeKey, listed]);
+    // askRuntime changes with the period and with the runs of the history.
+  }, [askRuntime, runIdsKey, runtimeKey]);
   const runtimeOf = useCallback(
     (id: string): RuntimeMatch | undefined =>
       runtime.key === runtimeKey ? runtime.answers[id] : undefined,

@@ -424,6 +424,27 @@ describe('useReuseSource', () => {
       }
     });
 
+    // A hub whose runs are all unknown (unversioned context) must not be
+    // asked again on every render: only a new period or a change of the runs
+    // asks again.
+    it('asks once while the runs and the period stay the same, unknown answers too', async () => {
+      h.runtime = { new: 'unknown', old: 'unknown' };
+      const view = render({ liveText: SPEC });
+      await waitFor(() => expect(view.result.current.loading).toBe(false));
+      const asked = () =>
+        h.post.mock.calls.filter(
+          ([path]) => path === '/dags/{fileName}/reuse-runtime'
+        ).length;
+      const before = asked();
+      for (let i = 0; i < 5; i++) {
+        h.history = [...h.history]; // the same runs, another array
+        view.rerender();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(asked()).toBe(before);
+      expect(view.result.current.source).toBeNull();
+    });
+
     it('has no automatic source when no run is of the same state', async () => {
       h.runtime = { new: 'different', old: 'different' };
       const view = render({ liveText: SPEC });
@@ -715,6 +736,36 @@ describe('the choice of the run', () => {
       id: 'run:new',
       auto: true,
     });
+  });
+
+  // A chosen run is read from a store that gives a new object on each
+  // render; the cached answers resolve at once. Rendering must still settle.
+  it('settles after a run is chosen: no render or request without end', async () => {
+    choose('old');
+    let renders = 0;
+    const view = renderHook(
+      () => {
+        renders++;
+        return useReuseSource({
+          fileName: 'example.yaml',
+          step: 'c',
+          previous: ['a', 'b'],
+          reads: ['b'],
+          followedUpstreamRunId: null,
+          liveText: SPEC,
+        });
+      },
+      { wrapper: wrapper(null) }
+    );
+    await waitFor(() => expect(view.result.current.loading).toBe(false));
+    const asked = () =>
+      h.post.mock.calls.filter(
+        ([path]) => path === '/dags/{fileName}/reuse-runtime'
+      ).length;
+    const [rendersBefore, askedBefore] = [renders, asked()];
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(asked()).toBe(askedBefore);
+    expect(renders - rendersBefore).toBeLessThan(5);
   });
 
   // TXE-6145: the user may name a run of another runtime profile state; the
