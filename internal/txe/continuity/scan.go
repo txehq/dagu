@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
@@ -520,7 +521,12 @@ func (s *scanner) txe() error {
 
 // store reads every record of a file collection rooted at dir.
 func (s *scanner) store(store, dir string, classify func(id string, data []byte) (*Record, []Issue)) error {
-	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+	// The walk stays serial and decides what each entry is; the record files
+	// are read on the bounded pool afterwards (TXE-7023), then classified in
+	// walk order. Seal sorts every list, so the inventory is the same.
+	type pending struct{ p, rel string }
+	var reads []pending
+	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -551,33 +557,51 @@ func (s *scanner) store(store, dir string, classify func(id string, data []byte)
 			s.issue("unsupported_record", ClassUnknown, store+"/"+rel, "%s/%s is not a JSON record", store, rel)
 			return nil
 		}
-		data, err := os.ReadFile(p) //nolint:gosec // a path under the scanned root
-		if err != nil {
-			return err
-		}
-		id := strings.TrimSuffix(rel, ".json")
-		rec, issues := classify(id, data)
+		reads = append(reads, pending{p: p, rel: rel})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	data := make([][]byte, len(reads))
+	if err := s.forEach(len(reads), func(i int) error {
+		b, err := os.ReadFile(reads[i].p) //nolint:gosec // a path under the scanned root
+		data[i] = b
+		return err
+	}); err != nil {
+		return err
+	}
+	for i, r := range reads {
+		id := strings.TrimSuffix(r.rel, ".json")
+		rec, issues := classify(id, data[i])
 		rec.Store = store
 		rec.ID = id
 		if rec.SHA256 == "" {
-			rec.SHA256 = recordDigest(data)
+			rec.SHA256 = recordDigest(data[i])
 		}
-		rec.Raw = rawDigest(data)
-		for i := range issues {
-			if issues[i].ID == "" {
-				issues[i].ID = store + "/" + id
+		rec.Raw = rawDigest(data[i])
+		for k := range issues {
+			if issues[k].ID == "" {
+				issues[k].ID = store + "/" + id
 			}
 		}
 		s.inv.Records = append(s.inv.Records, *rec)
 		s.inv.Issues = append(s.inv.Issues, issues...)
-		return nil
-	})
+	}
+	return nil
 }
 
 // files digests every file under rel as one area.
 func (s *scanner) files(rel, policy string) error {
 	base := filepath.Join(s.root.Path, filepath.FromSlash(rel))
-	return filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+	// The walk stays serial; each regular file's digest is taken on the
+	// bounded pool afterwards and written to its own entry (TXE-7023).
+	type pending struct {
+		idx int
+		p   string
+	}
+	var digests []pending
+	err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -618,13 +642,65 @@ func (s *scanner) files(rel, policy string) error {
 			s.issue("unsupported_file", "", s.root.Label+"/"+f.Path, "%s is not a regular file", f.Path)
 			return nil
 		}
-		f.Size, f.SHA256, err = fileDigest(p)
-		if err != nil {
-			return err
-		}
+		digests = append(digests, pending{idx: len(s.inv.Files), p: p})
 		s.inv.Files = append(s.inv.Files, f)
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	return s.forEach(len(digests), func(i int) error {
+		size, sum, err := fileDigest(digests[i].p)
+		if err != nil {
+			return err
+		}
+		f := &s.inv.Files[digests[i].idx]
+		f.Size, f.SHA256 = size, sum
+		return nil
+	})
+}
+
+// scanWorkers bounds how many files a scan reads at once. On the hub's Ceph
+// volume a small file costs 7.7 to 8.9 ms read alone and 0.8 to 1.1 ms with
+// 16 readers (TXE-7023), and the walk itself stays serial.
+var scanWorkers = 16
+
+// forEach runs fn for 0..n-1 on at most scanWorkers goroutines, and returns
+// once every one has returned. Its error is that of the lowest index that
+// failed, as a serial scan in walk order would report; a cancelled context
+// fails every call not yet started.
+func (s *scanner) forEach(n int, fn func(i int) error) error {
+	if n == 0 {
+		return nil
+	}
+	workers := min(max(scanWorkers, 1), n)
+	errs := make([]error, n)
+	next := make(chan int)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				if err := s.ctx.Err(); err != nil {
+					errs[i] = err
+					continue
+				}
+				errs[i] = fn(i)
+			}
+		}()
+	}
+	for i := range n {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *scanner) machineHome() error {
