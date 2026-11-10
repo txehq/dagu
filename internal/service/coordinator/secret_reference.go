@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
@@ -25,6 +26,12 @@ import (
 
 type SecretReferenceClient interface {
 	ResolveSecretReference(ctx context.Context, owner serviceregistry.HostInfo, ref secretref.Ref, workspace string, checkOnly bool, run SecretReferenceRun) (string, error)
+}
+
+// SecretReferenceRevisionClient is a SecretReferenceClient that also names
+// the stored revision a resolved value was read from (TXE-6222).
+type SecretReferenceRevisionClient interface {
+	ResolveSecretReferenceRevision(ctx context.Context, owner serviceregistry.HostInfo, ref secretref.Ref, workspace string, run SecretReferenceRun) (string, secretref.Revision, error)
 }
 
 type SecretReferenceRun struct {
@@ -59,6 +66,19 @@ func (r *secretReferenceResolver) ResolveReference(ctx context.Context, ref secr
 	return r.resolve(ctx, ref, false)
 }
 
+// ResolveReferenceRevision is ResolveReference that also names the stored
+// revision the coordinator read the value from. A client or coordinator
+// that does not name one gives the zero Revision: the run's identity is then
+// unknown (TXE-6222).
+func (r *secretReferenceResolver) ResolveReferenceRevision(ctx context.Context, ref secretref.Ref) (string, secretref.Revision, error) {
+	client, ok := r.client.(SecretReferenceRevisionClient)
+	if !ok {
+		value, err := r.resolve(ctx, ref, false)
+		return value, secretref.Revision{}, err
+	}
+	return client.ResolveSecretReferenceRevision(ctx, r.owner, ref, r.workspace, r.run)
+}
+
 func (r *secretReferenceResolver) CheckReferenceAccessibility(ctx context.Context, ref secretref.Ref) error {
 	_, err := r.resolve(ctx, ref, true)
 	return err
@@ -69,21 +89,48 @@ func (r *secretReferenceResolver) resolve(ctx context.Context, ref secretref.Ref
 }
 
 func (cli *clientImpl) ResolveSecretReference(ctx context.Context, owner serviceregistry.HostInfo, ref secretref.Ref, workspace string, checkOnly bool, run SecretReferenceRun) (string, error) {
-	if !emptyCoordinatorOwner(owner) && !completeCoordinatorOwner(owner) {
-		return "", fmt.Errorf("secret reference owner coordinator endpoint is incomplete")
+	resp, err := cli.secretReference(ctx, owner, secretReferenceRequest(ref, workspace, checkOnly, run))
+	if err != nil {
+		return "", err
 	}
+	return resp.GetValue(), nil
+}
 
-	req := secretReferenceRequest(ref, workspace, checkOnly, run)
+// ResolveSecretReferenceRevision resolves ref like ResolveSecretReference,
+// with the revision the coordinator names for the value. A coordinator that
+// names none (an older one) gives the zero Revision.
+func (cli *clientImpl) ResolveSecretReferenceRevision(ctx context.Context, owner serviceregistry.HostInfo, ref secretref.Ref, workspace string, run SecretReferenceRun) (string, secretref.Revision, error) {
+	resp, err := cli.secretReference(ctx, owner, secretReferenceRequest(ref, workspace, false, run))
+	if err != nil {
+		return "", secretref.Revision{}, err
+	}
+	return resp.GetValue(), secretReferenceRevision(resp), nil
+}
+
+// secretReferenceRevision is the revision a response names, or the zero
+// Revision when it names none or one out of range.
+func secretReferenceRevision(resp *coordinatorv1.ResolveSecretReferenceResponse) secretref.Revision {
+	version := resp.GetVersion()
+	if resp.GetSecretId() == "" || version <= 0 || version > math.MaxInt32 {
+		return secretref.Revision{}
+	}
+	return secretref.Revision{SecretID: resp.GetSecretId(), Version: int(version)}
+}
+
+func (cli *clientImpl) secretReference(ctx context.Context, owner serviceregistry.HostInfo, req *coordinatorv1.ResolveSecretReferenceRequest) (*coordinatorv1.ResolveSecretReferenceResponse, error) {
+	if !emptyCoordinatorOwner(owner) && !completeCoordinatorOwner(owner) {
+		return nil, fmt.Errorf("secret reference owner coordinator endpoint is incomplete")
+	}
 	if completeCoordinatorOwner(owner) {
 		return cli.resolveSecretReferenceTo(ctx, owner, req)
 	}
 	return cli.resolveSecretReference(ctx, req)
 }
 
-func (cli *clientImpl) resolveSecretReference(ctx context.Context, req *coordinatorv1.ResolveSecretReferenceRequest) (string, error) {
+func (cli *clientImpl) resolveSecretReference(ctx context.Context, req *coordinatorv1.ResolveSecretReferenceRequest) (*coordinatorv1.ResolveSecretReferenceResponse, error) {
 	members, err := cli.getCoordinatorMembers(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	var resp *coordinatorv1.ResolveSecretReferenceResponse
@@ -93,12 +140,12 @@ func (cli *clientImpl) resolveSecretReference(ctx context.Context, req *coordina
 		return callErr
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return resp.GetValue(), nil
+	return resp, nil
 }
 
-func (cli *clientImpl) resolveSecretReferenceTo(ctx context.Context, owner serviceregistry.HostInfo, req *coordinatorv1.ResolveSecretReferenceRequest) (string, error) {
+func (cli *clientImpl) resolveSecretReferenceTo(ctx context.Context, owner serviceregistry.HostInfo, req *coordinatorv1.ResolveSecretReferenceRequest) (*coordinatorv1.ResolveSecretReferenceResponse, error) {
 	var resp *coordinatorv1.ResolveSecretReferenceResponse
 	err := cli.callOwner(ctx, owner, false, func(ctx context.Context, member serviceregistry.HostInfo, client *client) error {
 		var callErr error
@@ -106,9 +153,9 @@ func (cli *clientImpl) resolveSecretReferenceTo(ctx context.Context, owner servi
 		return callErr
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return resp.GetValue(), nil
+	return resp, nil
 }
 
 func emptyCoordinatorOwner(owner serviceregistry.HostInfo) bool {
@@ -175,11 +222,15 @@ func (h *Handler) ResolveSecretReference(ctx context.Context, req *coordinatorv1
 		return &coordinatorv1.ResolveSecretReferenceResponse{}, nil
 	}
 
-	value, err := resolver.ResolveReference(ctx, ref)
+	value, revision, err := resolver.ResolveReferenceRevision(ctx, ref)
 	if err != nil {
 		return nil, secretReferenceRPCError(err)
 	}
-	return &coordinatorv1.ResolveSecretReferenceResponse{Value: value}, nil
+	return &coordinatorv1.ResolveSecretReferenceResponse{
+		Value:    value,
+		SecretId: revision.SecretID,
+		Version:  int64(revision.Version),
+	}, nil
 }
 
 func (h *Handler) authorizeSecretReference(ctx context.Context, req *coordinatorv1.ResolveSecretReferenceRequest, ref secretref.Ref) error {

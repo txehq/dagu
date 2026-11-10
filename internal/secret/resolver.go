@@ -32,6 +32,45 @@ func (r *ReferenceResolver) ResolveReference(ctx context.Context, ref secretref.
 	return value, err
 }
 
+// ResolveReferenceRevision is ResolveReference that also names the stored
+// revision the value was read from: the secret's ID and the version of the
+// value, taken from the same read (TXE-6222).
+func (r *ReferenceResolver) ResolveReferenceRevision(ctx context.Context, ref secretref.Ref) (string, secretref.Revision, error) {
+	sec, err := r.lookup(ctx, ref)
+	if err != nil {
+		return "", secretref.Revision{}, err
+	}
+	value, version, err := r.store.ResolveValue(ctx, sec.ID)
+	if err != nil {
+		return "", secretref.Revision{}, err
+	}
+	return value, versionRevision(sec, version), nil
+}
+
+// Revision names the stored revision ref resolves to now, from metadata
+// alone: no value is read. A revision that cannot be named is the zero
+// Revision.
+func (r *ReferenceResolver) Revision(ctx context.Context, ref secretref.Ref) (secretref.Revision, error) {
+	sec, err := r.lookup(ctx, ref)
+	if err != nil {
+		return secretref.Revision{}, err
+	}
+	version, err := r.store.GetCurrentVersion(ctx, sec.ID)
+	if err != nil {
+		return secretref.Revision{}, err
+	}
+	return versionRevision(sec, version), nil
+}
+
+// versionRevision is the revision of sec's value version, or the zero
+// Revision when the version is not one of sec.
+func versionRevision(sec *Secret, version *VersionMetadata) secretref.Revision {
+	if version == nil || version.SecretID != sec.ID {
+		return secretref.Revision{}
+	}
+	return secretref.Revision{SecretID: sec.ID, Version: version.Version}
+}
+
 // ReadReference returns the secret ref resolves to and its current value,
 // like ResolveReference, without recording the resolution on the secret.
 func (r *ReferenceResolver) ReadReference(ctx context.Context, ref secretref.Ref) (*Secret, string, error) {

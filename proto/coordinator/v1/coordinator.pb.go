@@ -6448,7 +6448,9 @@ func (b0 ResolveSecretReferenceRequest_builder) Build() *ResolveSecretReferenceR
 
 type ResolveSecretReferenceResponse struct {
 	state         protoimpl.MessageState `protogen:"hybrid.v1"`
-	Value         string                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"` // Plaintext secret value; empty for check_only
+	Value         string                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`                       // Plaintext secret value; empty for check_only
+	SecretId      string                 `protobuf:"bytes,2,opt,name=secret_id,json=secretId,proto3" json:"secret_id,omitempty"` // Managed secret the value was read from; empty from an older coordinator
+	Version       int64                  `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`                  // Version of the value, from the same read; 0 from an older coordinator
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -6485,14 +6487,38 @@ func (x *ResolveSecretReferenceResponse) GetValue() string {
 	return ""
 }
 
+func (x *ResolveSecretReferenceResponse) GetSecretId() string {
+	if x != nil {
+		return x.SecretId
+	}
+	return ""
+}
+
+func (x *ResolveSecretReferenceResponse) GetVersion() int64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
 func (x *ResolveSecretReferenceResponse) SetValue(v string) {
 	x.Value = v
+}
+
+func (x *ResolveSecretReferenceResponse) SetSecretId(v string) {
+	x.SecretId = v
+}
+
+func (x *ResolveSecretReferenceResponse) SetVersion(v int64) {
+	x.Version = v
 }
 
 type ResolveSecretReferenceResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
-	Value string
+	Value    string
+	SecretId string
+	Version  int64
 }
 
 func (b0 ResolveSecretReferenceResponse_builder) Build() *ResolveSecretReferenceResponse {
@@ -6500,6 +6526,8 @@ func (b0 ResolveSecretReferenceResponse_builder) Build() *ResolveSecretReference
 	b, x := &b0, m0
 	_, _ = b, x
 	x.Value = b.Value
+	x.SecretId = b.SecretId
+	x.Version = b.Version
 	return m0
 }
 
@@ -7270,9 +7298,11 @@ const file_proto_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"attemptKey\x12\x1d\n" +
 	"\n" +
 	"attempt_id\x18\a \x01(\tR\tattemptId\x12\x19\n" +
-	"\bdag_name\x18\b \x01(\tR\adagName\"6\n" +
+	"\bdag_name\x18\b \x01(\tR\adagName\"m\n" +
 	"\x1eResolveSecretReferenceResponse\x12\x14\n" +
-	"\x05value\x18\x01 \x01(\tR\x05value\"\xd7\x01\n" +
+	"\x05value\x18\x01 \x01(\tR\x05value\x12\x1b\n" +
+	"\tsecret_id\x18\x02 \x01(\tR\bsecretId\x12\x18\n" +
+	"\aversion\x18\x03 \x01(\x03R\aversion\"\xd7\x01\n" +
 	"\x1cResolveRuntimeProfileRequest\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1f\n" +
 	"\vattempt_key\x18\x02 \x01(\tR\n" +

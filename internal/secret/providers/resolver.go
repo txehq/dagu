@@ -80,6 +80,14 @@ type ReferenceResolver interface {
 	CheckReferenceAccessibility(ctx context.Context, ref secretref.Ref) error
 }
 
+// RevisionedReferenceResolver is a ReferenceResolver that also names the
+// stored revision each value was read from, taken from the same read as the
+// value (TXE-6222).
+type RevisionedReferenceResolver interface {
+	ReferenceResolver
+	ResolveReferenceRevision(ctx context.Context, ref secretref.Ref) (string, secretref.Revision, error)
+}
+
 // Registry manages all secret resolvers.
 // It is thread-safe and can be used concurrently.
 type Registry struct {
@@ -154,20 +162,42 @@ func (r *Registry) Get(provider string) Resolver {
 // Resolve fetches a single secret value.
 // Returns an error if the provider is unknown or resolution fails.
 func (r *Registry) Resolve(ctx context.Context, ref secretref.Ref) (string, error) {
+	value, _, err := r.resolve(ctx, ref)
+	return value, err
+}
+
+// resolve fetches a single secret value and, for a registry reference whose
+// resolver names it, the stored revision the value was read from. Any other
+// secret has no revision.
+func (r *Registry) resolve(ctx context.Context, ref secretref.Ref) (string, secretref.Revision, error) {
 	if ref.Ref != "" {
 		if ref.Provider != "" || ref.Key != "" || len(ref.Options) > 0 {
-			return "", fmt.Errorf("secret %q registry ref cannot include provider, key, or options", ref.Name)
+			return "", secretref.Revision{}, fmt.Errorf("secret %q registry ref cannot include provider, key, or options", ref.Name)
 		}
 		if r.referenceResolver == nil {
-			return "", fmt.Errorf("secret registry resolver is not configured for secret %q ref %q", ref.Name, ref.Ref)
+			return "", secretref.Revision{}, fmt.Errorf("secret registry resolver is not configured for secret %q ref %q", ref.Name, ref.Ref)
 		}
-		value, err := r.referenceResolver.ResolveReference(ctx, ref)
+		var (
+			value    string
+			revision secretref.Revision
+			err      error
+		)
+		if revisioned, ok := r.referenceResolver.(RevisionedReferenceResolver); ok {
+			value, revision, err = revisioned.ResolveReferenceRevision(ctx, ref)
+		} else {
+			value, err = r.referenceResolver.ResolveReference(ctx, ref)
+		}
 		if err != nil {
-			return "", &ResolveError{Name: ref.Name, Ref: ref.Ref, Err: err}
+			return "", secretref.Revision{}, &ResolveError{Name: ref.Name, Ref: ref.Ref, Err: err}
 		}
-		return value, nil
+		return value, revision, nil
 	}
+	value, err := r.resolveProvider(ctx, ref)
+	return value, secretref.Revision{}, err
+}
 
+// resolveProvider fetches a secret value from its external provider.
+func (r *Registry) resolveProvider(ctx context.Context, ref secretref.Ref) (string, error) {
 	if ref.Provider == "" {
 		return "", fmt.Errorf("provider is required for secret %q", ref.Name)
 	}
@@ -221,17 +251,34 @@ func (r *Registry) ResolveAll(ctx context.Context, refs []secretref.Ref) ([]stri
 		return nil, nil
 	}
 
-	envVars := make([]string, 0, len(refs))
+	envVars, _, err := r.ResolveAllRevisions(ctx, refs)
+	return envVars, err
+}
 
-	for _, ref := range refs {
-		value, err := r.Resolve(ctx, ref)
-		if err != nil {
-			return nil, err
-		}
-		envVars = append(envVars, fmt.Sprintf("%s=%s", ref.Name, value))
+// ResolveAllRevisions is ResolveAll that also returns, by secret name, the
+// stored revision each registry reference was read from. A secret without
+// one (an external provider, or a resolver that does not name revisions) has
+// no entry.
+func (r *Registry) ResolveAllRevisions(ctx context.Context, refs []secretref.Ref) ([]string, map[string]secretref.Revision, error) {
+	if len(refs) == 0 {
+		return nil, nil, nil
 	}
 
-	return envVars, nil
+	envVars := make([]string, 0, len(refs))
+	revisions := make(map[string]secretref.Revision, len(refs))
+
+	for _, ref := range refs {
+		value, revision, err := r.resolve(ctx, ref)
+		if err != nil {
+			return nil, nil, err
+		}
+		envVars = append(envVars, fmt.Sprintf("%s=%s", ref.Name, value))
+		if revision.Known() {
+			revisions[ref.Name] = revision
+		}
+	}
+
+	return envVars, revisions, nil
 }
 
 // CheckAccessibility validates that all secrets are accessible through no-fetch

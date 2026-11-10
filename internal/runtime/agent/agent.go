@@ -58,6 +58,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/runtimeenv"
 	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
 	"github.com/dagucloud/dagu/v2/internal/secret/providers"
+	secretref "github.com/dagucloud/dagu/v2/internal/secret/ref"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/dagucloud/dagu/v2/internal/telemetry"
 	"github.com/dagucloud/dagu/v2/internal/workspace"
@@ -643,7 +644,8 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 	if a.dag.DotenvLoaded {
 		dotenvFiles = append(dotenvFiles, "(read before the run started)")
 	}
-	a.runtimeIdentity = recordedRuntimeIdentity(a.dag, startup.profileIdentity, dotenvFiles, a.retryTarget)
+	inputs := runtimeInputs{profileIdentity: startup.profileIdentity, dotenvFiles: dotenvFiles, secrets: startup.secretRevisions}
+	a.runtimeIdentity = recordedRuntimeIdentity(a.dag, inputs, a.retryTarget)
 	if a.retryTarget != nil {
 		a.expectedRuntimeIdentity = a.retryTarget.ExpectedRuntimeIdentity
 	}
@@ -654,9 +656,10 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 	}
 
 	// A run whose outputs were reused automatically was admitted for one
-	// runtime identity: it stops before any step when its own differs.
-	if profileErr == nil {
-		profileErr = checkExpectedRuntimeIdentity(a.dag, startup.profileIdentity, dotenvFiles, a.retryTarget)
+	// runtime identity: it stops before any step when its own differs. A
+	// profile or secret that failed to resolve stops it with that failure.
+	if profileErr == nil && secretErr == nil {
+		profileErr = checkExpectedRuntimeIdentity(a.dag, inputs, a.retryTarget)
 		if profileErr != nil {
 			a.lock.Lock()
 			a.startupFailure = &ir.StartupFailure{Code: ir.StartupFailureRuntimeIdentityChanged}
@@ -2400,10 +2403,11 @@ func profileEntries(resolved *profilepkg.Resolved) []ir.RuntimeProfileEntry {
 }
 
 // resolveSecrets resolves all secrets defined in the DAG and returns them as
-// environment variable strings in "NAME=value" format.
-func (a *Agent) resolveSecrets(ctx context.Context, profileValues resolvedProfileValues) ([]string, error) {
+// environment variable strings in "NAME=value" format, with the stored
+// revision each registry reference was read from, by secret name.
+func (a *Agent) resolveSecrets(ctx context.Context, profileValues resolvedProfileValues) ([]string, map[string]secretref.Revision, error) {
 	if len(a.dag.Secrets) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	logger.Info(ctx, "Resolving secrets", tag.Count(len(a.dag.Secrets)))
@@ -2419,13 +2423,13 @@ func (a *Agent) resolveSecrets(ctx context.Context, profileValues resolvedProfil
 		}
 	}()
 
-	resolvedSecrets, err := secretRegistry.ResolveAll(secretCtx, a.dag.Secrets)
+	resolvedSecrets, revisions, err := secretRegistry.ResolveAllRevisions(secretCtx, a.dag.Secrets)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve secrets: %w", err)
+		return nil, nil, fmt.Errorf("failed to resolve secrets: %w", err)
 	}
 
 	logger.Debug(ctx, "Secrets resolved successfully", tag.Count(len(resolvedSecrets)))
-	return resolvedSecrets, nil
+	return resolvedSecrets, revisions, nil
 }
 
 // buildEnvScopeForSecrets creates the EnvScope secrets resolve against: DAG
