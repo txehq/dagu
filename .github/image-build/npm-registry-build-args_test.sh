@@ -97,8 +97,9 @@ for workflow in "$ROOT"/.github/workflows/*.y*ml; do
   [ "$builds" -gt 0 ] || continue
   passed="$(grep -cF "\${{ steps.npm-routes.outputs.build-args }}" "$workflow" || true)"
   routed="$(grep -cE '^[[:space:]]*(run: bash )\S*\.github/image-build/npm-registry-build-args\.sh[[:space:]]*$' "$workflow" || true)"
-  [ "$builds" = "$passed" ] && [ "$builds" = "$routed" ] \
-    || fail "${workflow#"$ROOT"/}: $builds image build(s), $routed helper step(s), $passed build-args that pass its output"
+  if [ "$builds" != "$passed" ] || [ "$builds" != "$routed" ]; then
+    fail "${workflow#"$ROOT"/}: $builds image build(s), $routed helper step(s), $passed build-args that pass its output"
+  fi
   # A workflow that builds another ref runs its own copy of the helper, before any registry login.
   if grep -E '^[[:space:]]*ref:' "$workflow" | grep -qvF 'github.sha'; then
     run_line="$(grep -nE 'run: bash \.workflow-npm-routes/\.github/image-build/npm-registry-build-args\.sh' "$workflow" | head -1 | cut -d: -f1 || true)"
