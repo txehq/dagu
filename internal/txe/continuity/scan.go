@@ -563,33 +563,44 @@ func (s *scanner) store(store, dir string, classify func(id string, data []byte)
 	if err != nil {
 		return err
 	}
-	data := make([][]byte, len(reads))
-	if err := s.forEach(len(reads), func(i int) error {
-		b, err := os.ReadFile(reads[i].p) //nolint:gosec // a path under the scanned root
-		data[i] = b
-		return err
-	}); err != nil {
-		return err
-	}
-	for i, r := range reads {
-		id := strings.TrimSuffix(r.rel, ".json")
-		rec, issues := classify(id, data[i])
-		rec.Store = store
-		rec.ID = id
-		if rec.SHA256 == "" {
-			rec.SHA256 = recordDigest(data[i])
+	// Records are read a batch at a time, so the contents held at once are
+	// bounded by the batch, not by the collection.
+	data := make([][]byte, min(storeReadBatch, len(reads)))
+	for start := 0; start < len(reads); start += storeReadBatch {
+		batch := reads[start:min(start+storeReadBatch, len(reads))]
+		if err := s.forEach(len(batch), func(i int) error {
+			b, err := os.ReadFile(batch[i].p) //nolint:gosec // a path under the scanned root
+			data[i] = b
+			return err
+		}); err != nil {
+			return err
 		}
-		rec.Raw = rawDigest(data[i])
-		for k := range issues {
-			if issues[k].ID == "" {
-				issues[k].ID = store + "/" + id
+		for i, r := range batch {
+			id := strings.TrimSuffix(r.rel, ".json")
+			rec, issues := classify(id, data[i])
+			rec.Store = store
+			rec.ID = id
+			if rec.SHA256 == "" {
+				rec.SHA256 = recordDigest(data[i])
 			}
+			rec.Raw = rawDigest(data[i])
+			data[i] = nil
+			for k := range issues {
+				if issues[k].ID == "" {
+					issues[k].ID = store + "/" + id
+				}
+			}
+			s.inv.Records = append(s.inv.Records, *rec)
+			s.inv.Issues = append(s.inv.Issues, issues...)
 		}
-		s.inv.Records = append(s.inv.Records, *rec)
-		s.inv.Issues = append(s.inv.Issues, issues...)
 	}
 	return nil
 }
+
+// storeReadBatch is how many record files store reads before it classifies
+// them: enough to keep the pool busy, few enough that a large collection's
+// contents are never all held at once.
+var storeReadBatch = 256
 
 // files digests every file under rel as one area.
 func (s *scanner) files(rel, policy string) error {

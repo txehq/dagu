@@ -34,6 +34,10 @@ func TestParallelScanEqualsSerialScan(t *testing.T) {
 
 	restore = continuity.SetScanWorkers(16)
 	parallel := scan(t, l)
+	// Batches smaller than every collection: records cross batch boundaries.
+	restoreBatch := continuity.SetStoreReadBatch(3)
+	batched := scan(t, l)
+	restoreBatch()
 	restore()
 
 	require.NotEmpty(t, serial.Files)
@@ -44,6 +48,9 @@ func TestParallelScanEqualsSerialScan(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, string(a), string(b))
 	assert.Equal(t, string(a), string(b))
+	c, err := json.Marshal(batched)
+	require.NoError(t, err)
+	assert.Equal(t, string(a), string(c))
 }
 
 // The pool really reads more than one file at a time, and never more than
