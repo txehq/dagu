@@ -17,3 +17,16 @@ type Ref struct {
 	// Options contains provider-specific configuration.
 	Options map[string]string `json:"options,omitempty"`
 }
+
+// Revision names the stored state a registry reference resolved to: the
+// managed secret's ID and the version of its value. It holds nothing derived
+// from the value (TXE-6222).
+type Revision struct {
+	SecretID string `json:"secretId"`
+	Version  int    `json:"version"`
+}
+
+// Known reports whether the revision names a stored state.
+func (r Revision) Known() bool {
+	return r.SecretID != "" && r.Version > 0
+}

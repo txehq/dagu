@@ -634,6 +634,8 @@ message ResolveSecretReferenceRequest {
 
 message ResolveSecretReferenceResponse {
   string value = 1; // Plaintext secret value; empty for check_only
+  string secret_id = 2; // Managed secret the value was read from; empty from an older coordinator
+  int64 version = 3; // Version of the value, from the same read; 0 from an older coordinator
 }
 
 message ResolveRuntimeProfileRequest {

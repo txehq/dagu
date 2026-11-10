@@ -173,6 +173,8 @@ steps:
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "secret-value", resp.GetValue())
+	assert.Equal(t, sec.ID, resp.GetSecretId(), "the revision the value was read from")
+	assert.Equal(t, int64(1), resp.GetVersion())
 
 	checkResp, err := handler.ResolveSecretReference(ctx, &coordinatorv1.ResolveSecretReferenceRequest{
 		Name:       "MY_SECRET",
@@ -185,6 +187,21 @@ steps:
 	})
 	require.NoError(t, err)
 	assert.Empty(t, checkResp.GetValue())
+	assert.Empty(t, checkResp.GetSecretId())
+
+	_, err = secretStore.WriteValue(ctx, sec.ID, secretpkg.WriteValueInput{Value: "rotated", CreatedAt: now})
+	require.NoError(t, err)
+	rotatedResp, err := handler.ResolveSecretReference(ctx, &coordinatorv1.ResolveSecretReferenceRequest{
+		Name:       "MY_SECRET",
+		Ref:        "prod/my-secret",
+		Workspace:  "payments",
+		WorkerId:   "worker-1",
+		AttemptKey: attemptKey,
+		AttemptId:  attempt.ID(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", rotatedResp.GetValue())
+	assert.Equal(t, int64(2), rotatedResp.GetVersion(), "a rotation, at the same instant")
 
 	nestedResp, err := handler.ResolveSecretReference(ctx, &coordinatorv1.ResolveSecretReferenceRequest{
 		Name:       "MY_SECRET",
@@ -196,7 +213,7 @@ steps:
 		DagName:    "external-child",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "secret-value", nestedResp.GetValue())
+	assert.Equal(t, "rotated", nestedResp.GetValue())
 
 	localNestedResp, err := handler.ResolveSecretReference(ctx, &coordinatorv1.ResolveSecretReferenceRequest{
 		Name:       "MY_SECRET",
@@ -208,7 +225,7 @@ steps:
 		DagName:    "nested-local-child",
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "secret-value", localNestedResp.GetValue())
+	assert.Equal(t, "rotated", localNestedResp.GetValue())
 
 	_, err = handler.ResolveSecretReference(ctx, &coordinatorv1.ResolveSecretReferenceRequest{
 		Name:       "MY_SECRET",

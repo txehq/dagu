@@ -26,6 +26,8 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
+	secretpkg "github.com/dagucloud/dagu/v2/internal/secret"
+	secretref "github.com/dagucloud/dagu/v2/internal/secret/ref"
 	"github.com/dagucloud/dagu/v2/internal/spec"
 	runtestutil "github.com/dagucloud/dagu/v2/internal/testutil"
 )
@@ -71,7 +73,7 @@ func newReuseRuntimeRig(t *testing.T) reuseRuntimeRig {
 	require.NotEqual(t, none, prodIdentity)
 	return reuseRuntimeRig{
 		api: api, dag: dag,
-		none: spec.RunRuntimeIdentity(dag, none), prod: spec.RunRuntimeIdentity(dag, prodIdentity),
+		none: spec.RunRuntimeIdentity(dag, none, nil), prod: spec.RunRuntimeIdentity(dag, prodIdentity, nil),
 		noneProfile: none, prodProfile: prodIdentity,
 	}
 }
@@ -216,8 +218,8 @@ func TestCheckDAGReuseRuntime(t *testing.T) {
 	saved, err := dags.GetDetails(ctx, rig.dag.Name, persis.DAGLoadOptions{AllowBuildErrors: true})
 	require.NoError(t, err)
 
-	rig.sourceRun(t, "run-none", spec.RunRuntimeIdentity(saved, rig.noneProfile))
-	rig.sourceRun(t, "run-prod", spec.RunRuntimeIdentity(saved, rig.prodProfile))
+	rig.sourceRun(t, "run-none", spec.RunRuntimeIdentity(saved, rig.noneProfile, nil))
+	rig.sourceRun(t, "run-prod", spec.RunRuntimeIdentity(saved, rig.prodProfile, nil))
 	rig.sourceRun(t, "run-old", "")
 
 	resp, err := rig.api.CheckDAGReuseRuntime(ctx, gen.CheckDAGReuseRuntimeRequestObject{
@@ -281,4 +283,50 @@ func writeMarkerCommand(path string) string {
 		return "Set-Content -Path '" + strings.ReplaceAll(path, "'", "''") + "' -Value x"
 	}
 	return "touch '" + strings.ReplaceAll(path, "'", `'\''`) + "'"
+}
+
+// The hub names a registry secret reference by the stored revision it
+// resolves to now, from metadata, in the DAG's workspace first: a rotation,
+// a secret of the workspace that shadows the global one, and a secret that
+// cannot be resolved each change what it names (TXE-6222).
+func TestProspectiveRuntimeIdentityNamesRegistrySecrets(t *testing.T) {
+	ctx := context.Background()
+	rig := newReuseRuntimeRig(t)
+	secrets := rig.api.secretStore
+	global, err := secretpkg.New(secretpkg.CreateInput{Workspace: secretpkg.GlobalWorkspace, Ref: "team/token", ProviderType: secretpkg.ProviderDaguManaged}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, secrets.Create(ctx, global, &secretpkg.WriteValueInput{Value: "v1"}))
+	dag, err := spec.LoadYAML(ctx, []byte("labels: [workspace=ops]\nsecrets:\n  - name: TOKEN\n    ref: team/token\nsteps:\n  - run: echo $TOKEN\n"))
+	require.NoError(t, err)
+
+	first := rig.api.prospectiveRuntimeIdentity(ctx, dag, "")
+	require.NotEmpty(t, first)
+	assert.Equal(t, spec.RunRuntimeIdentity(dag, rig.noneProfile, map[string]secretref.Revision{"TOKEN": {SecretID: global.ID, Version: 1}}), first)
+	assert.Equal(t, first, rig.api.prospectiveRuntimeIdentity(ctx, dag, ""), "the same state")
+
+	_, err = secrets.WriteValue(ctx, global.ID, secretpkg.WriteValueInput{Value: "v2"})
+	require.NoError(t, err)
+	rotated := rig.api.prospectiveRuntimeIdentity(ctx, dag, "")
+	require.NotEmpty(t, rotated)
+	assert.NotEqual(t, first, rotated, "a rotation")
+
+	shadow, err := secretpkg.New(secretpkg.CreateInput{Workspace: "ops", Ref: "team/token", ProviderType: secretpkg.ProviderDaguManaged}, time.Now())
+	require.NoError(t, err)
+	require.NoError(t, secrets.Create(ctx, shadow, &secretpkg.WriteValueInput{Value: "v2"}))
+	shadowed := rig.api.prospectiveRuntimeIdentity(ctx, dag, "")
+	require.NotEmpty(t, shadowed)
+	assert.NotEqual(t, rotated, shadowed, "the workspace's secret, with the same value")
+
+	disabled, err := secrets.GetByID(ctx, shadow.ID)
+	require.NoError(t, err)
+	require.NoError(t, disabled.SetStatus(secretpkg.StatusDisabled, "alice", time.Now()))
+	require.NoError(t, secrets.Update(ctx, disabled))
+	assert.Empty(t, rig.api.prospectiveRuntimeIdentity(ctx, dag, ""), "a disabled secret")
+
+	missing, err := spec.LoadYAML(ctx, []byte("secrets:\n  - name: TOKEN\n    ref: team/missing\nsteps:\n  - run: echo $TOKEN\n"))
+	require.NoError(t, err)
+	assert.Empty(t, rig.api.prospectiveRuntimeIdentity(ctx, missing, ""), "a missing secret")
+
+	rig.api.secretStore = nil
+	assert.Empty(t, rig.api.prospectiveRuntimeIdentity(ctx, dag, ""), "no secret store")
 }
