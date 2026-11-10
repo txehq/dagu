@@ -5,6 +5,7 @@ package agent_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -54,7 +55,7 @@ func TestAgentRefusesASeededRunOfAnotherRuntimeIdentity(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			th := test.Setup(t)
 			marker := filepath.Join(t.TempDir(), "executed")
-			dag := th.DAG(t, "steps:\n  - name: work\n    run: touch "+marker+"\n")
+			dag := th.DAG(t, fmt.Sprintf("steps:\n  - name: work\n    script: %q\n", writeFileCommand(marker, "ran")))
 
 			runID := "seeded-run"
 			prepared, err := th.DAGRunRepository.CreateAttempt(th.Context, dag.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
@@ -100,7 +101,7 @@ func TestAgentIdentityIsUnknownWithADotenvFile(t *testing.T) {
 		th := test.Setup(t)
 		dir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("REGION=eu\n"), 0o600))
-		dag := th.DAG(t, "working_dir: "+dir+"\nsteps:\n  - run: echo done\n")
+		dag := th.DAG(t, fmt.Sprintf("working_dir: %q\nsteps:\n  - run: echo done\n", dir))
 		dag.DAG.RuntimeResolved = resolvedBefore
 		// Resolved before by another process, which read the file and sent
 		// the mark with the environment.
