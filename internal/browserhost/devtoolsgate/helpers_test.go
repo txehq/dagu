@@ -56,6 +56,38 @@ type testGate struct {
 	runErr chan error
 }
 
+// pipePair is two pipes joined end to end in one process, as the gate and
+// the browser hold them: each side reads what the other writes. It is the
+// one place that closes such a pair: the write ends first, so each reader
+// sees end-of-file and returns, then the read ends. A read end closed while
+// a Read is in progress waits for that Read, on Windows for ever when
+// nothing will end it (the Windows unit shard of PR #240 sat 20 minutes in
+// a fixture that closed the read ends first).
+type pipePair struct {
+	// gateRead and gateWrite are the gate's ends; browserRead and
+	// browserWrite the browser's.
+	gateRead, gateWrite       *os.File
+	browserRead, browserWrite *os.File
+}
+
+func newPipePair(t *testing.T) *pipePair {
+	t.Helper()
+	browserRead, gateWrite, err := os.Pipe()
+	require.NoError(t, err)
+	gateRead, browserWrite, err := os.Pipe()
+	require.NoError(t, err)
+	return &pipePair{gateRead: gateRead, gateWrite: gateWrite, browserRead: browserRead, browserWrite: browserWrite}
+}
+
+// close closes the four ends, write ends first. An end closed already is
+// no error.
+func (p *pipePair) close() {
+	_ = p.gateWrite.Close()
+	_ = p.browserWrite.Close()
+	_ = p.gateRead.Close()
+	_ = p.browserRead.Close()
+}
+
 // startTestGate runs a fake browser and a gate over pipes in this process.
 func startTestGate(t *testing.T) *testGate {
 	t.Helper()
@@ -66,14 +98,11 @@ func startTestGate(t *testing.T) *testGate {
 // before the mux starts, where run installs the gate's own hooks.
 func startTestGateWith(t *testing.T, setup func(m *mux, f *fakeBrowser)) *testGate {
 	t.Helper()
-	browserRead, gateWrite, err := os.Pipe()
-	require.NoError(t, err)
-	gateRead, browserWrite, err := os.Pipe()
-	require.NoError(t, err)
-	fake := newFakeBrowser(browserRead, browserWrite)
+	pair := newPipePair(t)
+	fake := newFakeBrowser(pair.browserRead, pair.browserWrite)
 	go func() { _ = fake.serve() }()
 
-	m := newMux(newPipe(gateRead, gateWrite))
+	m := newMux(newPipe(pair.gateRead, pair.gateWrite))
 	if setup != nil {
 		setup(m, fake)
 	}
@@ -93,9 +122,7 @@ func startTestGateWith(t *testing.T, setup func(m *mux, f *fakeBrowser)) *testGa
 	t.Cleanup(func() {
 		g.close()
 		cancel()
-		m.pipe.close()
-		_ = browserRead.Close()
-		_ = browserWrite.Close()
+		pair.close()
 	})
 	return &testGate{t: t, gate: g, fake: fake, mux: m, token: token, runErr: runErr}
 }
