@@ -66,8 +66,8 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	}
 	m := newMux(browser.pipe)
 	if cfg.ProxyAuth != nil {
-		// Set before the mux reads the pipe: the responder must be in
-		// place for the first target the gate holds.
+		// Set before the mux reads the pipe: the responder's interception
+		// goes in place in m.start, before the gate holds any target.
 		newProxyResponder(m, *cfg.ProxyAuth).install()
 	}
 	// The keeper counts admitted clients from the first one: it is on the
@@ -99,7 +99,7 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 		return fail(fmt.Errorf("devtools gate: the browser did not answer over its pipe: %w", err))
 	}
 	if err := m.start(startCtx); err != nil {
-		return fail(fmt.Errorf("devtools gate: attach to the browser's targets: %w", err))
+		return fail(fmt.Errorf("devtools gate: %w", err))
 	}
 	g := newGate(m, cfg.Token, NewToken(), version)
 	port, err := g.listen()

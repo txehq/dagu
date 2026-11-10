@@ -56,17 +56,56 @@ type testGate struct {
 	runErr chan error
 }
 
-// startTestGate runs a fake browser and a gate over pipes in this process.
-func startTestGate(t *testing.T) *testGate {
+// pipePair is two pipes joined end to end in one process, as the gate and
+// the browser hold them: each side reads what the other writes. It is the
+// one place that closes such a pair: the write ends first, so each reader
+// sees end-of-file and returns, then the read ends. A read end closed while
+// a Read is in progress waits for that Read, on Windows for ever when
+// nothing will end it (the Windows unit shard of PR #240 sat 20 minutes in
+// a fixture that closed the read ends first).
+type pipePair struct {
+	// gateRead and gateWrite are the gate's ends; browserRead and
+	// browserWrite the browser's.
+	gateRead, gateWrite       *os.File
+	browserRead, browserWrite *os.File
+}
+
+func newPipePair(t *testing.T) *pipePair {
 	t.Helper()
 	browserRead, gateWrite, err := os.Pipe()
 	require.NoError(t, err)
 	gateRead, browserWrite, err := os.Pipe()
 	require.NoError(t, err)
-	fake := newFakeBrowser(browserRead, browserWrite)
+	return &pipePair{gateRead: gateRead, gateWrite: gateWrite, browserRead: browserRead, browserWrite: browserWrite}
+}
+
+// close closes the four ends, write ends first. An end closed already is
+// no error.
+func (p *pipePair) close() {
+	_ = p.gateWrite.Close()
+	_ = p.browserWrite.Close()
+	_ = p.gateRead.Close()
+	_ = p.browserRead.Close()
+}
+
+// startTestGate runs a fake browser and a gate over pipes in this process.
+func startTestGate(t *testing.T) *testGate {
+	t.Helper()
+	return startTestGateWith(t, nil)
+}
+
+// startTestGateWith is startTestGate with setup run on the mux and the fake
+// before the mux starts, where run installs the gate's own hooks.
+func startTestGateWith(t *testing.T, setup func(m *mux, f *fakeBrowser)) *testGate {
+	t.Helper()
+	pair := newPipePair(t)
+	fake := newFakeBrowser(pair.browserRead, pair.browserWrite)
 	go func() { _ = fake.serve() }()
 
-	m := newMux(newPipe(gateRead, gateWrite))
+	m := newMux(newPipe(pair.gateRead, pair.gateWrite))
+	if setup != nil {
+		setup(m, fake)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	runErr := make(chan error, 1)
 	go func() { runErr <- m.run(ctx) }()
@@ -83,9 +122,7 @@ func startTestGate(t *testing.T) *testGate {
 	t.Cleanup(func() {
 		g.close()
 		cancel()
-		m.pipe.close()
-		_ = browserRead.Close()
-		_ = browserWrite.Close()
+		pair.close()
 	})
 	return &testGate{t: t, gate: g, fake: fake, mux: m, token: token, runErr: runErr}
 }
@@ -202,6 +239,26 @@ func (c *cdpConn) call(sessionID, method string, params any) (json.RawMessage, e
 	}
 }
 
+// send sends a command without waiting for its reply, which read drops as
+// nobody's. It never fails the test, so a goroutine may use it.
+func (c *cdpConn) send(sessionID, method string, params any) {
+	c.mu.Lock()
+	c.nextID++
+	id := c.nextID
+	c.mu.Unlock()
+	command := map[string]any{"id": id, "method": method, "params": params}
+	if sessionID != "" {
+		command["sessionId"] = sessionID
+	}
+	data, err := json.Marshal(command)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = c.conn.Write(ctx, websocket.MessageText, data)
+}
+
 // mustCall fails the test on a protocol error.
 func (c *cdpConn) mustCall(sessionID, method string, params any) json.RawMessage {
 	c.t.Helper()
@@ -231,12 +288,20 @@ func (c *cdpConn) waitEvent(method string, accept func(message) bool) message {
 // noEvent asserts that no event with method arrives within wait.
 func (c *cdpConn) noEvent(method string, wait time.Duration) {
 	c.t.Helper()
+	c.noEvents(wait, method)
+}
+
+// noEvents asserts that no event with any of methods arrives within wait,
+// in one watch, so one forbidden event cannot slip by while another is
+// watched for.
+func (c *cdpConn) noEvents(wait time.Duration, methods ...string) {
+	c.t.Helper()
 	deadline := time.After(wait)
 	for {
 		select {
 		case event := <-c.events:
-			if event.Method == method {
-				c.t.Fatalf("unexpected %s event: %s", method, event.Params)
+			if slices.Contains(methods, event.Method) {
+				c.t.Fatalf("unexpected %s event: %s", event.Method, event.Params)
 			}
 		case <-deadline:
 			return
