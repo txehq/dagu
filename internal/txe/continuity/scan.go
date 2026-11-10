@@ -689,9 +689,7 @@ func (s *scanner) forEach(n int, fn func(i int) error) error {
 	next := make(chan int)
 	var wg sync.WaitGroup
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range next {
 				if err := s.ctx.Err(); err != nil {
 					errs[i] = err
@@ -699,7 +697,7 @@ func (s *scanner) forEach(n int, fn func(i int) error) error {
 				}
 				errs[i] = fn(i)
 			}
-		}()
+		})
 	}
 	for i := range n {
 		next <- i
