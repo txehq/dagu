@@ -68,6 +68,78 @@ steps:
 	assert.True(t, os.IsNotExist(err))
 }
 
+// A file moved out of the watched folder, seen gone, and moved back
+// unchanged is a second arrival: the scheduler queues a second run for it,
+// under another run ID, though its size and time are what they were.
+func TestWatchedFolderRunsAFileThatCameBackUnchanged(t *testing.T) {
+	inbox := t.TempDir()
+	away := filepath.Join(t.TempDir(), "order-1.txt")
+	done := filepath.Join(t.TempDir(), "done")
+
+	f := newFixture(t, `
+name: inbox
+watch:
+  path: `+yamlString(inbox)+`
+  interval: 1s
+steps:
+  - id: keep
+    action: file.copy
+    with:
+      source: ${WATCH_FILE}
+      destination: `+yamlString(filepath.ToSlash(done)+"/${WATCH_NAME}")+`
+      create_dirs: true
+      overwrite: true
+`).StartScheduler(90 * time.Second)
+	defer f.Stop()
+
+	watchRecord := func() string {
+		record, err := f.th.Backend.Collection(persis.CollectionWatchState).Get(f.th.Context, "watch")
+		if err != nil {
+			return ""
+		}
+		return string(record.Data)
+	}
+	finished := func(want int) []ir.DAGRunStatus {
+		var statuses []ir.DAGRunStatus
+		f.h.Wait.EventuallyEveryWithin("the file's runs finish", 40*time.Second, 200*time.Millisecond, func() bool {
+			var err error
+			statuses, err = f.th.DAGRunRepository.RecentStatuses(f.th.Context, "inbox", 5)
+			if err != nil || len(statuses) < want {
+				return false
+			}
+			for _, status := range statuses {
+				if status.Status == ir.Queued || status.Status == ir.Running {
+					return false
+				}
+			}
+			return true
+		})
+		return statuses
+	}
+
+	f.h.Wait.EventuallyEveryWithin("the folder is read", 20*time.Second, 200*time.Millisecond, func() bool {
+		return strings.Contains(watchRecord(), `"inbox"`)
+	})
+	path := filepath.Join(inbox, "order-1.txt")
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o600))
+	require.Len(t, finished(1), 1)
+
+	require.NoError(t, os.Rename(path, away))
+	f.h.Wait.EventuallyEveryWithin("the scheduler sees the file gone", 20*time.Second, 200*time.Millisecond, func() bool {
+		record := watchRecord()
+		return strings.Contains(record, `"inbox"`) && !strings.Contains(record, `"order-1.txt"`)
+	})
+	require.NoError(t, os.Rename(away, path))
+
+	statuses := finished(2)
+	require.Len(t, statuses, 2, "one run for each arrival")
+	assert.NotEqual(t, statuses[0].DAGRunID, statuses[1].DAGRunID)
+	for _, status := range statuses {
+		assert.Equal(t, ir.Succeeded, status.Status)
+		assert.Equal(t, ir.TriggerTypeFile, status.TriggerType)
+	}
+}
+
 // yamlString quotes a path for YAML, backslashes included.
 func yamlString(s string) string {
 	return `"` + strings.ReplaceAll(s, `\`, `\\`) + `"`

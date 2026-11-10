@@ -74,6 +74,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.DAGU_GITHUB_TOKEN }}
 
+      # BuildKit runs a Dockerfile's RUN steps without the job's environment, so the build
+      # passes the runner's npm cache, when it has one that answers (TXE-6359).
+      - name: Route the image build's Node fetches to the runner's npm cache
+        id: npm-routes
+        run: bash .github/image-build/npm-registry-build-args.sh
+
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
@@ -84,6 +90,7 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
             LDFLAGS=-X 'main.version=${{ env.VERSION }}'
+            ${{ steps.npm-routes.outputs.build-args }}
 
       - name: Export digest
         run: |

@@ -49,6 +49,23 @@ jobs:
           echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=${BASH_REMATCH[1]}-txe.${BASH_REMATCH[2]}" >> "$GITHUB_ENV"
 
+      # BuildKit runs a Dockerfile's RUN steps without the job's environment, so the build
+      # passes the runner's npm cache, when it has one that answers (TXE-6359). This runs the
+      # workflow's own copy of the helper, first: never code from the ref being built, and
+      # before any registry login. The checkout of that ref removes this directory.
+      - name: Check out the workflow's npm route helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: .workflow-npm-routes
+          persist-credentials: false
+          sparse-checkout: .github/image-build/npm-registry-build-args.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Route the image build's Node fetches to the runner's npm cache
+        id: npm-routes
+        run: bash .workflow-npm-routes/.github/image-build/npm-registry-build-args.sh
+
       - name: Check out the tag
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -84,6 +101,7 @@ jobs:
             org.opencontainers.image.version=${{ env.VERSION }}
           build-args: |
             LDFLAGS=-X 'main.version=${{ env.VERSION }}'
+            ${{ steps.npm-routes.outputs.build-args }}
 
       - name: Verify the pushed image reports its version
         env:

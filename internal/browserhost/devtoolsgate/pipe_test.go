@@ -4,9 +4,11 @@
 package devtoolsgate
 
 import (
+	"errors"
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,16 +16,10 @@ import (
 
 func TestPipeFraming(t *testing.T) {
 	t.Parallel()
-	in, peerOut, err := os.Pipe()
-	require.NoError(t, err)
-	peerIn, out, err := os.Pipe()
-	require.NoError(t, err)
-	p := newPipe(in, out)
-	t.Cleanup(func() {
-		p.close()
-		_ = peerIn.Close()
-		_ = peerOut.Close()
-	})
+	pair := newPipePair(t)
+	t.Cleanup(pair.close)
+	p := newPipe(pair.gateRead, pair.gateWrite)
+	peerIn, peerOut := pair.browserRead, pair.browserWrite
 
 	require.NoError(t, p.write([]byte(`{"id":1}`)))
 	got := make([]byte, 64)
@@ -50,4 +46,43 @@ func TestPipeFraming(t *testing.T) {
 	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	_, err = p.read()
 	assert.ErrorIs(t, err, io.EOF, "a closed pipe at a frame boundary is end-of-file")
+}
+
+// Closing a pipe pair with a Read in progress on each side returns at once
+// and ends both reads: the write ends go first, so the readers see
+// end-of-file. With the read ends first, a read end's Close waits for the
+// Read, on Windows for ever. The bounds keep a regression a failure, not a
+// hang.
+func TestPipePairCloseEndsReadsInProgress(t *testing.T) {
+	t.Parallel()
+	pair := newPipePair(t)
+	reads := make(chan error, 2)
+	for _, end := range []*os.File{pair.gateRead, pair.browserRead} {
+		go func() {
+			_, err := end.Read(make([]byte, 1))
+			reads <- err
+		}()
+	}
+	// The reads have begun by now, far more often than not; a read that
+	// starts after the close ends at once too, with the file closed.
+	time.Sleep(200 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		pair.close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("closing the pair waited on a read in progress")
+	}
+	for range 2 {
+		select {
+		case err := <-reads:
+			assert.True(t, errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed), "the read ended with end-of-file or a closed file: %v", err)
+		case <-time.After(10 * time.Second):
+			t.Fatal("a read in progress did not end with the close")
+		}
+	}
 }

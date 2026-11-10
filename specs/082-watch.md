@@ -40,13 +40,24 @@ that polls the folder and leaves empty runs behind.
   absolute path, and `WATCH_NAME`, its name. The run's trigger type is
   `file`.
 - The scheduler remembers each file by its size and modification time, so
-  a file runs once. A file replaced with other content runs again; a file
-  that went away and came back runs again. A file that is removed is
-  forgotten.
-- A run is named after the file's version (`file-` and a hash of the DAG,
-  the path, the size, and the time), so a file queued again after the
-  record was lost, as when the scheduler stopped between queuing the run
-  and saving the record, is the run the queue already holds.
+  a file runs once. A file replaced with other content runs again. A file
+  that a reading found gone is forgotten, so when a later reading finds it
+  again it runs again, changed or not. A file moved out and back between
+  two readings, or while the scheduler is off, was never found gone and
+  does not run again.
+- Each arrival is numbered in the record, and the record is saved, before
+  its run is queued. The run is named after the arrival (`file-` and a hash
+  of the DAG, the record's own random name, and the arrival's number). The
+  same arrival queued again, as when the scheduler stopped between queuing
+  the run and recording that it did, is the run the queue already holds;
+  another arrival of the file, of the same version or another, is another
+  run. An arrival that could not be saved is not queued until it is.
+- A record made anew, because `path` or `pattern` changed or the record was
+  lost, has a name of its own, so its numbers never name an earlier run.
+  When the record is lost, the files the folder holds are taken as already
+  there: an arrival whose run was not yet queued then does not run, and no
+  run is queued twice. A record written before arrivals were numbered
+  (version 1) is read with each of its files as handled.
 - `WATCH_FILE` and `WATCH_NAME` are chosen by whoever put the file in the
   folder: a `run:` step reads them with `printenv` or through
   `template.render` rather than interpolating them into its command.
@@ -56,10 +67,14 @@ that polls the folder and leaves empty runs behind.
   off is new when it returns.
 - A suspended DAG starts no runs; its files wait and run once it resumes.
   A file whose run could not be queued is tried again at the next reading.
+  A waiting file that changes waits to hold still again, and only its new
+  version runs.
 - A folder that cannot be read is reported once in the scheduler log, and
   read again every interval until it can be.
 - The record of watched folders is kept with the scheduler's state and
-  survives restarts. A DAG the scheduler leaves out for a while, as one
+  survives restarts. A record that cannot be read is tried again every
+  second, and no folder is read until it is; a record that is corrupt is
+  started over. A DAG the scheduler leaves out for a while, as one
   being edited is, keeps its record, so a file that arrives meanwhile runs
   once the DAG is back; the record of a DAG that is gone for good stays.
 

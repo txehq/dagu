@@ -28,7 +28,13 @@ import (
 //   - sessions a client attached explicitly are its own, and the gate
 //     detaches them when the client goes away;
 //   - events with a session id go to the client holding that session;
-//     browser-level events go to every client.
+//     browser-level events go to every client;
+//   - the gate may hold a session of its own on the browser target
+//     (Target.attachToBrowserTarget), set up before the auto-attach and so
+//     before any target can run, for what must be in place for every
+//     request of every target, such as the proxy's credential
+//     (proxyauth.go). Its events reach no client, and no client can
+//     address it.
 //
 // Commands the gate sends for itself run on the gate's own sessions, never on
 // a client's.
@@ -92,10 +98,6 @@ type target struct {
 	// attaching counts the private attaches in flight for the target; the
 	// target is not resumed while any is.
 	attaching int
-	// holds counts the gate's own setup pending on the target, such as a
-	// Fetch.enable on gateSession that must be in place before the target
-	// runs; the target is not resumed while any is.
-	holds int
 	// nestedAutoAttach is set once the gate asked for auto-attach on
 	// gateSession, so the target's own children are held too.
 	nestedAutoAttach bool
@@ -155,15 +157,22 @@ type mux struct {
 	// helper and of its leaving, under mu, so the lifetime policy's count
 	// matches the registrations (attend.go).
 	attendance *keeper
-	// onGateEvent receives events on the gate's own sessions, for the gate's
-	// own protocol use.
-	onGateEvent func(t *target, m message)
-	// onGateAttached runs, with mu held, once the gate's auto-attach holds a
-	// new target and before any client is attached to it. Setup the gate
-	// needs in place before the target runs calls holdLocked, sends its
-	// commands on t.gateSession with gateCommand, and calls
-	// releaseHoldLocked from the reply.
-	onGateAttached func(t *target)
+	// browserSession is the gate's own session on the browser target, "" when
+	// it holds none. Events on it go to onGateEvent and to no client; a
+	// client addressing it is refused like any session it does not own.
+	browserSession string
+	// beforeAttach, when set, runs in start before the gate's auto-attach is
+	// asked for: setup that must be in place before any target can run.
+	// afterAttach, when set, runs once the auto-attach is in place and the
+	// targets that already existed are in gateSessions: setup for what was
+	// there before beforeAttach's work could cover it. An error from either
+	// ends the start, and the gate does not serve.
+	beforeAttach func(ctx context.Context) error
+	afterAttach  func(ctx context.Context) error
+	// onGateEvent receives events on the gate's own sessions, the browser
+	// session and the auto-attach sessions, for the gate's own protocol
+	// use; session names the one the event arrived on. It runs with mu held.
+	onGateEvent func(session string, m message)
 	// onBrowserClosing runs, with mu held, once the browser acknowledged a
 	// client's Browser.close. It must not block.
 	onBrowserClosing func()
@@ -334,13 +343,30 @@ func (m *mux) call(ctx context.Context, sessionID, method string, params any) (j
 	}
 }
 
-// start asks the browser for the root auto-attach the gate holds. Every new
-// target is then held until the gate resumes it.
+// start puts the gate's own setup in place (beforeAttach), asks the browser
+// for the root auto-attach the gate holds, then completes the setup for the
+// targets that already existed (afterAttach). Every new target is held
+// until the gate resumes it. The order is the point: nothing the setup must
+// cover can run before the setup's outcome is known, and a setup the
+// browser refuses ends the start.
 func (m *mux) start(ctx context.Context) error {
+	if m.beforeAttach != nil {
+		if err := m.beforeAttach(ctx); err != nil {
+			return err
+		}
+	}
+	// The browser reports the targets that exist before it answers, so
+	// gateSessions holds them when the call returns.
 	_, err := m.call(ctx, "", "Target.setAutoAttach", map[string]any{
 		"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
 	})
-	return err
+	if err != nil {
+		return fmt.Errorf("attach to the browser's targets: %w", err)
+	}
+	if m.afterAttach != nil {
+		return m.afterAttach(ctx)
+	}
+	return nil
 }
 
 // handleBrowserMessage dispatches one message from the pipe.
@@ -407,6 +433,12 @@ func (m *mux) handleEventLocked(msg message, data []byte) {
 		}
 		return
 	}
+	if msg.SessionID == m.browserSession {
+		if m.onGateEvent != nil {
+			m.onGateEvent(msg.SessionID, msg)
+		}
+		return
+	}
 	if t, ok := m.privateSessions[msg.SessionID]; ok {
 		for c, session := range t.private {
 			if session == msg.SessionID {
@@ -422,8 +454,8 @@ func (m *mux) handleEventLocked(msg message, data []byte) {
 		c.deliverEvent(msg.SessionID, msg.Method, msg.Params)
 		return
 	}
-	if t, ok := m.gateSessions[msg.SessionID]; ok && m.onGateEvent != nil {
-		m.onGateEvent(t, msg)
+	if _, ok := m.gateSessions[msg.SessionID]; ok && m.onGateEvent != nil {
+		m.onGateEvent(msg.SessionID, msg)
 	}
 }
 
@@ -442,6 +474,12 @@ func (m *mux) onAttachedLocked(msg message) {
 	}
 	var info targetInfo
 	if err := json.Unmarshal(params.TargetInfo, &info); err != nil || info.TargetID == "" {
+		return
+	}
+	if info.Type == "browser" {
+		// The gate's own session on the browser target, announced before
+		// the reply that names it (start): the auto-attach never holds the
+		// browser itself, and the browser is no target of the gate's.
 		return
 	}
 	if len(m.attaching[info.TargetID]) > 0 {
@@ -483,30 +521,12 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 	}
 	m.targets[t.id] = t
 	m.gateSessions[session] = t
-	if m.onGateAttached != nil {
-		m.onGateAttached(t)
-	}
 	for c := range m.clients {
 		sub, ok := c.autoAttach[parent]
 		if !ok || !sub.filter.matches(t.typ) {
 			continue
 		}
 		m.attachPrivateLocked(c, t, sub.wait)
-	}
-	m.maybeResumeLocked(t)
-}
-
-// holdLocked keeps t from being resumed until releaseHoldLocked is called
-// as many times. m.mu must be held.
-func (m *mux) holdLocked(t *target) {
-	t.holds++
-}
-
-// releaseHoldLocked lets go of one hold on t and resumes it when nothing
-// else holds it. m.mu must be held, as it is in a gateCommand reply.
-func (m *mux) releaseHoldLocked(t *target) {
-	if t.holds > 0 {
-		t.holds--
 	}
 	m.maybeResumeLocked(t)
 }
@@ -624,10 +644,9 @@ func (m *mux) dropStashedLocked(targetID, session string) message {
 }
 
 // maybeResumeLocked lets a held target run once every client that asked to
-// wait for it has resumed it, no private attach is in flight, and the gate's
-// own setup on it is done.
+// wait for it has resumed it and no private attach is in flight.
 func (m *mux) maybeResumeLocked(t *target) {
-	if !t.paused || len(t.waiting) > 0 || t.attaching > 0 || t.holds > 0 {
+	if !t.paused || len(t.waiting) > 0 || t.attaching > 0 {
 		return
 	}
 	t.paused = false
@@ -642,6 +661,14 @@ func (m *mux) onDetachedLocked(msg message) {
 		TargetID  string `json:"targetId"`
 	}
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return
+	}
+	if params.SessionID != "" && params.SessionID == m.browserSession {
+		// The browser let go of the gate's own session, and with it what the
+		// gate kept in place for every request. Nothing is served without
+		// it: the gate closes, and the browser with it.
+		m.browserSession = ""
+		go m.close()
 		return
 	}
 	if t, ok := m.gateSessions[params.SessionID]; ok {
@@ -760,6 +787,11 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 		m.attachToTargetLocked(c, msg, sessionID)
 	case "Target.detachFromTarget":
 		m.detachFromTargetLocked(c, msg, sessionID)
+	case "Target.attachToBrowserTarget":
+		// A client's connection is its session on the browser already;
+		// another would be a session of nobody's, kept until the browser
+		// ends and addressed by no one.
+		c.deliverError(msg.ID, sessionID, "the connection is the browser session: send browser-level commands without a session id")
 	case "Runtime.runIfWaitingForDebugger":
 		m.runIfWaitingLocked(c, msg, sessionID)
 	case "Browser.close":

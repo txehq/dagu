@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dagucloud/dagu/v2/internal/browserhost"
 	"github.com/dagucloud/dagu/v2/internal/cmn/hostpattern"
 )
 
@@ -187,7 +188,7 @@ func serve(ctx context.Context, cfg Config, public *x509.CertPool, ready func(Re
 		case <-time.After(grace):
 			return
 		case cdpURL := <-s.browser:
-			watchBrowser(ctx, cdpURL, time.Until(deadline), browserPollInterval)
+			watchBrowser(ctx, cdpURL, time.Until(deadline), browserPollInterval, browserhost.BrowserID)
 		}
 	}()
 	var failure error

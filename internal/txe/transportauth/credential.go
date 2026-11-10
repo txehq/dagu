@@ -27,6 +27,7 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/txe/authn"
+	"github.com/dagucloud/dagu/v2/internal/txe/onbehalf"
 )
 
 // CredentialSchema is the version of the machine credential file.
@@ -348,6 +349,11 @@ func (s *RefreshingSource) Unsaved() error {
 
 // Token implements TokenSource. It returns a token only while it is
 // unexpired, by the clock read when it returns.
+//
+// A renewal's request to the provider is made on ctx's behalf: it ends with
+// ctx and keeps its values, and httptrace hooks in ctx do not fire for it.
+// To observe the token request itself, give WithHTTPClient a client whose
+// transport records it.
 func (s *RefreshingSource) Token(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -579,8 +585,13 @@ type tokenResponse struct {
 	Error        *string         `json:"error"`
 }
 
-// exchange asks the provider for a new access token.
+// exchange asks the provider for a new access token. The request is made on
+// behalf of whatever asked for the token, so it carries ctx's deadline,
+// cancellation and values but none of its httptrace hooks: a caller tracing
+// its own hub request does not read the renewal's connection events as that
+// request's (TXE-6352).
 func (s *RefreshingSource) exchange(ctx context.Context, credential MachineCredential) (renewal, error) {
+	ctx = onbehalf.Context(ctx)
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {credential.ClientID},

@@ -208,6 +208,11 @@ func newFakeBrowser(t *testing.T) *fakeBrowser {
 // DevTools gate does.
 const testGateToken = "TESTGATETOKEN000000000000A"
 
+// closedURL is a loopback URL whose connections always fail. Nothing can
+// listen on port 0, so a parallel test cannot take it over the way it can
+// reuse a freed port.
+const closedURL = "http://127.0.0.1:0"
+
 // url is the fake browser's address behind its gate.
 func (b *fakeBrowser) url() string {
 	return b.server.URL + "/" + testGateToken
