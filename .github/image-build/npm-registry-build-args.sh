@@ -15,7 +15,9 @@
 # installed either way.
 #
 # This repository is public, and a pushed image's provenance records its build arguments and a
-# job log can be read by anyone. So a URL with credentials is refused, and the URL is not logged.
+# job log can be read by anyone. So a URL that could carry a credential (userinfo, a query or a
+# fragment) is refused, and the URL is not logged. The ARGs stay out of the final stage of every
+# Dockerfile, where a passed value would enter the image's history.
 set -euo pipefail
 
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT must name the step output file}"
@@ -26,7 +28,7 @@ case $registry in
   "")
     echo "npm routes: the runner sets no npm registry; the build uses registry.npmjs.org" >&2
     ;;
-  *[[:space:]]* | *@*)
+  *[[:space:]]* | *@* | *\?* | *#*)
     echo "::warning::npm routes: the runner's npm registry is not a plain URL without credentials; the build uses registry.npmjs.org" >&2
     ;;
   http://* | https://*)

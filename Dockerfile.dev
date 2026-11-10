@@ -81,9 +81,6 @@ RUN set -ex && \
 # 1.61 is the last release that runs on Ubuntu's Node.js 18.
 ARG TARGETARCH
 ARG PLAYWRIGHT_VERSION=1.61.1
-# npx fetches Playwright from the runner's npm cache when the build passes one (TXE-6359).
-ARG npm_config_registry
-ARG pnpm_config_registry
 RUN set -ex; \
     if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
       PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \

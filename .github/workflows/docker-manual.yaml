@@ -65,6 +65,23 @@ jobs:
             digest_suffix: linux-arm-v7
             qemu: true
     steps:
+      # BuildKit runs a Dockerfile's RUN steps without the job's environment, so the build
+      # passes the runner's npm cache, when it has one that answers (TXE-6359). This runs the
+      # workflow's own copy of the helper, first: never code from the ref being built, and
+      # before any registry login. The checkout of that ref removes this directory.
+      - name: Check out the workflow's npm route helper
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.sha }}
+          path: .workflow-npm-routes
+          persist-credentials: false
+          sparse-checkout: .github/image-build/npm-registry-build-args.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Route the image build's Node fetches to the runner's npm cache
+        id: npm-routes
+        run: bash .workflow-npm-routes/.github/image-build/npm-registry-build-args.sh
+
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -80,7 +97,6 @@ jobs:
             Dockerfile
             Dockerfile.dev
             Dockerfile.alpine
-            .github/image-build/npm-registry-build-args.sh
           sparse-checkout-cone-mode: false
 
       - name: Use workflow Dockerfiles
@@ -90,8 +106,6 @@ jobs:
           cp .workflow-dockerfiles/Dockerfile .
           cp .workflow-dockerfiles/Dockerfile.dev .
           cp .workflow-dockerfiles/Dockerfile.alpine .
-          mkdir -p .github/image-build
-          cp .workflow-dockerfiles/.github/image-build/npm-registry-build-args.sh .github/image-build/
           rm -rf .workflow-dockerfiles
 
       - name: Set up QEMU
@@ -128,14 +142,6 @@ jobs:
             *)            VERSION="${INPUT_REF}" ;;
           esac
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
-      # BuildKit runs a Dockerfile's RUN steps without the job's environment, so the build
-      # passes the runner's npm cache, when it has one that answers (TXE-6359).
-      - name: Route the image build's Node fetches to the runner's npm cache
-        id: npm-routes
-        # A ref from before this helper has neither it nor the Dockerfile ARGs, so there is nothing to route.
-        if: ${{ hashFiles('.github/image-build/npm-registry-build-args.sh') != '' }}
-        run: bash .github/image-build/npm-registry-build-args.sh
 
       - name: Build and push Docker image
         id: build

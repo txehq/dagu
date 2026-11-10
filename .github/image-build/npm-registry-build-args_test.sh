@@ -72,6 +72,9 @@ grep -q 'did not answer' "$WORK/stderr" || fail "an erroring cache is not report
 
 expect "a URL with credentials passes nothing" "" "$(run npm_config_registry="http://user:secret@127.0.0.1:$open_port/")"
 if grep -q 'secret' "$WORK/stderr"; then fail "the credential reached the job log"; fi
+expect "a URL with a query passes nothing" "" "$(run npm_config_registry="http://127.0.0.1:$open_port/?token=secret")"
+if grep -q 'secret' "$WORK/stderr"; then fail "the query reached the job log"; fi
+expect "a URL with a fragment passes nothing" "" "$(run npm_config_registry="http://127.0.0.1:$open_port/#secret")"
 expect "a non-URL registry passes nothing" "" "$(run npm_config_registry=registry.local)"
 expect "a value that would add an output line passes nothing" "" "$(run npm_config_registry="$live
 EVIL=1")"
@@ -83,7 +86,7 @@ while IFS= read -r dockerfile; do
     toupper($1) == "FROM" { npm = 0; pnpm = 0; next }
     toupper($1) == "ARG" && $2 ~ /^npm_config_registry(=|$)/ { npm = 1 }
     toupper($1) == "ARG" && $2 ~ /^pnpm_config_registry(=|$)/ { pnpm = 1 }
-    /(^|[^[:alnum:]_.-])(pnpm +(install|i|fetch)|npm +(ci|install|i)|yarn +install|npx)([[:space:];&|]|$)/ && !(npm && pnpm) { print FNR }
+    /(^|[^[:alnum:]_.-])(pnpm +(install|i|fetch)|npm +(ci|install|i)|yarn +install)([[:space:];&|]|$)/ && !(npm && pnpm) { print FNR }
   ' "$ROOT/$dockerfile")"
   [ -z "$missing" ] || fail "$dockerfile: line(s) $(echo "$missing" | tr '\n' ' ')fetch Node packages without both registry ARGs in scope"
 done < <(git -C "$ROOT" ls-files | grep -E '(^|/)Dockerfile[^/]*$')
@@ -96,6 +99,16 @@ for workflow in "$ROOT"/.github/workflows/*.y*ml; do
   routed="$(grep -cE '^[[:space:]]*(run: bash )\S*\.github/image-build/npm-registry-build-args\.sh[[:space:]]*$' "$workflow" || true)"
   [ "$builds" = "$passed" ] && [ "$builds" = "$routed" ] \
     || fail "${workflow#"$ROOT"/}: $builds image build(s), $routed helper step(s), $passed build-args that pass its output"
+  # A workflow that builds another ref runs its own copy of the helper, before any registry login.
+  if grep -E '^[[:space:]]*ref:' "$workflow" | grep -qvF 'github.sha'; then
+    run_line="$(grep -nE 'run: bash \.workflow-npm-routes/\.github/image-build/npm-registry-build-args\.sh' "$workflow" | head -1 | cut -d: -f1 || true)"
+    login_line="$(grep -nE 'uses:[[:space:]]*docker/login-action@' "$workflow" | head -1 | cut -d: -f1 || true)"
+    if [ -z "$run_line" ]; then
+      fail "${workflow#"$ROOT"/}: builds another ref but does not run the workflow's own copy of the helper"
+    elif [ -n "$login_line" ] && [ "$run_line" -gt "$login_line" ]; then
+      fail "${workflow#"$ROOT"/}: runs the helper after the registry login"
+    fi
+  fi
 done
 
 if [ "$failures" -gt 0 ]; then
