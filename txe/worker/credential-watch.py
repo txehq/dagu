@@ -73,12 +73,50 @@ def cert_expiry(pem):
 _KUBE_FIELD = re.compile(r'^\s*(token|client-certificate-data):\s*["\']?([^"\'\s]+)["\']?\s*$')
 
 
+def _credential(field, value):
+    """(what, kind, expiry) for one kubeconfig credential field."""
+    if field == "token":
+        kind, exp = jwt_expiry(value)
+        return ("kubeconfig token", kind, exp)
+    try:
+        return ("kubeconfig client certificate", "x509", cert_expiry(base64.b64decode(value)))
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return ("kubeconfig client certificate", "unknown", None)
+
+
+def _json_kubeconfig(text):
+    """The credentials of a JSON kubeconfig (tunnel-credential.sh writes JSON), or None when the
+    text is not JSON."""
+    try:
+        config = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(config, dict):
+        return None
+    found = []
+    for entry in config.get("users") or []:
+        user = entry.get("user") if isinstance(entry, dict) else None
+        if not isinstance(user, dict):
+            continue
+        for field in ("token", "client-certificate-data"):
+            if isinstance(user.get(field), str) and user[field]:
+                found.append(_credential(field, user[field]))
+        for field in ("exec", "client-certificate", "auth-provider"):
+            if user.get(field):
+                found.append(("kubeconfig " + field, "unknown", None))
+    return found
+
+
 def kubeconfig_credentials(text):
     """[(what, kind, expiry or None)] for every token and inline client certificate in a kubeconfig.
 
-    A line parser, not YAML: a kubeconfig's credential fields are single scalars, and the
-    machine's python may have no YAML module. An exec plugin or a certificate file reference
-    is reported as "unknown", which pages: this check cannot see that credential's expiry."""
+    JSON (what tunnel-credential.sh writes) is read as JSON. Anything else goes through a line
+    parser, not YAML: a kubeconfig's credential fields are single scalars, and the machine's python
+    may have no YAML module. An exec plugin or a certificate file reference is reported as
+    "unknown", which pages: this check cannot see that credential's expiry."""
+    found = _json_kubeconfig(text)
+    if found is not None:
+        return found
     found = []
     for line in text.splitlines():
         m = _KUBE_FIELD.match(line)
@@ -86,15 +124,7 @@ def kubeconfig_credentials(text):
             if re.match(r'^\s*(exec|client-certificate|auth-provider):', line):
                 found.append(("kubeconfig " + line.strip().split(":")[0], "unknown", None))
             continue
-        field, value = m.groups()
-        if field == "token":
-            kind, exp = jwt_expiry(value)
-            found.append(("kubeconfig token", kind, exp))
-        else:
-            try:
-                found.append(("kubeconfig client certificate", "x509", cert_expiry(base64.b64decode(value))))
-            except (ValueError, OSError, subprocess.SubprocessError):
-                found.append(("kubeconfig client certificate", "unknown", None))
+        found.append(_credential(*m.groups()))
     return found
 
 

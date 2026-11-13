@@ -148,6 +148,34 @@ func TestCredentialWatchReadsTheWorkersCredentialFile(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(r.stdout, "worker-credential.json refresh token"), "read once")
 }
 
+// tunnel-credential.sh writes the kubeconfig as JSON: its token, client certificate and exec
+// plugin are read as they are from YAML, so a healthy kit-made tunnel does not page and an
+// expiring one does.
+func TestCredentialWatchReadsTheKitsJSONKubeconfig(t *testing.T) {
+	kubeconfig := func(user map[string]any) string {
+		raw, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "Config",
+			"clusters": []any{map[string]any{"name": "c", "cluster": map[string]any{"server": "https://k.example"}}},
+			"users":    []any{map[string]any{"name": "dagu-tunnel", "user": user}},
+			"contexts": []any{map[string]any{"name": "t", "context": map[string]any{"cluster": "c", "user": "dagu-tunnel"}}}})
+		require.NoError(t, err)
+		return string(raw)
+	}
+	healthy := watchHome(t, kubeconfig(map[string]any{"token": jwtWith(t, map[string]any{"exp": watchNow + 90*86400})}), nil)
+	r := runWatch(t, nil, 0, "--home", healthy, "--dry-run")
+	require.NoError(t, r.err, r.stderr)
+	assert.Regexp(t, `tunnel/kubeconfig token\s+jwt\s+expires `, r.stdout)
+	assert.NotContains(t, r.stdout, "would post")
+
+	cert := base64.StdEncoding.EncodeToString(certExpiring(t, time.Unix(watchNow, 0).Add(72*time.Hour)))
+	loud := watchHome(t, kubeconfig(map[string]any{"token": jwtWith(t, map[string]any{"exp": watchNow - 60}),
+		"client-certificate-data": cert, "exec": map[string]any{"command": "kubelogin"}}), nil)
+	r = runWatch(t, nil, 0, "--home", loud, "--dry-run")
+	require.NoError(t, r.err, r.stderr)
+	assert.Contains(t, r.stdout, "tunnel/kubeconfig token EXPIRED")
+	assert.Regexp(t, `tunnel/kubeconfig client certificate expires at \S+ \(in 3\.0 days\)`, r.stdout)
+	assert.Contains(t, r.stdout, "tunnel/kubeconfig exec: expiry unknown")
+}
+
 // A credential this cannot read the expiry of pages: it cannot be seen otherwise.
 func TestCredentialWatchPagesWhatItCannotRead(t *testing.T) {
 	home := watchHome(t, kubeconfigWith("    exec:", "      command: kubelogin"), nil)
