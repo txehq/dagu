@@ -176,14 +176,20 @@ func TestCredentialWatchReadsTheKitsJSONKubeconfig(t *testing.T) {
 	assert.Contains(t, r.stdout, "tunnel/kubeconfig exec: expiry unknown")
 }
 
-// A credential this cannot read the expiry of pages: it cannot be seen otherwise.
+// A credential this cannot read the expiry of pages: it cannot be seen otherwise. An opaque token
+// is shown as of unknown lifetime, never as "no expiry", and does not page (TXE-7226).
 func TestCredentialWatchPagesWhatItCannotRead(t *testing.T) {
-	home := watchHome(t, kubeconfigWith("    exec:", "      command: kubelogin"), nil)
+	home := watchHome(t, kubeconfigWith("    exec:", "      command: kubelogin"), map[string]string{
+		"bad-exp-credential.json": jwtWith(t, map[string]any{"exp": "tomorrow"}),
+		"opaque-credential.json":  "an-opaque-refresh-token"})
 	require.NoError(t, os.WriteFile(filepath.Join(home, "broken-credential.json"), []byte("not json"), 0o600))
 	r := runWatch(t, nil, 0, "--home", home, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Contains(t, r.stdout, "would post: [dagu-credential-watch] [FIRING] "+agentsMachine+": tunnel/kubeconfig exec: expiry unknown")
 	assert.Contains(t, r.stdout, "broken-credential.json: unreadable or has no refresh_token")
+	assert.Contains(t, r.stdout, "bad-exp-credential.json refresh token: expiry unknown")
+	assert.Regexp(t, `opaque-credential.json refresh token\s+opaque\s+lifetime unknown`, r.stdout)
+	assert.NotContains(t, r.stdout, "opaque-credential.json refresh token: ")
 }
 
 // webhook is a TLS Mattermost stand-in; refuse makes it answer 403.

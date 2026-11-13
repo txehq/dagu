@@ -16,8 +16,10 @@ the scan does not find). It posts to the webhook in FILE (a Mattermost incoming 
 --warn-days of expiry or past it, repeats hourly while that holds, and posts once when it clears.
 A credential with no expiry (a JWT with no exp, such as a non-expiring service-account token or an
 offline refresh token) is reported as such and never pages. A credential whose expiry cannot be
-read (an exec plugin, a certificate file reference, an unreadable file) pages: this check cannot
-see it. STATE records only what was delivered, so an undelivered post is tried again next run.
+read (an exec plugin, a certificate file reference, an unreadable file, a JWT whose exp is not a
+number) pages: this check cannot see it. An opaque token (not a JWT) is reported as of unknown
+lifetime and does not page: its lifetime is its provider's, and nothing on the machine could clear
+the page. STATE records only what was delivered, so an undelivered post is tried again next run.
 Exit 1 when a post could not be delivered.
 
 SECRETS. The webhook URL is read from FILE and sent only to urllib; it is never printed. Tokens are
@@ -42,7 +44,8 @@ USER_AGENT = "txe-dagu-credential-watch/1 (TXE-7226)"
 
 
 def jwt_expiry(token):
-    """("jwt", exp or None) for a JWT; ("opaque", None) for anything else. Reads only exp."""
+    """("jwt", exp or None) for a JWT; ("unknown", None) for a JWT whose exp is not a number;
+    ("opaque", None) for anything that is not a JWT. Reads only exp."""
     parts = token.split(".")
     if len(parts) != 3:
         return "opaque", None
@@ -56,7 +59,8 @@ def jwt_expiry(token):
     if exp in (None, 0):
         return "jwt", None
     if isinstance(exp, bool) or not isinstance(exp, (int, float)):
-        return "opaque", None
+        # A JWT that names an expiry this cannot read: that pages, as any unreadable expiry does.
+        return "unknown", None
     return "jwt", float(exp)
 
 
@@ -139,8 +143,10 @@ def _refresh_token(path, name):
     except (OSError, ValueError, KeyError, TypeError):
         return (name, "unknown", None, "unreadable or has no refresh_token")
     kind, exp = jwt_expiry(token)
-    # An opaque refresh token's lifetime is the provider's; it cannot be read here.
-    return (name + " refresh token", kind, exp, None)
+    # An opaque refresh token's lifetime is the provider's and nothing here can read it, so it is
+    # reported as unknown but does not page: it would page hourly with nothing on the machine
+    # able to clear it (TXE-7226). A JWT with an unreadable exp does page.
+    return (name + " refresh token", kind, exp, "expiry unknown" if kind == "unknown" else None)
 
 
 def machine_credentials(home, extra=()):
@@ -254,7 +260,11 @@ def watch(args):
     now = time.time() if args.now is None else args.now
     creds = machine_credentials(home, args.credential_file)
     for name, kind, exp, problem in creds:
-        print("%-44s %-7s %s" % (name, kind, problem or ("expires " + _utc(exp) if exp else "no expiry")))
+        if problem or exp:
+            what = problem or ("expires " + _utc(exp))
+        else:
+            what = "lifetime unknown (an opaque token's is the provider's)" if kind == "opaque" else "no expiry"
+        print("%-44s %-7s %s" % (name, kind, what))
     findings = credential_findings(creds, now, args.warn_days)
     state = {}
     if args.state:

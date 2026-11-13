@@ -159,7 +159,10 @@ It reads the expiry of every credential the worker and tunnel use under the TXE 
 kubeconfig's tokens and inline client certificates, and the refresh token of every
 `*-credential.json`, and the worker's credential wherever `--credential-file` put it. It posts to the alert webhook 7 days before one expires, and again after it
 has. It repeats hourly while that holds, and posts once when it clears. A credential with no expiry
-never posts. A credential whose expiry it cannot read posts, because it cannot see it. Only
+never posts. A credential whose expiry it cannot read posts, because it cannot see it: an exec
+plugin, a certificate file, an unreadable file, or a JWT whose `exp` is not a number. An opaque
+(non-JWT) token is shown as of unknown lifetime and does not post: its lifetime is the provider's,
+and nothing on the machine could clear the post. Only
 delivered posts are recorded in `credential-watch/state.json`, so a failed post is retried on the
 next run. Its output goes to `logs/credential-watch.log`, bounded at 1 MiB with 3 backups.
 
