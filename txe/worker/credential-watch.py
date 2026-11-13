@@ -8,6 +8,7 @@ check; the cluster-side heartbeat watch stays in txehq/txe (ops/dagu/machine-wat
   credential-watch.py --home HOME --webhook-file FILE --state STATE [--credential-file PATH]...
                       [--warn-days 7] [--label L]
   credential-watch.py --home HOME --dry-run
+  credential-watch.py --check-webhook FILE
 
 It finds the expiry of every credential the worker and tunnel use under HOME (the TXE home): the
 tunnel kubeconfig's tokens and inline client certificates, and every *-credential.json refresh
@@ -22,8 +23,12 @@ lifetime and does not page: its lifetime is its provider's, and nothing on the m
 the page. STATE records only what was delivered, so an undelivered post is tried again next run.
 Exit 1 when a post could not be delivered.
 
-SECRETS. The webhook URL is read from FILE and sent only to urllib; it is never printed. Tokens are
-decoded only to read their exp claim; no token, other claim or certificate body is printed.
+SECRETS. The webhook URL is read from FILE and sent only to urllib; no part of it is ever printed
+(TXE-7313). A URL that is not a well-formed https URL urllib can post to is refused when FILE is
+read, before any post, and --check-webhook (the installers' check) refuses it the same way. Every
+failure to build or deliver a post is reported by its class alone: nothing urllib or http.client
+raises is printed, because its message or traceback can hold the URL. Tokens are decoded only to
+read their exp claim; no token, other claim or certificate body is printed.
 """
 import argparse
 import base64
@@ -36,6 +41,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 REPEAT_SECONDS = 3600
@@ -222,28 +228,62 @@ def _machine_id(home):
         return "unknown machine"
 
 
+def _url_problem(url):
+    """Why url is not a webhook URL this watch posts to, or None.
+
+    The answer names a class of defect, never any part of the URL. Anything urllib or http.client
+    would refuse while posting is refused here instead, so it is refused at read time, before any
+    post: their errors carry the URL."""
+    if not url.startswith("https://"):
+        return "does not hold an https URL"
+    if any(not "!" <= c <= "~" for c in url):
+        return "holds a malformed https URL (whitespace, a control or a non-ASCII character)"
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # raises ValueError for a port that is not a number in range
+        host = parts.hostname
+        urllib.request.Request(url)
+    except Exception:  # noqa: BLE001 - its message can hold the URL; the class of defect is enough
+        return "holds a malformed https URL (it cannot be parsed)"
+    if "@" in parts.netloc:
+        return "holds a malformed https URL (it carries user credentials)"
+    if not host:
+        return "holds a malformed https URL (it names no host)"
+    return None
+
+
 def _read_webhook(path):
-    """The webhook URL in path, or (None, why). The URL itself is never part of a message."""
+    """The webhook URL in path, or (None, why). No part of the URL is ever part of why."""
     try:
         with open(path) as f:
             url = f.read().strip()
-    except OSError as e:
+    except (OSError, ValueError) as e:
         return None, "cannot read the webhook file %s (%s)" % (path, type(e).__name__)
-    if not url.startswith("https://"):
-        return None, "the webhook file %s does not hold an https URL" % path
+    problem = _url_problem(url)
+    if problem:
+        return None, "the webhook file %s %s" % (path, problem)
     return url, None
 
 
 def _send(url, text):
-    req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(),
-                                 headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
+    """None when the webhook took the post; else why not, as a class of failure only.
+
+    Building the request is inside the handler too, and every exception is caught: no message or
+    traceback of urllib or http.client is printed, because each can hold the URL."""
     try:
+        req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(),
+                                     headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
-            return None if 200 <= resp.status < 300 else "webhook answered %d" % resp.status
+            status = resp.status
     except urllib.error.HTTPError as e:
-        return "webhook answered %d" % e.code
-    except OSError as e:
+        return "webhook answered %s" % (e.code if isinstance(e.code, int) else "an HTTP error")
+    except urllib.error.URLError as e:
+        # urllib wraps what failed beneath it (a refused connection, a TLS failure) in reason.
+        cause = e.reason if isinstance(e.reason, BaseException) else e
+        return "%s posting to the webhook" % type(cause).__name__
+    except Exception as e:  # noqa: BLE001 - InvalidURL, an HTTPException, anything: its class only
         return "%s posting to the webhook" % type(e).__name__
+    return None if 200 <= status < 300 else "webhook answered %d" % status
 
 
 def _write_state(path, state):
@@ -319,7 +359,15 @@ def main(argv=None):
     p.add_argument("--label", default="", help="text placed before the machine id, e.g. TEST")
     p.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dry-run", action="store_true", help="print what would be posted; post and record nothing")
+    p.add_argument("--check-webhook", metavar="FILE",
+                   help="only check that FILE holds a webhook URL this posts to; exit 1 and say why when not")
     args = p.parse_args(argv)
+    if args.check_webhook:
+        _, err = _read_webhook(args.check_webhook)
+        if err:
+            sys.stderr.write(err + "\n")
+            return 1
+        return 0
     if not args.dry_run and not (args.webhook_file and args.state):
         p.error("--webhook-file and --state are needed unless --dry-run")
     return watch(args)

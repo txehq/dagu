@@ -169,7 +169,8 @@ json_field() {
 # GIVEN is --alert-webhook-file's value, or empty; EXISTING is the file the installed watch
 # already passes, or empty. With neither, TXE_DAGU_HOME/alert-webhook.url is used when it exists.
 # The file holds a secret URL, so it must be an absolute path to a regular file owned by this user
-# and readable by no one else; otherwise the reason goes to stderr and this returns 1. With no
+# and readable by no one else, and hold a URL that `credential-watch.py --check-webhook` accepts;
+# otherwise the reason goes to stderr and this returns 1. With no
 # file at all it prints nothing and returns 2: the caller decides whether that may pass.
 watch_webhook() {
   local path="${1:-${2:-}}" default="$TXE_DAGU_HOME/alert-webhook.url"
@@ -195,13 +196,13 @@ if st.st_uid != os.getuid():
     refuse("is not owned by this user")
 if st.st_mode & 0o077:
     refuse("has mode %#o; it must be readable by its owner only (0600)" % stat.S_IMODE(st.st_mode))
-try:
-    with open(path) as f:
-        ok = f.read().strip().startswith("https://")
-except OSError:
-    refuse("cannot be read")
-if not ok:
-    refuse("does not hold an https URL")
 PY
+  # The URL is checked by the watch that posts to it, so the install and the watch refuse the same
+  # URLs (TXE-7313). Its reason names the defect only, never any part of the URL.
+  local why
+  if ! why="$(python3 -I "$(dirname "${BASH_SOURCE[0]}")/credential-watch.py" --check-webhook "$path" 2>&1 >/dev/null)"; then
+    printf 'alert webhook file refused: %s\n' "$why" >&2
+    return 1
+  fi
   printf '%s\n' "$path"
 }
