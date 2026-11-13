@@ -17,11 +17,12 @@ Run by install-systemd.sh and uninstall-systemd.sh with `python3 -I`; it reads n
   units.py credential UNIT_FILE
       Print the credential file a worker unit passes, or nothing.
 
-  units.py write-watch UNITS HOME PYTHON SERVICE TIMER WEBHOOK_FILE
+  units.py write-watch UNITS HOME PYTHON SERVICE TIMER WEBHOOK_FILE [CREDENTIAL_FILE]
       Write the credential-expiry watch (TXE-7233): SERVICE, a oneshot that runs
       HOME/bin/credential-watch.py under HOME/bin/logpipe.py with PYTHON, with the macOS agent's
       arguments, and TIMER, which starts it a minute after the timer starts and hourly after.
-      WEBHOOK_FILE is passed as a path only, never the URL.
+      WEBHOOK_FILE is passed as a path only, never the URL. CREDENTIAL_FILE, when not empty, is the
+      worker's credential, which the watch reads too.
 
   units.py watch-webhook UNIT_FILE
       Print the webhook file a watch service passes, or nothing.
@@ -127,12 +128,13 @@ WATCH_LOG_CHUNK_BYTES = 65536
 WATCH_TIMEOUT_S = 300
 
 
-def watch_service(python, home, webhook_file):
+def watch_service(python, home, webhook_file, credential_file=""):
     argv = [python, "-I", f"{home}/bin/logpipe.py", "--path", f"{home}/logs/credential-watch.log",
             "--max-bytes", str(WATCH_LOG_MAX_BYTES), "--backups", str(WATCH_LOG_BACKUPS),
             "--chunk-bytes", str(WATCH_LOG_CHUNK_BYTES), "--",
             python, "-I", f"{home}/bin/credential-watch.py", "--home", home,
-            "--webhook-file", webhook_file, "--state", f"{home}/credential-watch/state.json"]
+            "--webhook-file", webhook_file, "--state", f"{home}/credential-watch/state.json",
+            *(["--credential-file", credential_file] if credential_file else [])]
     return "\n".join(["[Unit]", "Description=TXE Dagu credential-expiry watch",
                       "After=network-online.target", "",
                       "[Service]", "Type=oneshot",
@@ -151,11 +153,11 @@ def watch_timer(service):
                       "[Install]", "WantedBy=timers.target", ""])
 
 
-def write_watch(units, home, python, service, timer, webhook_file):
+def write_watch(units, home, python, service, timer, webhook_file, credential_file=""):
     for name, value in (("the TXE home", home), ("python3", python), ("the webhook file", webhook_file)):
         if not os.path.isabs(value):
             raise ValueError(f"{name} must be an absolute path for a unit, got {value!r}")
-    bodies = ((service, watch_service(python, home, webhook_file)), (timer, watch_timer(service)))
+    bodies = ((service, watch_service(python, home, webhook_file, credential_file)), (timer, watch_timer(service)))
     os.makedirs(units, exist_ok=True)
     for name, body in bodies:
         target = os.path.join(units, name)
@@ -223,7 +225,7 @@ def main(argv):
             print(f"units refused: {e}", file=sys.stderr)
             return 1
         return 0
-    if len(argv) == 7 and argv[0] == "write-watch":
+    if len(argv) in (7, 8) and argv[0] == "write-watch":
         try:
             write_watch(*argv[1:])
         except ValueError as e:

@@ -202,7 +202,7 @@ python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kub
   "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url"
 python3 -I "$here/agents.py" write-watch "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$python_bin" \
-  "$TXE_DAGU_WATCH_LABEL" "$webhook" || die "the credential watch's agent was not written"
+  "$TXE_DAGU_WATCH_LABEL" "$webhook" "$credential" || die "the credential watch's agent was not written"
 
 labels=("${TXE_DAGU_LABELS[@]}")
 if [ -n "$hub_url" ]; then

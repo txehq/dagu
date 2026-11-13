@@ -5,12 +5,14 @@ com.txe.dagu-credential-watch (install.sh) or the systemd user timer
 txe-dagu-credential-watch.timer (install-systemd.sh). It is the only copy of the machine-side
 check; the cluster-side heartbeat watch stays in txehq/txe (ops/dagu/machine-watch.py serve).
 
-  credential-watch.py --home HOME --webhook-file FILE --state STATE [--warn-days 7] [--label L]
+  credential-watch.py --home HOME --webhook-file FILE --state STATE [--credential-file PATH]...
+                      [--warn-days 7] [--label L]
   credential-watch.py --home HOME --dry-run
 
 It finds the expiry of every credential the worker and tunnel use under HOME (the TXE home): the
 tunnel kubeconfig's tokens and inline client certificates, and every *-credential.json refresh
-token. It posts to the webhook in FILE (a Mattermost incoming webhook) when one is within
+token, and each --credential-file (the worker's credential when the install was given one that
+the scan does not find). It posts to the webhook in FILE (a Mattermost incoming webhook) when one is within
 --warn-days of expiry or past it, repeats hourly while that holds, and posts once when it clears.
 A credential with no expiry (a JWT with no exp, such as a non-expiring service-account token or an
 offline refresh token) is reported as such and never pages. A credential whose expiry cannot be
@@ -96,8 +98,24 @@ def kubeconfig_credentials(text):
     return found
 
 
-def machine_credentials(home):
-    """[(name, kind, expiry or None, problem or None)] for every credential under a TXE Dagu home."""
+def _refresh_token(path, name):
+    """(name, kind, expiry, problem) for a credential file's refresh token."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        token = data["refresh_token"]
+        if not isinstance(token, str):
+            raise ValueError
+    except (OSError, ValueError, KeyError, TypeError):
+        return (name, "unknown", None, "unreadable or has no refresh_token")
+    kind, exp = jwt_expiry(token)
+    # An opaque refresh token's lifetime is the provider's; it cannot be read here.
+    return (name + " refresh token", kind, exp, None)
+
+
+def machine_credentials(home, extra=()):
+    """[(name, kind, expiry or None, problem or None)] for every credential under a TXE Dagu home,
+    and for each file in extra that the scan of the home did not already read."""
     out = []
     kube = os.path.join(home, "tunnel", "kubeconfig")
     if os.path.exists(kube):
@@ -111,25 +129,20 @@ def machine_credentials(home):
                 out.append(("tunnel/kubeconfig", "unknown", None, "holds no credential this can read"))
             for what, kind, exp in entries:
                 out.append(("tunnel/" + what, kind, exp, "expiry unknown" if kind == "unknown" else None))
+    seen = set()
     try:
         names = sorted(os.listdir(home))
     except OSError as e:
-        return out + [("TXE home", "unknown", None, "unreadable (%s)" % type(e).__name__)]
+        out.append(("TXE home", "unknown", None, "unreadable (%s)" % type(e).__name__))
+        names = []
     for name in names:
-        if not name.endswith("-credential.json"):
-            continue
-        try:
-            with open(os.path.join(home, name)) as f:
-                data = json.load(f)
-            token = data["refresh_token"]
-            if not isinstance(token, str):
-                raise ValueError
-        except (OSError, ValueError, KeyError, TypeError):
-            out.append((name, "unknown", None, "unreadable or has no refresh_token"))
-            continue
-        kind, exp = jwt_expiry(token)
-        # An opaque refresh token's lifetime is the provider's; it cannot be read here.
-        out.append((name + " refresh token", kind, exp, None))
+        if name.endswith("-credential.json"):
+            seen.add(os.path.realpath(os.path.join(home, name)))
+            out.append(_refresh_token(os.path.join(home, name), name))
+    for path in extra:
+        if os.path.realpath(path) not in seen:
+            seen.add(os.path.realpath(path))
+            out.append(_refresh_token(path, path))
     return out
 
 
@@ -209,7 +222,7 @@ def _write_state(path, state):
 def watch(args):
     home = os.path.expanduser(args.home)
     now = time.time() if args.now is None else args.now
-    creds = machine_credentials(home)
+    creds = machine_credentials(home, args.credential_file)
     for name, kind, exp, problem in creds:
         print("%-44s %-7s %s" % (name, kind, problem or ("expires " + _utc(exp) if exp else "no expiry")))
     findings = credential_findings(creds, now, args.warn_days)
@@ -260,6 +273,8 @@ def main(argv=None):
     p.add_argument("--home", default="~/.local/share/txe-dagu", help="the TXE home")
     p.add_argument("--webhook-file", help="a file holding the webhook's https URL")
     p.add_argument("--state", help="where delivered findings are recorded")
+    p.add_argument("--credential-file", action="append", default=[],
+                   help="a credential file outside the home's *-credential.json scan; repeatable")
     p.add_argument("--warn-days", type=float, default=7)
     p.add_argument("--label", default="", help="text placed before the machine id, e.g. TEST")
     p.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)

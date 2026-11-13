@@ -194,7 +194,7 @@ python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubec
   "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url" || die "the units were not written"
 python3 -I "$here/units.py" write-watch "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$python_bin" \
-  "$TXE_DAGU_WATCH_SERVICE" "$TXE_DAGU_WATCH_TIMER" "$webhook" || die "the credential watch's units were not written"
+  "$TXE_DAGU_WATCH_SERVICE" "$TXE_DAGU_WATCH_TIMER" "$webhook" "$credential" || die "the credential watch's units were not written"
 
 units=("$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT")
 [ -z "$hub_url" ] || units=("$TXE_DAGU_WORKER_UNIT")

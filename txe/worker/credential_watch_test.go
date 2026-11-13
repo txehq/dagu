@@ -133,6 +133,21 @@ func TestCredentialWatchFindsEachExpiry(t *testing.T) {
 	assert.Regexp(t, `builder-credential.json refresh token expires at \S+ \(in 3\.0 days\)`, r.stdout)
 }
 
+// The worker's credential given by --credential-file is watched wherever it is and whatever its
+// name, and a file the scan already reads is not reported twice.
+func TestCredentialWatchReadsTheWorkersCredentialFile(t *testing.T) {
+	home := watchHome(t, "", map[string]string{"worker-credential.json": jwtWith(t, map[string]any{"typ": "Offline"})})
+	outside := filepath.Join(t.TempDir(), "custom.json")
+	raw, err := json.Marshal(map[string]any{"refresh_token": jwtWith(t, map[string]any{"exp": watchNow - 60})})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(outside, raw, 0o600))
+	r := runWatch(t, nil, 0, "--home", home, "--dry-run",
+		"--credential-file", outside, "--credential-file", filepath.Join(home, "worker-credential.json"))
+	require.NoError(t, r.err, r.stderr)
+	assert.Contains(t, r.stdout, "would post: [dagu-credential-watch] [FIRING] "+agentsMachine+": "+outside+" refresh token EXPIRED")
+	assert.Equal(t, 1, strings.Count(r.stdout, "worker-credential.json refresh token"), "read once")
+}
+
 // A credential this cannot read the expiry of pages: it cannot be seen otherwise.
 func TestCredentialWatchPagesWhatItCannotRead(t *testing.T) {
 	home := watchHome(t, kubeconfigWith("    exec:", "      command: kubelogin"), nil)
@@ -241,14 +256,14 @@ func TestCredentialWatchRefusesAWebhookThatIsNotHTTPS(t *testing.T) {
 }
 
 // watchOut writes the watch's macOS agent and Linux units for one home and webhook file.
-func watchOut(t *testing.T, home, hook string) (agent map[string]any, service, timer unitFile) {
+func watchOut(t *testing.T, home, hook, cred string) (agent map[string]any, service, timer unitFile) {
 	t.Helper()
 	script := agentsScript(t)
 	units, err := filepath.Abs("units.py")
 	require.NoError(t, err)
 	agents := filepath.Join(t.TempDir(), "Launch Agents")
 	require.NoError(t, os.MkdirAll(agents, 0o700))
-	_, stderr, err := python(t, script, "write-watch", agents, home, unitsPython, "com.txe.dagu-credential-watch", hook)
+	_, stderr, err := python(t, script, "write-watch", agents, home, unitsPython, "com.txe.dagu-credential-watch", hook, cred)
 	require.NoError(t, err, stderr)
 	dump, stderr, err := python(t, "-c", `import json, plistlib, sys; print(json.dumps(plistlib.load(open(sys.argv[1], "rb"))))`,
 		filepath.Join(agents, "com.txe.dagu-credential-watch.plist"))
@@ -256,7 +271,7 @@ func watchOut(t *testing.T, home, hook string) (agent map[string]any, service, t
 	require.NoError(t, json.Unmarshal([]byte(dump), &agent))
 	dir := filepath.Join(t.TempDir(), "user")
 	_, stderr, err = python(t, units, "write-watch", dir, home, unitsPython,
-		"txe-dagu-credential-watch.service", "txe-dagu-credential-watch.timer", hook)
+		"txe-dagu-credential-watch.service", "txe-dagu-credential-watch.timer", hook, cred)
 	require.NoError(t, err, stderr)
 	service = readUnit(t, filepath.Join(dir, "txe-dagu-credential-watch.service"))
 	data, err := os.ReadFile(filepath.Join(dir, "txe-dagu-credential-watch.timer"))
@@ -275,11 +290,12 @@ func watchOut(t *testing.T, home, hook string) (agent map[string]any, service, t
 func TestWatchAgentAndUnitsRunTheSameCommand(t *testing.T) {
 	home := "/Users/some one/txe 100% $HOME"
 	hook := "/Users/some one/hooks/alert webhook.url"
-	agent, service, timer := watchOut(t, home, hook)
+	cred := "/Users/some one/elsewhere/custom 5%.json"
+	agent, service, timer := watchOut(t, home, hook, cred)
 	want := []any{unitsPython, "-I", home + "/bin/logpipe.py", "--path", home + "/logs/credential-watch.log",
 		"--max-bytes", "1048576", "--backups", "3", "--chunk-bytes", "65536", "--",
 		unitsPython, "-I", home + "/bin/credential-watch.py", "--home", home,
-		"--webhook-file", hook, "--state", home + "/credential-watch/state.json"}
+		"--webhook-file", hook, "--state", home + "/credential-watch/state.json", "--credential-file", cred}
 	assert.Equal(t, want, agent["ProgramArguments"])
 	assert.Equal(t, true, agent["RunAtLoad"])
 	assert.InDelta(t, 3600, agent["StartInterval"], 0)
@@ -368,7 +384,7 @@ plistlib.dump({"Label": "com.txe.dagu-credential-watch", "ProgramArguments": ["/
 	require.NoError(t, err, stderr)
 	assert.Equal(t, hook+"\n", out)
 
-	agent, _, _ := watchOut(t, "/home/dev/txe", hook)
+	agent, _, _ := watchOut(t, "/home/dev/txe", hook, "")
 	require.Equal(t, hook, agent["ProgramArguments"].([]any)[slices.Index(agent["ProgramArguments"].([]any), any("--webhook-file"))+1])
 	udir := filepath.Join(t.TempDir(), "user")
 	_, stderr, err = python(t, units, "write-watch", udir, "/home/dev/txe", unitsPython, "w.service", "w.timer", hook)

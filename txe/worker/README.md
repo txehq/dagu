@@ -157,7 +157,7 @@ launchd agent `com.txe.dagu-credential-watch` on macOS, at load and hourly, and 
 `txe-dagu-credential-watch.timer` on Linux, a minute after it starts and hourly after each run.
 It reads the expiry of every credential the worker and tunnel use under the TXE home: the tunnel
 kubeconfig's tokens and inline client certificates, and the refresh token of every
-`*-credential.json`. It posts to the alert webhook 7 days before one expires, and again after it
+`*-credential.json`, and the worker's credential wherever `--credential-file` put it. It posts to the alert webhook 7 days before one expires, and again after it
 has. It repeats hourly while that holds, and posts once when it clears. A credential with no expiry
 never posts. A credential whose expiry it cannot read posts, because it cannot see it. Only
 delivered posts are recorded in `credential-watch/state.json`, so a failed post is retried on the
