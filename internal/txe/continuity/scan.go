@@ -167,17 +167,35 @@ const (
 	// logpipeStampPattern is the UTC stamp logpipe.py names a moved log by,
 	// with the "-N" it adds when the name exists (STAMP, _STAMP_RE).
 	logpipeStampPattern = `[0-9]{8}T[0-9]{12}Z(-[0-9]+)?`
+	// logpipeLogPattern names the logs logpipe.py owns in logs/: the
+	// tunnel's and the worker's (TXE-4724) and the credential watch's
+	// (TXE-7233), each passed as --path by txe/worker/agents.py and units.py.
+	logpipeLogPattern = `(tunnel|worker|credential-watch)`
 )
 
-// machineHomeRules is a machine's TXE home as the worker installer
-// (txe/worker/install.sh) and the CLI write it; machine.json and packages
-// are read separately.
+// machineHomeRules is a machine's TXE home as the worker installers
+// (txe/worker/install.sh for launchd, install-systemd.sh for systemd) and
+// the CLI write it; machine.json and packages are read separately.
+// TestInstallerHomePathsAreClassified fails when an installer script names a
+// path in the home that these rules do not classify (TXE-7312).
 var machineHomeRules = []rule{
 	{name: "receipts", kind: kindDir, policy: PolicyMutable},
 	{name: "outputs", kind: kindDir, policy: PolicyImmutable},
 	{name: "client", kind: kindDir, exclude: "the CLI's Dagu home holds its hub credential; not read"},
 	{name: "skill", kind: kindDir, exclude: "unpacked skill revisions; reinstalled, not retained data"},
 	{name: "tunnel", kind: kindDir, exclude: "the tunnel's port-forward credential (a ServiceAccount kubeconfig and its expiry), renewed by tunnel-credential.sh; not read"},
+	// The credential watch's webhook at its default path (txe/worker/lib.sh
+	// watch_webhook): the file holds the webhook's secret URL, so it is
+	// excluded by name and type and never opened or hashed (TXE-7233).
+	{name: "alert-webhook.url", kind: kindFile, exclude: "the credential watch's alert webhook, a secret URL; not read"},
+	// The credential watch's record of the alerts it delivered, and the
+	// temporary file it is replaced through (credential-watch.py
+	// _write_state, tempfile.mkstemp with the prefix ".state-"). Losing it
+	// only repeats an alert, so it is counted, not compared.
+	{name: "credential-watch", kind: kindDir, dir: []rule{
+		{name: "state.json", kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^\.state-[A-Za-z0-9_]+$`), kind: kindFile, policy: PolicyOperational},
+	}},
 	// The worker's machine credential at its default path, with its lock
 	// and the temporary file a rotation is saved through
 	// (internal/cmd/txe_enrol.go, internal/txe/transportauth/credential.go).
@@ -207,23 +225,31 @@ var machineHomeRules = []rule{
 		// The installer's copy of txe/worker/logpipe.py, which both agents
 		// run under since TXE-4724; replaced by every install.
 		{name: "logpipe.py", kind: kindFile, policy: PolicyOperational},
+		// The installer's copy of txe/worker/credential-watch.py (TXE-7233),
+		// run by its own agent or timer under logpipe.py.
+		{name: "credential-watch.py", kind: kindFile, policy: PolicyOperational},
+		// What an install interrupted before its rename leaves: the next
+		// copy of a script, or the next link to the current binary. The
+		// next install replaces it.
+		{pattern: regexp.MustCompile(`^(logpipe|credential-watch)\.py\.next$`), kind: kindFile, policy: PolicyOperational},
+		{name: "dagu.next", kind: kindLink, target: regexp.MustCompile(`^dagu-` + daguVersionPattern + `$`), policy: PolicyOperational},
 	}},
 	// The launchd agents' output: diagnostics that grow while the agents
 	// run, not job data. Since TXE-4724 logpipe.py owns tunnel.log and
-	// worker.log and writes the other names here (txe/worker/logpipe.py),
-	// and launchd keeps one file per agent for logpipe's own output
-	// (txe/worker/agents.py). Only those exact names are classified.
+	// worker.log, and since TXE-7233 credential-watch.log, and writes the
+	// other names here (txe/worker/logpipe.py), and launchd keeps one file
+	// per agent for logpipe's own output (txe/worker/agents.py). Only those
+	// exact names are classified.
 	{name: "logs", kind: kindDir, dir: []rule{
-		{name: "tunnel.log", kind: kindFile, policy: PolicyOperational},
-		{name: "worker.log", kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^` + logpipeLogPattern + `\.log$`), kind: kindFile, policy: PolicyOperational},
 		// A rotated log, compressed or not yet, and a compression in progress.
-		{pattern: regexp.MustCompile(`^(tunnel|worker)\.log\.` + logpipeStampPattern + `(\.gz|\.gz\.tmp)?$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^` + logpipeLogPattern + `\.log\.` + logpipeStampPattern + `(\.gz|\.gz\.tmp)?$`), kind: kindFile, policy: PolicyOperational},
 		// The log launchd wrote before logpipe took it over, archived once
 		// and never deleted by logpipe.
-		{pattern: regexp.MustCompile(`^(tunnel|worker)\.legacy-` + logpipeStampPattern + `\.log$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^` + logpipeLogPattern + `\.legacy-` + logpipeStampPattern + `\.log$`), kind: kindFile, policy: PolicyOperational},
 		// logpipe's diagnostics and their one previous copy.
-		{pattern: regexp.MustCompile(`^(tunnel|worker)\.logpipe\.log(\.1)?$`), kind: kindFile, policy: PolicyOperational},
-		{pattern: regexp.MustCompile(`^(tunnel|worker)\.launchd\.log$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^` + logpipeLogPattern + `\.logpipe\.log(\.1)?$`), kind: kindFile, policy: PolicyOperational},
+		{pattern: regexp.MustCompile(`^` + logpipeLogPattern + `\.launchd\.log$`), kind: kindFile, policy: PolicyOperational},
 	}},
 	// The worker's DAGU_HOME. Its data directory holds only credentials so
 	// far; anything else it gains blocks until it is classified.
