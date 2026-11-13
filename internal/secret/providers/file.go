@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	secretref "github.com/dagucloud/dagu/v2/internal/secret/ref"
 )
@@ -51,7 +52,10 @@ func (r *fileResolver) CheckCapability(secretref.Ref) CheckCapability {
 	return CheckCapabilityNoFetch
 }
 
-// Resolve reads the secret value from a file.
+// Resolve reads the secret value from a file. The run of CR and LF bytes at
+// the end of the file is removed, much as shell `$(cat file)` drops trailing
+// newlines: a file saved by an editor or by `cmd > file` ends in one, and a
+// token carrying it is an invalid HTTP header value. All other bytes are kept.
 func (r *fileResolver) Resolve(_ context.Context, ref secretref.Ref) (string, error) {
 	filePath := r.resolvePath(ref.Key)
 
@@ -68,7 +72,7 @@ func (r *fileResolver) Resolve(_ context.Context, ref secretref.Ref) (string, er
 		return "", fmt.Errorf("failed to read secret file %s: %w", filePath, err)
 	}
 
-	return string(content), nil
+	return strings.TrimRight(string(content), "\r\n"), nil
 }
 
 // CheckAccessibility verifies the file exists and is readable without fetching its content.

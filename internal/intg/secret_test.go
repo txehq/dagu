@@ -7,12 +7,44 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/test"
 	"github.com/stretchr/testify/require"
 )
+
+// A file credential ending in a line ending reaches the step's environment
+// without it: a token with a trailing newline is an invalid HTTP header value.
+func TestFileSecretTrailingNewline(t *testing.T) {
+	t.Parallel()
+
+	th := test.Setup(t)
+	secretValue := "file-token-0123456789"
+	secretFile := th.TempFile(t, "token.txt", []byte(secretValue+"\r\n"))
+
+	run := `printf '%s\n' "len=${#GH_TOKEN}"`
+	if runtime.GOOS == "windows" {
+		run = `Write-Output ("len=" + $env:GH_TOKEN.Length)`
+	}
+	dag := th.DAG(t, `
+secrets:
+  - name: GH_TOKEN
+    provider: file
+    key: `+secretFile+`
+
+steps:
+  - name: token-length
+    run: '`+strings.ReplaceAll(run, "'", "''")+`'
+    output: RESULT
+`)
+	dag.Agent().RunSuccess(t)
+
+	dag.AssertLatestStatus(t, ir.Succeeded)
+	dag.AssertOutputs(t, map[string]any{"RESULT": fmt.Sprintf("len=%d", len(secretValue))})
+}
 
 func TestSecretMasking(t *testing.T) {
 	t.Parallel()

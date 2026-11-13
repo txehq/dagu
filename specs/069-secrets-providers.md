@@ -92,7 +92,10 @@ Provider-specific behavior covered here:
   real OS environment. An unset variable fails with
   `environment variable "<key>" is not set`.
 - `file`: resolves `key` as a file path. A relative path is resolved against
-  the DAG file's own directory. A missing file fails with
+  the DAG file's own directory. The value is the file's content without the
+  run of CR and LF bytes at its end, so a token file ending in `\n` or `\r\n`
+  resolves to the token alone; every other byte, including leading and
+  inner whitespace, is kept. A missing file fails with
   `secret file not found: <path>`.
 - `aws`: resolves `key` (a secret name or ARN) through AWS Secrets Manager
   using the standard AWS SDK, which honors `AWS_ENDPOINT_URL` and the AWS

@@ -147,12 +147,12 @@ func TestFileResolver_Resolve(t *testing.T) {
 
 		value, err := resolver.Resolve(ctx, ref)
 		require.NoError(t, err)
-		assert.Equal(t, content, value, "should preserve exact file content")
+		assert.Equal(t, "  secret with spaces  ", value, "spaces stay; only the trailing line ending goes")
 	})
 
 	t.Run("MultilineFile", func(t *testing.T) {
 		multilineFile := filepath.Join(tmpDir, "multiline.txt")
-		content := "line1\nline2\nline3\n"
+		content := "line1\nline2\r\nline3\n"
 		require.NoError(t, os.WriteFile(multilineFile, []byte(content), 0600))
 
 		ref := secretref.Ref{
@@ -163,7 +163,31 @@ func TestFileResolver_Resolve(t *testing.T) {
 
 		value, err := resolver.Resolve(ctx, ref)
 		require.NoError(t, err)
-		assert.Equal(t, content, value)
+		assert.Equal(t, "line1\nline2\r\nline3", value)
+	})
+
+	// A token saved by `gh auth token > file` or an editor ends in a line
+	// ending. Sent as an HTTP header value, that ending fails every request,
+	// so the value is read the way shell `$(cat file)` reads it.
+	t.Run("TrailingLineEnding", func(t *testing.T) {
+		for name, content := range map[string]string{
+			"LF":       "ghs_token\n",
+			"CRLF":     "ghs_token\r\n",
+			"Repeated": "ghs_token\n\r\n\n",
+		} {
+			t.Run(name, func(t *testing.T) {
+				secretFile := filepath.Join(tmpDir, "token-"+name)
+				require.NoError(t, os.WriteFile(secretFile, []byte(content), 0600))
+
+				value, err := resolver.Resolve(ctx, secretref.Ref{
+					Name:     "GH_TOKEN",
+					Provider: "file",
+					Key:      secretFile,
+				})
+				require.NoError(t, err)
+				assert.Equal(t, "ghs_token", value)
+			})
+		}
 	})
 
 	t.Run("BinaryFile", func(t *testing.T) {
