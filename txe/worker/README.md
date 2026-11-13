@@ -56,6 +56,11 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 | `alert-webhook.url` | the alert webhook's URL, mode 0600, if the install is not given another file | yours to write |
 | `logs/` | agent logs | kept |
 
+A continuity scan (`dagu txe continuity`) classifies every path in this table and refuses anything
+else in the home. A script here that adds a path to the home also adds its rule to
+`machineHomeRules` in `internal/txe/continuity/scan.go`; `TestInstallerHomePathsAreClassified`
+fails until it does. The scan never opens `alert-webhook.url` or the credentials.
+
 ## Install
 
 The cluster side (namespace, Service, the `dagu-tunnel` ServiceAccount and its Role) comes from
