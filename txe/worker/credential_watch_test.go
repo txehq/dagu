@@ -95,18 +95,57 @@ type watchRun struct {
 	err            error
 }
 
-// runWatch runs credential-watch.py at watchNow+offset with extra environment (the CA file for
-// the test webhook) and args.
-func runWatch(t *testing.T, env []string, offset int, args ...string) watchRun {
+// runWatch runs credential-watch.py with the python3 on PATH at watchNow+offset with args.
+func runWatch(t *testing.T, offset int, args ...string) watchRun {
 	t.Helper()
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
+	return runWatchUnder(t, py, offset, args...)
+}
+
+// runWatchUnder runs credential-watch.py with the interpreter py. Its environment holds PATH
+// alone: a test webhook's CA reaches the watch as --ca-file, never as SSL_CERT_FILE, which
+// Apple's /usr/bin/python3 ignores (TXE-7321).
+func runWatchUnder(t *testing.T, py string, offset int, args ...string) watchRun {
+	t.Helper()
 	cmd := exec.Command(py, append([]string{"-I", watchScript(t), "--now", fmt.Sprint(watchNow + offset)}, args...)...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
-	cmd.Env = append([]string{"PATH=/usr/bin:/bin"}, env...)
-	err = cmd.Run()
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	err := cmd.Run()
 	return watchRun{out.String(), errOut.String(), err}
+}
+
+// watchPythons are the interpreters the kit's installers can select on this machine.
+// install.sh and install-systemd.sh write the python3 found on PATH into the agent or unit. That
+// is this test's python3 on PATH, or /usr/bin/python3: Apple's (LibreSSL) on a Mac with no other
+// Python, and the distribution's own on Linux. One that cannot run is one no install selects.
+func watchPythons(t *testing.T) []string {
+	t.Helper()
+	var found []string
+	seen := map[string]bool{}
+	candidates := []string{"/usr/bin/python3"}
+	if py, err := exec.LookPath("python3"); err == nil {
+		candidates = append([]string{py}, candidates...)
+	}
+	for _, py := range candidates {
+		real, err := filepath.EvalSymlinks(py)
+		if err != nil || seen[real] || exec.Command(py, "-I", "-c", "import ssl").Run() != nil {
+			continue
+		}
+		seen[real] = true
+		found = append(found, py)
+	}
+	require.NotEmpty(t, found, "no python3 the kit could select")
+	return found
+}
+
+// forEachPython runs f as a subtest under each of watchPythons.
+func forEachPython(t *testing.T, f func(t *testing.T, py string)) {
+	t.Helper()
+	for _, py := range watchPythons(t) {
+		t.Run("python="+py, func(t *testing.T) { f(t, py) })
+	}
 }
 
 // Credentials with no expiry (the tunnel Secret's token, offline refresh tokens) never page;
@@ -116,7 +155,7 @@ func TestCredentialWatchFindsEachExpiry(t *testing.T) {
 	soon := time.Unix(watchNow, 0).Add(72 * time.Hour)
 	quiet := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"sub": "x"})),
 		map[string]string{"worker-credential.json": jwtWith(t, map[string]any{"typ": "Offline", "exp": 0})})
-	r := runWatch(t, nil, 0, "--home", quiet, "--dry-run")
+	r := runWatch(t, 0, "--home", quiet, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Contains(t, r.stdout, "tunnel/kubeconfig token")
 	assert.Contains(t, r.stdout, "worker-credential.json refresh token")
@@ -127,7 +166,7 @@ func TestCredentialWatchFindsEachExpiry(t *testing.T) {
 	loud := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"exp": watchNow - 60}),
 		"    client-certificate-data: "+cert),
 		map[string]string{"builder-credential.json": jwtWith(t, map[string]any{"exp": soon.Unix()})})
-	r = runWatch(t, nil, 0, "--home", loud, "--dry-run")
+	r = runWatch(t, 0, "--home", loud, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Regexp(t, `would post: \[dagu-credential-watch\] \[FIRING\] `+agentsMachine+`: tunnel/kubeconfig token EXPIRED at `, r.stdout)
 	assert.Regexp(t, `tunnel/kubeconfig client certificate expires at \S+ \(in 3\.0 days\)`, r.stdout)
@@ -142,7 +181,7 @@ func TestCredentialWatchReadsTheWorkersCredentialFile(t *testing.T) {
 	raw, err := json.Marshal(map[string]any{"refresh_token": jwtWith(t, map[string]any{"exp": watchNow - 60})})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(outside, raw, 0o600))
-	r := runWatch(t, nil, 0, "--home", home, "--dry-run",
+	r := runWatch(t, 0, "--home", home, "--dry-run",
 		"--credential-file", outside, "--credential-file", filepath.Join(home, "worker-credential.json"))
 	require.NoError(t, r.err, r.stderr)
 	assert.Contains(t, r.stdout, "would post: [dagu-credential-watch] [FIRING] "+agentsMachine+": "+outside+" refresh token EXPIRED")
@@ -162,7 +201,7 @@ func TestCredentialWatchReadsTheKitsJSONKubeconfig(t *testing.T) {
 		return string(raw)
 	}
 	healthy := watchHome(t, kubeconfig(map[string]any{"token": jwtWith(t, map[string]any{"exp": watchNow + 90*86400})}), nil)
-	r := runWatch(t, nil, 0, "--home", healthy, "--dry-run")
+	r := runWatch(t, 0, "--home", healthy, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Regexp(t, `tunnel/kubeconfig token\s+jwt\s+expires `, r.stdout)
 	assert.NotContains(t, r.stdout, "would post")
@@ -170,7 +209,7 @@ func TestCredentialWatchReadsTheKitsJSONKubeconfig(t *testing.T) {
 	cert := base64.StdEncoding.EncodeToString(certExpiring(t, time.Unix(watchNow, 0).Add(72*time.Hour)))
 	loud := watchHome(t, kubeconfig(map[string]any{"token": jwtWith(t, map[string]any{"exp": watchNow - 60}),
 		"client-certificate-data": cert, "exec": map[string]any{"command": "kubelogin"}}), nil)
-	r = runWatch(t, nil, 0, "--home", loud, "--dry-run")
+	r = runWatch(t, 0, "--home", loud, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Contains(t, r.stdout, "tunnel/kubeconfig token EXPIRED")
 	assert.Regexp(t, `tunnel/kubeconfig client certificate expires at \S+ \(in 3\.0 days\)`, r.stdout)
@@ -184,7 +223,7 @@ func TestCredentialWatchPagesWhatItCannotRead(t *testing.T) {
 		"bad-exp-credential.json": jwtWith(t, map[string]any{"exp": "tomorrow"}),
 		"opaque-credential.json":  "an-opaque-refresh-token"})
 	require.NoError(t, os.WriteFile(filepath.Join(home, "broken-credential.json"), []byte("not json"), 0o600))
-	r := runWatch(t, nil, 0, "--home", home, "--dry-run")
+	r := runWatch(t, 0, "--home", home, "--dry-run")
 	require.NoError(t, r.err, r.stderr)
 	assert.Contains(t, r.stdout, "would post: [dagu-credential-watch] [FIRING] "+agentsMachine+": tunnel/kubeconfig exec: expiry unknown")
 	assert.Contains(t, r.stdout, "broken-credential.json: unreadable or has no refresh_token")
@@ -235,29 +274,31 @@ func (w *webhook) take() []string {
 	return p
 }
 
-// startWebhook serves w over TLS and returns the webhook file and the environment that makes
-// python trust the test server.
-func startWebhook(t *testing.T, w *webhook) (file string, env []string) {
+// startWebhook serves w over TLS and returns the webhook file and the file of the CA that makes
+// the watch trust the test server, for --ca-file.
+func startWebhook(t *testing.T, w *webhook) (file, ca string) {
 	t.Helper()
 	srv := httptest.NewTLSServer(w)
 	t.Cleanup(srv.Close)
-	dir := t.TempDir()
-	ca := filepath.Join(dir, "ca.pem")
-	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600))
-	file = filepath.Join(dir, "webhook.url")
+	file = filepath.Join(t.TempDir(), "webhook.url")
 	require.NoError(t, os.WriteFile(file, []byte(srv.URL+"/"+watchSecret+"\n"), 0o600))
-	return file, []string{"SSL_CERT_FILE=" + ca}
+	return file, caFile(t, srv)
 }
 
 // A finding is posted once, again only after an hour, and resolved once when it clears; a post
 // that is not delivered is not recorded, so the next run tries it again. The URL is never printed.
+// It holds under every interpreter an install can select, Apple's /usr/bin/python3 included.
 func TestCredentialWatchDeliversRepeatsAndResolves(t *testing.T) {
+	forEachPython(t, testWatchDelivers)
+}
+
+func testWatchDelivers(t *testing.T, py string) {
 	w := &webhook{}
-	hook, env := startWebhook(t, w)
+	hook, ca := startWebhook(t, w)
 	home := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"exp": watchNow - 60})), nil)
 	state := filepath.Join(t.TempDir(), "state", "state.json")
 	run := func(offset int) watchRun {
-		r := runWatch(t, env, offset, "--home", home, "--webhook-file", hook, "--state", state)
+		r := runWatchUnder(t, py, offset, "--home", home, "--webhook-file", hook, "--state", state, "--ca-file", ca)
 		assert.NotContains(t, r.stdout+r.stderr, watchSecret, "the webhook URL is never printed")
 		return r
 	}
@@ -295,7 +336,7 @@ func TestCredentialWatchRefusesAWebhookThatIsNotHTTPS(t *testing.T) {
 	hook := filepath.Join(t.TempDir(), "webhook.url")
 	require.NoError(t, os.WriteFile(hook, []byte("http://chat.example/"+watchSecret), 0o600))
 	state := filepath.Join(t.TempDir(), "state.json")
-	r := runWatch(t, nil, 0, "--home", home, "--webhook-file", hook, "--state", state)
+	r := runWatch(t, 0, "--home", home, "--webhook-file", hook, "--state", state)
 	require.Error(t, r.err)
 	assert.Contains(t, r.stderr, "does not hold an https URL")
 	assert.NotContains(t, r.stderr, watchSecret)
@@ -357,25 +398,29 @@ func TestCredentialWatchRefusesAMalformedWebhook(t *testing.T) {
 		{"credentials", "https://userpart:passpart@" + markedHost + markedPath, "holds a malformed https URL (it carries user credentials)"},
 		{"http", "http://" + markedHost + markedPath + markedQuery, "does not hold an https URL"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			hook := webhookFile(t, tc.url)
-			state := filepath.Join(t.TempDir(), "state.json")
-			r := runWatch(t, nil, 0, "--home", home, "--webhook-file", hook, "--state", state)
-			require.Error(t, r.err)
-			assert.Contains(t, r.stderr, "could not deliver (the webhook file "+hook+" "+tc.why+")")
-			assertNoURLPart(t, r.stdout+r.stderr, tc.url)
-			assert.NoFileExists(t, state, "nothing undelivered is recorded")
+		forEachPython(t, func(t *testing.T, py string) {
+			t.Run(tc.name, func(t *testing.T) {
+				hook := webhookFile(t, tc.url)
+				state := filepath.Join(t.TempDir(), "state.json")
+				r := runWatchUnder(t, py, 0, "--home", home, "--webhook-file", hook, "--state", state)
+				require.Error(t, r.err)
+				assert.Contains(t, r.stderr, "could not deliver (the webhook file "+hook+" "+tc.why+")")
+				assertNoURLPart(t, r.stdout+r.stderr, tc.url)
+				assert.NoFileExists(t, state, "nothing undelivered is recorded")
 
-			r = runWatch(t, nil, 0, "--check-webhook", hook)
-			require.Error(t, r.err)
-			assert.Equal(t, "the webhook file "+hook+" "+tc.why+"\n", r.stderr)
-			assertNoURLPart(t, r.stdout+r.stderr, tc.url)
+				r = runWatchUnder(t, py, 0, "--check-webhook", hook)
+				require.Error(t, r.err)
+				assert.Equal(t, "the webhook file "+hook+" "+tc.why+"\n", r.stderr)
+				assertNoURLPart(t, r.stdout+r.stderr, tc.url)
+			})
 		})
 	}
 
-	r := runWatch(t, nil, 0, "--check-webhook", webhookFile(t, "https://"+markedHost+":8443"+markedPath+markedQuery))
-	require.NoError(t, r.err, r.stderr)
-	assert.Empty(t, r.stdout+r.stderr, "a well-formed URL passes silently")
+	forEachPython(t, func(t *testing.T, py string) {
+		r := runWatchUnder(t, py, 0, "--check-webhook", webhookFile(t, "https://"+markedHost+":8443"+markedPath+markedQuery))
+		require.NoError(t, r.err, r.stderr)
+		assert.Empty(t, r.stdout+r.stderr, "a well-formed URL passes silently")
+	})
 }
 
 // hijacked serves a TLS webhook that reads the post and then, instead of an HTTP answer, writes
@@ -395,17 +440,19 @@ func hijacked(t *testing.T, reply string) *httptest.Server {
 	return srv
 }
 
-// caEnv is the environment that makes python trust srv.
-func caEnv(t *testing.T, srv *httptest.Server) []string {
+// caFile writes srv's certificate, its own CA, to a file for --ca-file.
+func caFile(t *testing.T, srv *httptest.Server) string {
 	t.Helper()
 	ca := filepath.Join(t.TempDir(), "ca.pem")
 	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600))
-	return []string{"SSL_CERT_FILE=" + ca}
+	return ca
 }
 
 // A post to a well-formed URL that fails, in each way it can, is reported by the class of failure
 // alone, never with the URL, and is not recorded. An answer that is not HTTP raises an
 // http.client error that is not an OSError: that one used to escape as a traceback (TXE-7313).
+// Under every interpreter an install can select, --ca-file trusts its CA and nothing else: a
+// server whose certificate it does not hold is refused (TXE-7321).
 func TestCredentialWatchReportsAFailedPostByItsClassOnly(t *testing.T) {
 	home := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"exp": watchNow - 60})), nil)
 
@@ -417,28 +464,33 @@ func TestCredentialWatchReportsAFailedPostByItsClassOnly(t *testing.T) {
 	require.NoError(t, closed.Close())
 	notHTTP := hijacked(t, "not-an-http-answer\r\n\r\n")
 	silent := hijacked(t, "")
+	otherCA := filepath.Join(t.TempDir(), "other-ca.pem")
+	require.NoError(t, os.WriteFile(otherCA, certExpiring(t, time.Unix(watchNow, 0).Add(24*time.Hour)), 0o600))
 
-	for _, tc := range []struct {
-		name, base string
-		env        []string
-		why        string
-	}{
-		{"refused", refusing.URL, caEnv(t, refusing), "webhook answered 403"},
-		{"connection refused", closedURL, nil, "ConnectionRefusedError posting to the webhook"},
-		{"untrusted certificate", refusing.URL, nil, "SSLCertVerificationError posting to the webhook"},
-		{"not HTTP", notHTTP.URL, caEnv(t, notHTTP), "BadStatusLine posting to the webhook"},
-		{"no answer", silent.URL, caEnv(t, silent), "RemoteDisconnected posting to the webhook"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			url := tc.base + markedPath + markedQuery
-			state := filepath.Join(t.TempDir(), "state.json")
-			r := runWatch(t, tc.env, 0, "--home", home, "--webhook-file", webhookFile(t, url), "--state", state)
-			require.Error(t, r.err)
-			assert.Contains(t, r.stderr, "could not deliver ("+tc.why+"): tunnel/kubeconfig token EXPIRED")
-			assertNoURLPart(t, r.stdout+r.stderr, url)
-			assert.NoFileExists(t, state, "nothing undelivered is recorded")
-		})
-	}
+	forEachPython(t, func(t *testing.T, py string) {
+		for _, tc := range []struct{ name, base, ca, why string }{
+			{"refused", refusing.URL, caFile(t, refusing), "webhook answered 403"},
+			{"connection refused", closedURL, "", "ConnectionRefusedError posting to the webhook"},
+			{"untrusted certificate", refusing.URL, "", "SSLCertVerificationError posting to the webhook"},
+			{"another CA", refusing.URL, otherCA, "SSLCertVerificationError posting to the webhook"},
+			{"not HTTP", notHTTP.URL, caFile(t, notHTTP), "BadStatusLine posting to the webhook"},
+			{"no answer", silent.URL, caFile(t, silent), "RemoteDisconnected posting to the webhook"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				url := tc.base + markedPath + markedQuery
+				state := filepath.Join(t.TempDir(), "state.json")
+				args := []string{"--home", home, "--webhook-file", webhookFile(t, url), "--state", state}
+				if tc.ca != "" {
+					args = append(args, "--ca-file", tc.ca)
+				}
+				r := runWatchUnder(t, py, 0, args...)
+				require.Error(t, r.err)
+				assert.Contains(t, r.stderr, "could not deliver ("+tc.why+"): tunnel/kubeconfig token EXPIRED")
+				assertNoURLPart(t, r.stdout+r.stderr, url)
+				assert.NoFileExists(t, state, "nothing undelivered is recorded")
+			})
+		}
+	})
 }
 
 // _send never raises, whatever the URL: building the request is inside its handler, and a URL
@@ -446,20 +498,25 @@ func TestCredentialWatchReportsAFailedPostByItsClassOnly(t *testing.T) {
 // The watch never hands _send such a URL; this holds the handler to it if one ever gets past.
 func TestCredentialWatchSendReportsAnyFailureByItsClassOnly(t *testing.T) {
 	script := watchScript(t)
-	for _, tc := range []struct{ url, want string }{
-		{"https://127.0.0.1:9" + markedPath + " " + markedQuery, "InvalidURL posting to the webhook"},
-		{"https://127.0.0.1:portpart" + markedPath, "InvalidURL posting to the webhook"},
-		{"no-scheme-part" + markedPath, "ValueError posting to the webhook"},
-	} {
-		out, stderr, err := python(t, "-c", `import importlib.util, sys
+	forEachPython(t, func(t *testing.T, py string) {
+		for _, tc := range []struct{ url, want string }{
+			{"https://127.0.0.1:9" + markedPath + " " + markedQuery, "InvalidURL posting to the webhook"},
+			{"https://127.0.0.1:portpart" + markedPath, "InvalidURL posting to the webhook"},
+			{"no-scheme-part" + markedPath, "ValueError posting to the webhook"},
+		} {
+			cmd := exec.Command(py, "-I", "-c", `import importlib.util, sys
 spec = importlib.util.spec_from_file_location("watch", sys.argv[1])
 watch = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(watch)
 print(watch._send(sys.argv[2], "text"))`, script, tc.url)
-		require.NoError(t, err, stderr)
-		assert.Equal(t, tc.want+"\n", out)
-		assertNoURLPart(t, out+stderr, tc.url)
-	}
+			var out, errOut bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &errOut
+			cmd.Env = []string{"PATH=/usr/bin:/bin"}
+			require.NoError(t, cmd.Run(), errOut.String())
+			assert.Equal(t, tc.want+"\n", out.String())
+			assertNoURLPart(t, out.String()+errOut.String(), tc.url)
+		}
+	})
 }
 
 // watchOut writes the watch's macOS agent and Linux units for one home and webhook file.

@@ -183,6 +183,14 @@ refused before anything is built, because a machine whose credentials can expire
 be installed. The one exception is a machine on the worker channel with no credential yet, which
 starts no agent. The agent or unit gets the file's path, never the URL.
 
+The watch runs under the `python3` the install found on `PATH`, written into the agent or unit as
+an absolute path. On a Mac with no other Python that is Apple's `/usr/bin/python3`, which is
+supported. The watch checks the webhook's certificate against that interpreter's default trust
+store, and the agent and units set no TLS environment. Apple's `/usr/bin/python3` (LibreSSL)
+ignores `SSL_CERT_FILE` and `SSL_CERT_DIR`, so the tests hand their webhook's CA to the watch
+through a hidden `--ca-file`. The TLS tests run under each interpreter an install can select here
+(TXE-7321).
+
 On Linux the install runs the watch once and fails if that run fails. On macOS `status.sh` shows
 the last run's exit code. The agent's label is the one TXE-7226's hand-installed agent used, so an
 install replaces that agent and keeps its webhook file.
