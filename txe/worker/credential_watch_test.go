@@ -214,6 +214,18 @@ func (w *webhook) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w.agents = append(w.agents, r.UserAgent())
 }
 
+func (w *webhook) setRefuse(refuse bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.refuse = refuse
+}
+
+func (w *webhook) userAgents() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.agents)
+}
+
 func (w *webhook) take() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -249,18 +261,18 @@ func TestCredentialWatchDeliversRepeatsAndResolves(t *testing.T) {
 		return r
 	}
 
-	w.refuse = true
+	w.setRefuse(true)
 	r := run(0)
 	require.Error(t, r.err)
 	assert.Contains(t, r.stderr, "could not deliver (webhook answered 403)")
 	assert.NoFileExists(t, state, "nothing undelivered is recorded")
 
-	w.refuse = false
+	w.setRefuse(false)
 	require.NoError(t, run(60).err)
 	posts := w.take()
 	require.Len(t, posts, 1)
 	assert.Contains(t, posts[0], "[FIRING] "+agentsMachine+": tunnel/kubeconfig token EXPIRED")
-	assert.Equal(t, []string{"txe-dagu-credential-watch/1 (TXE-7226)"}, w.agents, "urllib's default agent is refused by the CDN")
+	assert.Equal(t, []string{"txe-dagu-credential-watch/1 (TXE-7226)"}, w.userAgents(), "urllib's default agent is refused by the CDN")
 
 	require.NoError(t, run(120).err)
 	assert.Empty(t, w.take(), "not again within the hour")
