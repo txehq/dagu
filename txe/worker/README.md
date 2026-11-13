@@ -174,7 +174,11 @@ next run. Its output goes to `logs/credential-watch.log`, bounded at 1 MiB with 
 The webhook is a Mattermost incoming webhook; its URL is a secret. The install takes the file from
 `--alert-webhook-file <absolute path>`. Without that flag it keeps the file the installed watch
 already uses, or falls back to `alert-webhook.url` in the TXE home. The file must be yours, a
-regular file, mode 0600 or tighter, and hold an `https://` URL. With no file, the install is
+regular file, mode 0600 or tighter, and hold a well-formed `https://` URL: printable ASCII only,
+with a host and no user credentials. The install and the watch apply the same check
+(`credential-watch.py --check-webhook FILE`), so a malformed URL is refused before any post. No
+message names any part of the URL: a refused URL, or a post that fails, is reported by the class
+of defect or failure alone (TXE-7313). With no file, the install is
 refused before anything is built, because a machine whose credentials can expire unseen should not
 be installed. The one exception is a machine on the worker channel with no credential yet, which
 starts no agent. The agent or unit gets the file's path, never the URL.

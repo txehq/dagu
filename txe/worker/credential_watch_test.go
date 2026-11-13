@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -301,6 +302,166 @@ func TestCredentialWatchRefusesAWebhookThatIsNotHTTPS(t *testing.T) {
 	assert.NoFileExists(t, state)
 }
 
+// A marked webhook URL's host, path and query: each is a run no message could hold by chance.
+const (
+	markedHost  = "chat-hostpart.example"
+	markedPath  = "/hooks-pathpart/secret-pathpart"
+	markedQuery = "?querypart=queryvalue"
+)
+
+// urlPart matches the runs between a URL's delimiters; numericPart, a run of digits and dots.
+var (
+	urlPart     = regexp.MustCompile(`[^/?#=&:@\[\]\s\x00-\x1f\x7f]+`)
+	numericPart = regexp.MustCompile(`^[0-9.]+$`)
+)
+
+// assertNoURLPart fails when out holds any part of url: any run of three or more characters
+// between its delimiters, except the scheme and the numeric runs (a test server's 127.0.0.1 and
+// port, which a temporary directory's random name could hold by chance).
+func assertNoURLPart(t *testing.T, out, url string) {
+	t.Helper()
+	assert.NotContains(t, out, "Traceback", "no traceback is printed: it can hold the URL")
+	for _, part := range urlPart.FindAllString(url, -1) {
+		if len(part) >= 3 && part != "https" && part != "http" && !numericPart.MatchString(part) {
+			assert.NotContains(t, out, part, "no part of the webhook URL is printed")
+		}
+	}
+}
+
+// webhookFile writes url into a new webhook file, mode 0600, the way an operator would.
+func webhookFile(t *testing.T, url string) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "webhook.url")
+	require.NoError(t, os.WriteFile(file, []byte(url+"\n"), 0o600))
+	return file
+}
+
+// A webhook URL urllib or http.client would refuse while posting, with its URL in the error, is
+// refused when it is read, before any post: by the watch and by --check-webhook, the installers'
+// check. The refusal names the defect alone and nothing is recorded (TXE-7313).
+func TestCredentialWatchRefusesAMalformedWebhook(t *testing.T) {
+	home := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"exp": watchNow - 60})), nil)
+	const unprintable = "holds a malformed https URL (whitespace, a control or a non-ASCII character)"
+	const unparsable = "holds a malformed https URL (it cannot be parsed)"
+	for _, tc := range []struct{ name, url, why string }{
+		{"space", "https://" + markedHost + markedPath + " " + markedQuery, unprintable},
+		{"tab", "https://" + markedHost + markedPath + "\t" + markedQuery, unprintable},
+		{"two lines", "https://" + markedHost + markedPath + "\nhttps://second-linepart.example/", unprintable},
+		{"control", "https://" + markedHost + markedPath + "\x01" + markedQuery, unprintable},
+		{"delete", "https://" + markedHost + markedPath + "\x7f", unprintable},
+		{"non-ASCII", "https://" + markedHost + markedPath + "-é" + markedQuery, unprintable},
+		{"port", "https://" + markedHost + ":portpart" + markedPath, unparsable},
+		{"port range", "https://" + markedHost + ":99999" + markedPath, unparsable},
+		{"IPv6", "https://[hostpart-v6" + markedPath, unparsable},
+		{"no host", "https://" + markedPath + markedQuery, "holds a malformed https URL (it names no host)"},
+		{"credentials", "https://userpart:passpart@" + markedHost + markedPath, "holds a malformed https URL (it carries user credentials)"},
+		{"http", "http://" + markedHost + markedPath + markedQuery, "does not hold an https URL"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hook := webhookFile(t, tc.url)
+			state := filepath.Join(t.TempDir(), "state.json")
+			r := runWatch(t, nil, 0, "--home", home, "--webhook-file", hook, "--state", state)
+			require.Error(t, r.err)
+			assert.Contains(t, r.stderr, "could not deliver (the webhook file "+hook+" "+tc.why+")")
+			assertNoURLPart(t, r.stdout+r.stderr, tc.url)
+			assert.NoFileExists(t, state, "nothing undelivered is recorded")
+
+			r = runWatch(t, nil, 0, "--check-webhook", hook)
+			require.Error(t, r.err)
+			assert.Equal(t, "the webhook file "+hook+" "+tc.why+"\n", r.stderr)
+			assertNoURLPart(t, r.stdout+r.stderr, tc.url)
+		})
+	}
+
+	r := runWatch(t, nil, 0, "--check-webhook", webhookFile(t, "https://"+markedHost+":8443"+markedPath+markedQuery))
+	require.NoError(t, r.err, r.stderr)
+	assert.Empty(t, r.stdout+r.stderr, "a well-formed URL passes silently")
+}
+
+// hijacked serves a TLS webhook that reads the post and then, instead of an HTTP answer, writes
+// reply on the bare connection and closes it.
+func hijacked(t *testing.T, reply string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		conn, _, err := rw.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_, _ = conn.Write([]byte(reply))
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// caEnv is the environment that makes python trust srv.
+func caEnv(t *testing.T, srv *httptest.Server) []string {
+	t.Helper()
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600))
+	return []string{"SSL_CERT_FILE=" + ca}
+}
+
+// A post to a well-formed URL that fails, in each way it can, is reported by the class of failure
+// alone, never with the URL, and is not recorded. An answer that is not HTTP raises an
+// http.client error that is not an OSError: that one used to escape as a traceback (TXE-7313).
+func TestCredentialWatchReportsAFailedPostByItsClassOnly(t *testing.T) {
+	home := watchHome(t, kubeconfigWith("    token: "+jwtWith(t, map[string]any{"exp": watchNow - 60})), nil)
+
+	refusing := httptest.NewTLSServer(&webhook{refuse: true})
+	t.Cleanup(refusing.Close)
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	closedURL := "https://" + closed.Addr().String()
+	require.NoError(t, closed.Close())
+	notHTTP := hijacked(t, "not-an-http-answer\r\n\r\n")
+	silent := hijacked(t, "")
+
+	for _, tc := range []struct {
+		name, base string
+		env        []string
+		why        string
+	}{
+		{"refused", refusing.URL, caEnv(t, refusing), "webhook answered 403"},
+		{"connection refused", closedURL, nil, "ConnectionRefusedError posting to the webhook"},
+		{"untrusted certificate", refusing.URL, nil, "SSLCertVerificationError posting to the webhook"},
+		{"not HTTP", notHTTP.URL, caEnv(t, notHTTP), "BadStatusLine posting to the webhook"},
+		{"no answer", silent.URL, caEnv(t, silent), "RemoteDisconnected posting to the webhook"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			url := tc.base + markedPath + markedQuery
+			state := filepath.Join(t.TempDir(), "state.json")
+			r := runWatch(t, tc.env, 0, "--home", home, "--webhook-file", webhookFile(t, url), "--state", state)
+			require.Error(t, r.err)
+			assert.Contains(t, r.stderr, "could not deliver ("+tc.why+"): tunnel/kubeconfig token EXPIRED")
+			assertNoURLPart(t, r.stdout+r.stderr, url)
+			assert.NoFileExists(t, state, "nothing undelivered is recorded")
+		})
+	}
+}
+
+// _send never raises, whatever the URL: building the request is inside its handler, and a URL
+// http.client refuses (with the URL in its message) comes back as the class of failure alone.
+// The watch never hands _send such a URL; this holds the handler to it if one ever gets past.
+func TestCredentialWatchSendReportsAnyFailureByItsClassOnly(t *testing.T) {
+	script := watchScript(t)
+	for _, tc := range []struct{ url, want string }{
+		{"https://127.0.0.1:9" + markedPath + " " + markedQuery, "InvalidURL posting to the webhook"},
+		{"https://127.0.0.1:portpart" + markedPath, "InvalidURL posting to the webhook"},
+		{"no-scheme-part" + markedPath, "ValueError posting to the webhook"},
+	} {
+		out, stderr, err := python(t, "-c", `import importlib.util, sys
+spec = importlib.util.spec_from_file_location("watch", sys.argv[1])
+watch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(watch)
+print(watch._send(sys.argv[2], "text"))`, script, tc.url)
+		require.NoError(t, err, stderr)
+		assert.Equal(t, tc.want+"\n", out)
+		assertNoURLPart(t, out+stderr, tc.url)
+	}
+}
+
 // watchOut writes the watch's macOS agent and Linux units for one home and webhook file.
 func watchOut(t *testing.T, home, hook, cred string) (agent map[string]any, service, timer unitFile) {
 	t.Helper()
@@ -560,6 +721,15 @@ esac
 	out, err = run("--alert-webhook-file", loose)
 	require.Error(t, err)
 	assert.Contains(t, out, "it must be readable by its owner only")
+
+	// The install refuses the URLs the watch refuses, by the same check, and prints no part of one.
+	malformed := "https://" + markedHost + markedPath + " " + markedQuery
+	out, err = run("--alert-webhook-file", webhookFile(t, malformed))
+	require.Error(t, err)
+	assert.Contains(t, out, "alert webhook file refused: the webhook file ")
+	assert.Contains(t, out, "holds a malformed https URL (whitespace, a control or a non-ASCII character)")
+	assertNoURLPart(t, out, malformed)
+	assert.NoFileExists(t, filepath.Join(agents, "com.txe.dagu.worker.plist"), "nothing was written")
 
 	// What TXE-7226 hand-installed: same label, its own script and webhook.
 	require.NoError(t, os.MkdirAll(agents, 0o700))
