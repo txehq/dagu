@@ -7,17 +7,25 @@
 #   txe/worker/install-systemd.sh --tag txe-v2.18.3-1                       # upgrade
 #   txe/worker/install-systemd.sh --tag txe-v2.18.3-1 --credential-file /abs/worker-credential.json
 #   txe/worker/install-systemd.sh --tag txe-v2.18.3-1 --no-credential   # roll back; keeps the file
+#   txe/worker/install-systemd.sh --tag txe-v2.18.3-1 --alert-webhook-file /abs/webhook.url
 #
 # Tested on Ubuntu 24.04 (arm64) in an isolated OrbStack machine with no host file sharing; other
 # distributions with systemd user instances should work but are not claimed.
 #
-# It writes two units into ~/.config/systemd/user (units.py) and starts them:
+# It writes these units into ~/.config/systemd/user (units.py) and starts them:
 #
 #   txe-dagu-tunnel.service  kubectl port-forward 127.0.0.1:18080 (UI/API) and
 #                            127.0.0.1:50055 (coordinator) to svc/dagu, using the
 #                            port-forward-only kubeconfig from tunnel-credential.sh
 #   txe-dagu-worker.service  dagu worker, id = this machine's mch_ id, labels
 #                            txe.machine and txe.owner, coordinator 127.0.0.1:50055
+#   txe-dagu-credential-watch.timer and .service
+#                            credential-watch.py, hourly: posts to the alert webhook 7 days
+#                            before a credential of this machine expires and after it has
+#                            (TXE-7233); the install runs it once and fails if that run fails
+#
+# The watch's webhook file is chosen and checked as install.sh's (see its header): an install
+# with none is refused.
 #
 # Each runs under bin/logpipe.py, which owns logs/tunnel.log or logs/worker.log and keeps it
 # bounded, as on macOS (TXE-5408). A log an earlier install's unit appended to is moved to
@@ -38,15 +46,15 @@ TXE_DAGU_UNITS_DIR="${TXE_DAGU_UNITS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/syst
 # Units need absolute paths (ExecStart, logs); a relative TXE home is made absolute here, as
 # lib.sh's link_dagu_on_path does for its link.
 case "$TXE_DAGU_HOME" in /*) ;; *) TXE_DAGU_HOME="$PWD/$TXE_DAGU_HOME" ;; esac
-TXE_DAGU_TUNNEL_UNIT="txe-dagu-tunnel.service"
-TXE_DAGU_WORKER_UNIT="txe-dagu-worker.service"
 
-tag="" owner_id="" credential="" credential_given=0 hub_url=""
+tag="" owner_id="" credential="" credential_given=0 hub_url="" webhook_given=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:-}"; shift 2 ;;
     --owner-id) owner_id="${2:-}"; shift 2 ;;
     --hub-url) hub_url="${2:-}"; [ -n "$hub_url" ] || die "--hub-url needs the hub's https address"; shift 2 ;;
+    --alert-webhook-file)
+      webhook_given="${2:-}"; [ -n "$webhook_given" ] || die "--alert-webhook-file needs the webhook file's absolute path"; shift 2 ;;
     --credential-file)
       [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
       [ "$credential_given" != none ] || die "--credential-file and --no-credential cannot both be given"
@@ -110,6 +118,18 @@ fi
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
 
+# The credential watch's webhook, as install.sh chooses it.
+webhook_rc=0
+webhook="$(watch_webhook "$webhook_given" \
+  "$(python3 -I "$here/units.py" watch-webhook "$TXE_DAGU_UNITS_DIR/$TXE_DAGU_WATCH_SERVICE")")" || webhook_rc=$?
+case "$webhook_rc" in
+  0) ;;
+  2) if [ -z "$hub_url" ] || [ -n "$credential" ]; then
+       die "not installing: the credential watch has no webhook; give --alert-webhook-file, or put the URL in $TXE_DAGU_HOME/alert-webhook.url (mode 0600)"
+     fi ;;
+  *) die "not installing: fix the alert webhook file" ;;
+esac
+
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
 if [ ! -x "$bin" ]; then
   src="$(mktemp -d)"
@@ -165,12 +185,16 @@ fi
 python_bin="$(python3 -I -c 'import sys; print(sys.executable)')" || die "python3 is not on PATH"
 install -m 0644 "$here/logpipe.py" "$TXE_DAGU_HOME/bin/logpipe.py.next"
 mv -f "$TXE_DAGU_HOME/bin/logpipe.py.next" "$TXE_DAGU_HOME/bin/logpipe.py"
+install -m 0644 "$here/credential-watch.py" "$TXE_DAGU_HOME/bin/credential-watch.py.next"
+mv -f "$TXE_DAGU_HOME/bin/credential-watch.py.next" "$TXE_DAGU_HOME/bin/credential-watch.py"
 
 # PATH is the installing shell's, so scheduled scripts find the same tools; nothing else from the
 # environment is copied, and no credential.
 python3 -I "$here/units.py" write "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url" || die "the units were not written"
+python3 -I "$here/units.py" write-watch "$TXE_DAGU_UNITS_DIR" "$TXE_DAGU_HOME" "$python_bin" \
+  "$TXE_DAGU_WATCH_SERVICE" "$TXE_DAGU_WATCH_TIMER" "$webhook" || die "the credential watch's units were not written"
 
 units=("$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WORKER_UNIT")
 [ -z "$hub_url" ] || units=("$TXE_DAGU_WORKER_UNIT")
@@ -182,13 +206,20 @@ done
 # A unit that exits right after starting (expired kubeconfig, port in use) is a failed install.
 "$here/systemd-wait-active.sh" "${units[@]}" \
   || die "installed, but a unit is not running; fix it and install again (the units stay installed)"
+# The watch: its timer runs it hourly; one run now, which a oneshot's start waits for, shows that
+# it can read this machine's credentials and deliver what it finds.
+"$systemctl_bin" --user enable "$TXE_DAGU_WATCH_TIMER" >/dev/null 2>&1 || die "systemctl --user enable $TXE_DAGU_WATCH_TIMER failed"
+"$systemctl_bin" --user restart "$TXE_DAGU_WATCH_TIMER" || die "systemctl --user restart $TXE_DAGU_WATCH_TIMER failed"
+"$systemctl_bin" --user start "$TXE_DAGU_WATCH_SERVICE" \
+  || die "installed, but the credential watch's first run failed; see: journalctl --user -u $TXE_DAGU_WATCH_SERVICE -n 50, and $TXE_DAGU_HOME/logs/credential-watch.log"
 
 printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
   "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"
 if [ "$credential_given" = none ] && [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then
   printf '  kept %s; install again without --no-credential to pass it\n' "$TXE_DAGU_HOME/worker-credential.json"
 fi
-for unit in "${units[@]}"; do
+printf '  alert webhook %s\n' "$webhook"
+for unit in "${units[@]}" "$TXE_DAGU_WATCH_TIMER"; do
   printf '  %s %s\n' "$unit" "$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)"
 done
 linger="$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)"

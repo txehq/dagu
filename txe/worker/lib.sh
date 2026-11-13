@@ -25,6 +25,19 @@ TXE_DAGU_AGENTS_DIR="$HOME/Library/LaunchAgents"
 TXE_DAGU_LINK_DIR="${TXE_DAGU_LINK_DIR:-$HOME/.local/bin}"
 TXE_DAGU_TUNNEL_LABEL="com.txe.dagu.tunnel"
 TXE_DAGU_WORKER_LABEL="com.txe.dagu.worker"
+# The credential-expiry watch (TXE-7233): hourly, beside the worker, on every installed machine.
+# The label is the one the hand-installed agent of TXE-7226 used, so an install replaces it.
+TXE_DAGU_WATCH_LABEL="com.txe.dagu-credential-watch"
+# The Linux units (install-systemd.sh, uninstall-systemd.sh). The watch is a oneshot service
+# started by its timer.
+TXE_DAGU_TUNNEL_UNIT="txe-dagu-tunnel.service"
+TXE_DAGU_WORKER_UNIT="txe-dagu-worker.service"
+TXE_DAGU_WATCH_SERVICE="txe-dagu-credential-watch.service"
+TXE_DAGU_WATCH_TIMER="txe-dagu-credential-watch.timer"
+# Every agent and every unit the kit installs. The scripts that start, stop or remove them use
+# these lists, and units_test.go fails when a label or unit above is missing from one.
+TXE_DAGU_LABELS=("$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_WATCH_LABEL")
+TXE_DAGU_UNITS=("$TXE_DAGU_WORKER_UNIT" "$TXE_DAGU_TUNNEL_UNIT" "$TXE_DAGU_WATCH_TIMER" "$TXE_DAGU_WATCH_SERVICE")
 
 die() { printf 'txe-dagu: %s\n' "$*" >&2; exit 1; }
 
@@ -150,4 +163,45 @@ worker_credential() {
 # json_field FILE KEY: print one top-level string field of a JSON file.
 json_field() {
   python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
+}
+
+# watch_webhook GIVEN EXISTING: print the webhook file the credential watch posts to (TXE-7233).
+# GIVEN is --alert-webhook-file's value, or empty; EXISTING is the file the installed watch
+# already passes, or empty. With neither, TXE_DAGU_HOME/alert-webhook.url is used when it exists.
+# The file holds a secret URL, so it must be an absolute path to a regular file owned by this user
+# and readable by no one else; otherwise the reason goes to stderr and this returns 1. With no
+# file at all it prints nothing and returns 2: the caller decides whether that may pass.
+watch_webhook() {
+  local path="${1:-${2:-}}" default="$TXE_DAGU_HOME/alert-webhook.url"
+  if [ -z "$path" ]; then
+    if [ -e "$default" ] || [ -L "$default" ]; then path="$default"; else return 2; fi
+  fi
+  python3 -I - "$path" <<'PY' || return 1
+import os, stat, sys
+path = sys.argv[1]
+def refuse(why):
+    sys.exit("alert webhook file refused: %s %s" % (path, why))
+if not os.path.isabs(path):
+    refuse("is not an absolute path")
+try:
+    st = os.lstat(path)
+except OSError:
+    refuse("does not exist")
+if stat.S_ISLNK(st.st_mode):
+    refuse("is a symlink; give the file itself")
+if not stat.S_ISREG(st.st_mode):
+    refuse("is not a regular file")
+if st.st_uid != os.getuid():
+    refuse("is not owned by this user")
+if st.st_mode & 0o077:
+    refuse("has mode %#o; it must be readable by its owner only (0600)" % stat.S_IMODE(st.st_mode))
+try:
+    with open(path) as f:
+        ok = f.read().strip().startswith("https://")
+except OSError:
+    refuse("cannot be read")
+if not ok:
+    refuse("does not hold an https URL")
+PY
+  printf '%s\n' "$path"
 }

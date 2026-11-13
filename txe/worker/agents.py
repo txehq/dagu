@@ -20,6 +20,15 @@ Run by install.sh and status.sh with `python3 -I`; it reads no environment.
 
   agents.py credential PLIST
       Print the credential file a worker agent passes, or nothing.
+
+  agents.py write-watch AGENTS HOME PYTHON LABEL WEBHOOK_FILE
+      Write the credential-expiry watch's agent (TXE-7233): HOME/bin/credential-watch.py, run
+      hourly and at load under HOME/bin/logpipe.py with PYTHON, posting through the webhook in
+      WEBHOOK_FILE (the path only, never the URL). install.sh puts both scripts there.
+
+  agents.py watch-webhook PLIST
+      Print the webhook file a watch agent passes, or nothing. It reads the agent the
+      hand-installed watch of TXE-7226 used as well, so an install keeps its webhook.
 """
 import contextlib, ipaddress, json, os, plistlib, re, stat, sys, urllib.parse
 
@@ -190,6 +199,39 @@ def write_agents(agents, home, kubectl, machine_id, owner_id, path, tunnel_label
         os.replace(target + ".tmp", target)
 
 
+# The watch's own limits: one run an hour writes a few lines, so 1 MiB holds months of them.
+WATCH_INTERVAL_S = 3600
+WATCH_LOG_MAX_BYTES, WATCH_LOG_BACKUPS = 1048576, 3
+# logpipe.py needs --max-bytes at least four chunks; its default chunk, 1 MiB, is the worker's.
+WATCH_LOG_CHUNK_BYTES = 65536
+
+
+def watch_arguments(python, home, webhook_file):
+    """The watch's command: credential-watch.py under logpipe.py, which bounds its log."""
+    return [python, "-I", f"{home}/bin/logpipe.py",
+            "--path", f"{home}/logs/credential-watch.log",
+            "--max-bytes", str(WATCH_LOG_MAX_BYTES), "--backups", str(WATCH_LOG_BACKUPS),
+            "--chunk-bytes", str(WATCH_LOG_CHUNK_BYTES), "--",
+            python, "-I", f"{home}/bin/credential-watch.py", "--home", home,
+            "--webhook-file", webhook_file, "--state", f"{home}/credential-watch/state.json"]
+
+
+def write_watch(agents, home, python, label, webhook_file):
+    for name, value in (("the TXE home", home), ("python3", python), ("the webhook file", webhook_file)):
+        if not os.path.isabs(value):
+            raise Refused(f"{name} must be an absolute path, got {value!r}")
+    body = {"Label": label, "ProgramArguments": watch_arguments(python, home, webhook_file),
+            # Runs at load and then hourly; it is not kept alive: each run checks and exits.
+            "RunAtLoad": True, "StartInterval": WATCH_INTERVAL_S, "ProcessType": "Background",
+            "WorkingDirectory": home,
+            "StandardOutPath": f"{home}/logs/credential-watch.launchd.log",
+            "StandardErrorPath": f"{home}/logs/credential-watch.launchd.log"}
+    target = os.path.join(agents, f"{label}.plist")
+    with open(target + ".tmp", "wb") as f:
+        plistlib.dump(body, f)
+    os.replace(target + ".tmp", target)
+
+
 def main(argv):
     if len(argv) == 3 and argv[0] == "check-credential":
         try:
@@ -220,6 +262,22 @@ def main(argv):
             return 0
         if "--worker.hub-url" in arguments:
             print(arguments[arguments.index("--worker.hub-url") + 1])
+        return 0
+    if len(argv) == 6 and argv[0] == "write-watch":
+        try:
+            write_watch(*argv[1:])
+        except Refused as e:
+            print(f"watch agent refused: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if len(argv) == 2 and argv[0] == "watch-webhook":
+        try:
+            with open(argv[1], "rb") as f:
+                arguments = plistlib.load(f).get("ProgramArguments", [])
+        except FileNotFoundError:
+            return 0
+        if "--webhook-file" in arguments[:-1]:
+            print(arguments[arguments.index("--webhook-file") + 1])
         return 0
     if len(argv) == 2 and argv[0] == "credential":
         try:
