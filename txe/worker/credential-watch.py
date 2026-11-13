@@ -29,6 +29,12 @@ read, before any post, and --check-webhook (the installers' check) refuses it th
 failure to build or deliver a post is reported by its class alone: nothing urllib or http.client
 raises is printed, because its message or traceback can hold the URL. Tokens are decoded only to
 read their exp claim; no token, other claim or certificate body is printed.
+
+TRUST. A post is verified against the interpreter's default trust store; nothing here sets, widens
+or turns off verification. The hidden --ca-file is for tests alone: it verifies against that one
+CA file instead, through ssl.create_default_context(cafile=), the one way every interpreter the kit
+selects honours. Apple's /usr/bin/python3 (LibreSSL) ignores SSL_CERT_FILE and SSL_CERT_DIR
+(TXE-7321). The agent and the units never pass it.
 """
 import argparse
 import base64
@@ -36,6 +42,7 @@ import datetime
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -265,15 +272,17 @@ def _read_webhook(path):
     return url, None
 
 
-def _send(url, text):
+def _send(url, text, ca_file=None):
     """None when the webhook took the post; else why not, as a class of failure only.
 
     Building the request is inside the handler too, and every exception is caught: no message or
-    traceback of urllib or http.client is printed, because each can hold the URL."""
+    traceback of urllib or http.client is printed, because each can hold the URL. ca_file (tests
+    only) replaces the default trust store with that one CA file."""
     try:
         req = urllib.request.Request(url, data=json.dumps({"text": text}).encode(),
                                      headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        context = ssl.create_default_context(cafile=ca_file) if ca_file else None
+        with urllib.request.urlopen(req, timeout=15, context=context) as resp:
             status = resp.status
     except urllib.error.HTTPError as e:
         return "webhook answered %s" % (e.code if isinstance(e.code, int) else "an HTTP error")
@@ -334,7 +343,7 @@ def watch(args):
         if args.dry_run:
             print("would post: " + text)
             continue
-        err = _send(url, text)
+        err = _send(url, text, args.ca_file)
         if err:
             failed = True
             sys.stderr.write("could not deliver (%s): %s\n" % (err, msg))
@@ -358,6 +367,8 @@ def main(argv=None):
     p.add_argument("--warn-days", type=float, default=7)
     p.add_argument("--label", default="", help="text placed before the machine id, e.g. TEST")
     p.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
+    # Tests only: verify the post against this CA file instead of the default store (TXE-7321).
+    p.add_argument("--ca-file", default=None, help=argparse.SUPPRESS)
     p.add_argument("--dry-run", action="store_true", help="print what would be posted; post and record nothing")
     p.add_argument("--check-webhook", metavar="FILE",
                    help="only check that FILE holds a webhook URL this posts to; exit 1 and say why when not")
