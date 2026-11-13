@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Report the local Dagu worker's state without changing anything (TXE-3727).
 # Exit 0 when the worker agent, and the tunnel unless it is on the worker channel, are
-# running and the server answers.
+# running, the credential watch is loaded and its last run succeeded, and the server answers.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -31,6 +31,17 @@ else
     printf '  %s exists but the agent does not pass it (installed with --no-credential, or before enrolment)\n' \
       "$TXE_DAGU_HOME/worker-credential.json"
   fi
+fi
+
+# The credential watch (TXE-7233) runs at load and hourly, so between runs it is loaded but not
+# running; its last run's exit code says whether that run delivered what it found.
+watch="$(launchctl print "gui/$(id -u)/$TXE_DAGU_WATCH_LABEL" 2>/dev/null)"
+if [ -z "$watch" ]; then
+  printf '%-22s %s\n' "$TXE_DAGU_WATCH_LABEL" "not loaded"; rc=1
+else
+  last="$(printf '%s\n' "$watch" | awk -F'= ' '/^\tlast exit code = /{print $2; exit}')"
+  printf '%-22s loaded, last exit %s\n' "$TXE_DAGU_WATCH_LABEL" "${last:-(none yet)}"
+  case "$last" in "" | 0 | "(never exited)") ;; *) rc=1 ;; esac
 fi
 
 hub_url="$(python3 -I "$here/agents.py" hub-url "$TXE_DAGU_AGENTS_DIR/$TXE_DAGU_WORKER_LABEL.plist" 2>/dev/null)"

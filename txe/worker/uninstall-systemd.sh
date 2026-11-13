@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stop and remove the Linux worker's systemd user units (TXE-4715).
 #
-#   txe/worker/uninstall-systemd.sh           # stop, disable and remove both units; keep the TXE home
+#   txe/worker/uninstall-systemd.sh           # stop, disable and remove every unit; keep the TXE home
 #   txe/worker/uninstall-systemd.sh --purge   # and then delete the TXE home (packages, outputs,
 #                                             # machine.json, the machine credential): irreversible
 #
@@ -25,9 +25,15 @@ systemctl_bin="$(command -v systemctl)" || die "systemctl is not on PATH"
 
 # A unit that fails to stop is an error, not a warning: --purge must never delete the home of a
 # worker that is still running.
-for unit in txe-dagu-worker.service txe-dagu-tunnel.service; do
+# Every unit the kit installs (lib.sh): the worker first, the watch's timer before the service it starts.
+for unit in "${TXE_DAGU_UNITS[@]}"; do
   if [ -e "$TXE_DAGU_UNITS_DIR/$unit" ] || [ "$("$systemctl_bin" --user is-active "$unit" 2>/dev/null || true)" = active ]; then
-    "$systemctl_bin" --user disable --now "$unit" >/dev/null || die "could not stop $unit; nothing was removed"
+    # The watch's service has no [Install] section (its timer starts it): it is stopped, not disabled.
+    if [ "$unit" = "$TXE_DAGU_WATCH_SERVICE" ]; then
+      "$systemctl_bin" --user stop "$unit" >/dev/null || die "could not stop $unit; nothing was removed"
+    else
+      "$systemctl_bin" --user disable --now "$unit" >/dev/null || die "could not stop $unit; nothing was removed"
+    fi
   fi
   # is-active exits non-zero for an inactive unit, so its exit code is not the answer; its word is.
   # Only "inactive" or "failed" is safe; an empty or unknown answer (no user bus, a failed query)

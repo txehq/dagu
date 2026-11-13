@@ -17,6 +17,16 @@ Run by install-systemd.sh and uninstall-systemd.sh with `python3 -I`; it reads n
   units.py credential UNIT_FILE
       Print the credential file a worker unit passes, or nothing.
 
+  units.py write-watch UNITS HOME PYTHON SERVICE TIMER WEBHOOK_FILE [CREDENTIAL_FILE]
+      Write the credential-expiry watch (TXE-7233): SERVICE, a oneshot that runs
+      HOME/bin/credential-watch.py under HOME/bin/logpipe.py with PYTHON, with the macOS agent's
+      arguments, and TIMER, which starts it a minute after the timer starts and hourly after.
+      WEBHOOK_FILE is passed as a path only, never the URL. CREDENTIAL_FILE, when not empty, is the
+      worker's credential, which the watch reads too.
+
+  units.py watch-webhook UNIT_FILE
+      Print the webhook file a watch service passes, or nothing.
+
 The machine credential itself is checked by agents.py check-credential, shared with macOS.
 """
 import contextlib, os, sys
@@ -109,6 +119,90 @@ def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, w
         os.replace(tmp, target)
 
 
+# The macOS watch agent's limits (agents.py); txe/worker's tests hold the two together.
+WATCH_INTERVAL_S = 3600
+WATCH_LOG_MAX_BYTES, WATCH_LOG_BACKUPS = 1048576, 3
+# logpipe.py needs --max-bytes at least four chunks; its default chunk, 1 MiB, is the worker's.
+WATCH_LOG_CHUNK_BYTES = 65536
+# A run reads a few files and makes a post per finding, each bounded to 15 s; this bounds a hung one.
+WATCH_TIMEOUT_S = 300
+
+
+def watch_service(python, home, webhook_file, credential_file=""):
+    argv = [python, "-I", f"{home}/bin/logpipe.py", "--path", f"{home}/logs/credential-watch.log",
+            "--max-bytes", str(WATCH_LOG_MAX_BYTES), "--backups", str(WATCH_LOG_BACKUPS),
+            "--chunk-bytes", str(WATCH_LOG_CHUNK_BYTES), "--",
+            python, "-I", f"{home}/bin/credential-watch.py", "--home", home,
+            "--webhook-file", webhook_file, "--state", f"{home}/credential-watch/state.json",
+            *(["--credential-file", credential_file] if credential_file else [])]
+    return "\n".join(["[Unit]", "Description=TXE Dagu credential-expiry watch",
+                      "After=network-online.target", "",
+                      "[Service]", "Type=oneshot",
+                      "ExecStart=" + " ".join(_quote(a, True) for a in argv),
+                      f"TimeoutStartSec={WATCH_TIMEOUT_S}",
+                      "StandardOutput=journal", "StandardError=journal", "SyslogIdentifier=%N", ""])
+
+
+def watch_timer(service):
+    return "\n".join(["[Unit]", "Description=Run the TXE Dagu credential-expiry watch hourly", "",
+                      "[Timer]",
+                      # A minute after the timer starts (the install, each boot or login), as
+                      # launchd's RunAtLoad; then an hour after each run, as its StartInterval.
+                      "OnActiveSec=60", f"OnUnitActiveSec={WATCH_INTERVAL_S}", "AccuracySec=60",
+                      f"Unit={service}", "",
+                      "[Install]", "WantedBy=timers.target", ""])
+
+
+def write_watch(units, home, python, service, timer, webhook_file, credential_file=""):
+    for name, value in (("the TXE home", home), ("python3", python), ("the webhook file", webhook_file)):
+        if not os.path.isabs(value):
+            raise ValueError(f"{name} must be an absolute path for a unit, got {value!r}")
+    bodies = ((service, watch_service(python, home, webhook_file, credential_file)), (timer, watch_timer(service)))
+    os.makedirs(units, exist_ok=True)
+    for name, body in bodies:
+        target = os.path.join(units, name)
+        with open(target + ".tmp", "w") as f:
+            f.write(body)
+        os.chmod(target + ".tmp", 0o644)
+        os.replace(target + ".tmp", target)
+
+
+def _exec_words(value):
+    """The words of an ExecStart= value _quote wrote, unescaped."""
+    words, i = [], 0
+    while i < len(value):
+        if value[i] == " ":
+            i += 1
+            continue
+        if value[i] != '"':
+            raise ValueError("not a quoted word")
+        word, i = [], i + 1
+        while i < len(value) and value[i] != '"':
+            c = value[i]
+            if c == "\\" or c in "%$":
+                i += 1
+                c = value[i] if c == "\\" else c
+            word.append(c)
+            i += 1
+        words.append("".join(word))
+        i += 1
+    return words
+
+
+def unit_webhook(unit_file):
+    """The webhook file a watch service passes, or None."""
+    try:
+        lines = open(unit_file).read().splitlines()
+    except FileNotFoundError:
+        return None
+    for line in lines:
+        if line.startswith("ExecStart="):
+            words = _exec_words(line[len("ExecStart="):])
+            if "--webhook-file" in words[:-1]:
+                return words[words.index("--webhook-file") + 1]
+    return None
+
+
 def unit_credential(unit_file):
     """The credential path a worker unit passes, or None. Reads only its own Environment= lines."""
     try:
@@ -130,6 +224,18 @@ def main(argv):
         except ValueError as e:
             print(f"units refused: {e}", file=sys.stderr)
             return 1
+        return 0
+    if len(argv) in (7, 8) and argv[0] == "write-watch":
+        try:
+            write_watch(*argv[1:])
+        except ValueError as e:
+            print(f"units refused: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if len(argv) == 2 and argv[0] == "watch-webhook":
+        value = unit_webhook(argv[1])
+        if value:
+            print(value)
         return 0
     if len(argv) == 2 and argv[0] == "credential":
         value = unit_credential(argv[1])

@@ -52,6 +52,8 @@ Everything lives under `~/.local/share/txe-dagu`, outside every git worktree.
 | `tunnel/tunnel-supervise.py`, `tunnel/supervise-state.json` | the tunnel supervisor, and the times it replaced the forward in the last hour | the script is replaced by each install |
 | `worker-credential.json`, `worker-credential.json.lock` | the worker's machine credential, mode 0600, and the lock the worker holds while renewing it | written by `dagu txe enrol`; the worker rewrites it when the provider rotates the refresh token |
 | `worker-home/` | the worker's `DAGU_HOME` | kept |
+| `bin/credential-watch.py`, `credential-watch/state.json` | the credential watch, and the findings it has delivered | the script is replaced by each install |
+| `alert-webhook.url` | the alert webhook's URL, mode 0600, if the install is not given another file | yours to write |
 | `logs/` | agent logs | kept |
 
 ## Install
@@ -61,9 +63,11 @@ txehq/txe `kubernetes/dagu` and must exist first.
 
 ```sh
 txe/worker/tunnel-credential.sh                     # uses your own context once
-txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_...
+txe/worker/install.sh --tag txe-v2.18.2-2 --owner-id own_... --alert-webhook-file /abs/webhook.url
 txe/worker/status.sh
 ```
+
+The install refuses a machine with no alert webhook: see "Credential watch".
 
 The owner id is minted once for the installation (`txe/worker/mint-id.sh own`) and recorded with
 the service. Pass it only on the first install. If `dagu txe machine create` has already run, it
@@ -146,6 +150,34 @@ back: it cannot be recreated without enrolling again. Revoking the enrolment in 
 change what the agent passes either. The installer still finds the file, and the worker then
 presents a revoked credential and is refused; the coordinator decides that, not the install.
 
+## Credential watch
+
+Every install also runs the credential-expiry watch (TXE-7233), `bin/credential-watch.py`: the
+launchd agent `com.txe.dagu-credential-watch` on macOS, at load and hourly, and the timer
+`txe-dagu-credential-watch.timer` on Linux, a minute after it starts and hourly after each run.
+It reads the expiry of every credential the worker and tunnel use under the TXE home: the tunnel
+kubeconfig's tokens and inline client certificates, and the refresh token of every
+`*-credential.json`, and the worker's credential wherever `--credential-file` put it. It posts to the alert webhook 7 days before one expires, and again after it
+has. It repeats hourly while that holds, and posts once when it clears. A credential with no expiry
+never posts. A credential whose expiry it cannot read posts, because it cannot see it: an exec
+plugin, a certificate file, an unreadable file, or a JWT whose `exp` is not a number. An opaque
+(non-JWT) token is shown as of unknown lifetime and does not post: its lifetime is the provider's,
+and nothing on the machine could clear the post. Only
+delivered posts are recorded in `credential-watch/state.json`, so a failed post is retried on the
+next run. Its output goes to `logs/credential-watch.log`, bounded at 1 MiB with 3 backups.
+
+The webhook is a Mattermost incoming webhook; its URL is a secret. The install takes the file from
+`--alert-webhook-file <absolute path>`. Without that flag it keeps the file the installed watch
+already uses, or falls back to `alert-webhook.url` in the TXE home. The file must be yours, a
+regular file, mode 0600 or tighter, and hold an `https://` URL. With no file, the install is
+refused before anything is built, because a machine whose credentials can expire unseen should not
+be installed. The one exception is a machine on the worker channel with no credential yet, which
+starts no agent. The agent or unit gets the file's path, never the URL.
+
+On Linux the install runs the watch once and fails if that run fails. On macOS `status.sh` shows
+the last run's exit code. The agent's label is the one TXE-7226's hand-installed agent used, so an
+install replaces that agent and keeps its webhook file.
+
 ## Upgrade
 
 Use the same tag as the server image: server and worker must run the same version.
@@ -197,19 +229,21 @@ Upgrade while no job is running, because restarting the worker ends its running 
 txe/worker/stop.sh
 ```
 
-This stops both agents. All data is kept.
+This stops every agent the install loaded: the worker, the tunnel and the credential watch. All data
+is kept.
 
 ## Linux (systemd)
 
 `install-systemd.sh` is the Linux counterpart of `install.sh` (TXE-4715). It takes the same flags
-(`--tag`, `--owner-id`, `--credential-file`, `--no-credential`) and keeps the same TXE home,
-`machine.json` and machine-credential rules. Instead of launchd agents it writes two **systemd
-user** units into `~/.config/systemd/user` and starts them:
+(`--tag`, `--owner-id`, `--credential-file`, `--no-credential`, `--alert-webhook-file`) and keeps
+the same TXE home, `machine.json`, machine-credential and webhook rules. Instead of launchd agents
+it writes these **systemd user** units into `~/.config/systemd/user` and starts them:
 
 | Unit | What it runs |
 |---|---|
 | `txe-dagu-tunnel.service` | the same `kubectl port-forward` as `com.txe.dagu.tunnel`, without its supervisor: systemd restarts it only when kubectl exits |
 | `txe-dagu-worker.service` | the same `dagu worker` as `com.txe.dagu.worker`; once enrolled, it gets the credential file's path in `DAGU_WORKER_AUTH_CREDENTIAL_FILE`, never its contents |
+| `txe-dagu-credential-watch.timer`, `.service` | the same credential watch as `com.txe.dagu-credential-watch`: a oneshot service its timer starts hourly |
 
 Each unit runs its program under `bin/logpipe.py`, as the macOS agents do, so both logs are bounded
 with the same limits (TXE-5408).
@@ -219,7 +253,7 @@ txe/worker/tunnel-credential.sh                                  # needs this ma
 txe/worker/install-systemd.sh --tag txe-v2.18.2-<n> --owner-id own_...   # first install
 dagu txe enrol --client-id <this machine's worker client> --wait 15m    # then, as on macOS
 txe/worker/install-systemd.sh --tag txe-v2.18.2-<n>                      # the worker now passes it
-txe/worker/uninstall-systemd.sh            # stop and remove both units; the TXE home is kept
+txe/worker/uninstall-systemd.sh            # stop and remove every unit; the TXE home is kept
 txe/worker/uninstall-systemd.sh --purge    # and delete the TXE home (irreversible)
 ```
 

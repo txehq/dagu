@@ -5,9 +5,10 @@
 #   txe/worker/install.sh --tag txe-v2.18.3-1                       # upgrade
 #   txe/worker/install.sh --tag txe-v2.18.3-1 --credential-file /abs/worker-credential.json
 #   txe/worker/install.sh --tag txe-v2.18.3-1 --no-credential   # roll back; keeps the file
+#   txe/worker/install.sh --tag txe-v2.18.3-1 --alert-webhook-file /abs/webhook.url
 #
 # It builds the worker from the same fork tag as the cluster image, keeps every
-# earlier binary, and writes two launchd agents that run whether or not any coding
+# earlier binary, and writes three launchd agents that run whether or not any coding
 # session is open:
 #
 #   com.txe.dagu.tunnel  kubectl port-forward 127.0.0.1:18080 (UI/API) and
@@ -17,6 +18,15 @@
 #                        connection is dead (TXE-5398)
 #   com.txe.dagu.worker  dagu worker, id = this machine's mch_ id, labels
 #                        txe.machine and txe.owner, coordinator 127.0.0.1:50055
+#   com.txe.dagu-credential-watch
+#                        credential-watch.py, at load and hourly: posts to the alert
+#                        webhook 7 days before a credential of this machine expires
+#                        and after it has (TXE-7233)
+#
+# The watch posts through the webhook URL in --alert-webhook-file, else the file the
+# installed watch already uses, else $TXE_DAGU_HOME/alert-webhook.url. That file must
+# be this user's and mode 0600; the agent gets its path, never the URL. With none, the
+# install is refused: a machine whose credentials can expire unseen is not installed.
 #
 # machine.json is written once and never rewritten: a second install with a
 # different --owner-id is refused, so a reinstall cannot change who owns this
@@ -41,12 +51,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=txe/worker/lib.sh
 . "$here/lib.sh"
 
-tag="" owner_id="" credential="" credential_given=0 hub_url=""
+tag="" owner_id="" credential="" credential_given=0 hub_url="" webhook_given=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --tag) tag="${2:-}"; shift 2 ;;
     --owner-id) owner_id="${2:-}"; shift 2 ;;
     --hub-url) hub_url="${2:-}"; [ -n "$hub_url" ] || die "--hub-url needs the hub's https address"; shift 2 ;;
+    --alert-webhook-file)
+      webhook_given="${2:-}"; [ -n "$webhook_given" ] || die "--alert-webhook-file needs the webhook file's absolute path"; shift 2 ;;
     --credential-file)
       [ -n "${2:-}" ] || die "--credential-file needs the credential's absolute path"
       [ "$credential_given" != none ] || die "--credential-file and --no-credential cannot both be given"
@@ -113,6 +125,19 @@ fi
 credential="$(worker_credential "$credential_given" "$credential" "$machine_id")" \
   || die "not installing: fix the machine credential, or give --credential-file"
 
+# The credential watch's webhook, checked before the build too. Only a machine on the worker
+# channel with no credential yet starts no agent, and may have none.
+webhook_rc=0
+webhook="$(watch_webhook "$webhook_given" \
+  "$(python3 -I "$here/agents.py" watch-webhook "$TXE_DAGU_AGENTS_DIR/$TXE_DAGU_WATCH_LABEL.plist")")" || webhook_rc=$?
+case "$webhook_rc" in
+  0) ;;
+  2) if [ -z "$hub_url" ] || [ -n "$credential" ]; then
+       die "not installing: the credential watch has no webhook; give --alert-webhook-file, or put the URL in $TXE_DAGU_HOME/alert-webhook.url (mode 0600)"
+     fi ;;
+  *) die "not installing: fix the alert webhook file" ;;
+esac
+
 # Binary: built from the tag, kept beside every earlier version.
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
 if [ ! -x "$bin" ]; then
@@ -165,6 +190,9 @@ mv -f "$TXE_DAGU_HOME/tunnel/tunnel-supervise.py.next" "$TXE_DAGU_HOME/tunnel/tu
 # The worker's log wrapper (TXE-4724), beside the worker binaries it runs.
 install -m 0644 "$here/logpipe.py" "$TXE_DAGU_HOME/bin/logpipe.py.next"
 mv -f "$TXE_DAGU_HOME/bin/logpipe.py.next" "$TXE_DAGU_HOME/bin/logpipe.py"
+# The credential watch (TXE-7233), beside it.
+install -m 0644 "$here/credential-watch.py" "$TXE_DAGU_HOME/bin/credential-watch.py.next"
+mv -f "$TXE_DAGU_HOME/bin/credential-watch.py.next" "$TXE_DAGU_HOME/bin/credential-watch.py"
 
 # launchd agents. PATH is the installing shell's, so scheduled scripts find the same
 # tools; nothing else from the environment is copied, and no credential: the worker
@@ -173,10 +201,12 @@ mkdir -p "$TXE_DAGU_AGENTS_DIR"
 python3 -I "$here/agents.py" write "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$kubectl_bin" "$machine_id" "$owner_id" "$PATH" \
   "$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_NAMESPACE" "$TXE_DAGU_SERVICE" \
   "$TXE_DAGU_UI_PORT" "$TXE_DAGU_COORD_PORT" "$credential" "$python_bin" "$hub_url"
+python3 -I "$here/agents.py" write-watch "$TXE_DAGU_AGENTS_DIR" "$TXE_DAGU_HOME" "$python_bin" \
+  "$TXE_DAGU_WATCH_LABEL" "$webhook" "$credential" || die "the credential watch's agent was not written"
 
-labels=("$TXE_DAGU_TUNNEL_LABEL" "$TXE_DAGU_WORKER_LABEL")
+labels=("${TXE_DAGU_LABELS[@]}")
 if [ -n "$hub_url" ]; then
-  labels=("$TXE_DAGU_WORKER_LABEL")
+  labels=("$TXE_DAGU_WORKER_LABEL" "$TXE_DAGU_WATCH_LABEL")
   # agents.py removed its file: stop a tunnel an earlier install left running.
   launchctl bootout "gui/$(id -u)/$TXE_DAGU_TUNNEL_LABEL" 2>/dev/null || true
 fi
@@ -187,8 +217,8 @@ for label in "${labels[@]}"; do
 done
 
 [ -z "$hub_url" ] || printf 'worker channel: %s (no tunnel, no kubectl)\n' "$hub_url"
-printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n' \
-  "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}"
+printf 'installed %s (%s)\n  machine %s\n  owner   %s\n  home    %s\n  credential %s\n  alert webhook %s\n' \
+  "$version" "$tag" "$machine_id" "$owner_id" "$TXE_DAGU_HOME" "${credential:-none (the worker presents no machine credential)}" "$webhook"
 if [ "$credential_given" = none ] && [ -e "$TXE_DAGU_HOME/worker-credential.json" ]; then
   printf '  kept %s; install again without --no-credential to pass it\n' "$TXE_DAGU_HOME/worker-credential.json"
 fi
