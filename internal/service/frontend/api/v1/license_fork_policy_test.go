@@ -201,6 +201,52 @@ func TestForkPolicy_APIKeyLimit(t *testing.T) {
 	})
 }
 
+// The key list reports the limit CreateAPIKey enforces, so the API Keys page
+// offers creation exactly while the server would accept it (TXE-7489). Each
+// case fills the server to the reported limit and checks the next key.
+func TestForkPolicy_ListReportsAPIKeyLimit(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		maxAPIKeys *int
+		wantLimit  int
+		wantSource api.APIKeyLimitSource
+	}{
+		{"unset", nil, 2, api.APIKeyLimitSourceCommunityDefault},
+		{"zero", new(0), 0, api.APIKeyLimitSourceForkPolicy},
+		{"three", new(3), 3, api.APIKeyLimitSourceForkPolicy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			server := setupForkPolicyServer(t, license.ForkPolicy{MaxAPIKeys: tc.maxAPIKeys})
+			token := getAdminToken(t, server)
+
+			list := func() api.APIKeysListResponse {
+				var list api.APIKeysListResponse
+				server.Client().Get("/api/v1/api-keys").
+					WithBearerToken(token).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &list)
+				require.NotNil(t, list.UnlicensedApiKeyLimit)
+				require.NotNil(t, list.UnlicensedApiKeyLimitSource)
+				assert.Equal(t, tc.wantLimit, *list.UnlicensedApiKeyLimit)
+				assert.Equal(t, tc.wantSource, *list.UnlicensedApiKeyLimitSource)
+				return list
+			}
+			list()
+
+			fill := tc.wantLimit
+			nextStatus := http.StatusForbidden
+			if tc.wantLimit == 0 {
+				fill, nextStatus = 4, http.StatusCreated
+			}
+			createForkPolicyTestKeys(t, server, token, fill)
+			assert.Len(t, list().ApiKeys, fill)
+			server.Client().Post("/api/v1/api-keys", newCreateAPIKeyRequest("one-more", api.UserRoleViewer)).
+				WithBearerToken(token).ExpectStatus(nextStatus).Send(t)
+		})
+	}
+}
+
 // Incidents are unlocked by an active license only. The policy lists no such
 // feature and must not reach them, whatever else it opens.
 func TestForkPolicy_IncidentsStayGated(t *testing.T) {

@@ -34,8 +34,17 @@ func (a *API) ListAPIKeys(ctx context.Context, _ api.ListAPIKeysRequestObject) (
 		return nil, err
 	}
 
+	// The page decides whether to offer "Create API Key" from these two
+	// fields, so they come from the same function CreateAPIKey enforces.
+	limit, fromForkPolicy := a.unlicensedAPIKeyLimit()
+	source := api.APIKeyLimitSourceCommunityDefault
+	if fromForkPolicy {
+		source = api.APIKeyLimitSourceForkPolicy
+	}
 	return api.ListAPIKeys200JSONResponse{
-		ApiKeys: toAPIKeys(keys),
+		ApiKeys:                     toAPIKeys(keys),
+		UnlicensedApiKeyLimit:       &limit,
+		UnlicensedApiKeyLimitSource: &source,
 	}, nil
 }
 
@@ -386,10 +395,10 @@ func (a *API) requireCommunityAPIKeyLimit(ctx context.Context) error {
 			HTTPStatus: http.StatusForbidden,
 		}
 	}
-	message := "Community edition supports up to 2 API keys. " +
-		"Delete an existing key or configure a license to create more."
+	message := fmt.Sprintf("Community edition supports up to %d API keys. "+
+		"Delete an existing key or configure a license to create more.", limit)
 	if a.isFreeLicense() {
-		message = "The Free plan supports up to 2 API keys. Team and Pro remove the limit."
+		message = fmt.Sprintf("The Free plan supports up to %d API keys. Team and Pro remove the limit.", limit)
 	}
 	return &Error{
 		Code:       api.ErrorCodeForbidden,

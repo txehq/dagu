@@ -22358,8 +22358,21 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/APIKey"
+        unlicensedApiKeyLimit:
+          type: integer
+          minimum: 0
+          description: "How many API keys this server allows while it has no active paid license. Zero means no limit. The server enforces this number when a key is created; a server that omits it applies the community default of 2."
+        unlicensedApiKeyLimitSource:
+          $ref: "#/components/schemas/APIKeyLimitSource"
       required:
         - apiKeys
+
+    APIKeyLimitSource:
+      type: string
+      description: "What set the unlicensed API key limit: community_default is the built-in community limit, fork_policy is license.fork_policy.max_api_keys."
+      enum:
+        - community_default
+        - fork_policy
 
     CreateAPIKeyRequest:
       type: object
