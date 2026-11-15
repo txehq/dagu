@@ -3,7 +3,7 @@
 
 import { Link } from 'react-router-dom';
 import { hasActiveLicense, isFreeLicense } from '@/lib/license';
-import { components } from '@/api/v1/schema';
+import { APIKeyLimitSource, components } from '@/api/v1/schema';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
@@ -36,12 +36,17 @@ import {
 } from 'lucide-react';
 import { useCallback, useContext, useEffect, useState } from 'react';
 import { APIKeyFormModal } from './APIKeyFormModal';
+import {
+  OLDER_SERVER_API_KEY_LIMIT,
+  readAPIKeyLimit,
+  type APIKeyLimit,
+} from './apiKeyLimit';
 import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { I18nTemplate } from '@/i18n/I18nTemplate';
 
 type APIKey = components['schemas']['APIKey'];
-const COMMUNITY_API_KEY_LIMIT = 2;
+type APIKeysListResponse = components['schemas']['APIKeysListResponse'];
 
 function surfaceLabel(surface: string): string {
   if (surface === 'rest_api') return 'REST';
@@ -62,6 +67,9 @@ export default function APIKeysPage() {
   const isAdmin = useIsAdmin();
   const appBarContext = useContext(AppBarContext);
   const [apiKeys, setApiKeys] = useState<APIKey[]>([]);
+  const [keyLimit, setKeyLimit] = useState<APIKeyLimit>(
+    OLDER_SERVER_API_KEY_LIMIT
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,7 +79,8 @@ export default function APIKeysPage() {
   const [deletingKey, setDeletingKey] = useState<APIKey | null>(null);
   const activeLicense = hasActiveLicense(license);
   const communityLimitReached =
-    !activeLicense && apiKeys.length >= COMMUNITY_API_KEY_LIMIT;
+    !activeLicense && keyLimit.limit > 0 && apiKeys.length >= keyLimit.limit;
+  const forkPolicyLimit = keyLimit.source === APIKeyLimitSource.fork_policy;
   const freePlan = isFreeLicense(license);
 
   // Set page title
@@ -96,8 +105,9 @@ export default function APIKeysPage() {
         throw new Error('Failed to fetch API keys');
       }
 
-      const data = await response.json();
+      const data: Partial<APIKeysListResponse> = await response.json();
       setApiKeys(data.apiKeys || []);
+      setKeyLimit(readAPIKeyLimit(data));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load API keys');
     } finally {
@@ -185,20 +195,29 @@ export default function APIKeysPage() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
           <div>
             <p className="font-medium">
-              <I18nText
-                text={
-                  freePlan
-                    ? 'The Free plan supports up to 2 API keys.'
-                    : 'Community installs can manage up to 2 API keys.'
-                }
-              />
+              {forkPolicyLimit ? (
+                <I18nTemplate
+                  text="This server allows up to {limit} API keys."
+                  values={{ limit: keyLimit.limit }}
+                />
+              ) : (
+                <I18nText
+                  text={
+                    freePlan
+                      ? 'The Free plan supports up to 2 API keys.'
+                      : 'Community installs can manage up to 2 API keys.'
+                  }
+                />
+              )}
             </p>
             <p className="mt-1">
               <I18nText
                 text={
-                  freePlan
-                    ? 'Existing keys remain active. Revoke a key to create another, or move to Team or Pro to remove the limit.'
-                    : 'Existing keys remain active, but new key creation is blocked until extra keys are revoked or a license is configured.'
+                  forkPolicyLimit
+                    ? 'Existing keys remain active. Revoke a key to create another.'
+                    : freePlan
+                      ? 'Existing keys remain active. Revoke a key to create another, or move to Team or Pro to remove the limit.'
+                      : 'Existing keys remain active, but new key creation is blocked until extra keys are revoked or a license is configured.'
                 }
               />
             </p>

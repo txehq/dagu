@@ -417,6 +417,10 @@ const baseEnglish = {
   'Community Edition': 'Community Edition',
   'Community installs can manage up to 2 API keys.':
     'Community installs can manage up to 2 API keys.',
+  'This server allows up to {limit} API keys.':
+    'This server allows up to {limit} API keys.',
+  'Existing keys remain active. Revoke a key to create another.':
+    'Existing keys remain active. Revoke a key to create another.',
   'Complete task': 'Complete task',
   completed: 'completed',
   'Page not found': 'Page not found',
@@ -3673,6 +3677,10 @@ const baseChinese = {
   'Community Edition': '社区版',
   'Community installs can manage up to 2 API keys.':
     '社区版最多可管理 2 个 API 密钥。',
+  'This server allows up to {limit} API keys.':
+    '此服务器最多允许 {limit} 个 API 密钥。',
+  'Existing keys remain active. Revoke a key to create another.':
+    '现有密钥保持有效。撤销一个密钥即可创建新密钥。',
   'Complete task': '完成任务',
   completed: '已完成',
   'Page not found': '页面不存在',
@@ -6849,6 +6857,10 @@ const baseJapanese = {
   'Community Edition': 'コミュニティエディション',
   'Community installs can manage up to 2 API keys.':
     'コミュニティ版では最大2つのAPIキーを管理できます。',
+  'This server allows up to {limit} API keys.':
+    'このサーバーで使用できるAPIキーは最大{limit}個です。',
+  'Existing keys remain active. Revoke a key to create another.':
+    '既存のキーは引き続き有効です。別のキーを作成するには、キーを1つ取り消してください。',
   'Complete task': 'タスクを完了',
   completed: '完了',
   'Page not found': 'ページが見つかりません',

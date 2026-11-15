@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   APIKeyAllowedSurfaces,
   APIKeyAttributionClass,
+  APIKeyLimitSource,
   UserRole,
   type components,
 } from '@/api/v1/schema';
@@ -118,16 +119,36 @@ function makeAPIKey(id: string): APIKey {
   };
 }
 
+type KeyLimitFields = Pick<
+  components['schemas']['APIKeysListResponse'],
+  'unlicensedApiKeyLimit' | 'unlicensedApiKeyLimitSource'
+>;
+
+function makeAPIKeys(count: number): APIKey[] {
+  return Array.from({ length: count }, (_, i) => makeAPIKey(String(i + 1)));
+}
+
+/** The key-limit fields of a server that runs the given fork policy limit. */
+function forkPolicyLimit(limit: number): KeyLimitFields {
+  return {
+    unlicensedApiKeyLimit: limit,
+    unlicensedApiKeyLimitSource: APIKeyLimitSource.fork_policy,
+  };
+}
+
 function renderPage({
   license,
   apiKeys,
+  keyLimit = {},
 }: {
   license?: Partial<Config['license']>;
   apiKeys: APIKey[];
+  // Omitted, the response is an older server's, which reports no limit.
+  keyLimit?: KeyLimitFields;
 }) {
   const fetchMock = vi.fn().mockResolvedValue({
     ok: true,
-    json: async () => ({ apiKeys }),
+    json: async () => ({ apiKeys, ...keyLimit }),
   });
   vi.stubGlobal('fetch', fetchMock);
 
@@ -157,6 +178,10 @@ describe('APIKeysPage', () => {
   it('warns and disables creation when a community install reaches 2 API keys', async () => {
     renderPage({
       apiKeys: [makeAPIKey('1'), makeAPIKey('2')],
+      keyLimit: {
+        unlicensedApiKeyLimit: 2,
+        unlicensedApiKeyLimitSource: APIKeyLimitSource.community_default,
+      },
     });
 
     expect(
@@ -211,6 +236,76 @@ describe('APIKeysPage', () => {
     expect(
       screen.getByRole('button', { name: /create api key/i })
     ).toBeDisabled();
+  });
+
+  // An older server reports no limit and enforced 2 with no license.
+  it('applies the community limit of 2 when the server reports no limit', async () => {
+    renderPage({ apiKeys: makeAPIKeys(2) });
+
+    expect(
+      await screen.findByText(/Community installs can manage up to 2 API keys/i)
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: /create api key/i })
+    ).toBeDisabled();
+  });
+
+  it('allows a third key when the server allows 3', async () => {
+    renderPage({ apiKeys: makeAPIKeys(2), keyLimit: forkPolicyLimit(3) });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('api-key-2')[0]).toBeVisible();
+    });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /create api key/i })
+    ).toBeEnabled();
+  });
+
+  it('refuses a fourth key and names the server limit of 3', async () => {
+    renderPage({ apiKeys: makeAPIKeys(3), keyLimit: forkPolicyLimit(3) });
+
+    expect(
+      await screen.findByText('This server allows up to 3 API keys.')
+    ).toBeVisible();
+    expect(screen.queryByText(/Community installs/i)).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /create api key/i })
+    ).toBeDisabled();
+  });
+
+  it('never refuses when the server reports no limit (0)', async () => {
+    renderPage({ apiKeys: makeAPIKeys(12), keyLimit: forkPolicyLimit(0) });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('api-key-12')[0]).toBeVisible();
+    });
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /create api key/i })
+    ).toBeEnabled();
+  });
+
+  // The server applies the fork policy limit to the Free plan as well.
+  it('follows the server limit on the Free plan', async () => {
+    renderPage({
+      license: {
+        valid: true,
+        plan: 'free',
+        features: [],
+        community: false,
+        source: 'file',
+      },
+      apiKeys: makeAPIKeys(2),
+      keyLimit: forkPolicyLimit(3),
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('api-key-2')[0]).toBeVisible();
+    });
+    expect(
+      screen.getByRole('button', { name: /create api key/i })
+    ).toBeEnabled();
   });
 
   it('warns when an inactive loaded license reaches 2 API keys', async () => {

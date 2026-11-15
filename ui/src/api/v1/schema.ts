@@ -9068,7 +9068,15 @@ export interface components {
         /** @description List of API keys */
         APIKeysListResponse: {
             apiKeys: components["schemas"]["APIKey"][];
+            /** @description How many API keys this server allows while it has no active paid license. Zero means no limit. The server enforces this number when a key is created; a server that omits it applies the community default of 2. */
+            unlicensedApiKeyLimit?: number;
+            unlicensedApiKeyLimitSource?: components["schemas"]["APIKeyLimitSource"];
         };
+        /**
+         * @description What set the unlicensed API key limit: community_default is the built-in community limit, fork_policy is license.fork_policy.max_api_keys.
+         * @enum {string}
+         */
+        APIKeyLimitSource: APIKeyLimitSource;
         /** @description Create API key request */
         CreateAPIKeyRequest: {
             /** @description Human-readable name */
@@ -30329,6 +30337,10 @@ export enum APIKeyAllowedSurfaces {
 export enum APIKeyAttributionClass {
     user_owned = "user_owned",
     service_account = "service_account"
+}
+export enum APIKeyLimitSource {
+    community_default = "community_default",
+    fork_policy = "fork_policy"
 }
 export enum CreateAPIKeyRequestAllowedSurfaces {
     rest_api = "rest_api",
