@@ -673,6 +673,12 @@ var guardRefused = []string{
 	"perl -Mmutants -e 1",
 	"ruby -r ./mutants.rb app.rb",
 	`ruby -E UTF-8 -e 'system("python3 mutants.py")'`,
+	`ruby -We 'system("python3 mutants.py /x")'`,
+	`ruby -Kue 'system("python3 mutants.py")'`,
+	"perl -d:mutants app.pl",
+	"perl -dt:mutants app.pl",
+	"ruby --encoding UTF-8 mutants.rb",
+	"ruby --external-encoding=UTF-8 tools/mutants.rb",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -739,6 +745,8 @@ var guardAllowed = []string{
 	"perl -Iexe -ne 'print if /mutants.py/' notes.md",
 	"perl -lne 'print if /run-mutations.sh/' notes.md",
 	"ruby -E UTF-8 -e 'puts 1' mutants.json",
+	"perl -d -e 1",
+	"ruby --encoding UTF-8 app.rb mutants.json",
 	"perl -ne 'print if /mutants.py/' notes.md",
 	"git show origin/main:txe/mutate/guard-hook.py | head",
 	"git log --grep=mutate --oneline",

@@ -69,9 +69,11 @@ SCRIPT_RUNNER_TOOLS = {"coverage", "pdb", "pyinstrument", "memray", "scalene", "
 PRELOAD_OPTS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 # perl and ruby switch clusters: code switches; switches whose value is attached or the next word;
 # switches whose optional value can only be attached (the rest of the cluster).
-PERL_CODE, PERL_VALUE, PERL_ATTACHED = "eE", "IMm", "ixdDCV"
-RUBY_CODE, RUBY_VALUE, RUBY_ATTACHED = "e", "rIEC", "xKW"
-DIGIT_VALUE = "l0T"
+PERL_CODE, PERL_VALUE, PERL_ATTACHED = "eE", "IMm", "ixDCV"
+RUBY_CODE, RUBY_VALUE, RUBY_ATTACHED = "e", "rIEC", "x"
+DIGIT_VALUE = "l0TW"
+RUBY_LONG_VALUE = {"--encoding", "--external-encoding", "--internal-encoding", "--enable", "--disable",
+                   "--dump", "--backtrace-limit", "--crash-report", "--parser"}
 SWITCH_DIGITS = re.compile(r"x[0-9A-Fa-f]*|[0-9]*")
 # Wrapper commands run their arguments as a command. Value: options that take a separate value,
 # and how many positional words come before the command (timeout's duration, chrt's priority).
@@ -626,13 +628,16 @@ class Judge:
         return stdin_is_mutant(cmd, False, self.depth)
 
     def perl_ruby(self, prog: str, args: list, cmd) -> bool:
-        """perl and ruby switches are clustered (`-lne'code'`): each cluster is read a character at
-        a time. Every -e chunk is judged (both may be given more than once); a switch that takes a
-        value ends its cluster, so `-Iexe` is a directory, not code; a preloaded module (`-Mname`,
-        `-r name`) that is a mutant is refused."""
+        """Every argument word is judged as code (-e may be given more than once, attached to any
+        switch cluster): a word is refused only when it both names a mutant and calls something
+        that runs one, so a pattern or a file name alone stays data. The switch clusters
+        (`-lne'code'`) are then read a character at a time, only to skip switch values, catch a
+        mutant preload (`-Mname`, `-r name`, `-d:name`) and find the script operand."""
+        if any(code_runs_mutant(a.text) for a in args):
+            return True
         code_sw = PERL_CODE if prog == "perl" else RUBY_CODE
         either, attached_only = (PERL_VALUE, PERL_ATTACHED) if prog == "perl" else (RUBY_VALUE, RUBY_ATTACHED)
-        chunks, j = [], 0
+        code, j = False, 0
         while j < len(args):
             t = args[j].text
             if t == "--":
@@ -641,30 +646,45 @@ class Judge:
             if not t.startswith("-") or t == "-":
                 break
             if t.startswith("--"):
-                j += 1
+                j += 2 if prog == "ruby" and "=" not in t and t in RUBY_LONG_VALUE else 1
                 continue
             k = 1
             while k < len(t):
                 ch, rest = t[k], t[k + 1:]
                 k += 1
-                if ch in DIGIT_VALUE:  # -l, -0, -T, -W take only digits (-0x1F, -W:no-x aside): skip them
+                if ch in DIGIT_VALUE:  # -l, -0, -T, -W take only digits (-0x1F aside): skip them
+                    if ch == "W" and rest.startswith(":"):
+                        break  # ruby -W:no-deprecated
                     m = SWITCH_DIGITS.match(rest)
                     k += m.end() if m else 0
+                    continue
+                if prog == "ruby" and ch == "K":
+                    k += 1  # -K takes exactly one character (-Ku)
+                    continue
+                if prog == "perl" and ch == "d":  # -d, -dt, -d:Module, -dt:Module=args
+                    mod = rest[1:] if rest.startswith("t") else rest
+                    if mod[:1] in (":", "="):
+                        if mutant_named(mod[1:].split("=")[0].split(",")[0]):
+                            return True
+                        break
+                    k += 1 if rest.startswith("t") else 0
                     continue
                 if ch in code_sw or ch in either:
                     if not rest and j + 1 < len(args):
                         j += 1
                         rest = args[j].text
                     if ch in code_sw:
-                        chunks.append(rest)
+                        code = True
+                        if code_runs_mutant(rest):  # attached code (`-esystem(...)`) has no word boundary above
+                            return True
                     elif ch in "Mmr" and mutant_named(rest.split("=")[0]):
                         return True  # perl -Mmutants, ruby -r ./mutants.rb
                     break
                 if ch in attached_only:
                     break
             j += 1
-        if chunks:
-            return any(code_runs_mutant(c) for c in chunks)
+        if code:
+            return False  # -e code runs instead of a script; the words after it are its arguments
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             return operand_is_mutant(args[j])
         return stdin_is_mutant(cmd, False, self.depth)
