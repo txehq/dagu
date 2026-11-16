@@ -75,19 +75,38 @@ def echo_is_off(fd):
     return termios.tcgetattr(fd)[3] & ECHO_BITS == 0
 
 
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # a member we may not signal: not ours to stop
+        return False
+    return True
+
+
 def stop_group(proc):
-    if proc.poll() is not None:
-        return
+    """Stop the child's whole process group (its own session), whether or not
+    the leader has exited: a descendant can outlive it holding a pipe."""
+    pgid = proc.pid
     for sig, wait in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0)):
+        proc.poll()  # reap the leader if it exited, so it does not count as alive
+        if not group_alive(pgid):
+            break
         try:
-            os.killpg(proc.pid, sig)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+            break
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            proc.poll()
+            if not group_alive(pgid):
+                break
+            time.sleep(0.05)
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class Child:

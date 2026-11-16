@@ -190,6 +190,14 @@ if mode == "print-key":
     print("your key is", line)
 if mode == "hang":
     time.sleep(60)
+if mode == "fork-exit":
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)  # holds stdout and stderr open after the leader exits
+        os._exit(0)
+    rec["descendant"] = pid
+    save()
+    os._exit(0)
 print("context added")
 `)
 	return script, record
@@ -265,6 +273,9 @@ func TestTTYKeyFailsWhenTheKeyLeaksOrTheChildHangs(t *testing.T) {
 		"write-back": {nil, "came back on the pty"},
 		"print-key":  {nil, "output contained the key"},
 		"hang":       {[]string{"--exit-timeout", "1"}, "did not exit within 1"},
+		// The leader exits; its descendant keeps the pipes open and must be
+		// stopped with the group.
+		"fork-exit": {[]string{"--exit-timeout", "1"}, "did not exit within 1"},
 	} {
 		t.Run(mode, func(t *testing.T) {
 			script, record := standIn(t, t.TempDir())
@@ -308,9 +319,15 @@ func assertProcessGone(t *testing.T, rec map[string]any) {
 	if rec == nil {
 		return
 	}
-	pid := int(rec["pid"].(float64))
-	assert.Eventually(t, func() bool { return syscall.Kill(pid, 0) != nil }, 5*time.Second, 50*time.Millisecond,
-		"the stand-in %s is still running", strconv.Itoa(pid))
+	for _, field := range []string{"pid", "descendant"} {
+		v, ok := rec[field].(float64)
+		if !ok {
+			continue
+		}
+		pid := int(v)
+		assert.Eventually(t, func() bool { return syscall.Kill(pid, 0) != nil }, 5*time.Second, 50*time.Millisecond,
+			"the stand-in's %s %s is still running", field, strconv.Itoa(pid))
+	}
 }
 
 func toStrings(v any) []string {
