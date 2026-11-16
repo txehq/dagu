@@ -82,6 +82,8 @@ if args[:3] == ["image", "inspect", "missing"]:
 if args[:2] == ["image", "inspect"] and "slowinspect" in args[2]:
     time.sleep(30)
 if args[:1] == ["inspect"]:
+    if os.path.exists(LOG + ".slowclean"):
+        time.sleep(30)
     r = reg()
     if args[-1] not in r:
         sys.exit(1)
@@ -885,4 +887,29 @@ func TestDemoDeadlineCoversImageCheck(t *testing.T) {
 	assert.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
 	assert.Less(t, time.Since(start), 20*time.Second)
 	assert.Contains(t, out.String(), "did not answer inside the deadline")
+}
+
+// A live mutation target edited during the baseline (not only during its own mutant) stops the
+// run: every target's content is read before the tree is copied and checked after every run.
+func TestLiveTargetWatchedFromStart(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	live := filepath.Join(f.tree, "check.sh")
+	bind := fmt.Sprintf("live = %q\n", live)
+	f.docker = fakeDocker(t, f.root, f.log, bind+`open(live, "a").write("# edited\n")`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "after baseline: the live tree's check.sh changed")
+}
+
+// Cleanup is inside the deadline: a docker slow to answer cleanup cannot hold the run past it by
+// more than the bounded floor.
+func TestCleanupInsideDeadline(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".slowclean", nil, 0o644))
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	// 6 s deadline, 2 s cleanup reserve, inspect cut to the 2 s left (floor 1 s).
+	assert.Less(t, time.Since(start), 12*time.Second)
+	assert.Contains(t, o.stderr, "cleanup error")
 }

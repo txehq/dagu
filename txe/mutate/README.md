@@ -17,7 +17,8 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
 
 - **A fresh copy per mutant.** The live tree is copied once (without `.git`, `node_modules` and
   `.local`; `--exclude` adds names), and each run gets its own copy of that. The live tree is
-  never edited, and a change to a file a mutant names stops the run.
+  never edited. Every file a mutant names is read before the copy, and a change to any of them
+  after any run (baselines included) stops the run.
 - **A container per run.** It has two mounts, both inside the work directory this run created:
   the run's own directory (read-write, at `/work`) and the seeded module proxy (read-only, at
   `/goproxy`). It has no network (`--network none` unless `--network` says otherwise), no Docker
@@ -56,7 +57,11 @@ the work directory as evidence.
 records its container id with `--cidfile` in the work directory, outside every mount, and carries
 a unique name and an owner label holding the run's random token. On a timeout, the deadline or a
 signal, the runner force-removes each container whose docker client had not returned, and only
-when docker reports that exact name and token on it.
+when docker reports that exact name and token on it. Runs stop a cleanup reserve (a third of `--deadline`, at most
+45 s) before the deadline, and each cleanup call is cut to what remains, with a 1 s floor: a
+container left running is still removed when the deadline has just passed, so cleanup can overrun
+the deadline by about 2 s per such container (at most one: runs are sequential). A cleanup that
+fails is reported as `cleanup error` on stderr and in the report.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.

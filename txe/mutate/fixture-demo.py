@@ -179,7 +179,7 @@ class Demo:
                 targets.append((cid, f"mutate-sandboxed-{token[:12]}-{cid.stem}", token))
         for cidfile, name, token in targets:
             try:
-                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env))
+                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env, self.end))
             except (OSError, subprocess.TimeoutExpired) as e:
                 self.cleanup.append(f"{name}: cleanup error {e}")
         self.say(f"container sweep: {self.cleanup or 'nothing recorded'}")

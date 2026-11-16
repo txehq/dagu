@@ -349,7 +349,16 @@ SANDBOX_ENV_DIRS = {
 }
 
 
-def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, env: dict[str, str]) -> str:
+def call_limit(cap: float, hard_end: float | None) -> float:
+    """A cleanup call's timeout: cap, cut to what the hard deadline leaves, never under 1 s (a
+    container is still removed when the deadline has just passed; the overrun is bounded)."""
+    if hard_end is None:
+        return cap
+    return max(1.0, min(cap, hard_end - time.monotonic()))
+
+
+def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, env: dict[str, str],
+                           hard_end: float | None = None) -> str:
     """Force-remove one container this run started, and nothing else.
 
     The container is the one docker recorded in cidfile (kept outside every mount, so no sandboxed
@@ -364,12 +373,13 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
     except OSError:
         pass
     probe = subprocess.run([docker, "inspect", "--format", "{{.Name}} {{index .Config.Labels \"" + OWNER_LABEL + "\"}}",
-                            target], capture_output=True, text=True, env=env, timeout=15)
+                            target], capture_output=True, text=True, env=env, timeout=call_limit(15, hard_end))
     if probe.returncode != 0:
         return f"{target}: absent"
     if probe.stdout.strip() != f"/{name} {token}":
         return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
-    rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env, timeout=30)
+    rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env,
+                        timeout=call_limit(30, hard_end))
     return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
@@ -390,14 +400,21 @@ class Result:
 
 
 class Runner:
-    def __init__(self, args, watch: Watch, forbidden: dict[str, Path], work: WorkDir, docker: str):
+    def __init__(self, args, watch: Watch, forbidden: dict[str, Path], work: WorkDir, docker: str,
+                 live_targets: list[Mutant]):
         self.args = args
         self.watch = watch
         self.forbidden = forbidden
         self.work = work
         self.docker = docker
         self.seq = 0
-        self.deadline = args.deadline_at
+        # Runs stop a cleanup reserve before the hard deadline, so removing a container whose
+        # client was killed fits inside it.
+        self.hard_end = args.deadline_at
+        self.reserve = min(45.0, args.deadline / 3) if args.deadline else 0.0
+        self.deadline = args.deadline_at - self.reserve if args.deadline_at else None
+        # Every mutation target's live content, read before the tree was copied.
+        self.live = {m.file: file_digest(args.tree / m.file) for m in live_targets}
         # (name, cidfile) of every container started whose docker client has not returned.
         self.pending: dict[str, Path] = {}
         self.cleanup_log: list[str] = []
@@ -415,7 +432,7 @@ class Runner:
         for name, cidfile in list(self.pending.items()):
             try:
                 self.cleanup_log.append(remove_owned_container(self.docker, cidfile, name, self.work.token,
-                                                               self.docker_env()))
+                                                               self.docker_env(), self.hard_end))
             except (OSError, subprocess.TimeoutExpired) as e:
                 self.cleanup_log.append(f"{name}: cleanup error {e}")
             del self.pending[name]
@@ -468,7 +485,6 @@ class Runner:
 
     def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
         before = self.watch.snapshot()
-        live = {m.file: file_digest(self.args.tree / m.file) for m in ([mutant] if mutant else [])}
         d = self.prepare(label, pristine, mutant)
         name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
         # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
@@ -494,7 +510,7 @@ class Runner:
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
-        for f, digest in live.items():
+        for f, digest in self.live.items():
             if file_digest(self.args.tree / f) != digest:
                 raise SharedStateChanged(f"after {label}: the live tree's {f} changed")
         if outcome is None:
@@ -673,9 +689,9 @@ def main(argv: list[str]) -> int:
         work = WorkDir(args.workdir_root)
         report["workdir"] = str(work.path)
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
+        runner = Runner(args, watch, forbidden, work, args.docker, mutants)  # reads live targets first
         pristine = work.path / "pristine"
         copy_tree(args.tree, pristine, tuple(args.exclude))
-        runner = Runner(args, watch, forbidden, work, args.docker)
         if not args.no_seed:
             seed_modules(args, work, pristine, modcache, caller_proxy, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
