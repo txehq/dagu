@@ -41,9 +41,11 @@ ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 REASON = ("Refused: this runs a mutation test outside the sandboxed runner. A mutant breaks a guard on "
           "purpose and must not run against this host's shared caches, HOME or worktree (TXE-7547). "
-          "Run it through mutate-sandboxed: `mutate-sandboxed --mutants <list.json> --tree <dir> -- <test cmd>` "
-          "(~/.coding_global/bin/mutate-sandboxed runs txehq/dagu main's txe/mutate/mutate-sandboxed.py). "
-          "If this command is not a mutation run, rename what it runs or ask your coordinator.")
+          "Run it through mutate-sandboxed: `mutate-sandboxed --mutants <list.json> --tree <dir> "
+          "--image sha256:<local image id> -- <test cmd>` (~/.coding_global/bin/mutate-sandboxed runs the "
+          "reviewed txehq/dagu txe/mutate/mutate-sandboxed.py its launcher pins by commit and sha256). "
+          "If this is not a mutation run, do not rename anything to get past this check: ask your "
+          "coordinator, since this hook is a heuristic over command text.")
 
 
 def flatten(command: str) -> str:

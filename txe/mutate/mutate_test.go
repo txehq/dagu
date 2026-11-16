@@ -594,6 +594,11 @@ func TestGuardHook(t *testing.T) {
 		assert.Equal(t, 2, code, "should refuse: %s", c)
 		assert.Empty(t, stdout)
 		assert.Contains(t, stderr, "mutate-sandboxed", c)
+		// The advice is a command that would actually run, and never "rename it".
+		assert.Contains(t, stderr, "--image sha256:<local image id> -- <test cmd>")
+		assert.Contains(t, stderr, "pins by commit and sha256")
+		assert.NotContains(t, stderr, "main's")
+		assert.Contains(t, stderr, "do not rename anything")
 	}
 	allowed := []string{
 		"python3 -I txe/mutate/mutate-sandboxed.py --mutants m.json -- go test ./...",
