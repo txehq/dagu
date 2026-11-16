@@ -296,6 +296,13 @@ class Parser:
             cur.set_source("1", src)
             cur.set_source("2", src)
         else:  # <, <>, >, >>, >| and a descriptor-less <& target: the file it opens
+            fdp = fd_of_path(target.text) if target.procsub is None and op in ("<", "<>") else None
+            if fdp == "0":
+                src = cur.fds.get("0") or ("pipe", None)  # `< /dev/stdin`: what stdin holds now
+            elif fdp == "?":
+                src = ("unknown", "?")
+            elif fdp is not None:
+                src = cur.fds.get(fdp) or ("unknown", fdp)  # `< /dev/fd/3` reopens fd 3 as it is NOW
             cur.set_source(key, src)
 
     def read_heredocs(self):
@@ -483,6 +490,8 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0) ->
     kind, value = src
     if kind == "unknown" or hops > 8:
         return True
+    if kind == "pipe":
+        return cmd is not None and piped_mutant(cmd)
     if kind == "file":
         fd = fd_of_path(value)
         if fd is None:
@@ -853,7 +862,7 @@ class Judge:
         return stdin_is_mutant(cmd, False, self.depth)
 
     def go_run(self, args: list) -> bool:
-        if not args or args[0].text != "run":
+        if not args or args[0].text not in ("run", "test"):
             return False
         j, ops = 1, []
         while j < len(args):
@@ -861,8 +870,16 @@ class Judge:
             if t == "--":
                 j += 1
                 continue
+            if t in ("-exec", "--exec") or t.startswith(("-exec=", "--exec=")):
+                # go run|test -exec XPROG: go runs `XPROG a.out args`, so XPROG is a command
+                value = t.split("=", 1)[1] if "=" in t else (args[j + 1].text if j + 1 < len(args) else "")
+                if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
+                    return True
             if t.startswith("-"):
-                j += 2 if t in GO_VALUE_FLAGS else 1
+                j += 2 if t in GO_VALUE_FLAGS and "=" not in t else 1
+                continue
+            if args[0].text == "test":
+                j += 1  # go test's packages are not scripts; only -exec matters here
                 continue
             if ops and not t.endswith(".go"):
                 break
