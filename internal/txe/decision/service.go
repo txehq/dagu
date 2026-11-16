@@ -339,7 +339,7 @@ func (r RetryRequest) params(j *registry.Job) registry.RetryRunParams {
 	case registry.RetryIntentRepublish:
 		p.Step = registry.RetryStepPublish
 	case registry.RetryIntentRerun:
-		p.Rerun = true
+		p.Step = registry.RetryStepRun
 	}
 	return p
 }
@@ -472,14 +472,13 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID string, req RetryReques
 			AttemptID string  `json:"attempt_id"`
 			QueuedAt  *string `json:"queued_at"`
 			Step      string  `json:"step"`
-			Rerun     bool    `json:"rerun"`
 		}
 		if err := json.Unmarshal(p.Action.Params, &params); err != nil {
 			return nil, true, fmt.Errorf("decision: retry proposal %s params: %w", p.ProposalID, err)
 		}
 		// The intent is part of the request: a key used to ask for a
 		// re-run never replays as a republish, nor the reverse.
-		stored := registry.RetryRunParams{Step: params.Step, Rerun: params.Rerun}
+		stored := registry.RetryRunParams{Step: params.Step}
 		same = params.RunID == req.RunID && params.AttemptID == req.AttemptID &&
 			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion &&
 			stored.Intent() == req.Intent

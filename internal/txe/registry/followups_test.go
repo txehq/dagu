@@ -1363,18 +1363,17 @@ func TestFailedRetryNamesItsOwnExecution(t *testing.T) {
 	}
 }
 
-// A retry may name only the publish step, the step is part of the binding,
-// so a decision to re-run never authorizes a republish, and only the
-// reviewer, which sees the machine's seal, proposes one.
+// A retry may name only the publish step or, as a person's rerun, the job's
+// step; the step is part of the binding, so a decision to re-run never
+// authorizes a republish. Only the reviewer, which sees the machine's seal,
+// proposes a republish, and it never proposes a rerun (TXE-7629).
 func TestRetryStepIsBound(t *testing.T) {
 	r := newRetryFixture(t)
 	r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
 	c := acquire(t, r.f, r.job.JobID, ClaimReview, time.Hour)
 	id, err := RetryProposalID("run-1", ExecutionRef("a1", ""), r.job.Version)
 	require.NoError(t, err)
-	put := func(params RetryRunParams) (*Proposal, error) {
-		raw, err := json.Marshal(params)
-		require.NoError(t, err)
+	putRaw := func(raw json.RawMessage) (*Proposal, error) {
 		var p *Proposal
 		_, err = r.f.tx(r.job.JobID, agent, func(tx *JobTx) error {
 			var err error
@@ -1383,11 +1382,19 @@ func TestRetryStepIsBound(t *testing.T) {
 		})
 		return p, err
 	}
+	put := func(params RetryRunParams) (*Proposal, error) {
+		return putRaw(mustJSON(t, params))
+	}
 
 	other := r.params("run-1", "a1")
-	other.Step = "run"
+	other.Step = "check"
 	_, err = put(other)
-	assert.Equal(t, CodeInvalid, code(t, err), "only the publish step may be named")
+	assert.Equal(t, CodeInvalid, code(t, err), "only the publish and job steps may be named")
+
+	rerun := r.params("run-1", "a1")
+	rerun.Step = RetryStepRun
+	_, err = put(rerun)
+	assert.Equal(t, CodeNotPermitted, code(t, err), "a reviewer never proposes a rerun; only a person asks for one")
 
 	republish := r.params("run-1", "a1")
 	republish.Step = RetryStepPublish
@@ -1397,10 +1404,14 @@ func TestRetryStepIsBound(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, whole, p.BindingDigest, "a republish is not bound like a re-run")
 
-	both := r.params("run-1", "a1")
-	both.Step, both.Rerun = RetryStepPublish, true
-	_, err = put(both)
-	assert.Equal(t, CodeInvalid, code(t, err), "a retry either republishes or runs the job again")
+	// The key an unreleased build stored a rerun under is no field of the
+	// params, and strict decoding refuses it, alone or with a step.
+	for _, extra := range []string{`"rerun":true`, `"step":"publish","rerun":true`} {
+		legacy := mustJSON(t, r.params("run-1", "a1"))
+		legacy = append(legacy[:len(legacy)-1:len(legacy)-1], []byte(","+extra+"}")...)
+		_, err = putRaw(legacy)
+		assert.Equal(t, CodeInvalid, code(t, err), "legacy %s", extra)
+	}
 }
 
 // TXE-7515: a person asks for a republish, an explicit rerun or an
@@ -1439,7 +1450,7 @@ func TestPersonRetryIntents(t *testing.T) {
 	// A rerun of the same execution while the republish is decided and not
 	// settled is a conflicting intent; so is an unspecified retry.
 	rerun := r.params("run-1", "a1")
-	rerun.Rerun = true
+	rerun.Step = RetryStepRun
 	_, _, err = r.propose(rerun, "key-rerun")
 	assert.Equal(t, CodeRetryIntentConflict, code(t, err))
 	_, _, err = r.propose(r.params("run-1", "a1"), "key-plain")
@@ -1449,7 +1460,7 @@ func TestPersonRetryIntents(t *testing.T) {
 	r2 := newRetryFixture(t)
 	r2.rc.attempts["run-1"] = failedAttempt("a1", r2.job.DAGSpecSHA256)
 	rerun2 := r2.params("run-1", "a1")
-	rerun2.Rerun = true
+	rerun2.Step = RetryStepRun
 	p2, _, err := r2.propose(rerun2, "key-rerun")
 	require.NoError(t, err)
 	rerunID, err := RetryIntentProposalID("run-1", ref, r2.job.Version, RetryIntentRerun)
@@ -1459,6 +1470,13 @@ func TestPersonRetryIntents(t *testing.T) {
 	whole, err := BindingDigest(r2.job, ActionSpec{Name: ActionRetryRun, Params: mustJSON(t, r2.params("run-1", "a1"))})
 	require.NoError(t, err)
 	assert.NotEqual(t, whole, p2.BindingDigest, "an explicit rerun is not bound like an unspecified retry")
+	// TXE-7629: the stored bytes name the job's step and no rerun key, so
+	// the rollback floors, which decode them strictly, read them.
+	assert.Contains(t, string(p2.Action.Params), `"step":"run"`)
+	assert.NotContains(t, string(p2.Action.Params), `"rerun"`)
+	var stored2 RetryRunParams
+	require.NoError(t, decodeParams(p2.Action.Params, &stored2))
+	assert.Equal(t, RetryIntentRerun, stored2.Intent())
 }
 
 // TXE-7515: the job's machine refuses an unspecified retry of a sealed
@@ -1486,7 +1504,7 @@ func TestRetryRefusedWithoutEffectReleasesTheOtherIntents(t *testing.T) {
 	assert.Equal(t, ProposalDecided, p2.State)
 
 	rerun := r.params("run-1", "a1")
-	rerun.Rerun = true
+	rerun.Step = RetryStepRun
 	_, _, err = r.propose(rerun, "key-rerun")
 	assert.Equal(t, CodeRetryIntentConflict, code(t, err), "the republish now holds the execution")
 }
@@ -1543,7 +1561,7 @@ func TestRetryIntentConflictWithAnOpenProposal(t *testing.T) {
 	require.NoError(t, err)
 
 	rerun := r.params("run-1", "a1")
-	rerun.Rerun = true
+	rerun.Step = RetryStepRun
 	_, _, err = r.propose(rerun, "key-rerun")
 	assert.Equal(t, CodeRetryIntentConflict, code(t, err), "the reviewer's open republish is answered or rejected first")
 
@@ -1551,7 +1569,7 @@ func TestRetryIntentConflictWithAnOpenProposal(t *testing.T) {
 	require.NoError(t, err, "the same intent is not a conflict")
 
 	other := r.params("run-2", "b1")
-	other.Rerun = true
+	other.Step = RetryStepRun
 	_, _, err = r.propose(other, "key-other")
 	require.NoError(t, err, "another run's retry is not a conflict")
 }

@@ -110,7 +110,7 @@ func TestTxeRepublishBinding(t *testing.T) {
 		}
 		return out
 	}
-	publish, rerun, unspecified := with(base, "step", "publish"), with(base, "rerun", true), base
+	publish, rerun, unspecified := with(base, "step", "publish"), with(base, "step", "run"), base
 
 	assert.NoError(t, bind(retryRunAction(publish), registry.RetryFormPublish), "an approved republish")
 	assert.NoError(t, bind(retryRunAction(rerun), registry.RetryFormFromJobStep), "an approved rerun, from the job's step")
@@ -189,8 +189,10 @@ func TestTxeRepublishBinding(t *testing.T) {
 		"no intent sent as a republish":          bind(retryRunAction(unspecified), registry.RetryFormPublish),
 		"a republish sent with no step":          bind(retryRunAction(publish), registry.RetryFormWholeRun),
 		"a republish sent from the job step":     bind(retryRunAction(publish), registry.RetryFormFromJobStep),
-		"both republish and rerun":               bind(retryRunAction(with(publish, "rerun", true)), registry.RetryFormPublish),
-		"another step approved":                  bind(retryRunAction(with(base, "step", "run")), registry.RetryFormFromJobStep),
+		"a legacy rerun key with a republish":    bind(retryRunAction(with(publish, "rerun", true)), registry.RetryFormPublish),
+		"a legacy rerun key, from the job step":  bind(retryRunAction(with(base, "rerun", true)), registry.RetryFormFromJobStep),
+		"a legacy rerun key, with no step":       bind(retryRunAction(with(base, "rerun", true)), registry.RetryFormWholeRun),
+		"another step approved":                  bind(retryRunAction(with(base, "step", "check")), registry.RetryFormFromJobStep),
 		"a request naming no action, no step":    txeRepublishBinding(job, nil, run, republishExpectation(), registry.RetryFormWholeRun, republishNow),
 		"a request naming no action, as a rerun": txeRepublishBinding(job, nil, run, republishExpectation(), registry.RetryFormFromJobStep, republishNow),
 	} {

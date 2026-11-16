@@ -4,9 +4,11 @@ A hub or a worker can be rolled back to a **floor release**. The floor's registr
 the stores the current code wrote. Action parameters are decoded strictly (`decodeParams`,
 `DisallowUnknownFields`), so one field the current code writes and a floor does not know makes the
 floor refuse the whole record, and every path that decodes it. TXE-7553 found that for the explicit
-rerun's `rerun: true`: on -17 and -19 it blocks authorizing the decision, settling the action,
+rerun's `rerun: true`: on -17 and -19 it blocked authorizing the decision, settling the action,
 ending moved-on retries and any later person's retry on the same job. Nothing caught it before
-merge.
+merge. TXE-7629 (R2) now stores a rerun as `step: "run"`, a field every floor knows, so the floors
+read its records and refuse none of them (the nine documented refusals went to zero).
+`knownFloorFailures` is empty.
 
 Records the registry rewrites (jobs, resource events, artifact manifests, the resource index
 marker) are decoded leniently (`json.Unmarshal`). A floor reads a field it does not know without
@@ -93,7 +95,7 @@ Only temporary stores are used. No live store or shared hub is touched.
 2. If a new intent carries it, add the intent to `rollbackFloorIntents`. Otherwise the fixture must
    still write a record that carries it.
 3. Run the CI job. Every path the floors refuse is named in its failure. Either make the encoding
-   one the floors accept (TXE-7553's R2), or record the incompatibility: a `Breaks` entry naming the
+   one the floors accept (as TXE-7629 did for the rerun), or record the incompatibility: a `Breaks` entry naming the
    ticket with the decision (a writer gate, or a raised floor), and each refused path in
    `knownFloorFailures`.
 

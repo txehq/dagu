@@ -58,7 +58,7 @@ func approveRerun(t *testing.T, f *queueFixture, j txeQueueJob, runID string) ap
 }
 
 // approveRetry is approveRerun for the params form sets: a republish
-// (Step) or an explicit rerun (Rerun).
+// (Step publish) or an explicit rerun (Step run).
 func approveRetry(t *testing.T, f *queueFixture, j txeQueueJob, runID string, form func(*registry.RetryRunParams)) approvedRerun {
 	t.Helper()
 	person := registry.Actor{Kind: registry.ActorHuman, ID: "owner"}
@@ -148,7 +148,7 @@ func TestQueueDispatch_TxeExplicitFormsAreRefused(t *testing.T) {
 		reason string
 	}{
 		"republish":      {func(p *registry.RetryRunParams) { p.Step = registry.RetryStepPublish }, "approved as a republish"},
-		"explicit rerun": {func(p *registry.RetryRunParams) { p.Rerun = true }, "approved as a rerun of the job"},
+		"explicit rerun": {func(p *registry.RetryRunParams) { p.Step = registry.RetryStepRun }, "approved as a rerun of the job"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newQueueFixture(t)

@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"strconv"
 	"time"
-
-	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
 
 // RetryForm is how a retry of a registered job's run is carried out: which
@@ -21,8 +19,9 @@ const (
 	// its publish step again.
 	RetryFormWholeRun RetryForm = "whole_run"
 	// RetryFormFromJobStep retries the job's step and everything after it
-	// (stepName txepkg.RunStepName, includeDownstream): the job runs again
-	// whatever the failed execution did.
+	// (stepName RetryStepRun, includeDownstream): the job runs again
+	// whatever the failed execution did. Only a person's rerun, whose
+	// params name step RetryStepRun, is carried out so.
 	RetryFormFromJobStep RetryForm = "from_job_step"
 	// RetryFormPublish retries the publish step alone, taking its failed
 	// prerequisite as done (stepName RetryStepPublish,
@@ -30,6 +29,10 @@ const (
 	// is not run again.
 	RetryFormPublish RetryForm = "publish"
 )
+
+// legacyRerunKey is the params key an unreleased build stored a person's
+// rerun under (TXE-7629). No code writes it; the binding refuses it.
+const legacyRerunKey = "rerun"
 
 // RetriedExecution names the execution of a run a retry is made for, as Dagu
 // stores it.
@@ -90,8 +93,18 @@ func CheckRetryRun(job *Job, action *Action, runID string, expected RetriedExecu
 	// Not decoded strictly: a field added to the params later is part of
 	// the binding the digest is recomputed over, not a reason to refuse.
 	var params RetryRunParams
+	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(action.Spec.Params, &params); err != nil {
 		return stale("action %s has unreadable params", action.ActionID)
+	}
+	if err := json.Unmarshal(action.Spec.Params, &keys); err != nil {
+		return stale("action %s has unreadable params", action.ActionID)
+	}
+	// The key an unreleased build stored a person's rerun under, before it
+	// became step RetryStepRun (TXE-7629). Read leniently it would pass as
+	// a retry naming no intent, so it is refused in every form.
+	if _, ok := keys[legacyRerunKey]; ok {
+		return stale("action %s names %q, which no registry writes; a person's rerun names step %q", action.ActionID, legacyRerunKey, RetryStepRun)
 	}
 	switch form {
 	case RetryFormWholeRun, RetryFormFromJobStep, RetryFormPublish:
@@ -100,10 +113,8 @@ func CheckRetryRun(job *Job, action *Action, runID string, expected RetriedExecu
 	}
 	approved := approvedRetryForm(params)
 	switch {
-	case params.Step != "" && params.Step != RetryStepPublish:
-		return stale("action %s retries step %q; only %q is a step a decision retries", action.ActionID, params.Step, RetryStepPublish)
-	case params.Step != "" && params.Rerun:
-		return stale("action %s both republishes and runs the job again; it is carried out as neither", action.ActionID)
+	case params.Step != "" && params.Step != RetryStepPublish && params.Step != RetryStepRun:
+		return stale("action %s retries step %q; only %q (a republish) and %q (a person's rerun) are steps a decision retries", action.ActionID, params.Step, RetryStepPublish, RetryStepRun)
 	case approved != form:
 		return stale("action %s was approved as %s; it is carried out only as one (%s), not as %s", action.ActionID, approved.describe(), approved.request(), form.describe())
 	case strconv.Itoa(action.Attempt) != request.ActionAttempt || action.BindingDigest != request.BindingDigest:
@@ -144,7 +155,7 @@ func (f RetryForm) request() string {
 	case RetryFormPublish:
 		return "stepName " + strconv.Quote(RetryStepPublish) + ", acceptFailedPrerequisites"
 	case RetryFormFromJobStep:
-		return "stepName " + strconv.Quote(txepkg.RunStepName) + ", includeDownstream"
+		return "stepName " + strconv.Quote(RetryStepRun) + ", includeDownstream"
 	case RetryFormWholeRun:
 		return "no stepName"
 	}

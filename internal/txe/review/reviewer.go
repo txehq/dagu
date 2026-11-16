@@ -1582,7 +1582,7 @@ type RetryRequest struct {
 	// re-run of the run.
 	Step string
 	// Rerun is a person's explicit request to run the job again
-	// (TXE-7515). It is sent as a retry from the job's step with every step
+	// (TXE-7515), decided as step RetryStepRun. It is sent as a retry from the job's step with every step
 	// after it, so the job's step runs again even when it succeeded and only
 	// publishing failed; a native retry of the run would keep a succeeded
 	// job step and run only publish, for the result already sealed.
@@ -1832,12 +1832,20 @@ func (r *Reviewer) retryRunNoted(ctx context.Context, job Job, action Action, no
 	if action.Attempt <= 0 || action.BindingDigest == "" {
 		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the registry's record of action " + action.ID + " gives no attempt number or binding digest to make the retry of run " + runID + " for"}
 	}
-	rerun := action.Params[RetryRunRerunParam]
-	request.Rerun = rerun == "true" && request.Step == ""
+	if legacy, ok := action.Params[RetryRunRerunParam]; ok {
+		// No registry writes this key: a person's rerun names step
+		// RetryStepRun (TXE-7629). A decision carrying it was not made by
+		// the code that binds it, so it is not carried out in any form.
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision about run " + runID + " names " + RetryRunRerunParam + "=" + agentText(legacy) + ", which no registry writes; a person's rerun names step " + RetryStepRun}
+	}
+	if request.Step == RetryStepRun {
+		// A person's explicit rerun is sent as a retry from the job's step
+		// with every step after it (remote.go), never as a retry of that
+		// step alone.
+		request.Step, request.Rerun = "", true
+	}
 	switch {
-	case rerun != "" && (rerun != "true" || request.Step != ""):
-		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision about run " + runID + " names " + RetryRunRerunParam + "=" + rerun + " with step " + agentText(request.Step) + "; a retry either runs the job again or republishes, never both"}
-	case rerun == "true":
+	case request.Rerun:
 		// The person asked for a new execution of the job on purpose: it
 		// runs whatever the retried execution sealed. A sealed result is
 		// superseded and never published, and the detail says so.
