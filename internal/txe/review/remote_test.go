@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
@@ -542,6 +543,52 @@ func TestRemoteRunsAfterReadsFinishedRunsInOrder(t *testing.T) {
 	got, err := remote.RunsAfter(context.Background(), job, "")
 	require.ErrorContains(t, err, "earlier reviews covered")
 	assert.Empty(t, got)
+}
+
+// A run's evidence carries the error the service recorded for the run and
+// for each step, such as a lost lease, on one line and bounded, and the job
+// version its DAG was rendered for. A run whose labels name no version, or
+// two, has none.
+func TestRemoteRunEvidenceCarriesErrorsAndVersion(t *testing.T) {
+	job := "job_01HZX0000000000000000000AA"
+	long := strings.Repeat("é", 2000)
+	detail, err := json.Marshal(map[string]any{"dagRunDetails": map[string]any{
+		"attemptId": "a-r1", "statusLabel": "failed",
+		"error":  "distributed run lease expired: worker w1 stopped reporting\n\x1b[31mat 03:01Z\u200b",
+		"labels": []string{"txe.job=" + job, "txe.version=10"},
+		"nodes": []map[string]any{
+			{"step": map[string]any{"name": "run"}, "statusLabel": "failed", "error": "lease expired\r\nworker gone"},
+			{"step": map[string]any{"name": "publish"}, "statusLabel": "failed", "error": long},
+		},
+	}})
+	require.NoError(t, err)
+	stub := &stubTransport{t: t, replies: map[string]string{
+		"/dag-runs/" + job + "?fromDate=0&limit=100": `{"dagRuns":[` +
+			`{"dagRunId":"r1","attemptId":"a-r1","statusLabel":"failed","finishedAt":"2026-10-09T10:01:00Z"},` +
+			`{"dagRunId":"r2","attemptId":"a-r2","statusLabel":"failed","finishedAt":"2026-10-09T10:02:00Z"},` +
+			`{"dagRunId":"r3","attemptId":"a-r3","statusLabel":"succeeded","finishedAt":"2026-10-09T10:03:00Z"}]}`,
+		"/txe/jobs/" + job + "/reviews": `{"reviews":[]}`,
+		"/dag-runs/" + job + "/r1":      string(detail),
+		"/dag-runs/" + job + "/r2":      `{"dagRunDetails":{"attemptId":"a-r2","statusLabel":"failed","labels":["txe.version=10","txe.version=11"],"nodes":[]}}`,
+		"/dag-runs/" + job + "/r3":      `{"dagRunDetails":{"attemptId":"a-r3","statusLabel":"succeeded","nodes":[]}}`,
+	}}
+	runs, err := (&review.Remote{Transport: stub}).RunsAfter(context.Background(), job, "")
+	require.NoError(t, err)
+	require.Len(t, runs, 3)
+
+	r1 := runs[0]
+	assert.Equal(t, "distributed run lease expired: worker w1 stopped reporting [31mat 03:01Z", r1.Error)
+	assert.Equal(t, 10, r1.JobVersion)
+	require.Len(t, r1.Steps, 2)
+	assert.Equal(t, "lease expired worker gone", r1.Steps[0].Error)
+	assert.LessOrEqual(t, len(r1.Steps[1].Error), 1024)
+	assert.True(t, strings.HasSuffix(r1.Steps[1].Error, "...[truncated]"))
+	assert.True(t, utf8.ValidString(r1.Steps[1].Error), "a cut never splits a character")
+	assert.True(t, strings.HasPrefix(r1.Steps[1].Error, "éé"), "the start of an error is kept")
+
+	assert.Zero(t, runs[1].JobVersion, "two versions name none")
+	assert.Empty(t, runs[1].Error)
+	assert.Zero(t, runs[2].JobVersion, "no label names no version")
 }
 
 // runList is a stub of the service for one job: its run list, and the

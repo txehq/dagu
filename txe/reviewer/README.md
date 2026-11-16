@@ -514,6 +514,21 @@ files.
   returned that time, so the status of one execution is never paired with
   the output of another. No review names it, so the next review meets the
   run's latest execution.
+- A run's evidence carries the error the service recorded for the run and
+  for each step (`error`, such as a lost lease), on one line and at most
+  1 KiB each, and the job version the run's DAG was rendered for
+  (`job_version`, from its `txe.version` label; 0 when the labels name none
+  or more than one).
+- A run that did not succeed carries `seal` (`state: sealed_unpublished`,
+  `execution`, `job_version`, `files`) when this machine holds the result
+  that exact execution sealed, the seal is the run's latest and its files
+  still have their sealed digests, the run ran the job's current version
+  and snapshot, and its publish step did not succeed. The reviewer reads it
+  with the same seal reader that decides a republish. It names no path, file
+  or content. A seal of another execution, one that changed, one that cannot
+  be read, or a run of another or unknown version gives no marker. The
+  marker only informs the agent: whether a retry is proposed as a republish
+  is decided again when the agent asks for one, and nothing runs from it.
 - Evidence that does not fit is shortened, never dropped silently: a run
   with more than 12 steps keeps failed, aborted and rejected steps first
   (the earliest of them always), then any other status that is not a plain

@@ -20,9 +20,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	api "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -838,7 +841,7 @@ func (r *Remote) runEvidence(ctx context.Context, jobID string, run runSummary) 
 	if ev.SpecSHA256, err = r.runSpecDigest(ctx, jobID, run.DagRunID); err != nil {
 		return ev, false, fmt.Errorf("spec of run %s: %w", run.DagRunID, err)
 	}
-	if ev.Steps, err = r.stepEvidence(ctx, jobID, run.DagRunID); err != nil {
+	if err = r.stepEvidence(ctx, jobID, &ev); err != nil {
 		return ev, false, fmt.Errorf("steps of run %s: %w", run.DagRunID, err)
 	}
 	var after struct {
@@ -887,24 +890,34 @@ const (
 
 // stepEvidence reads the end of each step's output from the service. A
 // script's result is in its output whichever way it also publishes values.
-func (r *Remote) stepEvidence(ctx context.Context, jobID, runID string) ([]StepEvidence, error) {
+// From the same record of the run it reads the error the service recorded
+// for the run and for each step, and the job version the run's DAG was
+// rendered for: zero when the run's labels do not say. It sets ev's Steps,
+// Error and JobVersion.
+func (r *Remote) stepEvidence(ctx context.Context, jobID string, ev *RunEvidence) error {
+	runID := ev.RunID
 	var detail struct {
 		DagRunDetails struct {
-			Nodes []struct {
+			Error  string   `json:"error"`
+			Labels []string `json:"labels"`
+			Nodes  []struct {
 				Step struct {
 					Name string `json:"name"`
 				} `json:"step"`
 				StatusLabel string `json:"statusLabel"`
+				Error       string `json:"error"`
 			} `json:"nodes"`
 		} `json:"dagRunDetails"`
 	}
 	base := "/dag-runs/" + url.PathEscape(jobID) + "/" + url.PathEscape(runID)
 	if err := r.do(ctx, http.MethodGet, base, nil, &detail); err != nil {
-		return nil, err
+		return err
 	}
+	ev.Error = evidenceError(detail.DagRunDetails.Error)
+	ev.JobVersion = labelledVersion(detail.DagRunDetails.Labels)
 	steps := make([]StepEvidence, 0, len(detail.DagRunDetails.Nodes))
 	for _, node := range detail.DagRunDetails.Nodes {
-		step := StepEvidence{Name: node.Step.Name, Status: node.StatusLabel}
+		step := StepEvidence{Name: node.Step.Name, Status: node.StatusLabel, Error: evidenceError(node.Error)}
 		for stream, into := range map[string]*string{"stdout": &step.Stdout, "stderr": &step.Stderr} {
 			// The stream parameter is always sent: the service fails a
 			// step-log request that omits it.
@@ -927,12 +940,54 @@ func (r *Remote) stepEvidence(ctx context.Context, jobID, runID string) ([]StepE
 			case errors.Is(err, ErrNotFound):
 				// The step wrote nothing to this stream.
 			default:
-				return nil, fmt.Errorf("%s of step %s: %w", stream, step.Name, err)
+				return fmt.Errorf("%s of step %s: %w", stream, step.Name, err)
 			}
 		}
 		steps = append(steps, step)
 	}
-	return steps, nil
+	ev.Steps = steps
+	return nil
+}
+
+// maxEvidenceErrorLen bounds, in bytes, each error the service recorded
+// that the evidence carries.
+const maxEvidenceErrorLen = 1024
+
+// evidenceError is an error the service recorded, as the evidence carries
+// it: on one line, with control and format characters folded into spaces
+// and invalid UTF-8 replaced, and at most maxEvidenceErrorLen bytes. Its
+// start is kept: that is where an error says what went wrong.
+func evidenceError(text string) string {
+	text = strings.Join(strings.FieldsFunc(strings.ToValidUTF8(text, "\uFFFD"), func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	}), " ")
+	if len(text) <= maxEvidenceErrorLen {
+		return text
+	}
+	const cut = "...[truncated]"
+	end := maxEvidenceErrorLen - len(cut)
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end] + cut
+}
+
+// labelledVersion is the job version a run's labels name, or zero when
+// they name none, or more than one.
+func labelledVersion(labels []string) int {
+	version := 0
+	for _, label := range labels {
+		value, ok := strings.CutPrefix(label, txepkg.LabelVersion+"=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 || (version != 0 && version != n) {
+			return 0
+		}
+		version = n
+	}
+	return version
 }
 
 func tailBytes(s string, n int) string {
