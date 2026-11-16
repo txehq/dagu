@@ -126,6 +126,11 @@ The slot starts no earlier than 2026-11-17 00:10Z, after window-10's recovery ha
 | P9 | `rig.sh review-tick --rig $RIG --post-decision` (the one post-decision observation, only if it is needed) | no new attempt, proposal or action; counter unchanged | |
 | P10 | `rig.sh down --rig $RIG` | fixture retired; worker, relay and hub stopped by token; ports free; no shared port in logs; evidence read-only; shared worker equals P0 | a process that is not ours is refused and reported |
 
+**Credentials.**
+- The synthetic admin password, the person token and the API key live in 0600 files under the rig root.
+- `curl` reads them from files (`-H @file`, `-d @file`), so they never appear in any process's arguments. `rig_test.go` checks every `curl` line.
+- One residual is stated rather than hidden: `dagu context add` accepts the key only as a flag or from a terminal prompt. That single sub-second call carries the synthetic, loopback-only API key in its argv.
+
 Evidence lives in `$RIG/evidence/`. At the end it is copied to
 `~/Projects/k8sconfig/onprem-k3s/evidence/txe-7516/run-<UTC>/`, after the
 secret-redaction filter from the common brief. The rig root keeps the synthetic

@@ -45,8 +45,14 @@ pf() { "$PY" -I "$HERE/preflight.py" "$@"; }
 procs() { "$PY" -I "$HERE/procs.py" "$@"; }
 relayctl() { "$PY" -I "$HERE/relay.py" ctl "$RIG/control/relay.sock" "$1"; }
 json() { "$PY" -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
-get() { curl -sf "$API$1" -H "Authorization: Bearer $(cat "$RIG/person-token")"; }
-post() { curl -sf -X POST "$API$1" -H "Authorization: Bearer $(cat "$RIG/person-token")" -H 'Content-Type: application/json' -d "$2"; }
+# Credentials reach curl through 0600 files (-H @file, -d @file), never argv,
+# where any local account could read them with ps.
+get() { curl -sf "$API$1" -H @"$RIG/control/person.hdr"; }
+post() { curl -sf -X POST "$API$1" -H @"$RIG/control/person.hdr" -H 'Content-Type: application/json' -d "$2"; }
+# header_file <json file> <field> <out>: "Authorization: Bearer <field>" into a 0600 file.
+header_file() {
+  (umask 077; "$PY" -I -c 'import json,sys; v=json.load(open(sys.argv[1]))[sys.argv[2]]; open(sys.argv[3],"w").write("Authorization: Bearer "+v+"\n")' "$1" "$2" "$3")
+}
 
 load() {
   if [ "${1:-}" = --rig ]; then RIG=$2; shift 2; else RIG=${I5_RIG:-}; fi
@@ -167,8 +173,10 @@ cmd_up() {
   find "$RIG/hub/dags" -maxdepth 1 -name 'example-0*' -delete
 
   umask 077
-  curl -sf -X POST "$API/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"synth-owner\",\"password\":\"$(cat "$RIG/admin-password")\"}" | json 'd["token"]' | tr -d '\n' > "$RIG/person-token"
+  "$PY" -I -c 'import json,sys; json.dump({"username":"synth-owner","password":open(sys.argv[1]).read()}, open(sys.argv[2],"w"))' \
+    "$RIG/admin-password" "$RIG/control/login.json"
+  curl -sf -X POST "$API/auth/login" -H 'Content-Type: application/json' -d @"$RIG/control/login.json" > "$RIG/control/login-reply.json"
+  header_file "$RIG/control/login-reply.json" token "$RIG/control/person.hdr"
   post /api-keys '{"name":"rig-machine","description":"TXE-7516 rig machine CLI and reviewer","role":"admin","allowedSurfaces":["rest_api"],"attributionClass":"service_account","serviceAccountName":"rig-machine"}' > "$RIG/apikey.json"
   umask 022
   get /txe/installation > "$RIG/evidence/installation.json"
@@ -178,14 +186,18 @@ cmd_up() {
   local owner machine key
   owner=$(bash "$REPO/txe/worker/mint-id.sh" own); machine=$(bash "$REPO/txe/worker/mint-id.sh" mch)
   printf 'OWNER=%s\nMACHINE=%s\n' "$owner" "$machine" > "$RIG/ids.env"
-  key=$(json 'd["key"]' < "$RIG/apikey.json")
+  header_file "$RIG/apikey.json" key "$RIG/control/key.hdr"
   local act='{"kind":"cli","id":"rig-installer"}'
-  curl -sf -X POST "$API/txe/owners" -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+  curl -sf -X POST "$API/txe/owners" -H @"$RIG/control/key.hdr" -H 'Content-Type: application/json' \
     -d "{\"owner_id\":\"$owner\",\"display_name\":\"Synthetic Owner (TXE-7516 rig)\",\"actor\":$act}" >/dev/null
-  curl -sf -X POST "$API/txe/machines" -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
+  curl -sf -X POST "$API/txe/machines" -H @"$RIG/control/key.hdr" -H 'Content-Type: application/json' \
     -d "{\"machine_id\":\"$machine\",\"owner_id\":\"$owner\",\"display_name\":\"rig-7516-mac\",\"actor\":$act}" >/dev/null
   printf '{"schema":1,"machine_id":"%s","owner_id":"%s","display_name":"rig-7516-mac"}' "$machine" "$owner" > "$RIG/machine-home/machine.json"
   chmod 600 "$RIG/machine-home/machine.json"
+  # Known residual: `dagu context add` takes the key only as a flag or from a
+  # terminal prompt, so this one sub-second call carries the synthetic,
+  # loopback-only key in its argv (README "Credentials").
+  key=$(json 'd["key"]' < "$RIG/apikey.json")
   cli context add txe --server="$API_RELAY" --api-key="$key" --dagu-home="$RIG/machine-home/client" >/dev/null 2>&1 \
     || die "context add failed"
 
@@ -300,7 +312,19 @@ cmd_review_tick() {
   ids; . "$RIG/ids.env"
   local name; if [ "$post" = no ]; then name=tick1; else name=tick2; fi
   local out="$RIG/evidence/$name"; mkdir -p "$out"
-  local tr; tr=$(post "/dags/$R/enqueue" '{}' | json 'd["dagRunId"]'); echo "$tr" > "$out/review-run-id"
+  # One reviewer call per tick. The enqueued run is recorded before anything
+  # else, so a step that fails while collecting evidence is resumed on the
+  # same run and never enqueues the agent again.
+  local tr
+  if [ -s "$RIG/control/$name-run" ]; then
+    tr=$(cat "$RIG/control/$name-run")
+    say "$name: resuming the observation of review run $tr; nothing is enqueued"
+  else
+    tr=$(post "/dags/$R/enqueue" '{}' | json 'd["dagRunId"]') || die "$name: the reviewer run was not enqueued"
+    [ -n "$tr" ] || die "$name: the hub returned no run id"
+    echo "$tr" > "$RIG/control/$name-run"
+  fi
+  echo "$tr" > "$out/review-run-id"
   local st=""
   for _ in $(seq 1 330); do # the reviewer DAG's own timeout is 900 s
     st=$(label "$R" "$tr") || st=unreadable; case $st in succeeded|failed|partially_succeeded|aborted) break ;; esac; sleep 3
@@ -340,7 +364,7 @@ cmd_decide() {
   while :; do
     n=$((n + 1))
     last="$out/decision-response-$n.txt"
-    curl -s -w '\nHTTP %{http_code}\n' -X POST "$API/txe/jobs/$JOB/proposals/$p/decisions" -H "Authorization: Bearer $(cat "$RIG/person-token")" \
+    curl -s -w '\nHTTP %{http_code}\n' -X POST "$API/txe/jobs/$JOB/proposals/$p/decisions" -H @"$RIG/control/person.hdr" \
       -H 'Content-Type: application/json' -d "$(cat "$out/decision-request.json")" > "$last"
     # The same request is repeated, unchanged, only while the hub says the
     # decision is recorded and its follow-up pending (J17's decide.sh).

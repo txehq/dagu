@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -49,7 +50,7 @@ func initialisedRig(t *testing.T) fakeRig {
 	out, code := f.init(t)
 	require.Equal(t, 0, code, out)
 	write(t, filepath.Join(f.root, "ids.env"), "OWNER=own_X\nMACHINE=mch_01M00000000000000000000000\nJOB=job_X\nRUN=run_X\n")
-	write(t, filepath.Join(f.root, "person-token"), "synthetic")
+	write(t, filepath.Join(f.root, "control", "person.hdr"), "Authorization: Bearer synthetic\n")
 	return f
 }
 
@@ -86,10 +87,9 @@ func TestRigDecideMarksOnlyACompletedDecision(t *testing.T) {
 func TestRigDecideRecordsAnAcceptedDecision(t *testing.T) {
 	f := initialisedRig(t)
 	mark(t, f, "tick1")
-	calls := 0
+	var calls atomic.Int32
 	fakeHub(t, proposalRoutes(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls == 1 {
+		if calls.Add(1) == 1 {
 			reply(503, map[string]any{"code": "follow_up_pending"})(w, r)
 			return
 		}
@@ -97,7 +97,7 @@ func TestRigDecideRecordsAnAcceptedDecision(t *testing.T) {
 	}))
 	out, code := rig(t, "decide", "--rig", f.root, "--proposal", "prp_1", "--verdict", "retry", "--authority", "msg_test")
 	require.Equal(t, 0, code, out)
-	assert.Equal(t, 2, calls, "a pending follow-up is replayed with the same request")
+	assert.EqualValues(t, 2, calls.Load(), "a pending follow-up is replayed with the same request")
 	assert.FileExists(t, filepath.Join(f.root, "control", "step-decided"))
 	var auth map[string]string
 	raw, err := os.ReadFile(filepath.Join(f.root, "evidence", "decision", "authority.json"))
@@ -321,4 +321,43 @@ func TestCheckProof(t *testing.T) {
 	queued, _ := published("queued", "failed", sealedSha(t, runDir))
 	_, code = check(queued, art, "1\n", "1\n")
 	assert.Equal(t, 3, code, "a queued admitted execution is pending, not failed")
+}
+
+// A tick that fails while collecting evidence is resumed on the run it already
+// enqueued: the agent is called once per tick, whatever happens after.
+func TestRigReviewTickNeverEnqueuesTwice(t *testing.T) {
+	f := initialisedRig(t)
+	mark(t, f, "eligibility")
+	write(t, filepath.Join(f.root, "control", "counter"), "1\n")
+	var enqueued atomic.Int32
+	var proposalsOK atomic.Bool
+	ok := reply(200, map[string]any{"ok": true})
+	fakeHub(t, map[string]func(http.ResponseWriter, *http.Request){
+		"POST /api/v1/dags/txe-reviewer-01M00000000000000000000000/enqueue": func(w http.ResponseWriter, r *http.Request) {
+			enqueued.Add(1)
+			reply(200, map[string]any{"dagRunId": "rv1"})(w, r)
+		},
+		"GET /api/v1/dag-runs/txe-reviewer-01M00000000000000000000000/rv1": reply(200, map[string]any{"dagRunDetails": map[string]any{"statusLabel": "succeeded"}}),
+		"GET /api/v1/txe/jobs/job_X/proposals": func(w http.ResponseWriter, r *http.Request) {
+			if !proposalsOK.Load() {
+				reply(500, map[string]any{"error": "boom"})(w, r)
+				return
+			}
+			reply(200, map[string]any{"open": []any{}, "finished": []any{}})(w, r)
+		},
+		"GET /api/v1/txe/jobs/job_X/actions": ok,
+		"GET /api/v1/dag-runs/job_X/run_X":   ok,
+	})
+	out, code := rig(t, "review-tick", "--rig", f.root)
+	assert.NotEqual(t, 0, code, out)
+	assert.NoFileExists(t, filepath.Join(f.root, "control", "step-tick1"))
+	proposalsOK.Store(true)
+	out, code = rig(t, "review-tick", "--rig", f.root)
+	require.Equal(t, 0, code, out)
+	assert.Contains(t, out, "resuming the observation of review run rv1")
+	assert.EqualValues(t, 1, enqueued.Load(), "the reviewer was enqueued once")
+	out, code = rig(t, "review-tick", "--rig", f.root)
+	assert.NotEqual(t, 0, code)
+	assert.Contains(t, out, "step tick1 already ran")
+	assert.EqualValues(t, 1, enqueued.Load())
 }

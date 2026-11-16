@@ -175,6 +175,12 @@ func TestRigNeverTouchesTheSharedInstallation(t *testing.T) {
 	for _, banned := range []string{"launchctl", "pkill", "pgrep", "kill -9", "18080", "50055", "com.txe.dagu", "kubectl", "docker"} {
 		assert.NotContains(t, text, banned)
 	}
+	// Credentials reach curl through 0600 files, never its arguments.
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.Contains(line, "curl ") {
+			assert.NotRegexp(t, `Bearer|password|\$key|\$\(cat`, line, "a credential in curl's argv")
+		}
+	}
 	shared := regexp.MustCompile(`\.local/share/txe-dagu[^-]`)
 	for line := range strings.SplitSeq(text, "\n") {
 		if shared.MatchString(line) {
