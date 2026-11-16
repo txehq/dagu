@@ -84,6 +84,7 @@ import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
 import { I18nTemplate } from '@/i18n/I18nTemplate';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
 
 /**
  * Props for the NodeStatusTableRow component
@@ -396,8 +397,12 @@ function NodeStatusTableRow({
     dagRun.status !== Status.Running &&
     dagRun.status !== Status.Queued &&
     dagRun.status !== Status.Waiting;
+  // The hub retries a registered TXE job's run, or a run on its path, only
+  // by carrying out a TXE decision of the whole run (TXE-7517): a step of it
+  // is never retried alone, so no step retry is offered.
   const canRetryStep =
     showStepActions &&
+    !isTxeJobDAGName(dagRun.rootDAGRunName || dagRun.name) &&
     dagRun.status !== Status.Waiting &&
     dagRun.status !== Status.Queued &&
     !node.step.humanTask &&

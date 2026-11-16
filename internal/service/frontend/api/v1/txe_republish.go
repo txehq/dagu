@@ -5,7 +5,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -13,7 +12,6 @@ import (
 	"path"
 	"reflect"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -61,22 +59,61 @@ func txeRepublishShape(stepName, subDAGRunID string, includeDownstream, bypassPr
 	return nil
 }
 
-// txeRetryRunAction is the part of a dagu.retry_run action's params a
-// republish is bound to.
-type txeRetryRunAction struct {
-	RunID     string `json:"run_id"`
-	AttemptID string `json:"attempt_id"`
-	QueuedAt  string `json:"queued_at"`
-	Step      string `json:"step"`
+// txeDecisionRequired refuses a registered job's retry made for no action:
+// the run is retried only by carrying out a person's TXE decision.
+const txeDecisionRequired = "txe_decision_required"
+
+// txeDecisionRequiredRefusal names the route a registered job's run is
+// retried by: the TXE job's own controls, which record a person's decision
+// the job's machine then carries out with this endpoint.
+func txeDecisionRequiredRefusal(jobID, runID string) error {
+	return &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
+		Message: fmt.Sprintf("run %s is a registered TXE job's run and is not retried directly: use \"Run again\" or \"Publish sealed result\" on TXE job %s (/txe/jobs/%s); nothing was retried", runID, jobID, jobID),
+		Details: map[string]any{"code": txeDecisionRequired, "job_id": jobID, "route": "/txe/jobs/" + jobID}}
 }
 
-// txeCheckRepublish binds a conditional retry of a registered job's run to
-// the action it was made for, both ways: a republish needs an approved
-// dagu.retry_run of this run's expected execution with step "publish", and
-// such an approval cannot be used for any other retry. It is called after
-// the job's admission (txeAdmitDAG), so dag is the job's current version.
-// baseConfig is the base configuration the retry is dispatched with.
-func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, runID string, expect *persis.ExpectedExecution, accept bool) error {
+// txeRetryUnbound is the reason a registered job's retry made for an
+// action is refused when it does not carry that action out as approved
+// (TXE-7517). The refusal keeps the code every reviewer build reads as
+// "nothing started" (accept_failed_prerequisites_unsupported), so an older
+// machine that sends a decision in another form settles it as not applied
+// rather than unknown; details.reason says why.
+const txeRetryUnbound = "retry_unbound"
+
+func txeRetryUnboundRefusal(format string, args ...any) error {
+	return &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
+		Message: fmt.Sprintf(format, args...), Details: map[string]any{"code": txeRepublishUnsupported, "reason": txeRetryUnbound}}
+}
+
+// txeRetryForm is the form in which a registered job's retry is carried
+// out, from what it asks of Dagu: the publish step alone (accept, whose
+// shape txeRepublishShape checked), the job's step and everything after it,
+// or the whole run. Any other step retry is no decision's form.
+func txeRetryForm(stepName, subDAGRunID string, includeDownstream, bypassPreconditions, accept bool) (registry.RetryForm, error) {
+	switch {
+	case accept:
+		return registry.RetryFormPublish, nil
+	case stepName == "" && subDAGRunID == "":
+		return registry.RetryFormWholeRun, nil
+	case stepName == txepkg.RunStepName && includeDownstream && subDAGRunID == "" && !bypassPreconditions:
+		return registry.RetryFormFromJobStep, nil
+	}
+	return "", txeRetryUnboundRefusal("a registered TXE job's run is retried whole, from its %q step with includeDownstream, or as a republish; step %q is not retried so", txepkg.RunStepName, stepName)
+}
+
+// txeCheckRepublish admits a retry of a registered job's run only as the
+// carrying out of the approved dagu.retry_run action it is made for, in
+// the form that action approved (registry.CheckRetryRun): a republish as
+// the publish step alone, an explicit rerun from the job's step with
+// includeDownstream, and a retry that names neither as a retry of the
+// whole run. A retry made for no action, one in another form, and one that
+// does not bind the action as it is now are refused before anything is
+// queued or created (TXE-7517). A DAG that is no registered job's is
+// unaffected. It is called after the job's admission (txeAdmitDAG), so dag
+// is the job's current version. baseConfig is the base configuration the
+// retry is dispatched with; stepName, subDAGRunID, includeDownstream and
+// bypassPreconditions are what the request asks.
+func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, runID, stepName, subDAGRunID string, includeDownstream, bypassPreconditions bool, expect *persis.ExpectedExecution, accept bool) error {
 	jobID, err := txeJobIdentity(dag)
 	if err != nil {
 		return err
@@ -88,7 +125,11 @@ func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, ru
 		return nil
 	}
 	if expect == nil || expect.Request == nil {
-		return nil // not made for an action: nothing to bind
+		return txeDecisionRequiredRefusal(jobID, runID)
+	}
+	form, err := txeRetryForm(stepName, subDAGRunID, includeDownstream, bypassPreconditions, accept)
+	if err != nil {
+		return err
 	}
 	s, err := a.txeStore()
 	if err != nil {
@@ -113,54 +154,28 @@ func (a *API) txeCheckRepublish(ctx context.Context, dag *ir.DAG, baseConfig, ru
 			return err
 		}
 	}
-	return txeRepublishBinding(job, job.Actions[expect.Request.ActionID], runID, expect, accept, time.Now())
+	return txeRepublishBinding(job, job.Actions[expect.Request.ActionID], runID, expect, form, time.Now())
 }
 
-// txeRepublishBinding decides a registered job's conditional retry against
-// the action it names (nil when the job has none by that id). A republish
-// is carried out only for the approved action's attempt that is executing
-// now, under its live grant, for the job's current version.
-func txeRepublishBinding(job *registry.Job, action *registry.Action, runID string, expect *persis.ExpectedExecution, accept bool, now time.Time) error {
-	jobID := job.JobID
-	if action == nil || action.Spec.Name != registry.ActionRetryRun {
-		if accept {
-			return txeRepublishRefusal("retryRequest names no dagu.retry_run action of job %s", jobID)
-		}
-		return nil // another kind of follow-up; the decision service binds it
+// txeRepublishBinding decides a registered job's conditional retry, carried
+// out in form, against the action it names (nil when the job has none by
+// that id), with the registry's one binding (registry.CheckRetryRun). A
+// refused republish keeps its message as it was; a refusal in any other
+// form also gives details.reason retry_unbound. Both have the code every
+// reviewer reads as a refusal before any effect.
+func txeRepublishBinding(job *registry.Job, action *registry.Action, runID string, expect *persis.ExpectedExecution, form registry.RetryForm, now time.Time) error {
+	refuse := txeRetryUnboundRefusal
+	if form == registry.RetryFormPublish {
+		refuse = txeRepublishRefusal
 	}
-	var params txeRetryRunAction
-	if err := json.Unmarshal(action.Spec.Params, &params); err != nil {
-		return txeRepublishRefusal("action %s has unreadable params", action.ActionID)
+	err := registry.CheckRetryRun(job, action, runID,
+		registry.RetriedExecution{AttemptID: expect.AttemptID, QueuedAt: expect.QueuedAt},
+		registry.RetryActionRequest{ActionAttempt: expect.Request.ActionAttempt, BindingDigest: expect.Request.BindingDigest},
+		form, now)
+	if re, ok := errors.AsType[*registry.Error](err); ok {
+		return refuse("%s", re.Message)
 	}
-	publishOnly := params.Step == txepkg.PublishStepName
-	switch {
-	case params.Step != "" && !publishOnly:
-		return txeRepublishRefusal("action %s retries step %q; only %q is a step a decision retries", action.ActionID, params.Step, txepkg.PublishStepName)
-	case publishOnly && !accept:
-		return txeRepublishRefusal("action %s was approved as a republish of the sealed result; it is carried out only as one (stepName %q, acceptFailedPrerequisites)", action.ActionID, txepkg.PublishStepName)
-	case !accept:
-		return nil
-	case !publishOnly:
-		return txeRepublishRefusal("action %s was approved as a retry of the run, not a republish of its sealed result", action.ActionID)
-	case strconv.Itoa(action.Attempt) != expect.Request.ActionAttempt || action.BindingDigest != expect.Request.BindingDigest:
-		return txeRepublishRefusal("retryRequest does not name the current attempt and binding of action %s", action.ActionID)
-	case params.RunID != runID || params.AttemptID != expect.AttemptID || params.QueuedAt != expect.QueuedAt:
-		return txeRepublishRefusal("action %s was approved for another run or execution", action.ActionID)
-	case action.Kind != registry.ActionApproved:
-		return txeRepublishRefusal("action %s is not a person's approved decision", action.ActionID)
-	case action.State != registry.ActionExecuting || action.Grant == nil || action.Grant.Attempt != action.Attempt || !now.Before(action.Grant.ExpiresAt):
-		return txeRepublishRefusal("action %s is not executing attempt %d under a live grant", action.ActionID, action.Attempt)
-	case action.JobVersion != job.Version:
-		return txeRepublishRefusal("action %s was approved for version %d of job %s, which is now at version %d", action.ActionID, action.JobVersion, jobID, job.Version)
-	}
-	// The binding is recomputed from the job as it is now, as the registry
-	// computes it, so an approval of another version, package or action
-	// cannot pass as this one's.
-	current, err := registry.BindingDigest(job, action.Spec)
-	if err != nil || current != action.BindingDigest {
-		return txeRepublishRefusal("action %s no longer binds job %s as it is now", action.ActionID, jobID)
-	}
-	return nil
+	return err
 }
 
 // txeGeneratedPublishStep checks that the job's DAG, as stored (the bytes

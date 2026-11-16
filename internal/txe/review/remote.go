@@ -2142,9 +2142,16 @@ var retryRefusedBeforeEffect = map[string]int{
 	"execution_changed":             http.StatusConflict,
 	"conditional_retry_unsupported": http.StatusConflict,
 	// The republish option was refused: not a TXE job's run, not its
-	// publish step alone, or without the expected execution and request.
+	// publish step alone, or without the expected execution and request;
+	// or a registered job's retry did not carry out the action it names as
+	// approved (TXE-7517, details.reason retry_unbound).
 	"accept_failed_prerequisites_unsupported": http.StatusBadRequest,
 	// No connected worker of the job's machine can run a republish; the
 	// service checks that before it creates or dispatches the retry.
 	"worker_capability_missing": http.StatusConflict,
+	// A registered job's retry made for no action (TXE-7517); the service
+	// refuses it before it queues or creates anything. One that does not
+	// carry out the action it names as approved is refused with
+	// accept_failed_prerequisites_unsupported, above.
+	"txe_decision_required": http.StatusConflict,
 }

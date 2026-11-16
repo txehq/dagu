@@ -1161,3 +1161,86 @@ describe('NodeStatusTableRow inline log of a failed step', () => {
     expect(fetched[fetched.length - 1]?.options?.refreshInterval).toBe(2000);
   });
 });
+
+// TXE-7517: the hub retries a registered TXE job's run only through a TXE
+// decision of the whole run, so no step of it, nor of a run on its path, is
+// offered for retry. Ported from main's stepStatusGate.test.ts.
+describe('NodeStatusTableRow on a TXE job run', () => {
+  const job = 'job_01M4XEETKWKZX504BK65ADBVYB';
+  const failedNode = {
+    step: { name: 'build' },
+    status: NodeStatus.Failed,
+    statusLabel: NodeStatusLabel.failed,
+    stdout: '',
+    stderr: '',
+    startedAt: '',
+    finishedAt: '',
+    retryCount: 0,
+    doneCount: 1,
+  } as components['schemas']['Node'];
+
+  beforeEach(() => {
+    configMock.runDags = true;
+    postMock.mockReset();
+    mockedUseQuery.mockImplementation(() => ({
+      data: undefined,
+      isLoading: false,
+      error: undefined,
+      isValidating: false,
+      mutate: vi.fn(),
+    }));
+  });
+
+  function renderRow(run: components['schemas']['DAGRunDetails']) {
+    render(
+      <MemoryRouter>
+        <AppBarContext.Provider value={appBarValue}>
+          <DAGContext.Provider
+            value={{ refresh: vi.fn(), name: run.name, fileName: run.name }}
+          >
+            <table>
+              <tbody>
+                <NodeStatusTableRow
+                  rownum={1}
+                  node={failedNode}
+                  name={run.name}
+                  dagRun={run}
+                  view="desktop"
+                />
+              </tbody>
+            </table>
+          </DAGContext.Provider>
+        </AppBarContext.Provider>
+      </MemoryRouter>
+    );
+  }
+
+  async function retryOffered(): Promise<boolean> {
+    const user = userEvent.setup();
+    const trigger = screen.queryByRole('button', { name: 'Step actions' });
+    if (!trigger) return false;
+    await user.click(trigger);
+    return screen.queryByRole('menuitem', { name: 'Retry step' }) !== null;
+  }
+
+  it('offers no step retry on a job run', async () => {
+    renderRow({ ...dagRun, name: job, status: Status.Failed });
+    expect(await retryOffered()).toBe(false);
+  });
+
+  it('offers no step retry on a run under a job run', async () => {
+    renderRow({
+      ...dagRun,
+      name: 'helper',
+      status: Status.Failed,
+      rootDAGRunName: job,
+      rootDAGRunId: 'root-1',
+    });
+    expect(await retryOffered()).toBe(false);
+  });
+
+  it('keeps step retry on any other DAG', async () => {
+    renderRow({ ...dagRun, name: 'etl', status: Status.Failed });
+    expect(await retryOffered()).toBe(true);
+  });
+});
