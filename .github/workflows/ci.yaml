@@ -431,7 +431,9 @@ jobs:
 
   # TXE-7557: each declared rollback floor's own registry code, built at its
   # pinned commit, reads a temporary store the current code wrote, in every
-  # persisted lifecycle state (internal/txe/registry/rollback-floor.md).
+  # persisted lifecycle state, and rewrites every rewritten record kind with
+  # every field compared, a planted field included (TXE-7559)
+  # (internal/txe/registry/rollback-floor.md).
   test-rollback-floor:
     name: Test rollback floor
     needs: changes
