@@ -691,6 +691,8 @@ var guardRefused = []string{
 	"python3 00< mutants.py",
 	"node -e 'console.log(1)' -r ./mutants.js",
 	`ruby --some-new-option value -e 'system("python3 mutants.py")'`,
+	"bash --rcfile /dev/null run-mutations.sh",
+	"bash --init-file ~/.bashrc -- tools/mutants.sh",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

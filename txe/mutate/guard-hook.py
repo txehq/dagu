@@ -66,6 +66,8 @@ DATA_KEYWORDS = {"for", "select", "case", "fi", "done", "esac", "in", "[[", "]]"
 SCRIPT_RUNNER_MODULES = {"runpy", "pdb", "cProfile", "profile", "trace", "coverage", "debugpy", "pyinstrument",
                          "memray", "scalene", "viztracer", "line_profiler", "kernprof", "py_spy"}
 SCRIPT_RUNNER_TOOLS = {"coverage", "pdb", "pyinstrument", "memray", "scalene", "viztracer", "kernprof", "py-spy"}
+# Shell long options whose value is the next word (bash --rcfile FILE, --init-file FILE).
+SHELL_LONG_VALUE = {"--rcfile", "--init-file"}
 PRELOAD_OPTS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 # perl and ruby switch clusters: code switches; switches whose value is attached or the next word;
 # switches whose optional value can only be attached (the rest of the cluster).
@@ -598,7 +600,7 @@ class Judge:
             if t == "--":
                 j += 1
                 break
-            if t in ("-o", "+o", "-O", "+O"):
+            if t in ("-o", "+o", "-O", "+O") or t in SHELL_LONG_VALUE:
                 j += 2
             elif len(t) > 1 and t[0] in "-+":
                 code = code or (not t.startswith("--") and "c" in t[1:])
