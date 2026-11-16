@@ -78,3 +78,16 @@ jobs:
       - run: |
           tool=build
           go $tool -modcache
+      - run: |
+          cache_dir="$cache_dir/subdir"
+          rm -rf "$cache_dir" # want:env-path-delete
+      - run: |
+          own_dir="$(mktemp -d)"
+          own_dir="$own_dir/sub"
+          rm -rf "$own_dir"
+      - run: |
+          a=-n
+          a=-modcache
+          b=-n; b=-x; c=-n; c=-x; d=-n; d=-x; e=-n; e=-x
+          f=-n; f=-x; g=-n; g=-x; h=-n; h=-x; i=-n; i=-x
+          go clean $a $b $c $d $e $f $g $h $i # want:go-clean-cache

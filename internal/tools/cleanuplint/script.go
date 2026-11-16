@@ -483,8 +483,8 @@ func (sc *scriptScan) expansions(text string) []string {
 }
 
 // expandOnce returns text with its references substituted once: one
-// reading per combination of the referenced variables' values, then one
-// with each variable's values joined. It returns nil when no reference has
+// reading with each variable's values joined, then one per combination of
+// the referenced variables' values. It returns nil when no reference has
 // a value.
 func (sc *scriptScan) expandOnce(text string) []string {
 	vals := map[string][]string{}
@@ -510,7 +510,14 @@ func (sc *scriptScan) expandOnce(text string) []string {
 			return ref
 		})
 	}
-	var out []string
+	// The reading with each variable's values joined comes first, so the
+	// reading cap never drops it: it is the reading the lint made before
+	// readings per combination, so the lint never reports less than that.
+	joined := map[string]string{}
+	for _, n := range names {
+		joined[n] = strings.Join(vals[n], " ")
+	}
+	out := []string{subst(joined)}
 	pick := map[string]string{}
 	var walk func(i int)
 	walk = func(i int) {
@@ -527,11 +534,7 @@ func (sc *scriptScan) expandOnce(text string) []string {
 		}
 	}
 	walk(0)
-	joined := map[string]string{}
-	for _, n := range names {
-		joined[n] = strings.Join(vals[n], " ")
-	}
-	return append(out, subst(joined))
+	return out
 }
 
 // assignedValues returns the distinct values assigns gives name, in order.
@@ -603,8 +606,21 @@ func (sc *scriptScan) collectAssignments() {
 
 // propagate marks every variable whose value can come from the environment.
 func (sc *scriptScan) propagate() {
+	// A name every assignment of which reads its own old value
+	// (dir="$dir/sub") never gets a value of the script's own, so it keeps
+	// whatever the environment gave it. One assignment that does not read
+	// it (dir="$(mktemp -d)", S="$TMP/s") is the base the others extend.
+	onlySelf := map[string]bool{}
 	for _, a := range sc.assigns {
-		if a.overridden {
+		if _, seen := onlySelf[a.name]; !seen {
+			onlySelf[a.name] = true
+		}
+		if !sc.refersToSelf(a) {
+			onlySelf[a.name] = false
+		}
+	}
+	for _, a := range sc.assigns {
+		if a.overridden || (onlySelf[a.name] && sc.envSource(a.name)) {
 			sc.tainted[a.name] = true
 		}
 	}
@@ -633,6 +649,37 @@ func (sc *scriptScan) varTainted(name string) bool {
 	}
 	if sc.defined[name] {
 		return false
+	}
+	return sc.envSource(name)
+}
+
+// refersToSelf reports an assignment whose value reads the variable it
+// assigns, outside any expression that creates a fresh temporary path.
+func (sc *scriptScan) refersToSelf(a assignment) bool {
+	var re *regexp.Regexp
+	switch sc.l {
+	case langShell:
+		re = shellRefRe
+	case langMake:
+		re = argRefRe
+	case langPowerShell:
+		re = psRefRe
+	case langNone, langGo, langPython:
+		return false
+	}
+	for _, m := range re.FindAllStringSubmatch(stripCreated(a.rhs), -1) {
+		if m[1] == a.name || (sc.l == langPowerShell && strings.EqualFold(m[1], a.name)) {
+			return true
+		}
+	}
+	return false
+}
+
+// envSource reports whether a variable the script never assigned would
+// name a path the environment chose.
+func (sc *scriptScan) envSource(name string) bool {
+	if sc.l == langPowerShell {
+		name = strings.ToLower(name)
 	}
 	switch sc.l {
 	case langShell, langMake:
