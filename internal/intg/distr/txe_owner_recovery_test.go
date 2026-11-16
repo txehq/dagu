@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -54,8 +56,12 @@ func (h txeOwnerRuns) RetryRun(_ context.Context, _, runID string, expected revi
 	dag := f.dagWrapper.DAG
 	opts := []executor.TaskOption{executor.WithWorkerSelector(dag.WorkerSelector), executor.WithPreviousStatus(&failed),
 		executor.WithRequireLatestIsPrevious(true), executor.WithRetryRequest(request.ActionID, request.ActionAttempt, request.BindingDigest)}
-	if request.Step == txepkg.PublishStepName {
+	switch {
+	case request.Step == txepkg.PublishStepName:
 		opts = append(opts, executor.WithStep(txepkg.PublishStepName), executor.WithAcceptFailedPrerequisites(true))
+	case request.Rerun:
+		// As the hub does for {stepName: run, includeDownstream: true}.
+		opts = append(opts, executor.WithStep(txepkg.RunStepName), executor.WithIncludeDownstream(true))
 	}
 	task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, runID, opts...)
 	admitted := &dispatch.AdmittedExecution{}
@@ -96,6 +102,12 @@ const txeOwnerMachine = "mch_01HZX0000000000000000000AA"
 // the given intent parameters and has the machine's executor carry it out.
 func txeOwnerRetry(t *testing.T, lost *txeLostPublish, intent map[string]string) review.Executed {
 	t.Helper()
+	return txeOwnerRetryWith(t, lost, intent, txeOwnerRuns{t: t, lost: lost})
+}
+
+// txeOwnerRetryWith is txeOwnerRetry through the given hub side.
+func txeOwnerRetryWith(t *testing.T, lost *txeLostPublish, intent map[string]string, runs review.RunRetrier) review.Executed {
+	t.Helper()
 	failed := lost.failed
 	reg := reviewtest.New()
 	job := review.Job{
@@ -124,7 +136,7 @@ func txeOwnerRetry(t *testing.T, lost *txeLostPublish, intent map[string]string)
 	r := &review.Reviewer{
 		MachineID: txeOwnerMachine, Registry: reg, Holder: txeOwnerMachine + "/executor", AgentClient: "none",
 		DecideDAG: review.DecideDAGName(txeOwnerMachine), ClaimTTL: 10 * time.Minute,
-		Runs:         txeOwnerRuns{t: t, lost: lost},
+		Runs:         runs,
 		Seals:        txeOwnerSeals{txeclient.Outputs{Home: lost.run.home}},
 		RetryObserve: distrTestTimeout(30 * time.Second),
 	}
@@ -203,4 +215,94 @@ func TestTXEOwnerRecovery_OwnerRepublishPublishesTheSealedResult(t *testing.T) {
 	assert.Contains(t, again.Skipped, "nothing is retried")
 	assert.Equal(t, 1, txeExecutions(t, lost.control))
 	assert.Len(t, lost.run.registry.manifests, 1)
+}
+
+// An explicit rerun of a run whose job step succeeded and sealed its result
+// and whose publish failed runs the job's step again: a native retry of the
+// run would keep the succeeded job step and only publish, so the result the
+// person asked to supersede would be published. The rerun is a new
+// execution of the script that seals and publishes its own result.
+func TestTXEOwnerRecovery_ExplicitRerunRunsAJobStepThatSucceeded(t *testing.T) {
+	control := t.TempDir()
+	run := txeStartPublishJob(t, txeRetryScript, map[string]string{"TXE_FIXTURE_CONTROL": control},
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} })
+	first := run.f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	runID := first.DAGRunID
+
+	// The job runs again and seals; publishing fails.
+	run.registry.setDown(true)
+	run.retryDirect(t, runID, txepkg.RunStepName)
+	failed := run.waitFor(t, "the second execution did not fail at publish", func(s ir.DAGRunStatus) bool {
+		return s.DAGRunID == runID && s.AttemptID != first.AttemptID && s.Status == ir.Failed
+	})
+	require.Equal(t, 2, txeExecutions(t, control))
+	require.Len(t, failed.Nodes, 2)
+	require.Equal(t, ir.NodeSucceeded, failed.Nodes[0].Status, "the job step succeeded")
+	seal, err := txeclient.Outputs{Home: run.home}.Sealed(txeTestJob, runID)
+	require.NoError(t, err)
+	require.Equal(t, txeExecution(failed), seal.Execution)
+	run.registry.setDown(false)
+
+	lost := &txeLostPublish{run: run, control: control, failed: failed}
+	out := txeOwnerRetry(t, lost, map[string]string{review.RetryRunRerunParam: "true"})
+	require.NotEmpty(t, out.Action.ID, "nothing was begun: %s", out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
+	assert.Contains(t, out.Action.Detail, "superseded and was not published")
+	rerun := lost.nextExecution(t, "the rerun did not finish")
+	assert.Equal(t, ir.Succeeded, rerun.Status)
+	assert.Equal(t, 3, txeExecutions(t, control), "the job's step did not run again")
+	manifest, ok := run.registry.execution(rerun)
+	require.True(t, ok, "the rerun published nothing")
+	assert.Equal(t, txeExecution(rerun), manifest.ProducedIn, "what was published is the rerun's own result")
+	assert.Equal(t, txeDigest(txeExecutionContent(3)), manifest.Artifacts[0].SHA256)
+	_, published := run.registry.execution(failed)
+	assert.False(t, published, "the superseded sealed result was published")
+}
+
+// Root's ruling (TXE-7515): the explicit modes do not redefine an ordinary
+// retry. A retry that names no intent, of a run whose job step failed and
+// sealed nothing, is carried out as it always was: a native retry of the
+// run (no step named, no rerun form), which runs the job's script again and
+// publishes the new execution's result.
+func TestTXEOwnerRecovery_UnspecifiedRetryOfAnUnsealedRunIsUnchanged(t *testing.T) {
+	control := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(control, "fail-job"), nil, 0o600))
+	run := txeStartPublishJob(t, txeRetryScript, map[string]string{"TXE_FIXTURE_CONTROL": control},
+		func(home txepkg.Home, _ string) []string { return []string{"--dagu-home", home.ClientDir()} })
+	failed := run.f.waitForStatus(ir.Failed, executionStatusTimeout())
+	require.Equal(t, 1, txeExecutions(t, control))
+	require.Len(t, failed.Nodes, 2)
+	require.Equal(t, ir.NodeFailed, failed.Nodes[0].Status, "the job step failed")
+	_, err := txeclient.Outputs{Home: run.home}.Sealed(txeTestJob, failed.DAGRunID)
+	require.ErrorIs(t, err, txeclient.ErrNotSealed, "nothing was sealed")
+	require.NoError(t, os.Remove(filepath.Join(control, "fail-job")))
+
+	lost := &txeLostPublish{run: run, control: control, failed: failed}
+	runs := &txeRecordingRuns{txeOwnerRuns: txeOwnerRuns{t: t, lost: lost}}
+	out := txeOwnerRetryWith(t, lost, nil, runs)
+	require.NotEmpty(t, out.Action.ID, "nothing was begun: %s", out.Skipped)
+	assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
+	assert.NotContains(t, out.Action.Detail, "superseded")
+	require.Len(t, runs.requests, 1)
+	assert.Equal(t, review.RetryRequest{ActionID: runs.requests[0].ActionID, ActionAttempt: runs.requests[0].ActionAttempt,
+		BindingDigest: runs.requests[0].BindingDigest}, runs.requests[0], "a native retry of the run: no step, no rerun form")
+
+	rerun := lost.nextExecution(t, "the retry did not finish")
+	assert.Equal(t, ir.Succeeded, rerun.Status)
+	assert.Equal(t, 2, txeExecutions(t, control), "the job's script ran again")
+	manifest, ok := run.registry.execution(rerun)
+	require.True(t, ok, "the retry published nothing")
+	assert.Equal(t, txeExecution(rerun), manifest.ProducedIn)
+	assert.Equal(t, txeDigest(txeExecutionContent(2)), manifest.Artifacts[0].SHA256)
+}
+
+// txeRecordingRuns is txeOwnerRuns that keeps every retry request sent.
+type txeRecordingRuns struct {
+	txeOwnerRuns
+	requests []review.RetryRequest
+}
+
+func (h *txeRecordingRuns) RetryRun(ctx context.Context, jobID, runID string, expected review.Execution, request review.RetryRequest) (review.Execution, error) {
+	h.requests = append(h.requests, request)
+	return h.txeOwnerRuns.RetryRun(ctx, jobID, runID, expected, request)
 }

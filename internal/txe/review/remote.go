@@ -2085,10 +2085,15 @@ func (r remoteRuns) RetryRun(ctx context.Context, jobID, runID string, expected 
 		"dagRunId": runID, "expectedAttemptId": expected.AttemptID, "expectedQueuedAt": expected.QueuedAt,
 		"retryRequest": map[string]string{"actionId": request.ActionID, "actionAttempt": request.ActionAttempt, "bindingDigest": request.BindingDigest},
 	}
-	if request.Step != "" {
+	switch {
+	case request.Step != "":
 		// A republish: the service runs only this step, with its failed
 		// prerequisite, the job step, taken as done.
 		body["stepName"], body["acceptFailedPrerequisites"] = request.Step, true
+	case request.Rerun:
+		// An explicit rerun: the job's step and every step after it run
+		// again, whether or not the job's step succeeded before.
+		body["stepName"], body["includeDownstream"] = txepkg.RunStepName, true
 	}
 	var answer json.RawMessage
 	err = r.t.Do(ctx, http.MethodPost, path, body, &answer)

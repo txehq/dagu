@@ -824,9 +824,10 @@ func (tx *JobTx) checkRetryIntent(params RetryRunParams, id string) error {
 
 // retrySettledWithoutEffect reports whether the decided retry proposal's
 // action was settled with nothing run: its every attempt is failed or not
-// applied and none recorded an execution its request admitted. A retry with
-// no action yet, one in flight, or one that may have started an execution is
-// not.
+// applied, and none recorded an execution its request admitted unless run
+// history shows that execution abandoned before dispatch. A retry with no
+// action yet, one in flight, or one whose admitted execution may have run
+// (dispatched, still being prepared, or not readable) is not.
 func (tx *JobTx) retrySettledWithoutEffect(proposalID string) (bool, error) {
 	found := false
 	for _, a := range tx.Job.Actions {
@@ -841,7 +842,11 @@ func (tx *JobTx) retrySettledWithoutEffect(proposalID string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if admitted != "" {
+		if admitted == "" {
+			continue
+		}
+		execution, _, err := tx.admittedRetry(a, admitted)
+		if err != nil || !execution.Abandoned {
 			return false, nil
 		}
 	}

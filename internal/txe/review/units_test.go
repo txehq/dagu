@@ -1616,6 +1616,9 @@ func TestRetryIntentAgainstTheSeal(t *testing.T) {
 				} else {
 					assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
 					assert.Equal(t, []string{w.step}, f.runs.steps)
+					// Only an explicit rerun is sent as a rerun of the job's
+					// step: the service then runs the job step again.
+					assert.Equal(t, []bool{intent == "rerun"}, f.runs.reruns)
 				}
 				assert.Contains(t, out.Action.Detail, w.detail)
 			})

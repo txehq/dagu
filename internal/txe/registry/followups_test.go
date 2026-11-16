@@ -1491,6 +1491,37 @@ func TestRetryRefusedWithoutEffectReleasesTheOtherIntents(t *testing.T) {
 	assert.Equal(t, CodeRetryIntentConflict, code(t, err), "the republish now holds the execution")
 }
 
+// TXE-7515: a retry whose request the coordinator admitted and then
+// abandoned before dispatch ran nothing, so once settled it releases the
+// execution too; one whose admitted execution was dispatched does not.
+func TestRetryAbandonedAdmissionReleasesTheOtherIntents(t *testing.T) {
+	for name, abandoned := range map[string]bool{"abandoned": true, "dispatched": false} {
+		t.Run(name, func(t *testing.T) {
+			r := newRetryFixture(t)
+			r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+			p, d, err := r.propose(r.params("run-1", "a1"), "key-plain")
+			require.NoError(t, err)
+			ec := acquire(t, r.f, r.job.JobID, ClaimExecution, time.Hour)
+			act, g, err := r.authorize(p, d, ec)
+			require.NoError(t, err)
+			a2 := ExecutionRef("a2", "")
+			r.admit(t, act, r.params("run-1", "a1"), a2, abandoned, false)
+			require.NoError(t, r.settleOutcome(act, g, ec, ActionFailed, "", admittedOutcome(a2)))
+			// The run is back at the execution the decisions are about.
+			r.rc.attempts["run-1"] = failedAttempt("a1", r.job.DAGSpecSHA256)
+
+			republish := r.params("run-1", "a1")
+			republish.Step = RetryStepPublish
+			_, _, err = r.propose(republish, "key-republish")
+			if abandoned {
+				require.NoError(t, err, "an abandoned admission ran nothing")
+				return
+			}
+			assert.Equal(t, CodeRetryIntentConflict, code(t, err), "a dispatched admission may have run")
+		})
+	}
+}
+
 // TXE-7515: an open proposal of another intent, such as the reviewer's
 // republish waiting on the owner, is a conflict for a person's rerun of
 // the same execution; a retry of another execution or run is not.

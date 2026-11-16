@@ -1581,6 +1581,12 @@ type RetryRequest struct {
 	// step for the retried execution's sealed result, and empty for a
 	// re-run of the run.
 	Step string
+	// Rerun is a person's explicit request to run the job again
+	// (TXE-7515). It is sent as a retry from the job's step with every step
+	// after it, so the job's step runs again even when it succeeded and only
+	// publishing failed; a native retry of the run would keep a succeeded
+	// job step and run only publish, for the result already sealed.
+	Rerun bool
 }
 
 // RunState is what the service reports about one run of a job.
@@ -1827,6 +1833,7 @@ func (r *Reviewer) retryRunNoted(ctx context.Context, job Job, action Action, no
 		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the registry's record of action " + action.ID + " gives no attempt number or binding digest to make the retry of run " + runID + " for"}
 	}
 	rerun := action.Params[RetryRunRerunParam]
+	request.Rerun = rerun == "true" && request.Step == ""
 	switch {
 	case rerun != "" && (rerun != "true" || request.Step != ""):
 		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision about run " + runID + " names " + RetryRunRerunParam + "=" + rerun + " with step " + agentText(request.Step) + "; a retry either runs the job again or republishes, never both"}
