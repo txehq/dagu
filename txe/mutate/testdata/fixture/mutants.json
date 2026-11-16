@@ -1,0 +1,8 @@
+[
+  {
+    "name": "cleanup cleans the env module cache",
+    "file": "cleanup.go",
+    "old": "return nil // CLEANUP",
+    "new": "return exec.Command(\"go\", \"clean\", \"-modcache\").Run()"
+  }
+]
