@@ -1,0 +1,42 @@
+# The I5 harness fixture (TXE-7516). rig.sh replaces @RIG@ with the rig root.
+# Root ruling D5: the purpose and brief state truthfully what the job does and
+# give the reviewer no instruction about which recovery to choose.
+schema: 1
+title: TXE-7516 isolated I5 fixture
+purpose: >-
+  Isolated test fixture (TXE-7516). Each run writes one result.json that belongs
+  to that run alone: it names the run and its ordinal, and no later run writes it
+  again. It calls no external service and changes no shared state.
+project:
+  name: TXE-7516 isolated I5
+targets:
+  - kind: example.rig
+    environment: local
+    stable_id:
+      id: rig-7516-i5
+    display_name: rig 7516
+    existence_check: event_only
+schedule:
+  cron: "0 3 1 1 *"
+  timezone: UTC
+  timeout_sec: 900
+package:
+  include: [run.sh]
+  entrypoint: [./run.sh]
+env:
+  I5_CONTROL_DIR: "@RIG@/control"
+expected_outcome:
+  success_criteria:
+    - Each run exits 0 and publishes its own result.json to the hub.
+  deliverables:
+    - name: result
+      path: result.json
+      delivery: hub
+      required: true
+lifetime:
+  open_ended: true
+review_policy:
+  cadence: "* * * * *"
+  brief: >-
+    Isolated test fixture. Each run's result.json is that run's own result;
+    a later run does not reproduce it.
