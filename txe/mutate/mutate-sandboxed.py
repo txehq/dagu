@@ -96,6 +96,8 @@ def identity(path: Path) -> dict | None:
         st = os.lstat(path)
     except FileNotFoundError:
         return None
+    except OSError as e:  # unreadable is a distinct state, so a change to it is seen, never skipped
+        return {"unreadable": e.errno}
     ident = {"dev": st.st_dev, "ino": st.st_ino, "symlink": os.path.islink(path)}
     birth = getattr(st, "st_birthtime", None)
     if birth is not None:
@@ -108,6 +110,8 @@ def file_digest(path: Path) -> str | None:
         return hashlib.sha256(path.read_bytes()).hexdigest()
     except FileNotFoundError:
         return None
+    except OSError as e:
+        return f"unreadable: errno {e.errno}"
 
 
 @dataclass
@@ -159,8 +163,10 @@ def entries(d: Path) -> dict:
                 except FileNotFoundError:
                     continue
                 out[e.name] = [st.st_dev, st.st_ino]
-    except (FileNotFoundError, NotADirectoryError, PermissionError):
+    except FileNotFoundError:
         pass
+    except OSError as e:  # every entry read before then counts as lost: the check fails closed
+        return {"<unreadable>": e.errno}
     return out
 
 
@@ -768,8 +774,11 @@ def main(argv: list[str]) -> int:
                 report["shared_state_changed"] = str(e)
                 code = EXIT_SHARED_CHANGED
                 args.keep = True
-            except OSError as e:
-                report["final_check_error"] = str(e)
+            except OSError as e:  # a check that cannot read the host fails closed
+                loud(f"at the end of the run the host check could not read: {e}")
+                report["shared_state_changed"] = f"final check unreadable: {e}"
+                code = EXIT_SHARED_CHANGED
+                args.keep = True
         try:
             report["identity_after"] = watch.snapshot()
         except OSError as e:

@@ -986,3 +986,17 @@ func TestStoppedRunStillChecksSharedState(t *testing.T) {
 	assert.Contains(t, o.stderr, "after the end of the run")
 	assert.Len(t, removals(t, f.log), 1, "the container is still removed")
 }
+
+// A watched path that becomes unreadable is a change, not a skipped check: the run fails closed
+// with the shared-state alarm.
+func TestUnreadableWatchFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads through permissions")
+	}
+	f := alarmFixture(t, `os.chmod(os.path.join(modcache, sentinel), 0)`)
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(f.modcache, sentinel), 0o644) })
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Contains(t, o.stderr, "unreadable")
+}
