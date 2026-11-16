@@ -48,7 +48,15 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   and the ownership token written into it at creation still match.
 
 Exit codes: 0 done with no finding (survivors are listed, not failures); 2 refused or bad input;
-3 shared state changed; 4 the unmutated tree failed; 5 findings.
+3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (the
+whole run, every container included) or by SIGTERM, SIGINT or SIGHUP. Any exit from 3 to 6 keeps
+the work directory as evidence.
+
+**Containers the runner started, and only those, are removed when it stops.** Each `docker run`
+records its container id with `--cidfile` in the work directory, outside every mount, and carries
+a unique name and an owner label holding the run's random token. On a timeout, the deadline or a
+signal, the runner force-removes each container whose docker client had not returned, and only
+when docker reports that exact name and token on it.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.
@@ -77,18 +85,26 @@ script gets past it; it catches the habit that caused the incident, and the rule
 
 ## The acceptance demonstration
 
-`fixture-demo.sh` runs `testdata/fixture` (a module with no dependencies, whose one mutant runs
+`fixture-demo.py` runs `testdata/fixture` (a module with no dependencies, whose one mutant runs
 `go clean -modcache` with its environment), one step per call, each against sentinel-only fake
-caches. Neither step reads the real module cache.
+caches. Neither step reads the real module cache, and the image is named by its id (never
+pulled).
 
-- `fixture-demo.sh sandboxed <evidence> <image-id>`: through the real sandbox. Expected: exit 0,
-  the mutant SURVIVED, the fake caches and sentinels unchanged.
-- `fixture-demo.sh outer-negative <evidence> <image-id>`: the alarm, with the boundary removed,
-  proven inside an outer container with no network, no capabilities, no Docker socket, no
-  credentials and no mount but a read-only copy of this directory. There `negative-in-outer.sh`
-  plays the host with fake caches and gives the runner `testdata/leaky-docker.py`, which runs the
-  mutant with the caller's environment. Expected: the runner inside exits 3. A boundary-off run
-  never happens on a real host: there is no flag for it.
+- `fixture-demo.py sandboxed <evidence> <image-id> [--deadline 300]`: through the real sandbox.
+  Expected: exit 0, the mutant SURVIVED, the fake caches and sentinels unchanged.
+- `fixture-demo.py outer-negative <evidence> <image-id> [--deadline 180]`: the alarm, with the
+  boundary removed, proven inside an outer container with no network, no capabilities, no Docker
+  socket, no credentials and no mount but a read-only copy of this directory. There
+  `negative-in-outer.sh` plays the host with fake caches and gives the runner
+  `testdata/leaky-docker.py`, which runs the mutant with the caller's environment. Expected: the
+  runner inside exits 3. A boundary-off run never happens on a real host: there is no flag for it.
+
+`--deadline` bounds the whole demo, every container, error handling and cleanup included. Past
+it, or on SIGTERM, SIGINT or SIGHUP, the demo stops the runner and both force-remove only the
+containers recorded as started (docker's `--cidfile`, kept outside every mount), each only when
+docker reports that container's own name and owner token. The demo works inside one directory it
+creates exclusively and stamps with a token; it removes it only when the token and the
+directory's identity still match, and keeps it as evidence after any unexpected result.
 
 Tests: `go test ./txe/mutate/`. They start no container, download nothing and run no
 destructive mutant: a fake docker plays the container on a temporary directory, and the alarm

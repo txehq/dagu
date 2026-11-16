@@ -38,7 +38,10 @@ occurrence is replaced by `new`.
 
 Exit codes: 0 done, no finding (survivors are listed, not failures); 2 refused or bad input;
 3 shared state changed (LOUD); 4 the unmutated tree failed; 5 findings (an unrepeated kill, a
-sandbox error or a timeout).
+sandbox error or a timeout); 6 stopped by --deadline or a signal. On a timeout, the deadline or a
+signal, every container this run started whose client had not returned is force-removed, by the
+id docker recorded (--cidfile, outside every mount), and only when docker reports that container's
+own name and this run's owner token on it.
 """
 from __future__ import annotations
 
@@ -46,8 +49,10 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,7 +66,9 @@ DEFAULT_EXCLUDES = (".git", "node_modules", ".local")
 # docker run's own failures: the daemon refused (125), the command could not run (126, 127).
 DOCKER_INFRA_EXITS = {125, 126, 127}
 
-EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS = 0, 2, 3, 4, 5
+EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_STOPPED = 0, 2, 3, 4, 5, 6
+OWNER_LABEL = "txe.mutate-sandboxed.owner"
+CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 
 
 class Refused(Exception):
@@ -70,6 +77,14 @@ class Refused(Exception):
 
 class SharedStateChanged(Exception):
     """A watched host path changed identity: the boundary failed."""
+
+
+class Stopped(Exception):
+    """The whole-run deadline passed, or a signal asked the run to stop."""
+
+
+def stop_on_signal(signum, _frame):
+    raise Stopped(f"signal {signal.Signals(signum).name}")
 
 
 # ---------------------------------------------------------------- identity
@@ -328,6 +343,37 @@ SANDBOX_ENV_DIRS = {
 }
 
 
+def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, env: dict[str, str]) -> str:
+    """Force-remove one container this run started, and nothing else.
+
+    The container is the one docker recorded in cidfile (kept outside every mount, so no sandboxed
+    code can rewrite it), or failing that the run's unique name. It is removed only when docker
+    reports that exact name and this run's owner label on it. Returns what happened.
+    """
+    target = name
+    try:
+        cid = cidfile.read_text().strip()
+        if CONTAINER_ID.match(cid):
+            target = cid
+    except OSError:
+        pass
+    probe = subprocess.run([docker, "inspect", "--format", "{{.Name}} {{index .Config.Labels \"" + OWNER_LABEL + "\"}}",
+                            target], capture_output=True, text=True, env=env, timeout=30)
+    if probe.returncode != 0:
+        return f"{target}: absent"
+    if probe.stdout.strip() != f"/{name} {token}":
+        return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
+    rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env, timeout=60)
+    return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
+
+
+def docker_client_env() -> dict[str, str]:
+    """What the docker client itself needs from the caller, unchanged; none of it reaches a
+    container (docker run passes only --env values)."""
+    keep = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "USER", "LANG")
+    return {k: os.environ[k] for k in keep if k in os.environ}
+
+
 @dataclass
 class Result:
     name: str
@@ -345,6 +391,28 @@ class Runner:
         self.work = work
         self.docker = docker
         self.seq = 0
+        self.deadline = time.monotonic() + args.deadline if args.deadline else None
+        # (name, cidfile) of every container started whose docker client has not returned.
+        self.pending: dict[str, Path] = {}
+        self.cleanup_log: list[str] = []
+
+    def remaining(self, what: str) -> float:
+        """Seconds the next step may take: the per-run timeout, cut to what the deadline leaves."""
+        if self.deadline is None:
+            return float(self.args.timeout)
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed before {what}")
+        return min(float(self.args.timeout), left)
+
+    def remove_pending(self) -> None:
+        for name, cidfile in list(self.pending.items()):
+            try:
+                self.cleanup_log.append(remove_owned_container(self.docker, cidfile, name, self.work.token,
+                                                               self.docker_env()))
+            except (OSError, subprocess.TimeoutExpired) as e:
+                self.cleanup_log.append(f"{name}: cleanup error {e}")
+            del self.pending[name]
 
     # A run gets its own directory: src (the tree copy) and sandbox/<env dirs>.
     def prepare(self, label: str, pristine: Path, mutant: Mutant | None) -> Path:
@@ -363,7 +431,7 @@ class Runner:
             clone_dir(warm, sb / "gocache")
         return d
 
-    def docker_argv(self, d: Path, name: str) -> list[str]:
+    def docker_argv(self, d: Path, name: str, cidfile: Path) -> list[str]:
         mounts: list[tuple[Path, str, bool]] = [(d, "/work", False)]
         seed = self.work.path / "seed" / "gomodcache" / "cache" / "download"
         if seed.is_dir():
@@ -378,7 +446,8 @@ class Runner:
             "GOENV": "off",
             "MUTATE_SANDBOXED": "1",
         })
-        argv = [self.docker, "run", "--rm", "--pull", "never", "--name", name, "--network", self.args.network,
+        argv = [self.docker, "run", "--rm", "--pull", "never", "--name", name, "--cidfile", str(cidfile),
+                "--label", f"{OWNER_LABEL}={self.work.token}", "--network", self.args.network,
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(self.args.pids),
                 "--memory", self.args.memory, "--cpus", self.args.cpus,
                 "--read-only", "--tmpfs", "/tmp:rw,size=256m", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -393,19 +462,27 @@ class Runner:
         before = self.watch.snapshot()
         live = {m.file: file_digest(self.args.tree / m.file) for m in ([mutant] if mutant else [])}
         d = self.prepare(label, pristine, mutant)
-        name = f"mutate-sandboxed-{os.getpid()}-{self.seq}-{secrets.token_hex(3)}"
-        argv = self.docker_argv(d, name)
+        name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
+        # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
+        cidfile = self.work.path / "cids" / f"{self.seq:03d}.cid"
+        cidfile.parent.mkdir(exist_ok=True)
+        argv = self.docker_argv(d, name, cidfile)
+        limit = self.remaining(label)
         log_path = d / "output.log"
         start = time.monotonic()
         code, outcome = None, None
+        self.pending[name] = cidfile
         with open(log_path, "wb") as log:
             try:
                 proc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env(),
-                                      timeout=self.args.timeout)
+                                      timeout=limit)
                 code = proc.returncode
+                del self.pending[name]
             except subprocess.TimeoutExpired:
+                self.remove_pending()
+                if limit < self.args.timeout:
+                    raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed during {label}")
                 outcome = "TIMEOUT"
-                subprocess.run([self.docker, "kill", name], capture_output=True, env=self.docker_env())
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
@@ -422,13 +499,10 @@ class Runner:
         return Result(label, outcome, code, round(secs, 2), str(log_path))
 
     def docker_env(self) -> dict[str, str]:
-        """What the docker client itself needs from the caller, unchanged; none of it reaches the
-        container (docker run passes only --env values)."""
-        keep = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "USER", "LANG")
-        return {k: os.environ[k] for k in keep if k in os.environ}
+        return docker_client_env()
 
 
-def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, caller_proxy: str) -> None:
+def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, caller_proxy: str, limit: float) -> None:
     """Fill an owned module cache from the unmutated tree. Reads the shared cache only as a file proxy."""
     seed = work.path / "seed"
     seed.mkdir()  # go mod download creates nothing for a module with no dependencies
@@ -440,8 +514,11 @@ def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, cal
         "GOFLAGS": "-modcacherw",
         "GOPROXY": ",".join(p for p in (file_url(shared_modcache / "cache" / "download"), caller_proxy) if p),
     })
-    out = subprocess.run(["go", "mod", "download"], cwd=pristine, env=env, capture_output=True, text=True,
-                         timeout=args.timeout)
+    try:
+        out = subprocess.run(["go", "mod", "download"], cwd=pristine, env=env, capture_output=True, text=True,
+                             timeout=limit)
+    except subprocess.TimeoutExpired as e:
+        raise Stopped(f"seeding the module proxy took longer than {limit:.0f}s") from e
     (seed / "download.log").write_text(out.stdout + out.stderr)
     if out.returncode != 0:
         raise Refused(f"seeding the module proxy failed (log {seed / 'download.log'}):\n{out.stderr[-2000:]}")
@@ -458,6 +535,9 @@ def parse(argv: list[str]):
                    help="an image present locally, best named by its immutable id (sha256:...); never pulled")
     p.add_argument("--network", default="none", help="docker network for the sandbox (default none)")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per sandboxed run")
+    p.add_argument("--deadline", type=int, default=0,
+                   help="seconds for the whole run, every container included; 0 means none. Past it the "
+                        "run stops, removes the containers it started and exits 6")
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
     p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
     p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
@@ -560,7 +640,10 @@ def main(argv: list[str]) -> int:
     initial = watch.snapshot()
     report["identity_before"] = initial
     work = None
+    runner = None
     code = EXIT_OK
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, stop_on_signal)
     try:
         check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
         if subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True).returncode != 0:
@@ -571,10 +654,11 @@ def main(argv: list[str]) -> int:
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
         pristine = work.path / "pristine"
         copy_tree(args.tree, pristine, tuple(args.exclude))
+        runner = Runner(args, watch, forbidden, work, args.docker)
         if not args.no_seed:
-            seed_modules(args, work, pristine, modcache, caller_proxy)
+            seed_modules(args, work, pristine, modcache, caller_proxy, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
-        code = run_all(args, mutants, Runner(args, watch, forbidden, work, args.docker), pristine, report)
+        code = run_all(args, mutants, runner, pristine, report)
     except SharedStateChanged as e:
         loud(str(e))
         report["shared_state_changed"] = str(e)
@@ -583,15 +667,30 @@ def main(argv: list[str]) -> int:
     except Refused as e:
         print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
         code = EXIT_REFUSED
+    except Stopped as e:
+        print(f"mutate-sandboxed: stopped: {e}; removing the containers this run started", file=sys.stderr)
+        report["stopped"] = str(e)
+        code = EXIT_STOPPED
+        args.keep = True  # evidence
     finally:
-        report["identity_after"] = watch.snapshot()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
+        if runner:
+            runner.remove_pending()
+            report["container_cleanup"] = runner.cleanup_log
+            for line in runner.cleanup_log:
+                print(f"mutate-sandboxed: container {line}", file=sys.stderr)
+        try:
+            report["identity_after"] = watch.snapshot()
+        except OSError as e:
+            report["identity_after"] = f"unreadable: {e}"
         report["exit"] = code
         text = json.dumps(report, indent=2, default=str)
         if args.report:
             args.report.write_text(text)
         if work:
             (work.path / "report.json").write_text(text)
-            if args.keep:
+            if args.keep or code in (EXIT_BASELINE, EXIT_FINDINGS):  # a failure keeps its evidence
                 print(f"work directory kept: {work.path}", file=sys.stderr)
             else:
                 try:

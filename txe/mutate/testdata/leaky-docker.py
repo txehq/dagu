@@ -19,7 +19,8 @@ args = sys.argv[1:]
 if args[:1] != ["run"]:
     sys.exit(0)
 VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt",
-          "--pids-limit", "--tmpfs", "--user", "--workdir", "--entrypoint", "--mount", "--env"}
+          "--pids-limit", "--tmpfs", "--user", "--workdir", "--entrypoint", "--mount", "--env", "--cidfile",
+          "--label"}
 i, work = 1, None
 while i < len(args) and args[i].startswith("--"):
     if args[i] == "--mount" and args[i + 1].endswith("target=/work"):

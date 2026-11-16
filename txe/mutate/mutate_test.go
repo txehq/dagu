@@ -20,7 +20,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -47,9 +49,13 @@ func script(t *testing.T, name string) string {
 
 // fakeDocker writes a docker stand-in that appends each argv to log as a JSON line and, for
 // `run`, executes the command on the host with only the --env values, /work and /goproxy mapped
-// to their mount sources. An image named "infra-125" exits 125 as the daemon would, and
-// `image inspect missing` fails. sideEffect, when set, is Python run on every `run` before the
-// command: the tests' stand-in for a boundary that leaked.
+// to their mount sources. It keeps a registry of "containers" (log + ".containers", a JSON map of
+// id to [name, owner label]): `run` writes the id to --cidfile and registers it until the command
+// ends; `inspect` and `rm -f` answer from the registry. An image named "infra-125" exits 125 as
+// the daemon would, an image containing "hang" registers and then sleeps, an image containing
+// "noexec" exits 0 without running the command, and `image inspect missing` fails. sideEffect,
+// when set, is Python run on every `run` before the command: the tests' stand-in for a boundary
+// that leaked.
 func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 	t.Helper()
 	effect := "pass"
@@ -57,18 +63,40 @@ func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 		effect = sideEffect[0]
 	}
 	src := `#!/usr/bin/env python3
-import json, os, subprocess, sys
+import hashlib, json, os, subprocess, sys, time
 LOG = ` + fmt.Sprintf("%q", log) + `
+REG = LOG + ".containers"
 args = sys.argv[1:]
 with open(LOG, "a") as f:
     f.write(json.dumps(args) + "\n")
+def reg():
+    try:
+        return json.load(open(REG))
+    except (OSError, ValueError):
+        return {}
+def save(r):
+    json.dump(r, open(REG + ".tmp", "w"))
+    os.replace(REG + ".tmp", REG)
 if args[:3] == ["image", "inspect", "missing"]:
     sys.exit(1)
+if args[:1] == ["inspect"]:
+    r = reg()
+    if args[-1] not in r:
+        sys.exit(1)
+    print("/%s %s" % tuple(r[args[-1]]))
+    sys.exit(0)
+if args[:2] == ["rm", "-f"]:
+    r = reg()
+    if args[2] not in r:
+        sys.exit(1)
+    del r[args[2]]
+    save(r)
+    sys.exit(0)
 if not args or args[0] != "run":
     sys.exit(0)
-VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt", "--pids-limit", "--tmpfs", "--user",
-          "--workdir", "--entrypoint", "--mount", "--env"}
-i, mounts, env, workdir = 1, {}, {}, "/"
+VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt", "--pids-limit",
+          "--tmpfs", "--user", "--workdir", "--entrypoint", "--mount", "--env", "--cidfile", "--label"}
+i, mounts, env, workdir, name, cidfile, owner = 1, {}, {}, "/", "", "", ""
 while i < len(args) and args[i].startswith("--"):
     flag = args[i]
     if flag in VALUED:
@@ -82,24 +110,58 @@ while i < len(args) and args[i].startswith("--"):
             env[k] = v
         elif flag == "--workdir":
             workdir = val
+        elif flag == "--name":
+            name = val
+        elif flag == "--cidfile":
+            cidfile = val
+        elif flag == "--label":
+            owner = val.split("=", 1)[1]
     else:
         i += 1
 image, cmd = args[i], args[i + 1:]
 if image == "infra-125":
     sys.exit(125)
-` + effect + `
-def host(p):
-    for target, source in sorted(mounts.items(), key=lambda kv: -len(kv[0])):
-        if p == target or p.startswith(target + "/"):
-            return source + p[len(target):]
-    return p
-env = {k: host(v.replace("file://", "", 1)) if v.startswith("file:///") else host(v) for k, v in env.items()}
-env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
-sys.exit(subprocess.run(cmd, env=env, cwd=host(workdir)).returncode)
+cid = hashlib.sha256(name.encode()).hexdigest()
+r = reg()
+r[cid] = [name, owner]
+save(r)
+if cidfile:
+    open(cidfile, "w").write(cid)
+if "hang" in image:
+    time.sleep(120)  # a container whose client is killed stays registered, as a detached one would
+if "noexec" in image:
+    code = 0
+else:
+` + "    " + strings.ReplaceAll(effect, "\n", "\n    ") + `
+    def host(p):
+        for target, source in sorted(mounts.items(), key=lambda kv: -len(kv[0])):
+            if p == target or p.startswith(target + "/"):
+                return source + p[len(target):]
+        return p
+    env = {k: host(v.replace("file://", "", 1)) if v.startswith("file:///") else host(v) for k, v in env.items()}
+    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
+    code = subprocess.run(cmd, env=env, cwd=host(workdir)).returncode
+r = reg()
+r.pop(cid, None)
+save(r)
+sys.exit(code)
 `
 	p := filepath.Join(dir, "docker")
 	require.NoError(t, os.WriteFile(p, []byte(src), 0o755))
 	return p
+}
+
+// registry reads the fake docker's live containers: id to [name, owner].
+func registry(t *testing.T, log string) map[string][]string {
+	t.Helper()
+	raw, err := os.ReadFile(log + ".containers")
+	if os.IsNotExist(err) {
+		return map[string][]string{}
+	}
+	require.NoError(t, err)
+	var r map[string][]string
+	require.NoError(t, json.Unmarshal(raw, &r))
+	return r
 }
 
 type fixture struct {
@@ -551,4 +613,251 @@ func TestGuardHookCodexInput(t *testing.T) {
 	}
 	code, _, _ := hook(t, `{"tool_name":"exec_command","tool_input":{"cmd":"go test ./..."}}`)
 	assert.Equal(t, 0, code)
+}
+
+// foreignContainer registers a container the run did not start: cleanup must never touch it.
+func foreignContainer(t *testing.T, log string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string][]string{strings.Repeat("f", 64): {"someone-elses", "other-owner"}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(log+".containers", raw, 0o644))
+}
+
+// removals are the container ids the runner force-removed.
+func removals(t *testing.T, log string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(log)
+	require.NoError(t, err)
+	var out []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
+		var argv []string
+		require.NoError(t, json.Unmarshal([]byte(line), &argv))
+		if len(argv) == 3 && argv[0] == "rm" && argv[1] == "-f" {
+			out = append(out, argv[2])
+		}
+	}
+	return out
+}
+
+// recordedCIDs are the ids docker wrote to the run's cidfiles.
+func recordedCIDs(t *testing.T, workdir string) []string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(workdir, "cids", "*.cid"))
+	require.NoError(t, err)
+	var ids []string
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		require.NoError(t, err)
+		ids = append(ids, string(raw))
+	}
+	return ids
+}
+
+// A run that outlives its per-run timeout is a TIMEOUT, never a kill, and the container its
+// killed client left behind is removed by its recorded id. Nothing else is removed.
+func TestTimeoutRemovesOnlyOwnedContainer(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	foreignContainer(t, f.log)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "1")
+	assert.Equal(t, 4, o.code, o.stdout+o.stderr)
+	assert.Equal(t, "TIMEOUT", o.outcomes()["baseline"])
+	ids := recordedCIDs(t, o.report["workdir"].(string))
+	require.Len(t, ids, 1)
+	assert.Equal(t, ids, removals(t, f.log))
+	assert.Equal(t, map[string][]string{strings.Repeat("f", 64): {"someone-elses", "other-owner"}}, registry(t, f.log))
+	assert.Contains(t, o.stderr, ids[0]+": removed")
+}
+
+// The whole-run deadline stops the run (exit 6) mid-container, removes the container it started,
+// keeps the work directory as evidence, and does so well inside the per-run timeout.
+func TestDeadlineStopsRun(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	foreignContainer(t, f.log)
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "2")
+	assert.Less(t, time.Since(start), 20*time.Second)
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "whole-run deadline (2s) passed during baseline")
+	workdir := o.report["workdir"].(string)
+	assert.DirExists(t, workdir)
+	ids := recordedCIDs(t, workdir)
+	require.Len(t, ids, 1)
+	assert.Equal(t, ids, removals(t, f.log))
+	assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
+}
+
+// SIGTERM and SIGINT stop the run (exit 6) and remove the running container by its recorded id.
+func TestSignalStopsRun(t *testing.T) {
+	for _, sig := range []os.Signal{syscall.SIGTERM, syscall.SIGINT} {
+		t.Run(sig.String(), func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			foreignContainer(t, f.log)
+			report := filepath.Join(f.root, "report.json")
+			cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
+				f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--shared-modcache", f.modcache,
+				"--shared-gocache", f.gocache, "--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed",
+				"--report", report, "--image", "hang", "--timeout", "60", "--", "sh", "check.sh")
+			var errb bytes.Buffer
+			cmd.Stderr = &errb
+			require.NoError(t, cmd.Start())
+			require.Eventually(t, func() bool { return len(registry(t, f.log)) == 2 }, 15*time.Second, 50*time.Millisecond)
+			require.NoError(t, cmd.Process.Signal(sig))
+			err := cmd.Wait()
+			var ee *exec.ExitError
+			require.ErrorAs(t, err, &ee, errb.String())
+			assert.Equal(t, 6, ee.ExitCode(), errb.String())
+			assert.Contains(t, errb.String(), "stopped: signal")
+			raw, err := os.ReadFile(report)
+			require.NoError(t, err)
+			var rep map[string]any
+			require.NoError(t, json.Unmarshal(raw, &rep))
+			ids := recordedCIDs(t, rep["workdir"].(string))
+			require.Len(t, ids, 1)
+			assert.Equal(t, ids, removals(t, f.log))
+			assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
+		})
+	}
+}
+
+// Cleanup removes a recorded id only when docker reports this run's name and owner label on it.
+func TestCleanupLeavesMismatchedContainer(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	id := strings.Repeat("a", 64)
+	raw, err := json.Marshal(map[string][]string{id: {"mutate-sandboxed-x-001", "another-token"}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(log+".containers", raw, 0o644))
+	cidfile := filepath.Join(root, "001.cid")
+	require.NoError(t, os.WriteFile(cidfile, []byte(id), 0o644))
+	prog := `
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "my-token", ms.docker_client_env()))
+print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
+print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, cidfile).CombinedOutput()
+	require.NoError(t, err, string(out))
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	require.Len(t, lines, 3)
+	assert.Contains(t, lines[0], "not ours")
+	assert.Equal(t, id+": removed", lines[1])
+	assert.Equal(t, id+": absent", lines[2])
+}
+
+// demo runs fixture-demo.py with the fake docker; the image decides what the fake does, and
+// "noexec" images run no command at all, so no fixture mutant executes on this host.
+func demo(t *testing.T, docker string, args ...string) (*exec.Cmd, *bytes.Buffer) {
+	t.Helper()
+	cmd := exec.Command(python(t), append([]string{"-I", script(t, "fixture-demo.py"), "--docker", docker}, args...)...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	return cmd, &out
+}
+
+// demoRoot is the directory the demo said it created; the test removes it if the demo kept it.
+func demoRoot(t *testing.T, out string) string {
+	t.Helper()
+	i := strings.Index(out, " root ")
+	require.GreaterOrEqual(t, i, 0, out)
+	root := strings.Fields(out[i+len(" root "):])[0]
+	require.Contains(t, root, "mutate-sandboxed-")
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+func exitCode(t *testing.T, err error) int {
+	t.Helper()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	require.ErrorAs(t, err, &ee)
+	return ee.ExitCode()
+}
+
+// The demo's happy path: the runner reports the mutant SURVIVED with the fake caches unchanged,
+// the demo exits 0 and removes the directory it created.
+func TestDemoSandboxedRemovesItsRoot(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	evidence := filepath.Join(root, "evidence")
+	cmd, out := demo(t, docker, "sandboxed", evidence, "sha256:noexec", "--deadline", "60")
+	require.Equal(t, 0, exitCode(t, cmd.Run()), out.String())
+	dir := demoRoot(t, out.String())
+	assert.NoDirExists(t, dir)
+	assert.Contains(t, out.String(), "result: EXPECTED")
+	assert.FileExists(t, filepath.Join(evidence, "sandboxed.report.json"))
+	assert.FileExists(t, filepath.Join(evidence, "sandboxed.log"))
+}
+
+// A hanging container meets the whole-demo deadline: the runner is stopped, the container it
+// recorded is removed (and no other), the demo exits 1 inside its deadline and keeps its root.
+func TestDemoDeadlineRemovesOnlyRecorded(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	foreignContainer(t, log)
+	start := time.Now()
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "30")
+	require.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
+	assert.Less(t, time.Since(start), 30*time.Second)
+	dir := demoRoot(t, out.String())
+	assert.DirExists(t, dir, "an unexpected result keeps its evidence")
+	assert.Contains(t, out.String(), "result: NOT AS EXPECTED")
+	assert.Len(t, removals(t, log), 1)
+	assert.Equal(t, map[string][]string{strings.Repeat("f", 64): {"someone-elses", "other-owner"}}, registry(t, log))
+}
+
+// SIGTERM to the demo stops the runner, which removes its recorded container; nothing else goes.
+func TestDemoSignalRemovesOnlyRecorded(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	foreignContainer(t, log)
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "120")
+	require.NoError(t, cmd.Start())
+	require.Eventually(t, func() bool { return len(registry(t, log)) == 2 }, 20*time.Second, 50*time.Millisecond)
+	require.NoError(t, cmd.Process.Signal(syscall.SIGTERM))
+	assert.Equal(t, 1, exitCode(t, cmd.Wait()), out.String())
+	demoRoot(t, out.String())
+	assert.Len(t, removals(t, log), 1)
+	assert.Len(t, registry(t, log), 1, "only the foreign container is left")
+}
+
+// The demo refuses a tag (only an immutable id) and an image that is not present locally.
+func TestDemoRefusals(t *testing.T) {
+	root := t.TempDir()
+	docker := fakeDocker(t, root, filepath.Join(root, "docker.log"))
+	for _, image := range []string{"golang:1.27.3-bookworm", "missing"} {
+		cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), image)
+		assert.Equal(t, 2, exitCode(t, cmd.Run()), out.String())
+	}
+}
+
+// A work directory is removed only while it is the one created: not after its token changed,
+// and not after it was replaced by another directory at the same path.
+func TestWorkDirRemovedOnlyOnMatch(t *testing.T) {
+	prog := `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+def verdict(w):
+    try:
+        w.remove(); return "removed"
+    except ms.Refused:
+        return "refused"
+w = ms.WorkDir(root); (w.path / ms.OWNER_FILE).write_text("someone else"); print(verdict(w), w.path.exists())
+w = ms.WorkDir(root); os.rename(w.path, str(w.path) + ".moved"); w.path.mkdir(); (w.path / ms.OWNER_FILE).write_text(w.token); print(verdict(w), w.path.exists())
+w = ms.WorkDir(root); print(verdict(w), w.path.exists())
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "refused True\nrefused True\nremoved False\n", string(out))
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # TXE-7549 step 2: the alarm fires when the sandbox boundary is gone. Runs ONLY inside the outer
-# container fixture-demo.sh starts (no network, no capabilities, no mount but a read-only copy of
+# container fixture-demo.py starts (no network, no capabilities, no mount but a read-only copy of
 # txe/mutate at /runner, no Docker socket, no credentials, no variable from the Mac). Inside it,
 # /fakehost plays the host: its fake GOMODCACHE and GOCACHE are the "shared" caches. The runner
 # is given testdata/leaky-docker.py as its docker, which runs the mutant with the caller's
