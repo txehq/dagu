@@ -103,8 +103,12 @@ cmd_init() {
   if [ -e "$RIG" ] && [ -n "$(ls -A "$RIG" 2>/dev/null)" ]; then die "init: $RIG exists and is not empty"; fi
   pf pins --manifest "$manifest"
   for b in "$hub" "$worker" "$reviewer"; do
-    grep -q "\"path\": \"$b\"" "$manifest" || die "init: $b is not a binary the manifest pins"
+    "$PY" -I -c 'import json,sys; m=json.load(open(sys.argv[1])); sys.exit(0 if any(v.get("path") == sys.argv[2] for v in m.get("binaries", {}).values()) else 1)' \
+      "$manifest" "$b" || die "init: $b is not a binary the manifest pins"
   done
+  # TXE-7529: R must render the pinned (TXE-7514) prompt and C must not, so the
+  # reviewer the agent reads is the one R installs.
+  pf prompt --manifest "$manifest" --reviewer-bin "$reviewer"
   pf ports --free "$PORT_FRONT,$PORT_FRONT_RELAY,$PORT_COORD"
   mkdir -p "$RIG"/{hub,hub-userhome,worker-home,worker-userhome,machine-home/bin,machine-userhome,reviewer-state,control,logs,job,evidence}
   chmod 700 "$RIG/machine-home"
@@ -183,7 +187,7 @@ cmd_up() {
   json '"republish_sealed" in json.dumps(d)' < "$RIG/evidence/installation.json" | grep -qx True \
     || die "the test installation does not list republish_sealed"
 
-  local owner machine key
+  local owner machine
   owner=$(bash "$REPO/txe/worker/mint-id.sh" own); machine=$(bash "$REPO/txe/worker/mint-id.sh" mch)
   printf 'OWNER=%s\nMACHINE=%s\n' "$owner" "$machine" > "$RIG/ids.env"
   header_file "$RIG/apikey.json" key "$RIG/control/key.hdr"
@@ -194,12 +198,13 @@ cmd_up() {
     -d "{\"machine_id\":\"$machine\",\"owner_id\":\"$owner\",\"display_name\":\"rig-7516-mac\",\"actor\":$act}" >/dev/null
   printf '{"schema":1,"machine_id":"%s","owner_id":"%s","display_name":"rig-7516-mac"}' "$machine" "$owner" > "$RIG/machine-home/machine.json"
   chmod 600 "$RIG/machine-home/machine.json"
-  # Known residual: `dagu context add` takes the key only as a flag or from a
-  # terminal prompt, so this one sub-second call carries the synthetic,
-  # loopback-only key in its argv (README "Credentials").
-  key=$(json 'd["key"]' < "$RIG/apikey.json")
-  cli context add txe --server="$API_RELAY" --api-key="$key" --dagu-home="$RIG/machine-home/client" >/dev/null 2>&1 \
-    || die "context add failed"
+  # `dagu context add` takes its key from a flag (argv) or, on a terminal, from
+  # its own no-echo prompt. ttykey.py answers that prompt through a pty it owns,
+  # from the 0600 apikey.json, with echo off and checked (TXE-7529).
+  "$PY" -I "$HERE/ttykey.py" --key-json "$RIG/apikey.json" --field key --log "$RIG/logs/context-add.log" -- \
+    /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$RIG/machine-userhome" TXE_DAGU_HOME="$RIG/machine-home" \
+    TXE_SESSION=rig-7516 "$RIG/machine-home/bin/dagu" context add txe --server="$API_RELAY" --dagu-home="$RIG/machine-home/client" \
+    > "$RIG/evidence/context-add.json" || die "context add failed (evidence/context-add.json, logs/context-add.log)"
 
   procs start --pidfile "$RIG/control/relay.pid" --log "$RIG/logs/relay.err" -- \
     "$PY" -I "$HERE/relay.py" serve --listen "$RELAY_COORD=[::1]:$PORT_COORD" \

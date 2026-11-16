@@ -68,13 +68,22 @@ func newFakeRig(t *testing.T) fakeRig {
 		}
 	}
 	f.manifest = filepath.Join(dir, "manifest.json")
-	args := []string{"manifest", "--out", f.manifest, "--harness-dir", "."}
+	prompt, _ := json.Marshal(passingPrompt(sha(t, f.reviewer)))
+	args := []string{"manifest", "--out", f.manifest, "--harness-dir", ".",
+		"--extra", "prompt=" + write(t, filepath.Join(dir, "records", "prompt.json"), string(prompt))}
 	for _, r := range records {
 		args = append(args, "--record", r)
 	}
 	out, code := tool(t, "pin.py", args...)
 	require.Equal(t, 0, code, out)
 	return f
+}
+
+// passingPrompt is a pin.py prompt record for a reviewer binary with sha256 rsha.
+func passingPrompt(rsha string) map[string]any {
+	return map[string]any{"role": "prompt", "ok": true, "expected_rendered_sha256": "p-A",
+		"reviewer": map[string]any{"binary_sha256": rsha, "rendered_prompt_sha256": "p-A"},
+		"base":     map[string]any{"binary_sha256": "c", "rendered_prompt_sha256": "p-base"}}
 }
 
 func (f fakeRig) init(t *testing.T, override ...string) (string, int) {
@@ -252,7 +261,7 @@ func TestFixtureRunWaitsForItsGoMarker(t *testing.T) {
 // The runbook calls ./rig.sh and the tools directly, so each must keep its
 // executable bit in the repository.
 func TestEntryPointsAreExecutable(t *testing.T) {
-	for _, f := range []string{"rig.sh", "relay.py", "preflight.py", "procs.py", "pin.py", "check_seal.py", "check_proof.py", "actions.py", "fixture-run.sh"} {
+	for _, f := range []string{"rig.sh", "relay.py", "preflight.py", "procs.py", "pin.py", "check_seal.py", "check_proof.py", "actions.py", "ttykey.py", "fixture-run.sh"} {
 		info, err := os.Stat(f)
 		require.NoError(t, err)
 		assert.NotZero(t, info.Mode().Perm()&0o111, "%s is not executable", f)
@@ -262,4 +271,16 @@ func TestEntryPointsAreExecutable(t *testing.T) {
 	require.ErrorAs(t, err, &exit, string(out))
 	assert.Equal(t, 2, exit.ExitCode())
 	assert.Contains(t, string(out), "rig.sh init", "with no step, ./rig.sh prints its usage")
+}
+
+// TXE-7529: the API key reaches `dagu context add` only through ttykey.py's pty,
+// never as --api-key, and the shell never holds it in a variable.
+func TestRigEntersTheKeyThroughThePty(t *testing.T) {
+	src, err := os.ReadFile("rig.sh")
+	require.NoError(t, err)
+	text := string(src)
+	assert.NotContains(t, text, "--api-key")
+	assert.NotRegexp(t, `json 'd\["key"\]'`, text, "the key is never read into the shell")
+	add := regexp.MustCompile(`(?s)ttykey\.py" --key-json "\$RIG/apikey\.json" --field key [^\n]*\\\n[^\n]*\\\n[^\n]*context add txe `)
+	assert.Regexp(t, add, text, "context add runs under ttykey.py")
 }
