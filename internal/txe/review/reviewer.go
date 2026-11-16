@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	txepkg "github.com/dagucloud/dagu/v2/internal/txe/pkg"
 )
 
 const (
@@ -438,6 +440,7 @@ func (r *Reviewer) prepareClaimed(ctx context.Context, claim Claim, job Job) (Pa
 	if err != nil {
 		return Packet{}, fmt.Errorf("read runs: %w", err)
 	}
+	r.markSeals(job, runs)
 	decisions, err := r.Registry.DecisionsAfter(ctx, job.ID, cp.DecisionCursor)
 	if err != nil {
 		return Packet{}, fmt.Errorf("read decisions: %w", err)
@@ -1622,10 +1625,47 @@ func retriedExecution(params map[string]string) (e Execution, complete bool) {
 type SealReader interface {
 	// RetriedSeal returns nil when execution e of the run sealed the run's
 	// latest result and every sealed file still has the digest it was
-	// sealed with: the result a republish of e publishes. It returns
-	// ErrNotSealed when it did not, and any other error when that cannot
-	// be told.
-	RetriedSeal(jobID, runID string, e Execution) error
+	// sealed with: the result a republish of e publishes. files is then the
+	// number of files the seal recorded. It returns ErrNotSealed when it
+	// did not, and any other error when that cannot be told.
+	RetriedSeal(jobID, runID string, e Execution) (files int, err error)
+}
+
+// markSeals gives each run that did not succeed the marker of the result
+// its execution sealed on this machine and never published, when there is
+// one. Only the runs a packet can show are read. The marker is bound to the
+// execution the run's evidence is of, through the seal reader, and to the
+// job's current version: a run of another version, or one whose version or
+// snapshot is not known, is not read and carries none. A seal that is not
+// the run's latest, has changed since it was sealed, or cannot be read gives
+// none either; the review goes on without it.
+func (r *Reviewer) markSeals(job Job, runs []RunEvidence) {
+	for i := range runs[:min(len(runs), maxPacketRuns)] {
+		run := &runs[i]
+		run.Seal = nil
+		if r.Seals == nil || run.Status == statusSucceeded || published(*run) || !run.Execution().known() {
+			continue
+		}
+		if run.JobVersion <= 0 || run.JobVersion != job.Version || run.SpecSHA256 == "" || run.SpecSHA256 != job.DAGSpecSHA256 {
+			continue
+		}
+		files, err := r.Seals.RetriedSeal(job.ID, run.RunID, run.Execution())
+		if err != nil {
+			continue
+		}
+		run.Seal = &SealMarker{State: SealUnpublished, Execution: run.Execution().Ref(), JobVersion: run.JobVersion, Files: files}
+	}
+}
+
+// statusSucceeded is the status label of a run or step that succeeded.
+const statusSucceeded = "succeeded"
+
+// published reports whether the run's evidence shows its publish step
+// succeeded.
+func published(run RunEvidence) bool {
+	return slices.ContainsFunc(run.Steps, func(s StepEvidence) bool {
+		return s.Name == txepkg.PublishStepName && s.Status == statusSucceeded
+	})
 }
 
 // ErrNotSealed is returned by SealReader when an execution has no intact
@@ -1642,7 +1682,7 @@ func (r *Reviewer) republishable(ctx context.Context, jobID, runID string, e Exe
 	if r.Seals == nil {
 		return false, ""
 	}
-	switch err := r.Seals.RetriedSeal(jobID, runID, e); {
+	switch _, err := r.Seals.RetriedSeal(jobID, runID, e); {
 	case errors.Is(err, ErrNotSealed):
 		return false, ""
 	case err != nil:

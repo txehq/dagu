@@ -1357,6 +1357,70 @@ func TestRetryOfASealedExecutionIsARepublish(t *testing.T) {
 	}
 }
 
+// The packet tells the agent which failed run sealed its result on this
+// machine and never published it, with the execution and version the seal
+// is bound to and how many files it holds, and nothing else. A seal that
+// is another execution's, changed since it was sealed, missing or
+// unreadable, or of a run of another version, reads as no seal. The marker
+// proposes nothing: no proposal and no retry follow from it.
+func TestPacketMarksAnUnpublishedSeal(t *testing.T) {
+	sealedRef := review.ExecutionRef("att-1", "")
+	for name, c := range map[string]struct {
+		seals   review.SealReader
+		version int
+		spec    string
+		status  string
+		// published is a run whose publish step succeeded.
+		published bool
+		marked    bool
+	}{
+		"sealed and intact":     {seals: seals{sealedRef: nil}, marked: true},
+		"stale: another's seal": {seals: seals{sealedRef: fmt.Errorf("the latest sealed result is execution b's: %w", errors.New("not the retried seal"))}},
+		"mutated since sealed":  {seals: seals{sealedRef: errors.New("out.json changed after it was sealed")}},
+		"missing":               {seals: seals{}},
+		"no seal reader":        {},
+		"older version":         {seals: seals{sealedRef: nil}, version: 0, spec: "sha256:older"},
+		"version not known":     {seals: seals{sealedRef: nil}, version: -1},
+		"run succeeded":         {seals: seals{sealedRef: nil}, status: "succeeded"},
+		"publish succeeded":     {seals: seals{sealedRef: nil}, published: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			run := review.RunEvidence{RunID: "run-1", JobVersion: 1, Status: "failed", SpecSHA256: specDigest, AttemptID: "att-1",
+				Steps: []review.StepEvidence{{Name: "run", Status: "succeeded"}, {Name: "publish", Status: "failed"}}}
+			switch {
+			case c.spec != "":
+				run.JobVersion, run.SpecSHA256 = 2, c.spec
+			case c.version < 0:
+				run.JobVersion = 0
+			}
+			if c.status != "" {
+				run.Status = c.status
+			}
+			if c.published {
+				run.Steps[1].Status = "succeeded"
+			}
+			require.NoError(t, f.registry.AddRun(jobID, run))
+			r := f.reviewer("reviewer-a")
+			r.Seals = c.seals
+			prepared, err := r.Prepare(context.Background(), jobID)
+			require.NoError(t, err)
+			require.Len(t, prepared.Packet.NewRuns, 1)
+			got := prepared.Packet.NewRuns[0].Seal
+			raw, err := json.Marshal(prepared.Packet.NewRuns[0])
+			require.NoError(t, err)
+			if !c.marked {
+				assert.Nil(t, got)
+				assert.NotContains(t, string(raw), `"seal"`)
+				return
+			}
+			assert.Equal(t, &review.SealMarker{State: review.SealUnpublished, Execution: sealedRef, JobVersion: 1, Files: 1}, got)
+			assert.Contains(t, string(raw), `"seal":{"state":"sealed_unpublished","execution":"`+sealedRef+`","job_version":1,"files":1}`)
+			assert.Empty(t, f.state().Proposals[jobID], "the marker proposes nothing")
+		})
+	}
+}
+
 // The owner's retry of a republish sends only the publish step, after
 // checking again that the sealed result is still there and the service
 // still republishes; when either changed, nothing is sent and the job is
