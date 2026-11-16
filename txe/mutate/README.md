@@ -135,7 +135,14 @@ and process substitution, redirections, here-documents) and judges only what wou
   `$(...)` and backticks anywhere, an unquoted here-document's substitutions); and code for a
   non-shell interpreter (`python3 -c`, `node -e`, `perl -e`, a here-document on python3's
   stdin) that imports a mutant module, or names a mutant script or tool and calls something that
-  runs a file or a process (`runpy`, `exec`, `subprocess`, `os.system`, `require`, ...).
+  runs a file or a process (`runpy`, `exec`, `subprocess`, `os.system`, `require`, `load`, ...),
+  also when the mutant is one of the code's own arguments (`python3 -c '...' mutants.py`: the
+  guard does not follow data flow, so it errs toward refusing).
+- **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
+  `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
+  and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
+  command does not set (`/dev/fd/$N`, one opened by an earlier `exec 3<`, any `/proc` path) fails
+  closed, as does nesting deeper than the reader follows and any internal error.
 - **Allowed, because the words are only data:** grep and sed patterns, echo and printf
   arguments, `--body`/`--text`/`-m` messages, paths given to cat, ls or shasum, a here-document
   written to a file, comments, and interpreter code that only mentions the names (prints them,
