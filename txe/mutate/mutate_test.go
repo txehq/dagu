@@ -194,6 +194,11 @@ if "staysup" in image:
     # Exits as a client but leaves its container registered (still running) after a pass.
     print("ok")
     sys.exit(0)
+if "sparsecache" in image:
+    sp = os.path.join(mounts["/work"], "sandbox", "gocache", "sparse")
+    if not os.path.exists(sp):
+        with open(sp, "wb") as fh:
+            fh.truncate(64 << 20)  # 64 MiB apparent, nothing allocated
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -1180,7 +1185,7 @@ func TestWorkDirectoryDoesNotAccumulate(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(g.tree, "pad.bin"), pad, 0o644))
 	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1", "--no-warm-gocache")
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	assert.Contains(t, o.stderr, "the work directory is over 1 MiB")
+	assert.Contains(t, o.stderr, "the work directory would pass 1 MiB")
 	assert.Empty(t, dockerRuns(t, g.log))
 }
 
@@ -1362,4 +1367,14 @@ except ValueError as e:
 		assert.Equal(t, "True ['sh', 'check.sh']", l)
 	}
 	assert.Equal(t, "refused: unknown docker run option --brand-new-flag", lines[len(runs)])
+}
+
+// A sparse file is counted at the size a copy would take: a baseline that leaves a 64 MiB sparse
+// file in its build cache is stopped before the warm-cache copy writes it out in full.
+func TestSparseFileCountedAtCopySize(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "sparsecache", "--max-work-mib", "32")
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "before the warm build cache: the work directory would pass 32 MiB")
+	assert.NoFileExists(t, filepath.Join(o.report["workdir"].(string), "warm-gocache", "sparse"))
 }

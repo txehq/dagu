@@ -496,7 +496,9 @@ def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256) ->
                     st = entry.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                tally[0] += getattr(st, "st_blocks", 0) * 512
+                # A copy writes a sparse file's holes out in full: count what a copy would take.
+                allocated = getattr(st, "st_blocks", 0) * 512
+                tally[0] += max(allocated, st.st_size) if stat.S_ISREG(st.st_mode) else allocated
                 if stat.S_ISDIR(st.st_mode):
                     try:
                         sub = os.open(entry.name, flags, dir_fd=fd)
@@ -580,16 +582,23 @@ class Runner:
         self.containers: dict[str, tuple[Path, str]] = {}
         self.cleanup_log: list[str] = []
 
-    def room(self, what: str) -> None:
-        """Before copying anything more into the work directory: its total size stays under
-        --max-work-mib and the free space beside it over --min-free-mib, or the run stops."""
+    def room(self, what: str, sources: tuple[Path, ...] = ()) -> None:
+        """Before copying sources into the work directory: with the copy's full size added (sparse
+        files counted at their apparent size), the work directory stays under --max-work-mib and
+        the free space beside it over --min-free-mib, or the run stops."""
         used, _entries, problem = dir_usage(self.work.path, self.args.max_files * 4, 30.0)
         if problem:
             raise Stopped(f"before {what}: {problem}")
-        if used > self.args.max_work_mib * 2**20:
-            raise Stopped(f"before {what}: the work directory is over {self.args.max_work_mib} MiB")
-        if shutil.disk_usage(self.work.path).free < self.args.min_free_mib * 2**20:
-            raise Stopped(f"before {what}: free space is under {self.args.min_free_mib} MiB")
+        need = 0
+        for src in sources:
+            size, _n, problem = dir_usage(src, self.args.max_files, 30.0)
+            if problem:
+                raise Stopped(f"before {what}: {problem}")
+            need += size
+        if used + need > self.args.max_work_mib * 2**20:
+            raise Stopped(f"before {what}: the work directory would pass {self.args.max_work_mib} MiB")
+        if shutil.disk_usage(self.work.path).free - need < self.args.min_free_mib * 2**20:
+            raise Stopped(f"before {what}: free space would fall under {self.args.min_free_mib} MiB")
 
     def assert_stopped(self, result: "Result") -> None:
         """Before the host reads a run's directory: the run's container is gone, or exists and is
@@ -717,7 +726,8 @@ class Runner:
     def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
         before = self.watch.snapshot()
         self.remaining(label)  # the deadline is checked before the run's own copies start
-        self.room(label)
+        warm = self.work.path / "warm-gocache"
+        self.room(label, (pristine, warm) if self.args.warm_gocache and warm.is_dir() else (pristine,))
         d = self.prepare(label, pristine, mutant)
         name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
         # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
@@ -931,7 +941,6 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
         return EXIT_BASELINE
     if args.warm_gocache:
-        runner.room("the warm build cache")
         # The baseline's container wrote this tree: no symlink may lie on the path to it, and it
         # must resolve inside the baseline's own directory, or the host-side clone could read a
         # host directory into every later mutant's mount.
@@ -939,6 +948,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         cache = plain_target(Path(base.dir), "sandbox/gocache")
         if not cache.is_dir():
             raise Refused("the baseline left no build cache directory to warm from")
+        runner.room("the warm build cache", (cache,))
         clone_dir(cache, runner.work.path / "warm-gocache", runner.deadline)
     runner.discard(base)
 

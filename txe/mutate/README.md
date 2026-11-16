@@ -32,8 +32,9 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   quota-backed storage: the bounds detect and stop a writer, they cannot refuse a fast burst. Runs
   do not accumulate either: each run's directory is discarded once its result is recorded (its
   log is kept outside it), and before every copy into the work directory its total size is
-  checked against `--max-work-mib` (32768) and the free space beside it against `--min-free-mib`;
-  either failing stops the run (exit 6). GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
+  checked against `--max-work-mib` (32768) and the free space beside it against `--min-free-mib`,
+  with the copy's full size added first (a sparse file counts at its apparent size, which is what
+  a copy writes out); either failing stops the run (exit 6). GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
   XDG_CACHE_HOME and XDG_CONFIG_HOME point under `/work/sandbox`. HOME is never set, here or
   anywhere in the runner: the container keeps its image user's default. Every `docker run` has
   `--pull never`, and an image that is not present locally is refused: name it by its id. An
