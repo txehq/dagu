@@ -1330,3 +1330,36 @@ func TestStoppedCheckInsideDeadline(t *testing.T) {
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "whether baseline stopped")
 }
+
+// The step-2 leaky docker parses the exact argument list the runner emits (captured from a real
+// runner invocation against the fake docker), so a new runner flag cannot silently break step 2:
+// an option the stand-in does not know is an error, never skipped.
+func TestLeakyDockerParsesRunnerArgv(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	runs := dockerRuns(t, f.log)
+	require.NotEmpty(t, runs)
+	raw, err := json.Marshal(runs)
+	require.NoError(t, err)
+	prog := `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("leaky", sys.argv[1])
+leaky = importlib.util.module_from_spec(spec); spec.loader.exec_module(leaky)
+for argv in json.loads(sys.argv[2]):
+    work, cmd = leaky.parse_run(argv)
+    print(work.endswith("-baseline") or "-" in work, cmd)
+try:
+    leaky.parse_run(["run", "--brand-new-flag", "x", "image", "sh"])
+except ValueError as e:
+    print("refused:", e)
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, filepath.Join("testdata", "leaky-docker.py")), string(raw)).CombinedOutput()
+	require.NoError(t, err, string(out))
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	require.Len(t, lines, len(runs)+1)
+	for _, l := range lines[:len(runs)] {
+		assert.Equal(t, "True ['sh', 'check.sh']", l)
+	}
+	assert.Equal(t, "refused: unknown docker run option --brand-new-flag", lines[len(runs)])
+}
