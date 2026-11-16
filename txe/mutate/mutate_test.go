@@ -685,6 +685,12 @@ var guardRefused = []string{
 	"python3 < mutants.py 3< /dev/null",
 	"bash -s -- foo < run-mutations.sh",
 	"cat run-mutations.sh | bash -s x",
+	"python3 3< mutants.py <&3",
+	"python3 /dev/fd/3 3< mutants.py",
+	"bash /dev/fd/3 3<<'EOF'\npython3 mutants.py\nEOF",
+	"python3 00< mutants.py",
+	"node -e 'console.log(1)' -r ./mutants.js",
+	`ruby --some-new-option value -e 'system("python3 mutants.py")'`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -757,6 +763,9 @@ var guardAllowed = []string{
 	"python3 app.py 3< mutants.py",
 	"bash -s < setup.sh -- mutants.py",
 	"cat 3<<'EOF' notes\npython3 mutants.py\nEOF",
+	`ruby -Kue 'puts File.read("mutants.rb")'`,
+	"python3 /dev/fd/3 3< app.py 4< mutants.py",
+	"python3 - 3< mutants.py",
 	"perl -ne 'print if /mutants.py/' notes.md",
 	"git show origin/main:txe/mutate/guard-hook.py | head",
 	"git log --grep=mutate --oneline",

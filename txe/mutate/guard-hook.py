@@ -149,6 +149,32 @@ class Cmd:
         self.stdin_text: "str | None" = None  # a here-document's body or a here-string's word
         self.stdin_procsub: "list[Cmd] | None" = None  # `< <(cmd)`: stdin is that command's output
         self.piped_from: "Cmd | None" = None
+        self.fds: dict = {}  # other input descriptors: "3" -> ("file", path) | ("procsub", cmds) | ("text", s)
+
+    def source(self, key: str):
+        """What input descriptor `key` reads, as (kind, value), or None."""
+        if key != "0":
+            return self.fds.get(key)
+        if self.stdin_text is not None:
+            return ("text", self.stdin_text)
+        if self.stdin_procsub is not None:
+            return ("procsub", self.stdin_procsub)
+        return ("file", self.stdin_file) if self.stdin_file is not None else None
+
+    def set_source(self, key: str, src):
+        if key != "0":
+            if src is not None:
+                self.fds[key] = src
+            return
+        self.stdin_file = self.stdin_text = self.stdin_procsub = None
+        if src is not None:
+            kind, value = src
+            if kind == "text":
+                self.stdin_text = value
+            elif kind == "procsub":
+                self.stdin_procsub = value
+            else:
+                self.stdin_file = value
 
 
 REDIRECT = re.compile(r"(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)")
@@ -194,7 +220,7 @@ class Parser:
 
         def finish():
             nonlocal cur
-            if cur.words or cur.stdin_file is not None or cur.stdin_text is not None or cur.stdin_procsub is not None:
+            if cur.words or cur.source("0") is not None or cur.fds:
                 self.cmds.append(cur)
             done, cur = cur, Cmd()
             return done
@@ -254,26 +280,25 @@ class Parser:
         op = op.lstrip("0123456789")
         if op.startswith("{"):
             fd, op = op[:op.index("}") + 1], op[op.index("}") + 1:]
-        if fd not in ("", "0"):  # `3< file` or `{v}< file` changes another descriptor, not stdin
-            op = "fd" + op
+        # The descriptor this redirection sets: "0" for stdin (no number, or any spelling of 0).
+        key = "0" if fd == "" or (fd.isdigit() and int(fd) == 0) else (str(int(fd)) if fd.isdigit() else fd)
         while self.i < len(self.s) and self.s[self.i] in " \t":
             self.i += 1
         start = self.i
         target = self.word()
-        if op in ("<<", "<<-", "fd<<", "fd<<-"):
-            raw = self.s[start:self.i]  # a here-document on another descriptor: its body is still skipped
-            self.heredocs.append((cur if not op.startswith("fd") else Cmd(), target.text, op.endswith("-"),
-                                  any(q in raw for q in "'\"\\")))
+        if op in ("<<", "<<-"):
+            raw = self.s[start:self.i]
+            self.heredocs.append((cur, key, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
         elif op == "<<<":
-            cur.stdin_text = target.text
-        elif op == "<" and target.procsub is not None:
-            cur.stdin_procsub = target.procsub
-        elif op == "<":
-            cur.stdin_file = target.text
+            cur.set_source(key, ("text", target.text))
+        elif op in ("<", "<>"):
+            cur.set_source(key, ("procsub", target.procsub) if target.procsub is not None else ("file", target.text))
+        elif op == "<&" and target.text.isdigit():
+            cur.set_source(key, cur.source(str(int(target.text))))  # `<&3`: stdin is whatever fd 3 holds
 
     def read_heredocs(self):
         s = self.s
-        for cmd, delim, strip_tabs, quoted in self.heredocs:
+        for cmd, key, delim, strip_tabs, quoted in self.heredocs:
             lines = []
             while self.i < len(s):
                 nl = s.find("\n", self.i)
@@ -283,7 +308,7 @@ class Parser:
                     break
                 lines.append(line)
             body = "\n".join(lines)
-            cmd.stdin_text = body
+            cmd.set_source(key, ("text", body))
             if not quoted:  # an unquoted body expands $(...) and backticks: those commands run
                 p = Parser(body, self.depth)
                 p.dquote(None)
@@ -411,11 +436,30 @@ def names_mutant_script(words) -> bool:
     return any(mutant_named(w.text, need_ext=True) for w in words)
 
 
-def operand_is_mutant(w: Word) -> bool:
-    """The script an interpreter runs: a file, or the output of a process substitution."""
+FD_PATH = re.compile(r"^/(?:dev|proc/self)/fd/([0-9]+)$")
+
+
+def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) -> bool:
+    """The script an interpreter runs: a file, the output of a process substitution, or an input
+    descriptor of the command (`python3 /dev/fd/3 3< mutants.py`)."""
     if w.procsub is not None:
         return any(names_mutant_script(c.words) for c in w.procsub)
+    m = FD_PATH.match(w.text)
+    if m and cmd is not None:
+        return source_runs_mutant(cmd.source(str(int(m.group(1)))), shell, depth)
     return mutant_named(w.text)
+
+
+def source_runs_mutant(src, shell: bool, depth: int) -> bool:
+    """Whether an input source, read as a program, runs a mutant."""
+    if src is None:
+        return False
+    kind, value = src
+    if kind == "file":
+        return mutant_named(value)
+    if kind == "procsub":
+        return any(names_mutant_script(c.words) for c in value)
+    return refuses(value, depth + 1) if shell else code_runs_mutant(value)
 
 
 def code_runs_mutant(code: str) -> bool:
@@ -433,15 +477,11 @@ def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
     """An interpreter with no script reads its program from stdin."""
     if cmd is None:
         return False
-    if cmd.stdin_file is not None and mutant_named(cmd.stdin_file):
-        return True
     if cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words):
         return True
-    if cmd.stdin_procsub is not None and any(names_mutant_script(c.words) for c in cmd.stdin_procsub):
-        return True  # python3 < <(cat mutants.py)
-    if cmd.stdin_text is None:
-        return False
-    return refuses(cmd.stdin_text, depth + 1) if shell else code_runs_mutant(cmd.stdin_text)
+    # A file, a process substitution (python3 < <(cat mutants.py)), a here-document or here-string,
+    # or another descriptor duplicated onto stdin (`<&3`).
+    return source_runs_mutant(cmd.source("0"), shell, depth)
 
 
 class Judge:
@@ -571,7 +611,7 @@ class Judge:
         if from_stdin:  # bash -s [args]: the program is stdin, the words are its arguments
             return stdin_is_mutant(cmd, True, self.depth)
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j])
+            return operand_is_mutant(args[j], cmd, True, self.depth)
         return stdin_is_mutant(cmd, True, self.depth)
 
     def python(self, args: list, cmd) -> bool:
@@ -604,7 +644,7 @@ class Judge:
                     break
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j])
+            return operand_is_mutant(args[j], cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
@@ -619,6 +659,7 @@ class Judge:
             j = 1
         elif prog == "deno" and args and args[0].text == "eval":
             return code_at(1)
+        evaluated = False  # -e code runs instead of a script; preloads after it still load
         while j < len(args):
             t = args[j].text
             opt, eq, val = t.partition("=")
@@ -627,18 +668,27 @@ class Judge:
             if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
                 return True  # node -r ./mutants.js: a preloaded module runs
             if opt in ("--eval", "--print") and eq:
-                return code_runs_mutant(val)  # node --eval='...'
-            if t in ("-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader",
-                     "--experimental-loader", "-C", "--conditions"):
+                if code_runs_mutant(val):
+                    return True  # node --eval='...'
+                evaluated = True
+                j += 1
+            elif t in ("-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader",
+                       "--experimental-loader", "-C", "--conditions"):
                 if t in ("-e", "--eval", "-p", "--print"):
-                    return code_at(j + 1)
+                    if code_at(j + 1):
+                        return True
+                    evaluated = True
                 j += 2
             elif t.startswith("-") and t != "-":
                 j += 1
+            elif evaluated:
+                j += 1  # an argument of the -e code: keep looking for options after it
             else:
                 break
+        if evaluated:
+            return False
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j])
+            return operand_is_mutant(args[j], cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
     def perl_ruby(self, prog: str, args: list, cmd) -> bool:
@@ -700,7 +750,7 @@ class Judge:
         if code:
             return False  # -e code runs instead of a script; the words after it are its arguments
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j])
+            return operand_is_mutant(args[j], cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
     def go_run(self, args: list) -> bool:
