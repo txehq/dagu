@@ -133,10 +133,17 @@ The caller's environment reaches the build only through a fixed list of variable
 temporary files, the module proxy and the module cache. The list's names are recorded and
 its values are not.
 
-The shared module cache is not trusted as it stands, because `-mod=readonly` does not rehash
-extracted files. `go mod download` and `go mod verify` must report every module matching
-go.sum before the build and again after it. The build cache is never shared: each build
-gets a fresh private `GOCACHE`, so the first build compiles cold. The record names the clone's commit and tree, the command,
+Neither of the caller's caches is used by the build. A writer of a shared module cache
+could change an extracted file during the build and restore it afterwards, and a writer of
+a shared build cache could plant compiled packages. Each build gets a fresh private
+`GOCACHE` and a fresh private `GOMODCACHE`. The module cache is filled only through Go's
+download path, which checks every zip against go.sum. Modules come from the caller's module
+cache downloads, served as a read-only file proxy, then from the caller's proxy. Extracted
+files in the shared cache are never read, so the build works offline when the caller's cache
+already holds the downloads. `go mod verify` must report every module matching before and
+after the build. The first build compiles cold.
+
+The record names the clone's commit and tree, the command,
 the variables the command set, and the Go version. A narrowed build's record must come from
 this builder (`machineauth-controlled-clone-v1`), for the module `narrowedScopes` lists.
 

@@ -512,12 +512,14 @@ type sourceSpec struct {
 // passThrough are the only variables of the caller's environment the build
 // sees, besides what it sets: where tools, temporary files, the module cache
 // and the module proxy are, and what Windows needs to start a process. Their
-// values are not recorded (a proxy URL may carry a credential). The shared
-// module cache is not trusted as it stands: -mod=readonly does not rehash
-// extracted files, so the build runs go mod verify (every cached module
-// against go.sum) before and after it. The build cache is never shared: a
-// writer of a shared GOCACHE could plant compiled packages under the keys a
-// build looks up, so each build gets a fresh, private one.
+// values are not recorded (a proxy URL may carry a credential). Neither cache
+// is shared with the build. A writer of a shared GOCACHE could plant compiled
+// packages under the keys a build looks up, and a writer of a shared
+// GOMODCACHE could change an extracted file during the build and restore it
+// after (a check before and after sees nothing). Each build gets a fresh
+// private build cache and a fresh private module cache, filled through go's
+// own download path (moduleProxyChain), which checks every zip against go.sum;
+// go mod verify runs before and after as well.
 var passThrough = []string{"PATH", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PATHEXT", "COMSPEC",
 	"GOPATH", "GOMODCACHE", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
 
@@ -625,6 +627,41 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 	return buildFromSourceIn(spec, callerEnv())
 }
 
+// moduleProxyChain is where the build's private module cache is filled from:
+// the caller's module cache downloads (zips and go.mod files, served as a
+// file proxy, so nothing need be fetched again), then the caller's proxy. Go
+// checks every zip against go.sum as it lands in the private cache; the
+// shared cache's extracted files are never read, so a change made to them,
+// at any moment, cannot reach the build.
+func moduleProxyChain(base []string) string {
+	value := func(key string) string {
+		v := ""
+		for _, kv := range base {
+			if k, rest, ok := strings.Cut(kv, "="); ok && k == key {
+				v = rest
+			}
+		}
+		return v
+	}
+	callerProxy := value("GOPROXY")
+	if callerProxy == "" {
+		callerProxy = "https://proxy.golang.org,direct"
+	}
+	if shared := value("GOMODCACHE"); shared != "" {
+		return fileURL(filepath.Join(shared, "cache", "download")) + "," + callerProxy
+	}
+	return callerProxy
+}
+
+// fileURL is a file:// URL of an absolute path, on Unix and Windows.
+func fileURL(p string) string {
+	slashed := filepath.ToSlash(p)
+	if strings.HasPrefix(slashed, "/") {
+		return "file://" + slashed
+	}
+	return "file:///" + slashed
+}
+
 // modulesVerified is what go mod verify prints when every cached module of
 // the build matches go.sum.
 const modulesVerified = "all modules verified"
@@ -686,8 +723,12 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 	}
 	built := filepath.Join(work, "dagu")
 	set := []string{"GOOS=" + spec.GOOS, "GOARCH=" + spec.GOARCH, "CGO_ENABLED=0", "GOTOOLCHAIN=auto", "GOFLAGS=", "GOWORK=off", "GOENV=off",
-		"HOME=" + work, "GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOCACHE=" + filepath.Join(work, "gocache")}
+		"HOME=" + work, "GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOCACHE=" + filepath.Join(work, "gocache"),
+		"GOMODCACHE=" + filepath.Join(work, "gomodcache"), "GOPROXY=" + moduleProxyChain(base)}
 	env := append(slices.Clone(base), set...)
+	// The private module cache's files are read-only; go clears it before the
+	// work directory goes.
+	defer func() { _, _ = runIn(work, env, 5*time.Minute, "go", "clean", "-modcache") }()
 	// Every module the build needs is in the cache and matches go.sum: a
 	// download is checked as it lands, and verify rehashes what was there.
 	verify := func(when string) error {
@@ -743,8 +784,13 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 	}
 	recorded := slices.Clone(set)
 	for i, kv := range recorded {
-		if strings.HasPrefix(kv, "GOCACHE=") {
-			recorded[i] = "GOCACHE=<a fresh private cache of this build>"
+		switch strings.SplitN(kv, "=", 2)[0] {
+		case "GOCACHE":
+			recorded[i] = "GOCACHE=<a fresh private build cache of this build>"
+		case "GOMODCACHE":
+			recorded[i] = "GOMODCACHE=<a fresh private module cache of this build>"
+		case "GOPROXY":
+			recorded[i] = "GOPROXY=<the caller's module cache downloads as a file proxy, then the caller's proxy>"
 		}
 	}
 	scope := fmt.Sprintf("built by %s from a verified clean clone of tag %s at commit %s (tree %s) for %s/%s; it is NOT the installed binary of any machine (the live worker runs its own build on its own platform)",
