@@ -70,6 +70,9 @@ DOCKER_INFRA_EXITS = {125, 126, 127}
 EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_STOPPED = 0, 2, 3, 4, 5, 6
 OWNER_LABEL = "txe.mutate-sandboxed.owner"
 CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+# Every proxy variable Docker's automatic proxy configuration can set, cleared on the command line.
+CLEARED_PROXY_ENV = {k: "" for base in ("HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "NO_PROXY", "ALL_PROXY")
+                     for k in (base, base.lower())}
 # docker inspect's answer for a container that does not exist (wording varies by version). Only
 # this establishes absence; any other failure (daemon down, auth) establishes nothing.
 NO_SUCH = re.compile(r"no such (object|container)", re.I)
@@ -639,6 +642,10 @@ class Runner:
             "GOTOOLCHAIN": "local",
             "GOENV": "off",
             "MUTATE_SANDBOXED": "1",
+            # Docker adds proxy settings from the client's config.json to every container unless
+            # the command line sets them; set each to empty, so no proxy URL (or credential in
+            # one) reaches sandboxed code.
+            **CLEARED_PROXY_ENV,
         })
         argv = [self.docker, "run", "--rm", "--pull", "never", "--name", name, "--cidfile", str(cidfile),
                 "--label", f"{OWNER_LABEL}={self.work.token}", "--network", self.args.network,

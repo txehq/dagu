@@ -165,6 +165,7 @@ class Demo:
                 "--label", f"{ms.OWNER_LABEL}={self.root.token}", "--network", "none", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2",
                 "--mount", f"type=bind,source={runner_copy},target=/runner,readonly", "--workdir", "/",
+                *[x for k in sorted(ms.CLEARED_PROXY_ENV) for x in ("--env", f"{k}=")],
                 "--entrypoint", "", self.args.image, "bash", "/runner/negative-in-outer.sh"]
         self.outer = (name, cidfile)
         self.say("outer: " + " ".join(argv))

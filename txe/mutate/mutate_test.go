@@ -377,6 +377,9 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 		assert.Contains(t, joined, "--cpus 4")
 		assert.NotContains(t, joined, "--env HOME=", "HOME is never set")
 		assert.Contains(t, joined, "--env GOFLAGS=-modcacherw -count=1", "no cached test result is replayed")
+		for _, k := range []string{"HTTP_PROXY", "https_proxy", "NO_PROXY", "all_proxy", "FTP_PROXY"} {
+			assert.Contains(t, argv, k+"=", "docker's configured proxies are cleared: %s", k)
+		}
 		assert.Contains(t, joined, "--cap-drop ALL")
 		assert.Contains(t, joined, "--read-only")
 		assert.NotContains(t, joined, "docker.sock")
@@ -1043,6 +1046,10 @@ func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
 	// be refused before the mutant runs.
 	assert.Contains(t, string(leaky), `if "{{.State.Running}}" in args:`)
 	assert.Contains(t, string(leaky), `print("false")`)
+	// The outer container's launch clears docker's configured proxies too (it is not run here).
+	demoSrc, err := os.ReadFile("fixture-demo.py")
+	require.NoError(t, err)
+	assert.Contains(t, string(demoSrc), `for k in sorted(ms.CLEARED_PROXY_ENV) for x in ("--env", f"{k}=")`)
 	assert.Contains(t, string(outer), `>"$fake/caller-env.json"`)
 	assert.Contains(t, string(outer), `fake=/fakehost`)
 	for _, key := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY"} {
