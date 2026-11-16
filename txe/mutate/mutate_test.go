@@ -156,6 +156,12 @@ if "truncatelog" in image:
         if name.endswith(".log"):
             open(os.path.join(mounts["/work"], name), "w").close()
     time.sleep(60)
+if "burst" in image:
+    # Writes past both bounds and exits at once, before any polling interval.
+    sys.stdout.buffer.write(b"z" * (3 << 20))
+    with open(os.path.join(mounts["/work"], "burst"), "wb") as fh:
+        fh.write(os.urandom(3 << 20))
+    sys.exit(0)
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -1048,6 +1054,8 @@ func TestWriteBoundsStopRun(t *testing.T) {
 		// The log is outside the run's mount and measured by the runner's own descriptor.
 		"output despite tamper": {"truncatelog", "--max-output-mib", "output over 1 MiB"},
 		"entries":               {"manyfiles", "--max-files", "run directory over 10 entries"},
+		// A burst written just before a normal exit is caught by the check before the exit is accepted.
+		"burst before exit": {"burst", "--max-output-mib", "output over 1 MiB"},
 		// An unreadable entry fails the measurement closed rather than being skipped.
 		"unreadable": {"lockdir", "--max-files", "unreadable entry in the run directory"},
 	}
@@ -1073,4 +1081,22 @@ func TestWriteBoundsStopRun(t *testing.T) {
 			assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
 		})
 	}
+}
+
+// Source preparation is inside the whole-run deadline: a tree too large to copy in time stops
+// the run (exit 6) without starting a container, close to the deadline.
+func TestTreeCopyInsideDeadline(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	big := filepath.Join(f.tree, "big")
+	require.NoError(t, os.MkdirAll(big, 0o755))
+	for i := range 20000 {
+		require.NoError(t, os.WriteFile(filepath.Join(big, fmt.Sprintf("f%05d", i)), nil, 0o644))
+	}
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--deadline", "3")
+	elapsed := time.Since(start)
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "whole-run deadline passed while")
+	assert.Less(t, elapsed, 8*time.Second)
+	assert.Empty(t, dockerRuns(t, f.log))
 }

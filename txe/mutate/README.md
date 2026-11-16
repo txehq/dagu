@@ -27,8 +27,9 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   run whose captured output passes `--max-output-mib` (64), whose own directory (its only writable
   host path) passes `--max-disk-mib` (16384), or that leaves less than `--min-free-mib` (2048)
   free beside the work directory is stopped as ERROR and its container removed. The size checks
-  poll (output every second, the directory every 5 s), so a run can overshoot a bound by what it
-  writes in that interval. GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
+  poll (output every second, the directory every 5 s, and both once more before a normal exit is
+  accepted), so a run can overshoot a bound by what it writes in that interval. `/work` is not
+  quota-backed storage: the bounds detect and stop a writer, they cannot refuse a fast burst. GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
   XDG_CACHE_HOME and XDG_CONFIG_HOME point under `/work/sandbox`. HOME is never set, here or
   anywhere in the runner: the container keeps its image user's default. Every `docker run` has
   `--pull never`, and an image that is not present locally is refused: name it by its id. A mount

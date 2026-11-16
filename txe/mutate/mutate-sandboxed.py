@@ -305,18 +305,33 @@ class WorkDir:
         shutil.rmtree(self.path)
 
 
-def copy_tree(src: Path, dst: Path, excludes: tuple[str, ...]) -> None:
+def check_deadline(deadline: float | None, what: str) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise Stopped(f"the whole-run deadline passed while {what}")
+
+
+def checked_copy(deadline: float | None, what: str):
+    """A shutil copy function that stops the copy at the deadline, file by file."""
+    def copy(s, d):
+        check_deadline(deadline, what)
+        return shutil.copy2(s, d)
+    return copy
+
+
+def copy_tree(src: Path, dst: Path, excludes: tuple[str, ...], deadline: float | None = None) -> None:
     """Copy the tree, keeping symlinks as links, and refuse any link that leads outside the copy.
 
     A link that resolves outside the copy (an absolute link into the live tree, say) would let a
     host-side step such as `go mod download` updating go.sum write through it into live files.
     Inside the container such a link dangles; on the host it is a hole, so it is refused."""
     def ignore(_d, names):
+        check_deadline(deadline, "copying the tree")
         return [n for n in names if n in excludes]
 
-    shutil.copytree(src, dst, symlinks=True, ignore=ignore)
+    shutil.copytree(src, dst, symlinks=True, ignore=ignore, copy_function=checked_copy(deadline, "copying the tree"))
     top = real(dst)
     for d, dirs, files in os.walk(dst):
+        check_deadline(deadline, "checking the copy's symlinks")
         for n in dirs + files:
             p = Path(d) / n
             if p.is_symlink() and not within(real(p), top):
@@ -324,13 +339,20 @@ def copy_tree(src: Path, dst: Path, excludes: tuple[str, ...]) -> None:
                               "a host-side step could write through it")
 
 
-def clone_dir(src: Path, dst: Path) -> None:
-    """Copy src to dst, with copy-on-write clones on APFS when cp supports them."""
-    if sys.platform == "darwin" and subprocess.run(["cp", "-cR", str(src), str(dst)], capture_output=True).returncode == 0:
-        return
+def clone_dir(src: Path, dst: Path, deadline: float | None = None) -> None:
+    """Copy src to dst, with copy-on-write clones on APFS when cp supports them, inside the
+    deadline."""
+    check_deadline(deadline, f"copying {src.name}")
+    if sys.platform == "darwin":
+        limit = None if deadline is None else max(0.1, deadline - time.monotonic())
+        try:
+            if subprocess.run(["cp", "-cR", str(src), str(dst)], capture_output=True, timeout=limit).returncode == 0:
+                return
+        except subprocess.TimeoutExpired as e:
+            raise Stopped(f"the whole-run deadline passed while copying {src.name}") from e
     if dst.exists():
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, symlinks=True)
+    shutil.copytree(src, dst, symlinks=True, copy_function=checked_copy(deadline, f"copying {src.name}"))
 
 
 # ---------------------------------------------------------------- host go facts
@@ -504,7 +526,7 @@ class Runner:
         self.seq += 1
         d = self.work.path / f"{self.seq:03d}-{''.join(c if c.isalnum() else '-' for c in label)[:40]}"
         d.mkdir()
-        clone_dir(pristine, d / "src")
+        clone_dir(pristine, d / "src", self.deadline)
         if mutant:
             apply_mutant(d / "src", mutant)
         sb = d / "sandbox"
@@ -513,7 +535,7 @@ class Runner:
         warm = self.work.path / "warm-gocache"
         if self.args.warm_gocache and warm.is_dir():
             shutil.rmtree(sb / "gocache")
-            clone_dir(warm, sb / "gocache")
+            clone_dir(warm, sb / "gocache", self.deadline)
         return d
 
     def docker_argv(self, d: Path, name: str, cidfile: Path) -> list[str]:
@@ -547,6 +569,7 @@ class Runner:
 
     def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
         before = self.watch.snapshot()
+        self.remaining(label)  # the deadline is checked before the run's own copies start
         d = self.prepare(label, pristine, mutant)
         name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
         # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
@@ -603,6 +626,21 @@ class Runner:
     def docker_env(self) -> dict[str, str]:
         return docker_client_env()
 
+    def over_output(self, log) -> str | None:
+        if os.fstat(log.fileno()).st_size > self.args.max_output_mib * 2**20:
+            return f"output over {self.args.max_output_mib} MiB"
+        return None
+
+    def over_disk(self, d: Path) -> str | None:
+        used, _entries, problem = dir_usage(d, self.args.max_files, 10.0)
+        if problem:
+            return problem
+        if used > self.args.max_disk_mib * 2**20:
+            return f"run directory over {self.args.max_disk_mib} MiB"
+        if shutil.disk_usage(d).free < self.args.min_free_mib * 2**20:
+            return f"free space under {self.args.min_free_mib} MiB"
+        return None
+
     def watch_run(self, proc: subprocess.Popen, d: Path, log, start: float, limit: float) -> int | None:
         """Wait for the docker client, bounding what the run may consume on the host: its time,
         its captured output, the size of its own directory (the only host path it can write),
@@ -611,23 +649,22 @@ class Runner:
         last_size_check = 0.0
         while True:
             try:
-                return proc.wait(timeout=1.0)
+                code = proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
-                pass
+                code = None
+            if code is not None:
+                # A run that wrote past a bound just before exiting is still over it: check once
+                # more before accepting the exit.
+                self.overrun = self.over_output(log) or self.over_disk(d)
+                return None if self.overrun else code
             now = time.monotonic()
             if now - start >= limit:
                 self.overrun = "time"
-            elif os.fstat(log.fileno()).st_size > self.args.max_output_mib * 2**20:
-                self.overrun = f"output over {self.args.max_output_mib} MiB"
-            elif now - last_size_check >= 5.0:
-                last_size_check = now
-                used, _entries, problem = dir_usage(d, self.args.max_files, 10.0)
-                if problem:
-                    self.overrun = problem
-                elif used > self.args.max_disk_mib * 2**20:
-                    self.overrun = f"run directory over {self.args.max_disk_mib} MiB"
-                elif shutil.disk_usage(d).free < self.args.min_free_mib * 2**20:
-                    self.overrun = f"free space under {self.args.min_free_mib} MiB"
+            else:
+                self.overrun = self.over_output(log)
+                if not self.overrun and now - last_size_check >= 5.0:
+                    last_size_check = now
+                    self.overrun = self.over_disk(d)
             if self.overrun:
                 proc.kill()
                 proc.wait()
@@ -742,7 +779,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
         return EXIT_BASELINE
     if args.warm_gocache:
-        clone_dir(Path(base.dir) / "sandbox" / "gocache", runner.work.path / "warm-gocache")
+        clone_dir(Path(base.dir) / "sandbox" / "gocache", runner.work.path / "warm-gocache", runner.deadline)
 
     findings = []
     for mu in mutants:
@@ -827,7 +864,7 @@ def main(argv: list[str]) -> int:
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
         runner = Runner(args, watch, forbidden, work, args.docker, mutants)  # reads live targets first
         pristine = work.path / "pristine"
-        copy_tree(args.tree, pristine, tuple(args.exclude))
+        copy_tree(args.tree, pristine, tuple(args.exclude), runner.deadline)
         if not args.no_seed:
             seed_modules(args, work, pristine, modcache, go_facts, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
