@@ -14,6 +14,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/ir"
+	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -21,6 +22,7 @@ import (
 // start only when it admits them; other DAGs are unaffected.
 type RunAdmitter interface {
 	AdmitRun(ctx context.Context, dagName, specSHA256 string) (registry.Admission, error)
+	AdmitQueuedRetry(ctx context.Context, jobID string, q registry.QueuedRetry) (registry.Admission, error)
 	RecordDroppedRun(ctx context.Context, jobID, runID string, adm registry.Admission) error
 	ReconcileExpired(ctx context.Context) ([]string, error)
 	ReconcileEffects(ctx context.Context) error
@@ -96,6 +98,13 @@ func (d *queueDispatcher) admitQueuedRun(
 		logger.Error(ctx, "Failed to check TXE job admission; leaving queued run pending", tag.Error(err))
 		return false
 	}
+	if adm.Admit && status.TriggerType == ir.TriggerTypeRetry {
+		adm, err = d.admitQueuedRetry(ctx, adm.JobID, ir.NewDAGRunRef(name, runRef.ID), status)
+		if err != nil {
+			logger.Error(ctx, "Failed to check TXE retry request; leaving queued run pending", tag.Error(err))
+			return false
+		}
+	}
 	if adm.Admit && d.dagExecutor != nil && !d.dagExecutor.IsDistributed(dag) {
 		// Registered jobs run only through their machine's worker, where the
 		// claim is admitted and recorded against retirement.
@@ -115,6 +124,58 @@ func (d *queueDispatcher) admitQueuedRun(
 	logger.Info(ctx, "Dropped queued run refused by TXE registry",
 		slog.String("job_id", adm.JobID), slog.String("code", string(adm.Code)))
 	return false
+}
+
+// admitQueuedRetry decides a queued retry of a registered job's run, which
+// would run one of its executions again. It starts only for the retry
+// request the hub recorded when it admitted a retry made for a person's
+// approved dagu.retry_run decision (TXE-7517): a retry queued without one,
+// such as by the local CLI, or with one that was not made for this run's
+// retried execution, is refused. The request must name an execution of the
+// run that the queued retry replaced and kept, and its ID must be the one the
+// hub derives from that execution and the action attempt
+// (ir.NewRetryRequest), so a request cannot be moved to another run or
+// execution. The registry then binds that request to its action now, at
+// dispatch, as the hub binds it at admission (registry.AdmitQueuedRetry):
+// the action, attempt, version, run and execution, a grant that is still
+// live, and the rerun intent.
+//
+// Trust boundary: this binds what a supported command can queue. It does not
+// defend against anyone who can write the data dir, who can edit the
+// registry and the run's status alike, or run arbitrary code on the host.
+func (d *queueDispatcher) admitQueuedRetry(ctx context.Context, jobID string, run ir.DAGRunRef, status *ir.DAGRunStatus) (registry.Admission, error) {
+	request := status.RetryRequest
+	if request == nil {
+		return registry.Admission{JobID: jobID, Code: registry.AdmitRetryUnbound,
+			Reason: "a retry of a registered job's run needs the retry request of an approved decision; retry it from the job's TXE controls"}, nil
+	}
+	mismatch := func(reason string) (registry.Admission, error) {
+		return registry.Admission{JobID: jobID, Code: registry.AdmitRetryMismatch, Reason: reason}, nil
+	}
+	if d.dagRunRepository == nil {
+		return registry.Admission{}, errors.New("no DAG-run repository to read the retried execution from")
+	}
+	retained, err := d.dagRunRepository.ListRetainedExecutions(ctx, run)
+	if err != nil {
+		return registry.Admission{}, fmt.Errorf("list retained executions: %w", err)
+	}
+	var retried *persis.RetainedExecution
+	for i := range retained {
+		if retained[i].Execution == request.RetryOf && retained[i].AttemptID == status.AttemptID {
+			retried = &retained[i]
+			break
+		}
+	}
+	if retried == nil {
+		return mismatch(fmt.Sprintf("retry request %s names no execution of run %s this retry replaced", request.ID, run.ID))
+	}
+	derived, err := ir.NewRetryRequest(run, retried.AttemptID, retried.QueuedAt, request.ActionID, request.ActionAttempt, request.BindingDigest)
+	if err != nil || derived.ID != request.ID || derived.RetryOf != request.RetryOf {
+		return mismatch(fmt.Sprintf("retry request %s was not made for execution %s of run %s", request.ID, request.RetryOf, run.ID))
+	}
+	return d.runAdmitter.AdmitQueuedRetry(ctx, jobID, registry.QueuedRetry{
+		RunID: run.ID, AttemptID: retried.AttemptID, QueuedAt: retried.QueuedAt, Request: *request,
+	})
 }
 
 // startTxeReconciler keeps the registry and Dagu converged: it indexes the
