@@ -26,6 +26,7 @@ func joinLines(l lang, phys []string) []logical {
 	var cur strings.Builder
 	start := 0
 	depth := 0
+	var py pyScanner
 	for i, p := range phys {
 		if cur.Len() == 0 {
 			start = i + 1
@@ -51,8 +52,8 @@ func joinLines(l lang, phys []string) []logical {
 			cont = true
 		}
 		if l == langPython {
-			depth += bracketDepth(stripComment(text))
-			if depth > 0 {
+			depth += py.depth(text)
+			if depth > 0 || py.inTriple() {
 				cont = true
 			} else {
 				depth = 0
@@ -69,6 +70,57 @@ func joinLines(l lang, phys []string) []logical {
 		out = append(out, logical{line: start, text: cur.String()})
 	}
 	return out
+}
+
+// pyScanner tracks Python string state across physical lines, so a bracket
+// or apostrophe inside a string or docstring ("bazel.yml's (") neither opens
+// a quote nor continues a line. Shell quoting rules do not apply to Python: a
+// backtick is an ordinary character, and a triple-quoted string spans lines.
+type pyScanner struct {
+	quote  byte // the open string's quote character, or 0
+	triple bool // the open string is triple-quoted
+}
+
+func (p *pyScanner) inTriple() bool { return p.quote != 0 && p.triple }
+
+// depth returns the net count of opening brackets outside strings and
+// comments on one physical line, carrying an open triple-quoted string to
+// the next line. A single-quoted string ends at the end of its line.
+func (p *pyScanner) depth(s string) int {
+	d := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if p.quote != 0 {
+			switch {
+			case c == '\\':
+				i++
+			case c == p.quote && !p.triple:
+				p.quote = 0
+			case c == p.quote && strings.HasPrefix(s[i:], strings.Repeat(string(c), 3)):
+				p.quote, p.triple = 0, false
+				i += 2
+			}
+			continue
+		}
+		switch c {
+		case '#':
+			return d
+		case '\'', '"':
+			p.quote = c
+			p.triple = strings.HasPrefix(s[i:], strings.Repeat(string(c), 3))
+			if p.triple {
+				i += 2
+			}
+		case '(', '[', '{':
+			d++
+		case ')', ']', '}':
+			d--
+		}
+	}
+	if !p.triple {
+		p.quote = 0
+	}
+	return d
 }
 
 func isCommentLine(s string) bool {
@@ -105,26 +157,6 @@ func (z *quoter) step(s string, i int) (int, bool) {
 		return i + 1, false
 	}
 	return i + 1, true
-}
-
-// bracketDepth is the net count of opening brackets outside quotes.
-func bracketDepth(s string) int {
-	d := 0
-	var z quoter
-	for i := 0; i < len(s); {
-		c := s[i]
-		next, plain := z.step(s, i)
-		if plain {
-			switch c {
-			case '(', '[', '{':
-				d++
-			case ')', ']', '}':
-				d--
-			}
-		}
-		i = next
-	}
-	return d
 }
 
 // stripComment drops a # comment that starts outside quotes, at the start of
@@ -226,7 +258,7 @@ var (
 	psRefRe    = regexp.MustCompile(`\$([A-Za-z_]\w*)\b(?::)?`)
 	pyRefRe    = regexp.MustCompile(`\b([A-Za-z_]\w*)\b`)
 
-	goEnvRe     = regexp.MustCompile(`(^|[^\w.-])go\s+env\b`)
+	goEnvRe     = regexp.MustCompile(`(^|[^\w.-])go(?:\s+-{1,2}C(?:\s*=\s*\S*|\s+\S+))?\s+env\b`)
 	tildeRe     = regexp.MustCompile(`(^|[\s=:"'(])~(/|\\|[\s"')]|$)`)
 	psSourceRe  = regexp.MustCompile(`(?i)\$env:\w+|\[(system\.)?environment\]::(GetEnvironmentVariable|GetFolderPath|ExpandEnvironmentVariables)|GetTempPath|\$HOME\b`)
 	pySourceRe  = regexp.MustCompile(`\bos\.environ\b|\bgetenv\s*\(|\benviron\.get\b|\bexpanduser\s*\(|\bexpandvars\s*\(|\bPath\.home\s*\(|\bgettempdir\s*\(|\btempfile\.tempdir\b`)

@@ -29,3 +29,4 @@ go clean -modcache="false"
 go clean -testcache; echo -cache
 echo "go clean with -modcache empties the shared cache"
 go clean -n ./...
+go -C ./sub clean -testcache

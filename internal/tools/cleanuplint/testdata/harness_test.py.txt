@@ -23,3 +23,20 @@ tight=os.environ["GOCACHE"]
 shutil.rmtree(tight)  # want:env-path-delete
 fallback = os.environ.get("GOCACHE") or tempfile.mkdtemp()
 shutil.rmtree(fallback)  # want:env-path-delete
+
+
+def docstring_with_apostrophe_and_bracket():
+    """Prose in a docstring.
+
+    An apostrophe or bracket in prose (bazel.yml's `bazel` job
+    does not continue the line or open a quote.
+    """
+    scratch = tempfile.mkdtemp()
+    shutil.rmtree(scratch)
+    shutil.rmtree(os.environ["HOME"])  # want:env-path-delete
+
+
+SCRIPT = f"""#!/bin/sh
+echo '(' it's text
+"""
+shutil.rmtree(os.getenv("GOMODCACHE"))  # want:env-path-delete
