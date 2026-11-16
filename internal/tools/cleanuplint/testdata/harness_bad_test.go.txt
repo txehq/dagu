@@ -12,6 +12,8 @@ import (
 
 var sharedCache = os.Getenv("GOMODCACHE")
 
+var modcacheArgs = []string{"clean", "-modcache"} // want:go-clean-cache
+
 type rig struct{ cache string }
 
 func runIn(env []string, name string, args ...string) {}
@@ -24,6 +26,16 @@ func TestPlanted(t *testing.T) {
 	runIn(nil, "go", "clean", "-modcache") // want:go-clean-cache
 	argv := append([]string{"clean"}, "-cache") // want:go-clean-cache
 	_ = argv
+	cleanArgs := []string{"clean"}
+	cleanArgs = append(cleanArgs, "-modcache")
+	_ = exec.Command("go", cleanArgs...).Run() // want:go-clean-cache
+	flag := "-fuzzcache"
+	cmd := exec.Command("go", "clean", flag) // want:go-clean-cache
+	_ = cmd.Run()
+	_ = exec.Command("go", modcacheArgs...).Run() // want:go-clean-cache
+	base := os.Getenv("XDG_CACHE_HOME")
+	goBuild := filepath.Join(base, "go-build")
+	_ = os.RemoveAll(goBuild) // want:env-path-delete
 	_ = os.RemoveAll(os.Getenv("GOCACHE")) // want:env-path-delete
 	home, _ := os.UserHomeDir()
 	_ = os.RemoveAll(filepath.Join(home, ".cache")) // want:env-path-delete

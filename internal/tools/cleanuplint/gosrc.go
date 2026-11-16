@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"path"
 	"slices"
 	"sort"
@@ -358,7 +359,7 @@ func (p *goPkg) isSource(gf *goFile, call *ast.CallExpr) bool {
 			}
 		}
 	}
-	lits := argvLiterals(call)
+	lits := argvLiterals(call, nil)
 	for i := 0; i+1 < len(lits); i++ {
 		if lits[i] == "go" && lits[i+1] == "env" {
 			return true
@@ -376,13 +377,29 @@ func (p *goPkg) isSource(gf *goFile, call *ast.CallExpr) bool {
 	return false
 }
 
+// litEnv holds, per variable name, the string literals assigned to it as a
+// value or an argv slice, so an argv built across variables is read whole:
+// args := []string{"clean"}; args = append(args, "-modcache").
+type litEnv map[string][]string
+
 // argvLiterals lists the string literals among a call's arguments in order,
-// looking into composite literals and append/slices calls that build an argv.
-func argvLiterals(call *ast.CallExpr) []string {
+// looking into composite literals, append/slices calls that build an argv,
+// and, with env, variables that hold literals.
+func argvLiterals(call *ast.CallExpr, env litEnv) []string {
+	var out []string
+	for _, a := range call.Args {
+		out = append(out, exprLits(a, env)...)
+	}
+	return out
+}
+
+func exprLits(e ast.Expr, env litEnv) []string {
 	var out []string
 	var walk func(e ast.Expr)
 	walk = func(e ast.Expr) {
 		switch e := e.(type) {
+		case *ast.Ident:
+			out = append(out, env[e.Name]...)
 		case *ast.BasicLit:
 			if e.Kind == token.STRING {
 				if s, err := strconv.Unquote(e.Value); err == nil {
@@ -403,10 +420,47 @@ func argvLiterals(call *ast.CallExpr) []string {
 			walk(e.X)
 		}
 	}
-	for _, a := range call.Args {
-		walk(a)
-	}
+	walk(e)
 	return out
+}
+
+// collectLits records the literals each name is assigned within n, in
+// source order, on top of env.
+func collectLits(n ast.Node, env litEnv) {
+	add := func(name string, rhs ast.Expr) {
+		if name == "" || name == "_" {
+			return
+		}
+		for _, s := range exprLits(rhs, env) {
+			if !slices.Contains(env[name], s) {
+				env[name] = append(env[name], s)
+			}
+		}
+	}
+	ast.Inspect(n, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if len(n.Lhs) == len(n.Rhs) {
+				for i, lhs := range n.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						add(id.Name, n.Rhs[i])
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			if len(n.Names) == len(n.Values) {
+				for i, id := range n.Names {
+					add(id.Name, n.Values[i])
+				}
+			}
+		}
+		return true
+	})
+}
+
+// cleanArgv reports literals that make a go clean of a whole cache.
+func cleanArgv(lits []string) bool {
+	return slices.Contains(lits, "clean") && slices.ContainsFunc(lits, func(s string) bool { return goCacheFlags[s] })
 }
 
 // argvBuilder reports a call that only assembles a slice: append, or
@@ -477,14 +531,32 @@ var rmRecursiveFlag = func(s string) bool { return rmRecRe.MatchString(s) }
 // a finding.
 func (p *goPkg) report() []Finding {
 	var out []Finding
+	pkgLits := litEnv{}
+	for _, gf := range p.files {
+		for _, d := range gf.file.Decls {
+			if gd, ok := d.(*ast.GenDecl); ok && gd.Tok != token.IMPORT {
+				collectLits(gd, pkgLits)
+			}
+		}
+	}
 	for _, gf := range p.files {
 		seenLit := map[*ast.BasicLit]bool{}
 		harness := isHarness(gf.src.rel)
 		var fd *ast.FuncDecl
+		var env litEnv
 		visit := func(n ast.Node) bool {
 			switch n := n.(type) {
+			case *ast.CompositeLit:
+				// An argv held in a variable: []string{"clean", "-modcache"}.
+				lits := stringLitNodes(n)
+				if len(lits) > 0 && !seenLit[lits[0]] && cleanArgv(exprLits(n, nil)) {
+					out = append(out, p.at(gf, n, ruleGoClean, goCleanMsg))
+					for _, s := range lits {
+						seenLit[s] = true
+					}
+				}
 			case *ast.CallExpr:
-				if f, ok := p.callFinding(gf, p.locals[fd], n, harness); ok {
+				if f, ok := p.callFinding(gf, p.locals[fd], env, n, harness); ok {
 					out = append(out, f)
 					for _, s := range stringLitNodes(n) {
 						seenLit[s] = true
@@ -516,6 +588,10 @@ func (p *goPkg) report() []Finding {
 		}
 		for _, d := range gf.file.Decls {
 			fd, _ = d.(*ast.FuncDecl)
+			env = maps.Clone(pkgLits)
+			if fd != nil {
+				collectLits(fd, env)
+			}
 			ast.Inspect(d, visit)
 		}
 	}
@@ -539,18 +615,14 @@ func (p *goPkg) at(gf *goFile, n ast.Node, rule, msg string) Finding {
 
 // callFinding judges one call: a go clean argv, os.RemoveAll of a tainted
 // path, or an argv running rm -r on a tainted path.
-func (p *goPkg) callFinding(gf *goFile, local taints, call *ast.CallExpr, harness bool) (Finding, bool) {
-	lits := argvLiterals(call)
-	hasClean, hasFlag := false, false
-	for _, s := range lits {
-		if s == "clean" {
-			hasClean = true
-		}
-		if goCacheFlags[s] {
-			hasFlag = true
-		}
+func (p *goPkg) callFinding(gf *goFile, local taints, env litEnv, call *ast.CallExpr, harness bool) (Finding, bool) {
+	if argvBuilder(call) {
+		// An append that only builds the argv is judged on its own
+		// literals; the call that runs the argv reads it through env.
+		env = nil
 	}
-	if hasClean && hasFlag {
+	lits := argvLiterals(call, env)
+	if cleanArgv(lits) {
 		return p.at(gf, call, ruleGoClean, goCleanMsg), true
 	}
 	if slices.ContainsFunc(lits, goCleanIn) {

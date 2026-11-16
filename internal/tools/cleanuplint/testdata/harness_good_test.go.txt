@@ -25,6 +25,8 @@ func TestCreated(t *testing.T) {
 	_ = os.Remove(os.Getenv("LOCK"))
 	_ = exec.Command("rm", "-f", home).Run()
 	_ = exec.Command("rm", "-rf", dir).Run()
+	testArgs := []string{"clean", "-testcache"}
+	_ = exec.Command("go", testArgs...).Run()
 	note := "it's; rm -rf ~" // data under test, never run
 	_ = note
 	//cleanuplint:allow the fixture shows a directive that carries a written reason
