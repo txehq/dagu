@@ -66,6 +66,7 @@ func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 import hashlib, json, os, subprocess, sys, time
 LOG = ` + fmt.Sprintf("%q", log) + `
 REG = LOG + ".containers"
+SECRET_DIR = os.path.join(os.path.dirname(LOG), "host-private")
 args = sys.argv[1:]
 with open(LOG, "a") as f:
     f.write(json.dumps(args) + "\n")
@@ -162,6 +163,12 @@ if "burst" in image:
     with open(os.path.join(mounts["/work"], "burst"), "wb") as fh:
         fh.write(os.urandom(3 << 20))
     sys.exit(0)
+if "swapcache" in image:
+    # The baseline replaces its build cache with a link to a host directory outside its mount.
+    import shutil as _sh
+    gc = os.path.join(mounts["/work"], "sandbox", "gocache")
+    _sh.rmtree(gc)
+    os.symlink(SECRET_DIR, gc)
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -1123,4 +1130,25 @@ func TestWorkDirectoryDoesNotAccumulate(t *testing.T) {
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "the work directory is over 1 MiB")
 	assert.Empty(t, dockerRuns(t, g.log))
+}
+
+// A baseline that swaps its build cache for a link to a host directory cannot get that directory
+// cloned into the warm cache: the clone is refused, and the host file never reaches a mount.
+func TestWarmCacheRefusesSwappedLink(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	secret := filepath.Join(f.root, "host-private")
+	require.NoError(t, os.MkdirAll(secret, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(secret, "private.txt"), []byte("host secret\n"), 0o600))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "swapcache")
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "runs through the symlink sandbox/gocache")
+	var leaked []string
+	_ = filepath.Walk(f.workRoot, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.Name() == "private.txt" {
+			leaked = append(leaked, p)
+		}
+		return nil
+	})
+	assert.Empty(t, leaked, "the host file was never copied into the work directory")
+	assert.Len(t, dockerRuns(t, f.log), 1, "no mutant ran after the refusal")
 }

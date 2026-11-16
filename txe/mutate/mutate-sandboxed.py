@@ -802,7 +802,13 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         return EXIT_BASELINE
     if args.warm_gocache:
         runner.room("the warm build cache")
-        clone_dir(Path(base.dir) / "sandbox" / "gocache", runner.work.path / "warm-gocache", runner.deadline)
+        # The baseline's container wrote this tree: no symlink may lie on the path to it, and it
+        # must resolve inside the baseline's own directory, or the host-side clone could read a
+        # host directory into every later mutant's mount.
+        cache = plain_target(Path(base.dir), "sandbox/gocache")
+        if not cache.is_dir():
+            raise Refused("the baseline left no build cache directory to warm from")
+        clone_dir(cache, runner.work.path / "warm-gocache", runner.deadline)
     runner.discard(base)
 
     findings = []
