@@ -108,13 +108,20 @@ DAGU_MACHINEAUTH_SOURCE_RECORD=/abs/source-w18.json go test ./internal/intg/mach
 
 The extraction follows the chain index → the platform's manifest (exactly one; the
 expected digest when given) → config (the platform, one diff id per layer) → every layer
-(blob digest and uncompressed diff id) → the file's last state across layers (whiteouts and
-opaque directories honoured, a link refused). It stops at the first link that does not hold
-and leaves no binary or record behind. It never overwrites. The source record checks the
-tag's commit with git, and checks the binary's build information for platform and
-`-X main.version`. Its scope says it is **not** the installed binary of any machine. An
-installed record (the worker kit's `dagu-<version>.json`) corroborates the tag, commit and
-version only, not the bytes.
+(blob digest, and uncompressed diff id over every byte including the tar's padding) → the
+file's last state across layers. Whiteouts of the file or of any directory above it, and
+opaque directories, delete what lower layers had. A layer's own file survives its own
+whiteouts. A link at the path, or a non-directory above it, is refused. The extraction
+stops at the first link that does not hold, leaves no binary or record behind, and never
+overwrites.
+
+The source record checks the tag's commit with git. It also checks the binary's own build
+information: platform, `-X main.version`, and a git stamp naming that commit with an
+unmodified tree. So the binary must be built from a clean clone of the tag, as the worker
+kit builds it; a `git archive` export or `-buildvcs=false` carries no stamp and is refused.
+Its scope says it is **not** the installed binary of any machine. An installed record (the
+worker kit's `dagu-<version>.json`) corroborates the tag, commit and version only, not the
+bytes.
 
 **Verify (`TestMachineAuthVerify`, the release gate's command):**
 

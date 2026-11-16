@@ -25,6 +25,9 @@ import (
 type ociFixture struct {
 	t      *testing.T
 	layout string
+	// pad, when set, pads each uncompressed tar with zeros to a multiple of
+	// pad bytes after its end-of-archive blocks, as some tar writers do.
+	pad int
 }
 
 type tarEntry struct {
@@ -59,6 +62,9 @@ func (f *ociFixture) layer(entries ...tarEntry) (digest, diffID string, size int
 			tf = tar.TypeReg
 		}
 		h := &tar.Header{Name: e.name, Mode: 0o755, Typeflag: tf, Size: int64(len(e.body))}
+		if tf == tar.TypeDir {
+			h.Mode, h.Size = 0o755, 0
+		}
 		if tf == tar.TypeSymlink {
 			h.Linkname, h.Size = "elsewhere", 0
 		}
@@ -69,6 +75,11 @@ func (f *ociFixture) layer(entries ...tarEntry) (digest, diffID string, size int
 		}
 	}
 	require.NoError(f.t, tw.Close())
+	if f.pad > 0 {
+		if rem := plain.Len() % f.pad; rem != 0 {
+			plain.Write(make([]byte, f.pad-rem))
+		}
+	}
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
 	_, err := zw.Write(plain.Bytes())
@@ -152,6 +163,34 @@ func TestExtractFollowsTheChainToTheBinary(t *testing.T) {
 	assert.Contains(t, err.Error(), "never overwrites")
 }
 
+// A tar padded past its end-of-archive blocks is read whole: both digests
+// cover every byte (the padding is part of the layer's diff id).
+func TestExtractReadsAPaddedLayer(t *testing.T) {
+	t.Parallel()
+	f := newOCIFixture(t)
+	f.pad = 10240
+	img := f.image([][]tarEntry{{{name: "usr/local/bin/dagu", body: "padded build"}}}, nil)
+	spec := f.spec(img)
+	rec, err := extractImageBinary(spec)
+	require.NoError(t, err)
+	assert.Equal(t, sha256Hex([]byte("padded build")), rec.BinarySHA256)
+}
+
+// A layer's whiteouts apply to the layers below it: a file the same layer
+// sets survives them, whatever the order of the tar's entries.
+func TestExtractKeepsAFileSetInTheWhiteoutsLayer(t *testing.T) {
+	t.Parallel()
+	f := newOCIFixture(t)
+	img := f.image([][]tarEntry{
+		{{name: "usr/local/bin/dagu", body: "old build"}},
+		{{name: "usr/local/bin/dagu", body: "new build"}, {name: "usr/local/.wh..wh..opq"}, {name: "usr/local/.wh.bin"}},
+	}, nil)
+	rec, err := extractImageBinary(f.spec(img))
+	require.NoError(t, err)
+	assert.Equal(t, sha256Hex([]byte("new build")), rec.BinarySHA256)
+	assert.Equal(t, img.layers[1], rec.Image.Layer)
+}
+
 // Each broken link stops the extraction, and nothing is left as a build.
 func TestExtractStopsOnAnyMismatch(t *testing.T) {
 	t.Parallel()
@@ -210,6 +249,14 @@ func TestExtractStopsOnAnyMismatch(t *testing.T) {
 			want: "no regular file at /usr/local/bin/dagu"},
 		"the binary's directory made opaque": {layers: [][]tarEntry{binary, {{name: "usr/local/.wh..wh..opq"}}},
 			want: "no regular file at /usr/local/bin/dagu"},
+		"the binary's directory removed by a whiteout": {layers: [][]tarEntry{binary, {{name: "usr/local/.wh.bin"}}},
+			want: "no regular file at /usr/local/bin/dagu"},
+		"a directory further up removed by a whiteout": {layers: [][]tarEntry{binary, {{name: ".wh.usr"}}},
+			want: "no regular file at /usr/local/bin/dagu"},
+		"a directory above the binary that is a link": {layers: [][]tarEntry{binary, {{name: "usr/local/bin", typeflag: tar.TypeSymlink}}},
+			want: "/usr/local/bin, above /usr/local/bin/dagu, is not a directory"},
+		"a whiteout of a sibling leaves the binary": {layers: [][]tarEntry{binary, {{name: "usr/local/bin/.wh.dagu-old"}, {name: "usr/local/.wh.binaries"}}},
+			want: ""},
 		"the binary is a link": {layers: [][]tarEntry{{{name: "usr/local/bin/dagu", typeflag: tar.TypeSymlink}}},
 			want: "is not a regular file"},
 		"no binary at all": {layers: [][]tarEntry{{{name: "usr/bin/other", body: "x"}}},
@@ -229,6 +276,10 @@ func TestExtractStopsOnAnyMismatch(t *testing.T) {
 				tc.spec(f, img, &spec)
 			}
 			_, err := extractImageBinary(spec)
+			if tc.want == "" {
+				require.NoError(t, err, "a whiteout of another path must not remove the binary")
+				return
+			}
 			require.Error(t, err, "the extraction went through")
 			assert.Contains(t, err.Error(), tc.want)
 			_, statErr := os.Stat(filepath.Join(spec.OutDir, "dagu"))
@@ -239,33 +290,55 @@ func TestExtractStopsOnAnyMismatch(t *testing.T) {
 	}
 }
 
-// buildVersioned builds a tiny program with -X main.version, as the worker
-// kit builds dagu, for the source record's tests.
-func buildVersioned(t *testing.T, version string) string {
+// buildVersioned builds a tiny program from a git checkout with
+// -X main.version, as the worker kit builds dagu from a clone of its tag, so
+// the binary carries its own VCS stamp. It returns the binary and the commit.
+// how: "clean", "modified" (a tracked file changed after the commit) or
+// "novcs" (-buildvcs=false).
+func buildVersioned(t *testing.T, version, how string) (string, string) {
 	t.Helper()
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		t.Skip("no go toolchain on PATH to build the fixture binary")
 	}
+	gitBin, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git on PATH to make the fixture checkout")
+	}
 	dir := t.TempDir()
+	run := func(name string, args ...string) string {
+		cmd := exec.Command(name, args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-mod=mod", "GOWORK=off",
+			"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s %v: %s", name, args, out)
+		return strings.TrimSpace(string(out))
+	}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module fixture\n\ngo 1.22\n"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nvar version = \"dev\"\n\nfunc main() { println(version) }\n"), 0o600))
-	out := filepath.Join(dir, "fixture")
+	run(gitBin, "init", "-q")
+	run(gitBin, "add", "-A")
+	run(gitBin, "-c", "user.name=fixture", "-c", "user.email=fixture@rig.test", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "fixture")
+	commit := run(gitBin, "rev-parse", "HEAD")
+	vcs := "-buildvcs=true"
+	switch how {
+	case "modified":
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nvar version = \"dev\"\n\nfunc main() { println(version, 1) }\n"), 0o600))
+	case "novcs":
+		vcs = "-buildvcs=false"
+	}
+	out := filepath.Join(t.TempDir(), "fixture")
 	if runtime.GOOS == "windows" {
 		out += ".exe"
 	}
-	cmd := exec.Command(goBin, "build", "-buildvcs=false", "-ldflags", "-X main.version="+version, "-o", out, ".")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOFLAGS=-mod=mod", "GOWORK=off")
-	raw, err := cmd.CombinedOutput()
-	require.NoError(t, err, "build the fixture: %s", raw)
-	return out
+	run(goBin, "build", vcs, "-ldflags", "-X main.version="+version, "-o", out, ".")
+	return out, commit
 }
 
 func TestSourceRecordHoldsTheBuildToItsTag(t *testing.T) {
 	t.Parallel()
-	bin := buildVersioned(t, "2.18.2-txe.18")
-	commit := narrowedScopes[0].Commit
+	bin, commit := buildVersioned(t, "2.18.2-txe.18", "clean")
 	tags := func(_, tag string) (string, error) {
 		if tag == "txe-v2.18.2-18" {
 			return commit, nil
@@ -281,6 +354,8 @@ func TestSourceRecordHoldsTheBuildToItsTag(t *testing.T) {
 	rec, err := recordSourceBuild(s, tags)
 	require.NoError(t, err)
 	assert.Equal(t, "source", rec.Kind)
+	assert.Equal(t, commit, rec.Source.Revision)
+	assert.Equal(t, "false", rec.Source.Modified)
 	assert.Contains(t, rec.Scope, "NOT the installed binary of any machine")
 	assert.Contains(t, rec.Scope, "corroborates the tag, commit and version only, not the bytes")
 	raw, err := os.ReadFile(s.Out)
@@ -288,22 +363,33 @@ func TestSourceRecordHoldsTheBuildToItsTag(t *testing.T) {
 	_, err = readProvenance(&provenanceRef{Record: s.Out, SHA256: sha256Hex(raw)}, rec.BinarySHA256)
 	require.NoError(t, err)
 
+	// The tag and the spec agree on another commit, but the binary's own stamp
+	// names the fixture's: no record.
+	other := strings.Repeat("f", 40)
+	anyTag := func(_, _ string) (string, error) { return other, nil }
+	modified, modifiedCommit := buildVersioned(t, "2.18.2-txe.18", "modified")
+	modifiedTag := func(_, _ string) (string, error) { return modifiedCommit, nil }
+	unstamped, _ := buildVersioned(t, "2.18.2-txe.18", "novcs")
 	for name, tc := range map[string]struct {
 		mutate func(s *sourceSpec)
+		tags   func(repo, tag string) (string, error)
 		want   string
 	}{
-		"a tag that names another commit": {func(s *sourceSpec) { s.Commit = strings.Repeat("f", 40) }, "tag txe-v2.18.2-18 is commit 5b011eba"},
-		"an unknown tag":                  {func(s *sourceSpec) { s.Tag = "txe-v9" }, "no such tag"},
-		"another platform":                {func(s *sourceSpec) { s.GOOS = "plan9" }, "the spec names plan9/"},
-		"another version":                 {func(s *sourceSpec) { s.Version = "2.18.2-txe.19" }, "do not set main.version=2.18.2-txe.19"},
+		"a tag that names another commit": {func(s *sourceSpec) { s.Commit = other }, tags, "tag txe-v2.18.2-18 is commit " + commit[:8]},
+		"an unknown tag":                  {func(s *sourceSpec) { s.Tag = "txe-v9" }, tags, "no such tag"},
+		"another platform":                {func(s *sourceSpec) { s.GOOS = "plan9" }, tags, "the spec names plan9/"},
+		"another version":                 {func(s *sourceSpec) { s.Version = "2.18.2-txe.19" }, tags, "do not set main.version=2.18.2-txe.19"},
 		"an installed record of another commit": {func(s *sourceSpec) {
 			s.Installed = &installedRecord{Tag: "txe-v2.18.2-18", Commit: strings.Repeat("e", 40), Version: "2.18.2-txe.18"}
-		}, "the installed record names"},
-		"a short commit": {func(s *sourceSpec) { s.Commit = "5b011eba" }, "is not a full commit id"},
+		}, tags, "the installed record names"},
+		"a short commit":                       {func(s *sourceSpec) { s.Commit = "5b011eba" }, tags, "is not a full commit id"},
+		"a binary stamped with another commit": {func(s *sourceSpec) { s.Commit = other }, anyTag, "the binary says it was built from " + commit},
+		"a binary from a modified tree":        {func(s *sourceSpec) { s.Binary, s.Commit = modified, modifiedCommit }, modifiedTag, "built from a modified tree"},
+		"a binary without a VCS stamp":         {func(s *sourceSpec) { s.Binary = unstamped }, tags, "carries no git revision of its own"},
 	} {
 		s := spec()
 		tc.mutate(&s)
-		_, err := recordSourceBuild(s, tags)
+		_, err := recordSourceBuild(s, tc.tags)
 		if assert.Error(t, err, name) {
 			assert.Contains(t, err.Error(), tc.want, name)
 		}

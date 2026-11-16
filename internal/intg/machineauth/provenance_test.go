@@ -70,8 +70,11 @@ type layerRecord struct {
 }
 
 type sourceProvenance struct {
-	Tag       string `json:"tag"`
-	Commit    string `json:"commit"`
+	Tag    string `json:"tag"`
+	Commit string `json:"commit"`
+	// Revision and Modified are the binary's own VCS stamp.
+	Revision  string `json:"vcs_revision"`
+	Modified  string `json:"vcs_modified"`
 	GoVersion string `json:"go_version"`
 	GOOS      string `json:"goos"`
 	GOARCH    string `json:"goarch"`
@@ -354,10 +357,14 @@ func extractImageBinary(spec extractSpec) (*provenanceRecord, error) {
 }
 
 // scanLayer reads one layer: it checks the blob against its digest and the
-// uncompressed stream against its diff id, and reports whether the layer sets
-// the target (a regular file, copied to tmp) or deletes it (a whiteout of the
-// file or an opaque whiteout of a directory above it). A link at the target
-// stops the extraction: the binary must be the file itself.
+// uncompressed stream against its diff id, every byte of each, the tar's
+// trailing padding included. It reports whether the layer sets the target (a
+// regular file, copied to tmp) or deletes what lower layers had there: a
+// whiteout of the target or of any directory above it, or an opaque whiteout
+// of a directory above it. A file the layer sets survives the layer's own
+// whiteouts, which apply to the layers below. A link at the target, or an
+// ancestor that is not a directory, stops the extraction: the binary must be
+// the file itself, at its own path.
 func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (present, deleted bool, err error) {
 	p, err := blobPath(layout, l.Digest)
 	if err != nil {
@@ -369,10 +376,11 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 	}
 	defer func() { _ = f.Close() }()
 	compressed := sha256.New()
-	stream := io.TeeReader(f, compressed)
+	raw := io.TeeReader(f, compressed)
+	stream := raw
 	switch l.MediaType {
 	case mtOCILayerGzip, mtDockerLayerGz:
-		gz, err := gzip.NewReader(stream)
+		gz, err := gzip.NewReader(raw)
 		if err != nil {
 			return false, false, err
 		}
@@ -383,8 +391,15 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 		return false, false, fmt.Errorf("media type %q is not a layer this extraction reads", l.MediaType)
 	}
 	uncompressed := sha256.New()
-	tr := tar.NewReader(io.TeeReader(stream, uncompressed))
-	dir, base := path.Split(target)
+	plain := io.TeeReader(stream, uncompressed)
+	tr := tar.NewReader(plain)
+	targetDir := path.Dir(target) + "/"
+	// whitedOut says whether a whiteout of name deletes the target: name is the
+	// target or one of its ancestor directories.
+	whitedOut := func(name string) bool {
+		return name == target || strings.HasPrefix(target, name+"/")
+	}
+	set, white := false, false
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -396,10 +411,14 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 		name := strings.TrimPrefix(path.Clean("/"+h.Name), "/")
 		entryDir, entryBase := path.Split(name)
 		switch {
-		case entryBase == ".wh..wh..opq" && strings.HasPrefix(dir, entryDir):
-			deleted, present = true, false
-		case entryBase == ".wh."+base && entryDir == dir:
-			deleted, present = true, false
+		case entryBase == ".wh..wh..opq":
+			if strings.HasPrefix(targetDir, entryDir) {
+				white = true
+			}
+		case strings.HasPrefix(entryBase, ".wh."):
+			if whitedOut(entryDir + strings.TrimPrefix(entryBase, ".wh.")) {
+				white = true
+			}
 		case name == target:
 			if h.Typeflag != tar.TypeReg {
 				return false, false, fmt.Errorf("%s is not a regular file in this layer (type %q)", "/"+target, h.Typeflag)
@@ -412,14 +431,17 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 			if err := errors.Join(cerr, out.Close()); err != nil {
 				return false, false, err
 			}
-			present, deleted = true, false
+			set = true
+		case strings.HasPrefix(target, name+"/") && h.Typeflag != tar.TypeDir:
+			return false, false, fmt.Errorf("/%s, above %s, is not a directory in this layer (type %q)", name, "/"+target, h.Typeflag)
 		}
 	}
-	// Drain what follows the tar's end, so both digests cover the whole blob.
-	if _, err := io.Copy(io.Discard, stream); err != nil {
+	// Drain what follows the tar's end through both hashing readers, so each
+	// digest covers its whole stream: the tar's padding, then the blob's rest.
+	if _, err := io.Copy(io.Discard, plain); err != nil {
 		return false, false, err
 	}
-	if _, err := io.Copy(io.Discard, f); err != nil {
+	if _, err := io.Copy(io.Discard, raw); err != nil {
 		return false, false, err
 	}
 	if got := "sha256:" + hex.EncodeToString(compressed.Sum(nil)); got != l.Digest {
@@ -428,7 +450,7 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 	if got := "sha256:" + hex.EncodeToString(uncompressed.Sum(nil)); got != diffID {
 		return false, false, fmt.Errorf("the uncompressed layer hashes to %s, the config's diff id is %s", got, diffID)
 	}
-	return present, deleted, nil
+	return set, white && !set, nil
 }
 
 // ── source record ────────────────────────────────────────────────────────────
@@ -489,8 +511,17 @@ func recordSourceBuild(spec sourceSpec, commitOf func(repo, tag string) (string,
 		return nil, fmt.Errorf("source record: the binary was built for %s/%s, the spec names %s/%s", settings["GOOS"], settings["GOARCH"], spec.GOOS, spec.GOARCH)
 	case !strings.Contains(settings["-ldflags"], "main.version="+spec.Version):
 		return nil, fmt.Errorf("source record: the binary's -ldflags %q do not set main.version=%s", settings["-ldflags"], spec.Version)
-	case settings["vcs.revision"] != "" && settings["vcs.revision"] != spec.Commit:
+	// The binary's own stamp ties it to the commit: the go command records the
+	// checkout's revision and whether its tree was modified (a build from a
+	// git clone of the tag, as the worker kit builds). A binary without that
+	// stamp, from another revision, or from a modified tree has no tie to the
+	// commit and gets no record.
+	case settings["vcs"] != "git" || settings["vcs.revision"] == "":
+		return nil, errors.New("source record: the binary carries no git revision of its own (built with -buildvcs=false, or not from a git checkout); build it from a clone of the tag")
+	case settings["vcs.revision"] != spec.Commit:
 		return nil, fmt.Errorf("source record: the binary says it was built from %s, not %s", settings["vcs.revision"], spec.Commit)
+	case settings["vcs.modified"] != "false":
+		return nil, fmt.Errorf("source record: the binary was built from a modified tree (vcs.modified=%q); build it from a clean clone of the tag", settings["vcs.modified"])
 	}
 	if in := spec.Installed; in != nil {
 		if in.Commit != spec.Commit || in.Tag != spec.Tag || in.Version != spec.Version {
@@ -508,7 +539,7 @@ func recordSourceBuild(spec sourceSpec, commitOf func(repo, tag string) (string,
 		scope += "; the installed record read from " + spec.Installed.ReadFrom + " corroborates the tag, commit and version only, not the bytes"
 	}
 	rec := &provenanceRecord{Schema: provenanceSchema, Kind: "source", Name: spec.Name, BinarySHA256: sha256Hex(raw), BinarySize: int64(len(raw)),
-		Source: &sourceProvenance{Tag: spec.Tag, Commit: commit, GoVersion: info.GoVersion, GOOS: settings["GOOS"], GOARCH: settings["GOARCH"],
+		Source: &sourceProvenance{Tag: spec.Tag, Commit: commit, Revision: settings["vcs.revision"], Modified: settings["vcs.modified"], GoVersion: info.GoVersion, GOOS: settings["GOOS"], GOARCH: settings["GOARCH"],
 			CGO: settings["CGO_ENABLED"], LDFlags: settings["-ldflags"], Installed: spec.Installed},
 		Scope: scope}
 	out, err := json.MarshalIndent(rec, "", "  ")
