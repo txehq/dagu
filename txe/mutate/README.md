@@ -60,6 +60,8 @@ when docker reports that exact name and token on it.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.
+The sandbox sets `GOFLAGS=-modcacherw -count=1`, so that copied cache never replays a cached test
+result: every baseline and mutant run executes its tests.
 
 ## Limits
 

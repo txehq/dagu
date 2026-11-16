@@ -391,7 +391,7 @@ class Runner:
         self.work = work
         self.docker = docker
         self.seq = 0
-        self.deadline = time.monotonic() + args.deadline if args.deadline else None
+        self.deadline = args.deadline_at
         # (name, cidfile) of every container started whose docker client has not returned.
         self.pending: dict[str, Path] = {}
         self.cleanup_log: list[str] = []
@@ -441,7 +441,9 @@ class Runner:
         env.update({
             "GOPROXY": "file:///goproxy" if seed.is_dir() else "off",
             "GOSUMDB": "off",  # go.sum still verifies every module; there is no network to ask
-            "GOFLAGS": "-modcacherw",
+            # -count=1: the copied build cache must not replay a cached test result, so every
+            # baseline and mutant run executes its tests.
+            "GOFLAGS": "-modcacherw -count=1",
             "GOTOOLCHAIN": "local",
             "GOENV": "off",
             "MUTATE_SANDBOXED": "1",
@@ -559,6 +561,8 @@ def parse(argv: list[str]):
         args.command = args.command[1:]
     if not args.command:
         p.error("give the test command after --")
+    # The deadline clock starts here, before any preflight, so it bounds the whole run.
+    args.deadline_at = time.monotonic() + args.deadline if args.deadline else None
     args.tree = real(args.tree)
     return args
 
@@ -646,7 +650,15 @@ def main(argv: list[str]) -> int:
         signal.signal(sig, stop_on_signal)
     try:
         check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
-        if subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True).returncode != 0:
+        left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
+        if left <= 0:
+            raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
+        try:
+            inspected = subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True,
+                                       env=docker_client_env(), timeout=min(left, 60.0))
+        except subprocess.TimeoutExpired as e:
+            raise Stopped(f"docker image inspect took longer than {min(left, 60.0):.0f}s") from e
+        if inspected.returncode != 0:
             raise Refused(f"image {args.image} is not present locally (or {args.docker} cannot reach a daemon); "
                           "this runner never pulls")
         work = WorkDir(args.workdir_root)

@@ -79,6 +79,8 @@ def save(r):
     os.replace(REG + ".tmp", REG)
 if args[:3] == ["image", "inspect", "missing"]:
     sys.exit(1)
+if args[:2] == ["image", "inspect"] and "slowinspect" in args[2]:
+    time.sleep(30)
 if args[:1] == ["inspect"]:
     r = reg()
     if args[-1] not in r:
@@ -302,6 +304,7 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 		assert.Contains(t, joined, "--memory 8g")
 		assert.Contains(t, joined, "--cpus 4")
 		assert.NotContains(t, joined, "--env HOME=", "HOME is never set")
+		assert.Contains(t, joined, "--env GOFLAGS=-modcacherw -count=1", "no cached test result is replayed")
 		assert.Contains(t, joined, "--cap-drop ALL")
 		assert.Contains(t, joined, "--read-only")
 		assert.NotContains(t, joined, "docker.sock")
@@ -860,4 +863,15 @@ w = ms.WorkDir(root); print(verdict(w), w.path.exists())
 	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "refused True\nrefused True\nremoved False\n", string(out))
+}
+
+// The deadline clock starts before preflight: a docker that hangs on the image check is stopped.
+func TestDeadlineCoversImageCheck(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "slowinspect", "--deadline", "2")
+	assert.Less(t, time.Since(start), 15*time.Second)
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "docker image inspect took longer than")
+	assert.Empty(t, dockerRuns(t, f.log))
 }
