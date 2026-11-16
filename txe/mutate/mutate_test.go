@@ -1378,3 +1378,20 @@ func TestSparseFileCountedAtCopySize(t *testing.T) {
 	assert.Contains(t, o.stderr, "before the warm build cache: the work directory would pass 32 MiB")
 	assert.NoFileExists(t, filepath.Join(o.report["workdir"].(string), "warm-gocache", "sparse"))
 }
+
+// The first copy of the live tree is checked to fit before it starts: a tree larger than the
+// work-directory cap stops the run with nothing copied, and what the copy excludes is not counted.
+func TestTreeCheckedBeforeFirstCopy(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "pad.bin"), make([]byte, 2<<20), 0o644))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1")
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "before copying the tree: the work directory would pass 1 MiB")
+	assert.NoFileExists(t, filepath.Join(o.report["workdir"].(string), "pristine", "pad.bin"))
+
+	g := newFixture(t, passingCheck)
+	require.NoError(t, os.MkdirAll(filepath.Join(g.tree, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(g.tree, ".git", "pack"), make([]byte, 2<<20), 0o644))
+	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1", "--no-warm-gocache")
+	assert.Equal(t, 0, o.code, "an excluded .git is not counted: %s", o.stdout+o.stderr)
+}

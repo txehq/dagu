@@ -469,7 +469,8 @@ class _Overrun(Exception):
     pass
 
 
-def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256) -> tuple[int, int, str | None]:
+def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256,
+              skip: tuple[str, ...] = ()) -> tuple[int, int, str | None]:
     """Bytes allocated and entries under d, not following links. The tree is written by sandboxed
     code, so the walk fails closed: an unreadable entry, more than max_entries entries, a walk
     longer than budget seconds, or nesting deeper than max_depth is a reason to stop the run.
@@ -487,6 +488,8 @@ def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256) ->
             raise _Overrun(f"run directory nested over {max_depth} levels")
         with os.scandir(fd) as it:
             for entry in it:
+                if entry.name in skip:  # what the copy excludes, at any depth, as copy_tree does
+                    continue
                 tally[1] += 1
                 if tally[1] > max_entries:
                     raise _Overrun(f"run directory over {max_entries} entries")
@@ -582,7 +585,7 @@ class Runner:
         self.containers: dict[str, tuple[Path, str]] = {}
         self.cleanup_log: list[str] = []
 
-    def room(self, what: str, sources: tuple[Path, ...] = ()) -> None:
+    def room(self, what: str, sources: tuple[Path, ...] = (), skip: tuple[str, ...] = ()) -> None:
         """Before copying sources into the work directory: with the copy's full size added (sparse
         files counted at their apparent size), the work directory stays under --max-work-mib and
         the free space beside it over --min-free-mib, or the run stops."""
@@ -591,7 +594,7 @@ class Runner:
             raise Stopped(f"before {what}: {problem}")
         need = 0
         for src in sources:
-            size, _n, problem = dir_usage(src, self.args.max_files, 30.0)
+            size, _n, problem = dir_usage(src, self.args.max_files, 30.0, skip=skip)
             if problem:
                 raise Stopped(f"before {what}: {problem}")
             need += size
@@ -1040,8 +1043,7 @@ def main(argv: list[str]) -> int:
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
         runner = Runner(args, watch, forbidden, work, args.docker, mutants)  # reads live targets first
         pristine = work.path / "pristine"
-        if shutil.disk_usage(work.path).free < args.min_free_mib * 2**20:
-            raise Stopped(f"before copying the tree: free space is under {args.min_free_mib} MiB")
+        runner.room("copying the tree", (args.tree,), tuple(args.exclude))
         copy_tree(args.tree, pristine, tuple(args.exclude), runner.deadline)
         runner.room("seeding")
         if not args.no_seed:
