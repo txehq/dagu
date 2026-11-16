@@ -1100,3 +1100,27 @@ func TestTreeCopyInsideDeadline(t *testing.T) {
 	assert.Less(t, elapsed, 8*time.Second)
 	assert.Empty(t, dockerRuns(t, f.log))
 }
+
+// Run directories do not accumulate: each is discarded once its result is recorded, and the
+// whole work directory is checked against --max-work-mib before every copy into it.
+func TestWorkDirectoryDoesNotAccumulate(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	pad := make([]byte, 2<<20)
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "pad.bin"), pad, 0o644))
+	var list []map[string]any
+	for i := range 6 {
+		list = append(list, map[string]any{"name": fmt.Sprintf("m%d", i), "file": "check.sh",
+			"old": ": GUARD", "new": fmt.Sprintf(": GUARD %d", i)})
+	}
+	// pristine 2 MiB + one live run copy 2 MiB fits 6 MiB; six kept copies would not.
+	o := f.run(t, f.mutants(t, list), "--max-work-mib", "6", "--no-warm-gocache")
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stdout, "mutants: 0/6 killed")
+
+	g := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(filepath.Join(g.tree, "pad.bin"), pad, 0o644))
+	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1", "--no-warm-gocache")
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "the work directory is over 1 MiB")
+	assert.Empty(t, dockerRuns(t, g.log))
+}

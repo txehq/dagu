@@ -503,6 +503,24 @@ class Runner:
         self.pending: dict[str, Path] = {}
         self.cleanup_log: list[str] = []
 
+    def room(self, what: str) -> None:
+        """Before copying anything more into the work directory: its total size stays under
+        --max-work-mib and the free space beside it over --min-free-mib, or the run stops."""
+        used, _entries, problem = dir_usage(self.work.path, self.args.max_files * 4, 30.0)
+        if problem:
+            raise Stopped(f"before {what}: {problem}")
+        if used > self.args.max_work_mib * 2**20:
+            raise Stopped(f"before {what}: the work directory is over {self.args.max_work_mib} MiB")
+        if shutil.disk_usage(self.work.path).free < self.args.min_free_mib * 2**20:
+            raise Stopped(f"before {what}: free space is under {self.args.min_free_mib} MiB")
+
+    def discard(self, result: "Result") -> None:
+        """A finished run's directory goes once its result is recorded (its log, outside it, stays),
+        so runs do not accumulate on the host."""
+        d = Path(result.dir)
+        if d.parent == self.work.path and d.name[:3].isdigit() and d.is_dir() and not d.is_symlink():
+            shutil.rmtree(d)
+
     def remaining(self, what: str) -> float:
         """Seconds the next step may take: the per-run timeout, cut to what the deadline leaves."""
         if self.deadline is None:
@@ -570,6 +588,7 @@ class Runner:
     def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
         before = self.watch.snapshot()
         self.remaining(label)  # the deadline is checked before the run's own copies start
+        self.room(label)
         d = self.prepare(label, pristine, mutant)
         name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
         # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
@@ -734,6 +753,9 @@ def parse(argv: list[str]):
                    help="a run whose captured output passes this is stopped as ERROR")
     p.add_argument("--max-disk-mib", type=int, default=16384,
                    help="a run whose own directory (its only writable host path) passes this is stopped as ERROR")
+    p.add_argument("--max-work-mib", type=int, default=32768,
+                   help="the whole work directory (copies, seed, build caches) may not pass this; checked "
+                        "before every copy into it")
     p.add_argument("--max-files", type=int, default=500000,
                    help="a run whose own directory passes this many entries is stopped as ERROR")
     p.add_argument("--min-free-mib", type=int, default=2048,
@@ -779,7 +801,9 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
         return EXIT_BASELINE
     if args.warm_gocache:
+        runner.room("the warm build cache")
         clone_dir(Path(base.dir) / "sandbox" / "gocache", runner.work.path / "warm-gocache", runner.deadline)
+    runner.discard(base)
 
     findings = []
     for mu in mutants:
@@ -788,6 +812,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         if r.outcome == "KILLED" and args.confirm_kills:
             again = runner.run(f"{mu.name} (again)", pristine, mu)
             r.__dict__["confirm"] = again.__dict__
+            runner.discard(again)
             if again.outcome != "KILLED":
                 r.outcome = "UNREPEATED-KILL"
                 findings.append(f"{mu.name}: killed once, then {again.outcome} alone in a new sandbox")
@@ -795,10 +820,12 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         if r.outcome in ("ERROR", "TIMEOUT"):
             findings.append(f"{mu.name}: {r.outcome}, log {r.log}")
         report["results"].append(r.__dict__)
+        runner.discard(r)
         print(line, flush=True)
 
     final = runner.run("baseline (after)", pristine, None)
     report["results"].append(final.__dict__)
+    runner.discard(final)
     print(f"baseline after: {final.outcome}", flush=True)
     if final.outcome != "PASSED":
         findings.append(f"the unmutated tree failed after the mutants: {final.outcome}, log {final.log}")
@@ -864,7 +891,10 @@ def main(argv: list[str]) -> int:
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
         runner = Runner(args, watch, forbidden, work, args.docker, mutants)  # reads live targets first
         pristine = work.path / "pristine"
+        if shutil.disk_usage(work.path).free < args.min_free_mib * 2**20:
+            raise Stopped(f"before copying the tree: free space is under {args.min_free_mib} MiB")
         copy_tree(args.tree, pristine, tuple(args.exclude), runner.deadline)
+        runner.room("seeding")
         if not args.no_seed:
             seed_modules(args, work, pristine, modcache, go_facts, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
