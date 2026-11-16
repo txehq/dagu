@@ -366,7 +366,7 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 		if s.lang == langPython {
 			text = lg.text // Python # inside strings is common; full-line comments were skipped
 		}
-		if goCleanIn(text) {
+		if goCleanIn(text) || goCleanIn(sc.expandArgs(text)) {
 			out = append(out, Finding{Path: s.rel, Line: lg.line, Rule: ruleGoClean, Msg: goCleanMsg})
 		}
 		if !isHarness(s.rel) {
@@ -379,6 +379,31 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 	}
 	return out, dirs
 }
+
+// expandArgs replaces each reference to a shell or make variable with the
+// values the file assigns it, so an argument array is read whole:
+// args=(clean -modcache); go "${args[@]}".
+func (sc *scriptScan) expandArgs(text string) string {
+	if sc.l != langShell && sc.l != langMake {
+		return text
+	}
+	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
+		name := argRefRe.FindStringSubmatch(ref)[1]
+		var vals []string
+		for _, a := range sc.assigns {
+			if a.name == name {
+				vals = append(vals, a.rhs)
+			}
+		}
+		if len(vals) == 0 {
+			return ref
+		}
+		return " " + strings.Join(vals, " ") + " "
+	})
+}
+
+// argRefRe is a variable reference: $x, ${x}, ${x[@]}, ${x[*]}, $(x).
+var argRefRe = regexp.MustCompile(`\$[({]?([A-Za-z_]\w*)(?:\[[@*]\])?[)}]?`)
 
 func (sc *scriptScan) collectAssignments() {
 	for _, lg := range sc.logical {

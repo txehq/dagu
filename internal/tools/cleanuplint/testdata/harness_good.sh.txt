@@ -21,3 +21,5 @@ scratch=$(mktemp -d "$HOME/.cache/x.XXXXXX")
 rm -rf "$scratch"
 legacy=`mktemp -d "$HOME/x.XXXXXX"`
 rm -rf "$legacy"
+testargs=(test -count=1 ./...)
+go "${testargs[@]}"

@@ -25,3 +25,7 @@ cache="${GOCACHE:-$(mktemp -d)}"
 rm -rf "$cache" # want:env-path-delete
 scratch="$HOME/.cache/$(mktemp -u XXXXXX)"
 rm -rf "$scratch" # want:env-path-delete
+args=(clean -modcache)
+go "${args[@]}" # want:go-clean-cache
+flag=-cache
+go clean "$flag" # want:go-clean-cache

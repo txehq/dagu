@@ -42,6 +42,9 @@ func TestPlanted(t *testing.T) {
 	_ = os.RemoveAll(sharedCache) // want:env-path-delete
 	out, _ := exec.Command("go", "env", "GOMODCACHE").Output()
 	_ = os.RemoveAll(strings.TrimSpace(string(out))) // want:env-path-delete
+	envArgs := []string{"env", "GOCACHE"}
+	viaVar, _ := exec.Command("go", envArgs...).Output()
+	_ = os.RemoveAll(strings.TrimSpace(string(viaVar))) // want:env-path-delete
 	_ = os.RemoveAll(cacheDir()) // want:env-path-delete
 	removeTree(os.TempDir())
 	_ = os.RemoveAll(gobuild.Default.GOPATH) // want:env-path-delete

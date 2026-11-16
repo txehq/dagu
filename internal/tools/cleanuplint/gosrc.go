@@ -54,6 +54,36 @@ type goPkg struct {
 	retTainted map[string]bool          // functions returning a tainted value
 	params     map[string]map[int]bool  // tainted parameters by function and index
 	locals     map[*ast.FuncDecl]taints // tainted names per function
+
+	pkgLits litEnv                   // literals held by package-level names
+	fnLits  map[*ast.FuncDecl]litEnv // literals held by names in each function
+	env     litEnv                   // the literals in scope where taint is judged
+}
+
+// lits computes, once, the literals each package-level name and each
+// function's names hold, so an argv in a variable is read whole.
+func (p *goPkg) lits() {
+	if p.fnLits != nil {
+		return
+	}
+	p.pkgLits = litEnv{}
+	p.fnLits = map[*ast.FuncDecl]litEnv{}
+	for _, gf := range p.files {
+		for _, d := range gf.file.Decls {
+			if gd, ok := d.(*ast.GenDecl); ok && gd.Tok != token.IMPORT {
+				collectLits(gd, p.pkgLits)
+			}
+		}
+	}
+	for _, gf := range p.files {
+		for _, d := range gf.file.Decls {
+			if fd, ok := d.(*ast.FuncDecl); ok {
+				env := maps.Clone(p.pkgLits)
+				collectLits(fd, env)
+				p.fnLits[fd] = env
+			}
+		}
+	}
 }
 
 type taints map[string]bool
@@ -127,6 +157,8 @@ func importNames(f *ast.File) map[string]string {
 
 // solve computes taint to a fixed point across the package.
 func (p *goPkg) solve() {
+	p.lits()
+	p.env = p.pkgLits
 	for changed := true; changed; {
 		changed = false
 		for _, gf := range p.files {
@@ -164,6 +196,8 @@ func (p *goPkg) solve() {
 // solveFunc updates one function's tainted names, its return taint, and the
 // parameters it taints in the functions it calls. It reports any change.
 func (p *goPkg) solveFunc(gf *goFile, fd *ast.FuncDecl) bool {
+	p.env = p.fnLits[fd]
+	defer func() { p.env = p.pkgLits }()
 	local := p.locals[fd]
 	if local == nil {
 		local = taints{}
@@ -368,7 +402,7 @@ func (p *goPkg) isSource(gf *goFile, call *ast.CallExpr) bool {
 			}
 		}
 	}
-	lits := argvLiterals(call, nil)
+	lits := argvLiterals(call, p.env)
 	for i := 0; i+1 < len(lits); i++ {
 		if lits[i] == "go" && lits[i+1] == "env" {
 			return true
@@ -540,14 +574,8 @@ var rmRecursiveFlag = func(s string) bool { return rmRecRe.MatchString(s) }
 // a finding.
 func (p *goPkg) report() []Finding {
 	var out []Finding
-	pkgLits := litEnv{}
-	for _, gf := range p.files {
-		for _, d := range gf.file.Decls {
-			if gd, ok := d.(*ast.GenDecl); ok && gd.Tok != token.IMPORT {
-				collectLits(gd, pkgLits)
-			}
-		}
-	}
+	p.lits()
+	defer func() { p.env = p.pkgLits }()
 	for _, gf := range p.files {
 		seenLit := map[*ast.BasicLit]bool{}
 		harness := isHarness(gf.src.rel)
@@ -597,10 +625,11 @@ func (p *goPkg) report() []Finding {
 		}
 		for _, d := range gf.file.Decls {
 			fd, _ = d.(*ast.FuncDecl)
-			env = maps.Clone(pkgLits)
+			env = p.pkgLits
 			if fd != nil {
-				collectLits(fd, env)
+				env = p.fnLits[fd]
 			}
+			p.env = env
 			ast.Inspect(d, visit)
 		}
 	}
