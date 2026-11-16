@@ -250,16 +250,20 @@ class Parser:
 
     def redirect(self, cur: Cmd, op: str):
         self.i += len(op)
+        fd = op[:len(op) - len(op.lstrip("0123456789"))]
         op = op.lstrip("0123456789")
         if op.startswith("{"):
-            op = op[op.index("}") + 1:]
+            fd, op = op[:op.index("}") + 1], op[op.index("}") + 1:]
+        if fd not in ("", "0"):  # `3< file` or `{v}< file` changes another descriptor, not stdin
+            op = "fd" + op
         while self.i < len(self.s) and self.s[self.i] in " \t":
             self.i += 1
         start = self.i
         target = self.word()
-        if op in ("<<", "<<-"):
-            raw = self.s[start:self.i]
-            self.heredocs.append((cur, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
+        if op in ("<<", "<<-", "fd<<", "fd<<-"):
+            raw = self.s[start:self.i]  # a here-document on another descriptor: its body is still skipped
+            self.heredocs.append((cur if not op.startswith("fd") else Cmd(), target.text, op.endswith("-"),
+                                  any(q in raw for q in "'\"\\")))
         elif op == "<<<":
             cur.stdin_text = target.text
         elif op == "<" and target.procsub is not None:
@@ -501,9 +505,14 @@ class Judge:
                 break
             if prog == "command" and t in ("-v", "-V"):
                 return False
-            if prog == "env" and t in ("-S", "--split-string") and i + 1 < len(words):
-                rest = " ".join(shlex.quote(w.text) for w in words[i + 2:])
-                return refuses(words[i + 1].text + " " + rest, self.depth + 1)
+            if prog == "env" and (t in ("-S", "--split-string") or t.startswith(("-S", "--split-string="))):
+                # -S STRING, -SSTRING or --split-string=STRING: STRING is split into the command
+                if t in ("-S", "--split-string"):
+                    payload, after = (words[i + 1].text if i + 1 < len(words) else ""), i + 2
+                else:
+                    payload, after = t.split("=", 1)[1] if t.startswith("--") else t[2:], i + 1
+                rest = " ".join(shlex.quote(w.text) for w in words[after:])
+                return refuses(payload + " " + rest, self.depth + 1)
             if t.startswith("-") and len(t) > 1:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
@@ -543,7 +552,7 @@ class Judge:
         return False
 
     def shell(self, args: list, cmd) -> bool:
-        j, code = 0, False
+        j, code, from_stdin = 0, False, False
         while j < len(args):
             t = args[j].text
             if t == "--":
@@ -553,11 +562,14 @@ class Judge:
                 j += 2
             elif len(t) > 1 and t[0] in "-+":
                 code = code or (not t.startswith("--") and "c" in t[1:])
+                from_stdin = from_stdin or (t[0] == "-" and not t.startswith("--") and "s" in t[1:])
                 j += 1
             else:
                 break
         if code:
             return j < len(args) and refuses(args[j].text, self.depth + 1)
+        if from_stdin:  # bash -s [args]: the program is stdin, the words are its arguments
+            return stdin_is_mutant(cmd, True, self.depth)
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             return operand_is_mutant(args[j])
         return stdin_is_mutant(cmd, True, self.depth)
@@ -614,6 +626,8 @@ class Judge:
                 return True  # --require=./mutants.js
             if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
                 return True  # node -r ./mutants.js: a preloaded module runs
+            if opt in ("--eval", "--print") and eq:
+                return code_runs_mutant(val)  # node --eval='...'
             if t in ("-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader",
                      "--experimental-loader", "-C", "--conditions"):
                 if t in ("-e", "--eval", "-p", "--print"):
