@@ -32,4 +32,9 @@ func TestCreated(t *testing.T) {
 	//cleanuplint:allow the fixture shows a directive that carries a written reason
 	_ = os.RemoveAll(os.Getenv("ALLOWED")) // allowed:env-path-delete
 	_ = os.RemoveAll(os.Getenv("ALLOWED_SAME_LINE")) //cleanuplint:allow the directive may also sit on the same line // allowed:env-path-delete
+	_ = exec.Command("go", "clean", "-modcache=false").Run()
+	_ = exec.Command("go", "clean", "-cache=0", "-fuzzcache=F").Run()
+	offArgs := []string{"clean", "-modcache=false"}
+	_ = exec.Command("go", offArgs...).Run()
+	_ = exec.Command("sh", "-c", "go clean -modcache=false -testcache").Run()
 }

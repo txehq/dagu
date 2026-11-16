@@ -29,3 +29,13 @@ args=(clean -modcache)
 go "${args[@]}" # want:go-clean-cache
 flag=-cache
 go clean "$flag" # want:go-clean-cache
+go clean -modcache=true # want:go-clean-cache
+go clean -cache=1 -i # want:go-clean-cache
+"$GO" clean --fuzzcache=TRUE # want:go-clean-cache
+go clean '-modcache=true' # want:go-clean-cache
+go clean -tags integration -modcache # want:go-clean-cache
+go clean -cache=false -modcache # want:go-clean-cache
+go clean $EXTRA_FLAGS -cache # want:go-clean-cache
+go clean -modcache="$want" # want:go-clean-cache
+go clean -tags '' -modcache # want:go-clean-cache
+go clean -tags "" -cache # want:go-clean-cache

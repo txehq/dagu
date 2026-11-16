@@ -14,14 +14,17 @@
 //
 // It reports two rules:
 //
-//   - go-clean-cache: `go clean` with -modcache, -cache or -fuzzcache, as an
-//     argv (exec.Command("go", "clean", "-modcache"), a Python list) or as
-//     shell text, anywhere in Go, shell, Makefile, workflow, PowerShell or
-//     Python files.
+//   - go-clean-cache: `go clean` with -modcache, -cache or -fuzzcache, bare
+//     or set to a true value (-modcache=true), as an argv
+//     (exec.Command("go", "clean", "-modcache"), a Python list) or as shell
+//     text, anywhere in Go, shell, Makefile, workflow, PowerShell or Python
+//     files.
 //   - env-path-delete: a recursive delete (os.RemoveAll, rm -r, find -delete,
 //     Remove-Item -Recurse, shutil.rmtree) of a path read from os.Getenv,
-//     os.UserHomeDir, os.TempDir, `go env`, HOME, TMPDIR, a GO* variable, or
-//     in a script any upper-case variable the script never assigns.
+//     os.UserHomeDir, os.TempDir, `go env`, HOME, TMPDIR, a GO* variable,
+//     in a script any upper-case variable the script never assigns, or in a
+//     workflow any ${{ }} expression (env, vars, inputs, runner, a step's
+//     outputs), which the runner fills in before the script starts.
 //
 // A finding that is right as written is kept with a directive on its line or
 // the line above, and the directive must say why:

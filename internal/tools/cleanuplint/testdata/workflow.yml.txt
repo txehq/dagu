@@ -16,3 +16,30 @@ jobs:
           $cache = go env GOMODCACHE
           Remove-Item -Recurse -Force $cache # want:env-path-delete
           Remove-Item -Recurse -Force .\build
+  expressions:
+    steps:
+      - run: rm -rf "${{ env.CACHE_ROOT }}" # want:env-path-delete
+      - run: rm -rf ${{ vars.SHARED_DIR }}/build # want:env-path-delete
+      - run: rm -rf "${{ env['CACHE_ROOT'] }}" # want:env-path-delete
+      - run: rm -rf "${{runner.temp}}/cache" # want:env-path-delete
+      - run: rm -rf "${{ inputs.cache || vars.CACHE_ROOT }}" # want:env-path-delete
+      - run: rm -rf ${{ inputs.cache || 'build' }}; echo done # want:env-path-delete
+      - run: |
+          root="${{ env.CACHE_ROOT }}"
+          rm -rf "$root" # want:env-path-delete
+      - run: go clean -modcache=true # want:go-clean-cache
+      - shell: pwsh
+        run: Remove-Item -Recurse -Force "${{ env.CACHE_ROOT }}" # want:env-path-delete
+      - shell: pwsh
+        run: |
+          $root = "${{ vars.SHARED_DIR }}"
+          Remove-Item -Recurse -Force $root # want:env-path-delete
+  expressions-good:
+    steps:
+      - run: echo "${{ env.CACHE_ROOT }}"
+      - run: rm -f "${{ env.CACHE_ROOT }}/lock"
+      - run: echo "${{ inputs.cache || 'none' }}" && rm -rf ./build
+      - run: go clean -modcache=false
+      - run: |
+          scratch="$(mktemp -d "${{ runner.temp }}/x.XXXXXX")"
+          rm -rf "$scratch"
