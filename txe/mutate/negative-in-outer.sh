@@ -19,6 +19,10 @@ for d in "$mod" "$fake/gocache"; do
 done
 cp -R /runner/testdata/fixture "$fake/fixture"
 export GOPATH="$fake/go" GOMODCACHE="$mod" GOCACHE="$fake/gocache" GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-modcacherw GOENV=off
+# The runner hands its docker client only a minimal environment, so the leaky stand-in reads the
+# fake host's Go settings from here and gives them to the mutant, as a leaked boundary would.
+printf '{"GOPATH":"%s","GOMODCACHE":"%s","GOCACHE":"%s","GOPROXY":"off","GOTOOLCHAIN":"local","GOFLAGS":"-modcacherw","GOENV":"off"}\n' \
+  "$GOPATH" "$GOMODCACHE" "$GOCACHE" >"$fake/caller-env.json"
 
 state() {
   for p in "$mod" "$mod/cache/download" "$fake/gocache" "$mod/.mutate-sandboxed-fixture-sentinel"; do

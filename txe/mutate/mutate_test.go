@@ -957,3 +957,20 @@ func TestKilledClientIsErrorAndCleaned(t *testing.T) {
 	assert.Equal(t, ids, removals(t, f.log))
 	assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
 }
+
+// The step-2 double cannot run here (it refuses outside a container, and no mutant runs on this
+// host), so this checks its contract by reading: the outer script writes the fake host's Go
+// settings to the file the leaky docker applies, with the paths the runner watches there.
+func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
+	outer, err := os.ReadFile("negative-in-outer.sh")
+	require.NoError(t, err)
+	leaky, err := os.ReadFile(filepath.Join("testdata", "leaky-docker.py"))
+	require.NoError(t, err)
+	assert.Contains(t, string(leaky), `CALLER_ENV = "/fakehost/caller-env.json"`)
+	assert.Contains(t, string(leaky), "env.update(json.load(f))")
+	assert.Contains(t, string(outer), `>"$fake/caller-env.json"`)
+	assert.Contains(t, string(outer), `fake=/fakehost`)
+	for _, key := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY"} {
+		assert.Contains(t, string(outer), `"`+key+`":`)
+	}
+}
