@@ -1,7 +1,8 @@
 name: codex-review-test
 
 # Tests for .github/codex-review (TXE-4719): the connector check over recorded payloads, and
-# the merge wrapper, and shellcheck. The PR's own copy runs with no secret and a read-only token.
+# the merge wrapper, the gate's maintenance-base pin (TXE-7556), and shellcheck. The PR's own copy
+# runs with no secret and a read-only token.
 
 on:
   pull_request:
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - '.github/codex-review/**'
+      - '.github/workflows/codex-review.yml'
 
 permissions:
   contents: read
@@ -25,6 +27,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+          # main's history: the gate pin must be a main commit with main's copy of what the gate runs.
+          fetch-depth: 0
       - name: Shellcheck
         run: shellcheck .github/codex-review/*.sh
       - name: The check over recorded connector payloads
@@ -33,5 +37,7 @@ jobs:
         run: bash .github/codex-review/test-merge.sh
       - name: The merge wrapper's merge methods over a real git history
         run: bash .github/codex-review/test-merge-git.sh
+      - name: The gate's maintenance-base pin is a main commit, current with main
+        run: bash .github/codex-review/test-gate-pin.sh origin/main
       - name: The fixture sanitizer keeps no private text
         run: python3 -I .github/codex-review/testdata/test_sanitize.py

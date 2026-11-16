@@ -22,6 +22,7 @@ commit() { # <file> <message>
     echo "$1" >"$F/$1" && g add "$1" && g commit -q -m "$2"
 }
 git init -q -b main "$F"
+mkdir -p "$F/.github/workflows" && echo "name: codex-review" >"$F/.github/workflows/codex-review.yml" && g add .github
 commit base "base"
 g checkout -q -b upstream
 commit up1 "upstream 1"
@@ -48,9 +49,22 @@ g checkout -q -b repair-empty main
 g commit -q --allow-empty -m "an empty commit on main"
 g checkout -q -b repair-swapped v9.9.9
 g merge -q -s ours --no-ff -m "main recorded onto upstream: the parents the wrong way round" main
+# Maintenance bases (TXE-7556), cut from the common base: one whose gate workflow is main's, a PR
+# on it, a PR on it that merged upstream, and a base whose gate workflow was edited.
+g checkout -q -b maint/txe-v9.9.9-1 main~1
+commit maint1 "maint 1"
+g checkout -q -b maint-fix maint/txe-v9.9.9-1
+commit maintfix "a maintenance fix"
+g checkout -q -b maint-sync maint/txe-v9.9.9-1
+g merge -q --no-ff -m "merge upstream v9.9.9 into the maintenance base" v9.9.9
+g checkout -q -b maint/txe-v9.9.9-2 main~1
+echo "name: codex-review # edited on the base" >"$F/.github/workflows/codex-review.yml" && g commit -q -am "a gate of its own"
+g checkout -q -b maint-fix-2 maint/txe-v9.9.9-2
+commit maintfix2 "a fix on the edited base"
 g checkout -q main
 TAG="$(g rev-parse 'v9.9.9^{commit}')"; UP1="$(g rev-parse 'v9.9.9~1')"; UP3="$(g rev-parse upstream)"; MAIN="$(g rev-parse main)"; BASE="$(g rev-parse main~1)"
 MAIN_TREE="$(g rev-parse 'main^{tree}')"; TAGOBJ="$(g rev-parse v9.9.9-annotated)"
+MB1=maint/txe-v9.9.9-1; MB1TIP="$(g rev-parse "$MB1")"; MB2=maint/txe-v9.9.9-2; MB2TIP="$(g rev-parse "$MB2")"
 if [ "$TAGOBJ" = "$TAG" ] || [ "$(g cat-file -t "$TAGOBJ")" != tag ]; then echo "fixture: the annotated tag should be its own object" >&2; exit 2; fi
 [ "$(g rev-parse 'repair^{tree}')" = "$MAIN_TREE" ] || { echo "fixture: the repair should have main's tree" >&2; exit 2; }
 
@@ -67,9 +81,10 @@ compare() { # <a> <b>: the API's status of a...b
   mb="$(g merge-base "$1" "$2" 2>/dev/null || true)"
   if [ "$1" = "$2" ]; then echo identical; elif [ "$mb" = "$1" ]; then echo ahead; elif [ "$mb" = "$2" ]; then echo behind; else echo diverged; fi
 }
-merge_into_main() { # <squash|merge>
+merge_into_main() { # <squash|merge>: into the PR's base
   [ "${*: -1}" = "$head" ] || { echo "gh: head mismatch" >&2; exit 1; }  # --match-head-commit
-  g checkout -q main || exit 1
+  g checkout -q "$PR_BASE" || exit 1
+  if [ -n "${ADVANCE_BASE_AT_MERGE:-}" ]; then echo late >"$REPO/late-base" && g add late-base && g commit -q -m "the base moved after the last read"; fi
   if [ -n "${ADVANCE_MAIN_AT_MERGE:-}" ]; then echo late >"$REPO/late" && g add late && g commit -q -m "main moved after the last read, before the merge"; fi
   if [ "$1" = squash ] || [ "${MERGE_AS:-}" = squash ]; then g merge -q --squash "$head" >/dev/null && g commit -q -m "PR #7 squashed" || exit 1
   else g merge -q --no-ff -m "Merge pull request #7" "$head" || exit 1; fi
@@ -80,14 +95,19 @@ merge_into_main() { # <squash|merge>
 case "$*" in
   *contents/.github/codex-review/codex-review-check.sh*) printf 'exit 0' | base64 ;;
   *"pulls/7 --jq [.merged"*) fail "$@"; if [ -s "$REPO/.merged" ]; then printf 'true\t%s\n' "$(cat "$REPO/.merged")"; else printf 'false\t\n'; fi ;;
-  *pulls/7*) if [ -s "$REPO/.merged" ]; then state=closed; else state=open; fi; printf '%s\tfalse\t%s\tmain\n' "$state" "$head" ;;
+  *pulls/7*) if [ -s "$REPO/.merged" ]; then state=closed; else state=open; fi; printf '%s\tfalse\t%s\t%s\n' "$state" "$head" "$PR_BASE" ;;
+  *contents/.github/workflows/codex-review.yml*) ref="${all#*\?ref=}"; ref="${ref%% *}"; fail "$@"; g show "$ref:.github/workflows/codex-review.yml" | base64 ;;
+  *branches/maint/*) b="${all#*branches/}"; b="${b%% *}"
+    # ADVANCE_BASE_AT_LAST_READ: the base moves just before its second read (the last before the merge).
+    if [ -e "$REPO/.base-read" ] && [ -n "${ADVANCE_BASE_AT_LAST_READ:-}" ]; then g checkout -q "$b" && echo moved >"$REPO/moved-base" && g add moved-base && g commit -q -m "the base moved during the checks"; fi
+    : >"$REPO/.base-read"; g rev-parse "$b" ;;
   *branches/main*) g rev-parse main ;;
   *git/commits/*) sha="${all#*git/commits/}"; sha="${sha%% *}"; [ "$(g cat-file -t "$sha" 2>/dev/null)" = commit ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
     case "$all" in *"--jq .sha") echo "$sha" ;; *) printf '%s\t%s\n' "$(g rev-parse "$sha^{tree}")" "$(g log -1 --format=%P "$sha" | tr ' ' ',')" ;; esac ;;
   *compare/*) spec="${all#*compare/}"; spec="${spec%%\?*}"; a="${spec%%...*}"; b="${spec##*...}"; st="$(compare "$a" "$b")" || exit 1
     case "$*" in *"per_page=1 "*) printf '%s\t%s\n' "$st" "$(g rev-list --count "$b" "^$a")" ;; *) g rev-list --reverse --parents "$b" "^$a" ;; esac ;;
   "api repos/txehq/dagu --jq .allow_merge_commit") echo "${ALLOW_MERGE:-true}" ;;
-  *actions/runs*) printf '%s\n' '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}' ;;
+  *actions/runs*) printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success","pull_requests":[{"number":7,"base":{"ref":"%s"}}]}\n' "$PR_BASE" ;;
   *check-runs*) if [ -n "${ADVANCE_MAIN_AT_CHECKS:-}" ]; then g checkout -q main && echo moved >"$REPO/moved" && g add moved && g commit -q -m "main moved during the checks"; fi; printf '%s\n' '{"name":"CI","app":{"id":1},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-11-08T00:00:00Z"}' ;;
   */status*) printf 'success\t1\n' ;;
   "pr merge 7 -R txehq/dagu --squash --match-head-commit "*) merge_into_main squash "$@" ;;
@@ -111,7 +131,8 @@ run() {
     fresh "$name"; log="$TMP/$name.log"; : >"$log"
     out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="${FAIL_ON:-}" ALLOW_MERGE="${ALLOW_MERGE:-true}" MERGE_AS="${MERGE_AS:-}" \
         ADVANCE_MAIN_AT_CHECKS="${ADVANCE_MAIN_AT_CHECKS:-}" ADVANCE_MAIN_AT_MERGE="${ADVANCE_MAIN_AT_MERGE:-}" MERGE_TAINT="${MERGE_TAINT:-}" \
-        REPO="$REPO" PR_HEAD="$branch" \
+        ADVANCE_BASE_AT_LAST_READ="${ADVANCE_BASE_AT_LAST_READ:-}" ADVANCE_BASE_AT_MERGE="${ADVANCE_BASE_AT_MERGE:-}" \
+        REPO="$REPO" PR_HEAD="$branch" PR_BASE="${PR_BASE:-main}" \
         bash "$HERE/merge.sh" "$@" 7 "$(r rev-parse "$branch")" 2>&1)"; rc=$?
     if [ "$rc" = "$want_rc" ] && [[ "$out" == *"$want"* ]] \
        && { { [ "$merged" = merged ] && [ -s "$REPO/.merged" ]; } || { [ "$merged" = not-merged ] && [ ! -e "$REPO/.merged" ] && [ "$(r rev-parse main)" = "$MAIN" ]; } \
@@ -179,7 +200,7 @@ fresh repair-stale-build; r checkout -q main && echo later >"$REPO/later" && r a
 STALE="$TMP/repair-stale-build"
 run_stale() {
     local out rc log="$TMP/repair-stale.log"; REPO="$STALE"; : >"$log"
-    out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="" ALLOW_MERGE=true REPO="$REPO" PR_HEAD=repair \
+    out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="" ALLOW_MERGE=true REPO="$REPO" PR_HEAD=repair PR_BASE=main \
         bash "$HERE/merge.sh" --method merge --expect-ancestor "$TAG" --repair 7 "$(r rev-parse repair)" 2>&1)"; rc=$?
     if [ "$rc" = 1 ] && [[ "$out" == *"a repair's parents must be main's tip and the expected ancestor ($(r rev-parse main),$TAG)"*"(if main moved, rebuild the repair on its tip)"* ]] && [ ! -e "$REPO/.merged" ]; then
         ok "repair-stale: main moved, the repair is refused"
@@ -193,5 +214,29 @@ MERGE_AS=squash run readback-no-reach 1 "PR #7 was merged, but its merge commit"
 check "readback-no-reach: the message says the ancestor is not reached" '[[ "$(cat "$TMP/readback-no-reach.log")" == *"compare/$TAG..."* ]] && ! reaches "$TAG"'
 # A readback that cannot be completed exits 1 and says the PR was merged.
 FAIL_ON="pulls/7 --jq [.merged" run readback-unread 1 "PR #7 was merged, but its merge commit could not be read" merged sync --method merge --expect-ancestor "$TAG"
+
+# ── A maintenance base (TXE-7556): reviewed and squashed under the same checks, onto that base ──
+PR_BASE="$MB1" run maint-squash 0 "merged PR #7 into $MB1 as " merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
+check "maint-squash: the base has the fix's tree as one commit on its tip; main did not move" \
+    '[ "$(r rev-parse "$MB1^{tree}")" = "$(g rev-parse "maint-fix^{tree}")" ] && [ "$(r rev-parse "$MB1^")" = "$MB1TIP" ] && [ "$(r rev-parse main)" = "$MAIN" ]'
+# The history rule is measured against the base: upstream merged into a maintenance PR is refused.
+PR_BASE="$MB1" run maint-sync-squash 1 "carries history $MB1 does not have: 2 commit(s) off its own first-parent line, such as $UP1" not-merged maint-sync --base "$MB1" --base-sha "$MB1TIP"
+# A mismatched base, head or sha is refused, and nothing moves.
+PR_BASE="$MB1" run maint-wrong-sha 1 "$MB1's tip is $MB1TIP, not $MAIN" not-merged maint-fix --base "$MB1" --base-sha "$MAIN"
+PR_BASE="$MB1" run maint-no-base-flag 1 "base is $MB1, not main" not-merged maint-fix
+PR_BASE="$MB1" run maint-other-base 1 "base is $MB1, not $MB2" not-merged maint-fix --base "$MB2" --base-sha "$MB2TIP"
+PR_BASE=main run main-pr-as-maint 1 "base is main, not $MB1" not-merged plain --base "$MB1" --base-sha "$MB1TIP"
+fresh maint-wrong-head; log="$TMP/maint-wrong-head.log"; : >"$log"
+out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="" REPO="$REPO" PR_HEAD=maint-fix PR_BASE="$MB1" \
+    bash "$HERE/merge.sh" --base "$MB1" --base-sha "$MB1TIP" 7 "$MB1TIP" 2>&1)"; rc=$?
+if [ "$rc" = 1 ] && [[ "$out" == *"head is $(g rev-parse maint-fix), not $MB1TIP"* ]] && [ ! -e "$REPO/.merged" ]; then ok "maint-wrong-head"; else bad "maint-wrong-head" "exit $rc: $out"; fi
+# The base's gate workflow differs from main's: the gate that ran there is not main's.
+PR_BASE="$MB2" run maint-wf-edited 1 "$MB2's .github/workflows/codex-review.yml at $MB2TIP is not main's" not-merged maint-fix-2 --base "$MB2" --base-sha "$MB2TIP"
+# The base moves while the PR is checked: the last read refuses.
+ADVANCE_BASE_AT_LAST_READ=1 PR_BASE="$MB1" run maint-moved-late 1 "$MB1 moved from $MB1TIP to " not-merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
+# The base moves after the last read: GitHub squashes onto the new tip; reported as merged, exit 1.
+ADVANCE_BASE_AT_MERGE=1 PR_BASE="$MB1" run maint-moved-at-merge 1 "PR #7 was merged, but its squash commit" merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
+check "maint-moved-at-merge: the squash's parent is the moved tip, named in the message, nothing rewritten" \
+    '[ "$(r rev-parse "$MB1^")" != "$MB1TIP" ] && [ -e "$REPO/late-base" ]'
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

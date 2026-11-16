@@ -101,6 +101,56 @@ Two rules, both in `merge.sh` and both behind every check above:
    a moved main, swapped parents, a wrong ancestor and a changed tree, accepts a main that moved
    after the last read, and reports a merge commit that differs from its first parent.
 
+## Maintenance bases (TXE-7556)
+
+A maintenance release is cut from a branch named exactly `maint/txe-v<x.y.z>-<n>` (for example
+`maint/txe-v2.18.2-19`), and every change to it is a PR reviewed and merged under the same gate as
+main. Nothing here creates such a branch: creating one, and any ruleset on it, is a separate step
+that root accepts explicitly.
+
+- **The check runs, with main's scripts.** `codex-review.yml` triggers on `main` and
+  `maint/txe-v*`. `pull_request_target` runs the *base's* copy of that file, and there
+  `github.sha` is the base's tip, so on a maintenance base the job checks out `.github/codex-review`
+  at `CODEX_REVIEW_GATE_SHA`: a main commit named by its full id. Its first step refuses any other
+  base name and a pin that main does not reach. On main nothing changed: main's tip runs.
+- **The pin follows main, loudly.** `test-gate-pin.sh` (in `codex-review-test.yaml`, on PRs and on
+  main) fails when main's copy of a file the gate runs differs from the pin's, and names the main
+  commit to move the pin to. So a PR that changes `codex-review-check.sh` or its fixtures is
+  followed by a PR that moves the pin; until then main's push run of `codex-review-test` is red.
+  The same test fails when the workflow stops triggering on maintenance bases, takes the scripts
+  from anywhere but main's tip or the pin, or widens its token.
+- **The merge is bound to the base and the head.** Merge with main's wrapper, naming the base and
+  the tip you reviewed against:
+
+   ```bash
+   git fetch -q origin main
+   git show origin/main:.github/codex-review/merge.sh \
+     | bash -s -- --base maint/txe-v2.18.2-19 --base-sha <the base's tip> <n> <head sha>
+   ```
+
+  It runs every check above against that base's tip: the PR's base is that name, the history rule
+  is measured against the base, main's codex-review run on the head is completed/success and names
+  this PR on this base, every other run is green, and main's check (read at main's tip) passes
+  now. In addition it refuses when the base's tip is not `--base-sha` at the first read or at the
+  last read before the merge, and when the base's `.github/workflows/codex-review.yml` is not
+  main's byte for byte (the gate that ran there would not be main's). A maintenance base is merged
+  by squash only: `--method merge` and `--repair` are refused. After the squash it reads the merge
+  commit back: its only parent must be `--base-sha`; a base that moved in the seconds after the
+  last read is reported as merged, with an error (exit 1), and left as it is.
+- **When main's `codex-review.yml` changes**, every live maintenance base's copy differs and its
+  PRs are refused until that copy is brought to main's again. That is the same root-accepted step
+  as creating the base (a commit that makes `git diff origin/main <base> --
+  .github/workflows/codex-review.yml` empty), never a bypass of the wrapper.
+
+What the other workflows do on a maintenance base (inventory, 2026-11-16): `ci.yaml`,
+`frontend-ci.yaml`, `conformance.yml`, `desktop-e2e.yaml`, `docker-browser-smoke.yaml`,
+`image-security.yaml`, `image-build-test.yaml`, `chart-ci.yaml` and `codex-review-test.yaml` run on
+`pull_request` with no branch filter (path filters only), so they run on a PR into any base, using
+the head's workflow files, as they do on main; the wrapper requires all of them green on the head.
+Their `push` triggers are `main` only, so a merge into a maintenance base starts no push run.
+`txe-image.yaml`, `release.yaml` and `docker.yaml` start on a tag push, whatever branch the tagged
+commit is on. Nothing else names a base.
+
 `review-override` is a person's decision: the check names who added it, and refuses one a bot
 added. Adding or removing the label re-runs the check, so removing it revokes the pass.
 
@@ -120,4 +170,5 @@ either way.
 `test-codex-review-check.sh` runs the check over recorded connector payloads (`testdata/`, from
 txehq/sub2api, txehq/txe and txehq/dagu PRs, reduced by `testdata/sanitize.py`); `test-merge.sh`
 runs the wrapper's refusals with a stand-in `gh`, and `test-merge-git.sh` its merge methods over a
-real git history; `codex-review-test.yaml` runs them with shellcheck.
+real git history, maintenance bases included; `test-gate-pin.sh` checks the gate workflow's
+maintenance-base pin and base guard; `codex-review-test.yaml` runs them with shellcheck.
