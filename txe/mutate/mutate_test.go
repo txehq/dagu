@@ -544,7 +544,8 @@ import json, os, sys
 LOG = ` + fmt.Sprintf("%q", goLog) + `
 with open(LOG, "a") as f:
     f.write(json.dumps({"args": sys.argv[1:], "env": {k: os.environ.get(k) for k in
-        ("HOME", "GOPROXY", "GOMODCACHE", "GOPATH", "GOCACHE", "GOFLAGS")}}) + "\n")
+        ("HOME", "GOPROXY", "GOMODCACHE", "GOPATH", "GOCACHE", "GOFLAGS", "GOWORK", "GOENV",
+         "MUTATE_TEST_CANARY")}}) + "\n")
 if sys.argv[1:3] == ["env", "-json"]:
     print(json.dumps({"GOMODCACHE": ` + fmt.Sprintf("%q", f.modcache) + `, "GOCACHE": ` + fmt.Sprintf("%q", f.gocache) + `,
                       "GOPATH": ` + fmt.Sprintf("%q", gopath) + `, "GOPROXY": "https://proxy.example,direct"}))
@@ -555,6 +556,8 @@ elif sys.argv[1:3] == ["mod", "download"]:
 	require.NoError(t, os.MkdirAll(bin, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(bin, "go"), []byte(fakeGo), 0o755))
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GOWORK", filepath.Join(f.root, "live", "go.work")) // a caller's workspace outside the copy
+	t.Setenv("MUTATE_TEST_CANARY", "host-only-value")
 
 	report := filepath.Join(f.root, "report.json")
 	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
@@ -578,6 +581,9 @@ elif sys.argv[1:3] == ["mod", "download"]:
 	require.NoError(t, err)
 	assert.Equal(t, "file://"+filepath.Join(realMod, "cache", "download")+",https://proxy.example,direct", download["GOPROXY"])
 	assert.Equal(t, os.Getenv("HOME"), download["HOME"], "HOME is never overridden")
+	assert.Equal(t, "off", download["GOWORK"], "a caller's GOWORK never points the seed at a live workspace")
+	assert.Equal(t, "off", download["GOENV"])
+	assert.Nil(t, download["MUTATE_TEST_CANARY"], "the seed's environment is built from nothing")
 	assert.NotContains(t, download["GOMODCACHE"], realMod)
 	assert.Contains(t, download["GOMODCACHE"], f.workRoot[len(filepath.Dir(f.workRoot)):])
 

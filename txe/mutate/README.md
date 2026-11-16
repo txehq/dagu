@@ -32,7 +32,10 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod
   download` fills an owned cache from the unmutated copy with
   `GOPROXY=file://<shared GOMODCACHE>/cache/download,<your GOPROXY>`. Go never writes to a file
-  proxy, and `go mod download` runs no project code. HOME is not overridden. `--no-seed` skips
+  proxy, and `go mod download` runs no project code. The seed's environment is built from
+  nothing: PATH, HOME (unchanged, never overridden), the standard proxy variables, the caller's
+  resolved GOPROXY/GOSUMDB/GOPRIVATE/GONOPROXY/GONOSUMDB/GOINSECURE/GOTOOLCHAIN, the owned caches,
+  and `GOWORK=off`, `GOENV=off`, so no caller variable can point Go at a live file. `--no-seed` skips
   this for a tree with no module dependencies.
 - **Host checks after every run.** The identity (device, inode and, on macOS, birth time) of the
   shared GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the live tree; that no entry

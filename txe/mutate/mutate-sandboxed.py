@@ -538,18 +538,38 @@ class Runner:
         return docker_client_env()
 
 
-def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, caller_proxy: str, limit: float) -> None:
-    """Fill an owned module cache from the unmutated tree. Reads the shared cache only as a file proxy."""
-    seed = work.path / "seed"
-    seed.mkdir()  # go mod download creates nothing for a module with no dependencies
-    env = dict(os.environ)
+# The caller's resolved go settings the seed keeps (read from `go env`, never inherited raw).
+SEED_GO_FACTS = ("GOPROXY", "GOSUMDB", "GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE", "GOTOOLCHAIN")
+# Variables the seed's network access may need, passed through unchanged.
+SEED_PASS = ("PATH", "HOME", "USER", "LANG", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
+             "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+def seed_env(seed: Path, shared_modcache: Path, facts: dict[str, str]) -> dict[str, str]:
+    """The seed's whole environment, built from nothing: no caller variable that could point Go at
+    a live file (GOWORK, GOFLAGS=-modfile=..., a go env file) reaches it. HOME is passed unchanged,
+    never overridden."""
+    env = {k: os.environ[k] for k in SEED_PASS if k in os.environ}
+    env.update({k: facts[k] for k in SEED_GO_FACTS if facts.get(k)})
     env.update({
         "GOMODCACHE": str(seed / "gomodcache"),
         "GOPATH": str(seed / "gopath"),
         "GOCACHE": str(seed / "gocache"),
         "GOFLAGS": "-modcacherw",
-        "GOPROXY": ",".join(p for p in (file_url(shared_modcache / "cache" / "download"), caller_proxy) if p),
+        "GOWORK": "off",  # only the copy's own go.mod, never a workspace file named from outside
+        "GOENV": "off",
+        "GOPROXY": ",".join(p for p in (file_url(shared_modcache / "cache" / "download"), facts.get("GOPROXY", ""))
+                            if p),
     })
+    return env
+
+
+def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, facts: dict[str, str],
+                 limit: float) -> None:
+    """Fill an owned module cache from the unmutated tree. Reads the shared cache only as a file proxy."""
+    seed = work.path / "seed"
+    seed.mkdir()  # go mod download creates nothing for a module with no dependencies
+    env = seed_env(seed, shared_modcache, facts)
     try:
         out = subprocess.run(["go", "mod", "download"], cwd=pristine, env=env, capture_output=True, text=True,
                              timeout=limit)
@@ -601,13 +621,13 @@ def parse(argv: list[str]):
     return args
 
 
-def resolve_shared(args) -> tuple[Path, Path, Path, str]:
-    """The shared GOMODCACHE, GOCACHE and GOPATH, and the caller's GOPROXY."""
-    facts = go_env(["GOMODCACHE", "GOCACHE", "GOPATH", "GOPROXY"], dict(os.environ), args.deadline_at)
+def resolve_shared(args) -> tuple[Path, Path, Path, dict[str, str]]:
+    """The shared GOMODCACHE, GOCACHE and GOPATH, and the caller's go settings the seed keeps."""
+    facts = go_env(["GOMODCACHE", "GOCACHE", "GOPATH", *SEED_GO_FACTS], dict(os.environ), args.deadline_at)
     modcache = real(args.shared_modcache or facts["GOMODCACHE"])
     gocache = real(args.shared_gocache or facts["GOCACHE"])
     gopath = real(facts["GOPATH"].split(os.pathsep)[0])
-    return modcache, gocache, gopath, facts.get("GOPROXY", "")
+    return modcache, gocache, gopath, facts
 
 
 def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report: dict) -> int:
@@ -659,7 +679,7 @@ def main(argv: list[str]) -> int:
     try:
         args = parse(argv)
         mutants = load_mutants(args.mutants, args.tree)
-        modcache, gocache, gopath, caller_proxy = resolve_shared(args)
+        modcache, gocache, gopath, go_facts = resolve_shared(args)
     except Refused as e:
         print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
         return EXIT_REFUSED
@@ -705,7 +725,7 @@ def main(argv: list[str]) -> int:
         pristine = work.path / "pristine"
         copy_tree(args.tree, pristine, tuple(args.exclude))
         if not args.no_seed:
-            seed_modules(args, work, pristine, modcache, caller_proxy, runner.remaining("seeding"))
+            seed_modules(args, work, pristine, modcache, go_facts, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
         code = run_all(args, mutants, runner, pristine, report)
     except SharedStateChanged as e:
