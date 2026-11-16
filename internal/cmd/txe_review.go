@@ -258,12 +258,15 @@ func txeReviewSteps(ctx *Context) (*review.Steps, error) {
 // when that step would publish it.
 type txeReviewSeals struct{ outputs txeclient.Outputs }
 
-func (s txeReviewSeals) RetriedSeal(jobID, runID string, e review.Execution) error {
-	_, err := s.outputs.RetriedSeal(jobID, runID, txeclient.Execution{AttemptID: e.AttemptID, QueuedAt: e.QueuedAt})
+func (s txeReviewSeals) RetriedSeal(jobID, runID string, e review.Execution) (int, error) {
+	seal, err := s.outputs.RetriedSeal(jobID, runID, txeclient.Execution{AttemptID: e.AttemptID, QueuedAt: e.QueuedAt})
 	if errors.Is(err, txeclient.ErrNotSealed) {
-		return fmt.Errorf("%w: %w", review.ErrNotSealed, err)
+		return 0, fmt.Errorf("%w: %w", review.ErrNotSealed, err)
 	}
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return len(seal.Files), nil
 }
 
 func runTXEReviewPrepare(ctx *Context, _ []string) error {

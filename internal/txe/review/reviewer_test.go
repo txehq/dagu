@@ -312,12 +312,15 @@ func (r *runs) Republishes(context.Context) (bool, error) {
 // listed sealed nothing.
 type seals map[string]error
 
-func (s seals) RetriedSeal(_, _ string, e review.Execution) error {
+func (s seals) RetriedSeal(_, _ string, e review.Execution) (int, error) {
 	err, ok := s[e.Ref()]
 	if !ok {
-		return review.ErrNotSealed
+		return 0, review.ErrNotSealed
 	}
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // Recover is the service's record of a retry request, by the id it derives
