@@ -131,6 +131,7 @@ r[cid] = [name, owner]
 save(r)
 if cidfile:
     open(cidfile, "w").write(cid)
+` + effect + `
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -139,7 +140,6 @@ if "hang" in image:
 if "noexec" in image:
     code = 0
 else:
-` + "    " + strings.ReplaceAll(effect, "\n", "\n    ") + `
     def host(p):
         for target, source in sorted(mounts.items(), key=lambda kv: -len(kv[0])):
             if p == target or p.startswith(target + "/"):
@@ -973,4 +973,16 @@ func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
 	for _, key := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY"} {
 		assert.Contains(t, string(outer), `"`+key+`":`)
 	}
+}
+
+// A run stopped by the deadline after the boundary leaked still ends in the shared-state alarm
+// (exit 3), not exit 6: the host check runs on every exit path.
+func TestStoppedRunStillChecksSharedState(t *testing.T) {
+	f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "3")
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "stopped:")
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Contains(t, o.stderr, "after the end of the run")
+	assert.Len(t, removals(t, f.log), 1, "the container is still removed")
 }

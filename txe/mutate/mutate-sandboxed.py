@@ -754,6 +754,22 @@ def main(argv: list[str]) -> int:
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
                 print(f"mutate-sandboxed: container {line}", file=sys.stderr)
+        # Every exit path, a stop by the deadline or a signal included, ends with the host check
+        # against the state read at the start: a boundary failure is never reported as exit 6.
+        if code != EXIT_SHARED_CHANGED:
+            try:
+                watch.verify(initial, "the end of the run")
+                if runner:
+                    for f, digest in runner.live.items():
+                        if file_digest(args.tree / f) != digest:
+                            raise SharedStateChanged(f"at the end of the run: the live tree's {f} changed")
+            except SharedStateChanged as e:
+                loud(str(e))
+                report["shared_state_changed"] = str(e)
+                code = EXIT_SHARED_CHANGED
+                args.keep = True
+            except OSError as e:
+                report["final_check_error"] = str(e)
         try:
             report["identity_after"] = watch.snapshot()
         except OSError as e:
