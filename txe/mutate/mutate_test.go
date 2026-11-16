@@ -1255,3 +1255,32 @@ func TestFailedRemovalStaysPending(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, strings.Count(string(raw), `["rm", "-f"`), "the removal was tried, then retried by the finalizer")
 }
+
+// The size walk streams entries and checks its limits per entry: a directory far larger than the
+// entry cap is cut off at the cap, not listed whole; links are never followed; depth is capped.
+func TestDirUsageStreamsAndCaps(t *testing.T) {
+	root := t.TempDir()
+	prog := `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+wide = root / "wide"; wide.mkdir()
+for i in range(5000):
+    open(wide / ("f%d" % i), "w").close()
+outside = root / "outside"; outside.mkdir(); (outside / "big").write_bytes(b"x" * (1 << 20))
+linked = root / "linked"; linked.mkdir(); os.symlink(outside, linked / "to-outside")
+deep = root / "deep"; p = deep
+for i in range(10):
+    p = p / "d"
+p.mkdir(parents=True)
+used, n, problem = ms.dir_usage(wide, 10, 60.0); print(n, problem)
+used, n, problem = ms.dir_usage(linked, 100, 60.0); print(n, problem, used < (1 << 20))
+used, n, problem = ms.dir_usage(deep, 100, 60.0, max_depth=5); print(problem)
+used, n, problem = ms.dir_usage(root / "absent", 100, 60.0); print(n, problem)
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "11 run directory over 10 entries\n1 None True\nrun directory nested over 5 levels\n0 None\n", string(out))
+}

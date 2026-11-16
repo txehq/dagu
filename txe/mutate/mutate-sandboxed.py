@@ -465,37 +465,63 @@ def output_tail(log_path: Path, size: int = 8192) -> str:
         return f"<unreadable: {e}>"
 
 
-def dir_usage(d: Path, max_entries: int, budget: float) -> tuple[int, int, str | None]:
+class _Overrun(Exception):
+    pass
+
+
+def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256) -> tuple[int, int, str | None]:
     """Bytes allocated and entries under d, not following links. The tree is written by sandboxed
-    code, so the walk fails closed: an entry it cannot read, more than max_entries entries, or a
-    walk longer than budget seconds is returned as a reason to stop the run."""
-    total, count, problem = 0, 0, []
+    code, so the walk fails closed: an unreadable entry, more than max_entries entries, a walk
+    longer than budget seconds, or nesting deeper than max_depth is a reason to stop the run.
+
+    Entries are streamed (os.scandir on a directory descriptor) and the limits checked per entry,
+    so a huge single directory is never listed whole into host memory. Each directory is opened
+    relative to its parent's descriptor with O_NOFOLLOW, so a directory swapped for a symlink
+    mid-walk cannot steer the walk onto a host path. One descriptor is open per level."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     started = time.monotonic()
+    tally = [0, 0]  # bytes, entries
 
-    def unreadable(err: OSError) -> None:
-        problem.append(f"unreadable entry in the run directory: {err}")
+    def walk(fd: int, depth: int) -> None:
+        if depth > max_depth:
+            raise _Overrun(f"run directory nested over {max_depth} levels")
+        with os.scandir(fd) as it:
+            for entry in it:
+                tally[1] += 1
+                if tally[1] > max_entries:
+                    raise _Overrun(f"run directory over {max_entries} entries")
+                if time.monotonic() - started > budget:
+                    raise _Overrun(f"run directory took over {budget:.0f}s to measure")
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                tally[0] += getattr(st, "st_blocks", 0) * 512
+                if stat.S_ISDIR(st.st_mode):
+                    try:
+                        sub = os.open(entry.name, flags, dir_fd=fd)
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        walk(sub, depth + 1)
+                    finally:
+                        os.close(sub)
 
-    # fwalk descends through directory descriptors opened without following links, so a container
-    # that swaps a directory for a symlink mid-walk cannot steer the walk onto a host path; each
-    # entry is stat'ed relative to its directory's descriptor, never followed.
-    for _root, dirs, files, dirfd in os.fwalk(d, onerror=unreadable, follow_symlinks=False):
-        for name in dirs + files:
-            count += 1
-            try:
-                total += os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_blocks * 512
-            except FileNotFoundError:
-                continue
-            except OSError as e:
-                return total, count, f"unreadable entry in the run directory: {e}"
-            except AttributeError:  # no st_blocks on this platform
-                continue
-        if problem:
-            return total, count, problem[0]
-        if count > max_entries:
-            return total, count, f"run directory over {max_entries} entries"
-        if time.monotonic() - started > budget:
-            return total, count, f"run directory took over {budget:.0f}s to measure"
-    return total, count, problem[0] if problem else None
+    try:
+        top = os.open(d, flags)
+    except FileNotFoundError:
+        return 0, 0, None
+    except OSError as e:
+        return 0, 0, f"unreadable entry in the run directory: {e}"
+    try:
+        walk(top, 0)
+    except _Overrun as e:
+        return tally[0], tally[1], str(e)
+    except OSError as e:
+        return tally[0], tally[1], f"unreadable entry in the run directory: {e}"
+    finally:
+        os.close(top)
+    return tally[0], tally[1], None
 
 
 def docker_client_env() -> dict[str, str]:
