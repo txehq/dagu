@@ -356,9 +356,12 @@ cmd_decide() {
 cmd_proof() {
   need decided; ids; . "$RIG/ids.env"
   local out="$RIG/evidence/proof"; mkdir -p "$out"
-  for _ in $(seq 1 200); do
-    get "/txe/jobs/$JOB/actions" > "$out/actions.json"
-    if grep -qE '"state": *"(succeeded|failed|escalated)"' "$out/actions.json"; then break; fi
+  local prp action=3
+  prp=$(json 'd["proposal"]' < "$RIG/evidence/decision/authority.json")
+  for _ in $(seq 1 200); do # up to 10 min for the decided action to settle
+    get "/txe/jobs/$JOB/actions" > "$out/actions.json" || { sleep 3; continue; }
+    action=0; "$PY" -I "$HERE/actions.py" "$out/actions.json" "$prp" > "$out/action.json" || action=$?
+    [ "$action" -eq 3 ] || break
     sleep 3
   done
   get "/dag-runs/$JOB/$RUN" > "$out/run-final.json"
@@ -367,8 +370,13 @@ cmd_proof() {
   get "/txe/jobs/$JOB/events" > "$out/events.json"
   cp "$RIG/control/counter" "$out/counter"
   local broken=""
+  case $action in
+    0) ;;
+    3) broken="the action for $prp did not settle in 10 min" ;;
+    *) broken="the action for $prp did not succeed: $(cat "$out/action.json")" ;;
+  esac
   "$PY" -I "$HERE/check_seal.py" "$RIG/evidence/loss/seals.json" "$(cat "$RIG/control/run-dir")" > "$out/seal-bytes-after.txt" \
-    || broken="the sealed bytes changed"
+    || broken="${broken:+$broken; }the sealed bytes changed"
   procs check --pidfile "$RIG/control/worker.pid" > "$out/worker-same-process.json" \
     || broken="${broken:+$broken; }the worker is not the process that ran the fixture"
   [ -z "$broken" ] || die "proof: $broken (evidence kept in $out). The step is not marked."

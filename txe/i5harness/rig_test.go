@@ -194,7 +194,7 @@ func TestRigInstallsTheReviewerWithTheReviewerBinary(t *testing.T) {
 	src, err := os.ReadFile("rig.sh")
 	require.NoError(t, err)
 	var install []string
-	for _, line := range strings.Split(string(src), "\n") {
+	for line := range strings.SplitSeq(string(src), "\n") {
 		if strings.Contains(line, "txe review install") && !strings.HasPrefix(strings.TrimSpace(line), "#") {
 			install = append(install, line)
 		}
@@ -236,4 +236,19 @@ func TestFixtureRunWaitsForItsGoMarker(t *testing.T) {
 	counter, err := os.ReadFile(filepath.Join(control, "counter"))
 	require.NoError(t, err)
 	assert.Equal(t, "2\n", string(counter), "each execution counts itself once")
+}
+
+// The runbook calls ./rig.sh and the tools directly, so each must keep its
+// executable bit in the repository.
+func TestEntryPointsAreExecutable(t *testing.T) {
+	for _, f := range []string{"rig.sh", "relay.py", "preflight.py", "procs.py", "pin.py", "check_seal.py", "actions.py", "fixture-run.sh"} {
+		info, err := os.Stat(f)
+		require.NoError(t, err)
+		assert.NotZero(t, info.Mode().Perm()&0o111, "%s is not executable", f)
+	}
+	out, err := exec.Command("./rig.sh").CombinedOutput()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, string(out))
+	assert.Equal(t, 2, exit.ExitCode())
+	assert.Contains(t, string(out), "rig.sh init", "with no step, ./rig.sh prints its usage")
 }

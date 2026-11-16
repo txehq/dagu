@@ -106,34 +106,85 @@ func TestRigDecideRecordsAnAcceptedDecision(t *testing.T) {
 	assert.Equal(t, "msg_test", auth["authority"])
 }
 
-// proof keeps its evidence but fails, unmarked, when the sealed bytes changed
-// or the worker is not the process that ran the fixture.
-func TestRigProofFailsWhenAnInvariantBreaks(t *testing.T) {
-	f := initialisedRig(t)
+// proofRig is a rig after a decision on prp_1, with a sealed run in place.
+func proofRig(t *testing.T) (f fakeRig, runDir string) {
+	t.Helper()
+	f = initialisedRig(t)
 	mark(t, f, "decided")
+	write(t, filepath.Join(f.root, "evidence", "decision", "authority.json"), `{"authority":"msg_test","proposal":"prp_1","verdict":"retry"}`)
 	seals, runDir := sealedRun(t)
-	require.NoError(t, os.MkdirAll(filepath.Join(f.root, "evidence", "loss"), 0o755))
 	raw, err := os.ReadFile(seals)
 	require.NoError(t, err)
 	write(t, filepath.Join(f.root, "evidence", "loss", "seals.json"), string(raw))
 	write(t, filepath.Join(f.root, "control", "run-dir"), runDir)
 	write(t, filepath.Join(f.root, "control", "counter"), "1\n")
-	require.NoError(t, os.WriteFile(filepath.Join(runDir, "executions", "a1-e1", "result.json"), []byte("changed"), 0o644))
-	write(t, filepath.Join(f.root, "control", "worker.pid"), `{"pid": 999999, "pgid": 999999, "lstart": "x", "comm": "dagu", "token": "t"}`)
-	ok := reply(200, map[string]any{"state": "succeeded"})
-	fakeHub(t, map[string]func(http.ResponseWriter, *http.Request){
-		"GET /api/v1/txe/jobs/job_X/actions":              ok,
+	return f, runDir
+}
+
+func proofRoutes(actions any) map[string]func(http.ResponseWriter, *http.Request) {
+	ok := reply(200, map[string]any{"ok": true})
+	return map[string]func(http.ResponseWriter, *http.Request){
+		"GET /api/v1/txe/jobs/job_X/actions":              reply(200, actions),
 		"GET /api/v1/dag-runs/job_X/run_X":                ok,
 		"GET /api/v1/dag-runs/job_X/run_X/attempts":       ok,
 		"GET /api/v1/txe/jobs/job_X/runs/run_X/artifacts": ok,
 		"GET /api/v1/txe/jobs/job_X/events":               ok,
-	})
+	}
+}
+
+var succeededAction = map[string]any{"in_flight": []any{}, "archived": []any{map[string]any{
+	"action_id": "act_1", "proposal_id": "prp_1", "state": "succeeded",
+	"outcome": map[string]any{"admitted": true, "admitted_execution": "b1-e2"}}}}
+
+func TestRigProofPassesOnlyWithEveryInvariant(t *testing.T) {
+	f, _ := proofRig(t)
+	pidfile := filepath.Join(f.root, "control", "worker.pid")
+	out, code := tool(t, "procs.py", "start", "--pidfile", pidfile, "--log", filepath.Join(f.root, "logs", "w.log"), "--", "/bin/sleep", "300")
+	require.Equal(t, 0, code, out)
+	t.Cleanup(func() { _, _ = tool(t, "procs.py", "stop", "--pidfile", pidfile, "--timeout", "5") })
+	fakeHub(t, proofRoutes(succeededAction))
+	out, code = rig(t, "proof", "--rig", f.root)
+	require.Equal(t, 0, code, out)
+	assert.FileExists(t, filepath.Join(f.root, "control", "step-proof"))
+}
+
+// proof keeps its evidence but fails, unmarked, when the action did not
+// succeed, the sealed bytes changed, or the worker is not the process that ran
+// the fixture.
+func TestRigProofFailsWhenAnInvariantBreaks(t *testing.T) {
+	f, runDir := proofRig(t)
+	require.NoError(t, os.WriteFile(filepath.Join(runDir, "executions", "a1-e1", "result.json"), []byte("changed"), 0o644))
+	write(t, filepath.Join(f.root, "control", "worker.pid"), `{"pid": 999999, "pgid": 999999, "lstart": "x", "comm": "dagu", "token": "t"}`)
+	fakeHub(t, proofRoutes(map[string]any{"in_flight": []any{}, "archived": []any{map[string]any{
+		"action_id": "act_1", "proposal_id": "prp_1", "state": "escalated", "outcome": map[string]any{}}}}))
 	out, code := rig(t, "proof", "--rig", f.root)
 	assert.NotEqual(t, 0, code, out)
+	assert.Contains(t, out, "the action for prp_1 did not succeed")
 	assert.Contains(t, out, "the sealed bytes changed")
 	assert.Contains(t, out, "the worker is not the process that ran the fixture")
 	assert.NoFileExists(t, filepath.Join(f.root, "control", "step-proof"))
 	assert.FileExists(t, filepath.Join(f.root, "evidence", "proof", "seal-bytes-after.txt"))
+}
+
+func TestActionsState(t *testing.T) {
+	dir := t.TempDir()
+	check := func(doc any) int {
+		b, _ := json.Marshal(doc)
+		_, code := tool(t, "actions.py", write(t, filepath.Join(dir, "a.json"), string(b)), "prp_1")
+		return code
+	}
+	action := func(bucket, state string, admitted bool) any {
+		return map[string]any{bucket: []any{map[string]any{"proposal_id": "prp_1", "state": state,
+			"outcome": map[string]any{"admitted": admitted, "admitted_execution": map[bool]string{true: "b1-e2"}[admitted]}}}}
+	}
+	assert.Equal(t, 0, check(succeededAction))
+	assert.Equal(t, 3, check(map[string]any{"archived": []any{}, "in_flight": []any{}}), "no action yet")
+	assert.Equal(t, 3, check(action("in_flight", "uncertain", true)), "still settling")
+	assert.Equal(t, 2, check(action("archived", "failed", false)))
+	assert.Equal(t, 2, check(action("archived", "succeeded", false)), "succeeded without an admitted execution")
+	two := map[string]any{"archived": []any{
+		map[string]any{"proposal_id": "prp_1", "state": "succeeded"}, map[string]any{"proposal_id": "prp_1", "state": "failed"}}}
+	assert.Equal(t, 2, check(two), "two actions for one proposal")
 }
 
 // up can fail at a preflight gate after starting the hub and before writing
