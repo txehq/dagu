@@ -721,6 +721,15 @@ var guardRefused = []string{
 	"node --title harmless mutants.js",
 	// Paths under /proc cannot be judged.
 	"python3 /proc/1/cwd/x.py",
+	// Security review of 93ed54893.
+	"cat mutants.py | python3 < /dev/stdin",
+	"python3 < /dev/fd/3 3< mutants.py",
+	`perl -e 'print 1' -- -e 'system($ARGV[0])' mutants.pl`,
+	"node --unknown-flag harmless app.js mutants.js",
+	`M=tools/mutants.py python3 -c 'import os, runpy; runpy.run_path(os.environ["M"])'`,
+	`env M=tools/mutants.py python3 -c 'import os, runpy; runpy.run_path(os.environ["M"])'`,
+	`python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:])' mutmut run`,
+	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' ./run-mutations`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

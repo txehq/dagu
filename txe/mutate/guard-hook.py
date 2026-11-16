@@ -470,20 +470,29 @@ def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) ->
         return stdin_is_mutant(cmd, shell, depth)
     if fd is not None:
         src = cmd.source(fd) if cmd is not None else None
-        return True if src is None else source_runs_mutant(src, shell, depth)
+        return True if src is None else source_runs_mutant(src, shell, depth, cmd)
     return mutant_named(w.text)
 
 
-def source_runs_mutant(src, shell: bool, depth: int) -> bool:
+def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0) -> bool:
     """Whether an input source, read as a program, runs a mutant. A duplicated descriptor whose
-    source is not set in this command is refused."""
+    source is not set in this command is refused, and so is a file that is a descriptor path
+    (`< /dev/fd/3`) the command does not set; `< /dev/stdin` reads the pipe."""
     if src is None:
         return False
     kind, value = src
-    if kind == "unknown":
+    if kind == "unknown" or hops > 8:
         return True
     if kind == "file":
-        return mutant_named(value)
+        fd = fd_of_path(value)
+        if fd is None:
+            return mutant_named(value)
+        if cmd is None or fd == "?":
+            return True
+        if fd == "0":
+            return piped_mutant(cmd)
+        nxt = cmd.source(fd)
+        return True if nxt is None else source_runs_mutant(nxt, shell, depth, cmd, hops + 1)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
     return refuses(value, depth + 1) if shell else code_runs_mutant(value)
@@ -506,18 +515,26 @@ def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
         return False
     # A redirection of stdin wins over the pipe: a file, a process substitution
     # (python3 < <(cat mutants.py)), a here-document or here-string, or a duplicated descriptor.
+    # A redirection from a descriptor path (`< /dev/stdin`, `< /dev/fd/3`) is followed.
     if cmd.source("0") is not None:
-        return source_runs_mutant(cmd.source("0"), shell, depth)
+        return source_runs_mutant(cmd.source("0"), shell, depth, cmd)
+    return piped_mutant(cmd)
+
+
+def piped_mutant(cmd) -> bool:
     return cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words)
 
 
-def code_and_args_run_mutant(code: str, rest: list) -> bool:
-    """Code given on the command line, and the arguments after it: the code runs a mutant itself,
-    or it calls something that runs a file or a process and an argument names a mutant script
-    (`python3 -c 'exec(open(sys.argv[1]).read())' mutants.py`)."""
+def code_and_args_run_mutant(code: str, rest: list, env=()) -> bool:
+    """Code given on the command line, its arguments and the command's variable assignments: the
+    code runs a mutant itself, or it calls something that runs a file or a process and an
+    argument or an assigned value names a mutant (`python3 -c 'exec(open(sys.argv[1]).read())'
+    mutants.py`, `M=mutants.py python3 -c '...os.environ["M"]...'`)."""
     if code_runs_mutant(code):
         return True
-    return bool(CODE_RUNS.search(code)) and names_mutant_script(rest)
+    if not CODE_RUNS.search(code):
+        return False
+    return any(mutant_named(w.text) for w in rest) or any(mutant_named(v) for v in env)
 
 
 class Judge:
@@ -592,6 +609,8 @@ class Judge:
             if t.startswith("-") and len(t) > 1:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
+                k, _, v = t.partition("=")
+                self.vars[k] = v  # env NAME=value cmd: the command sees it
                 i += 1
             else:
                 break
@@ -678,7 +697,7 @@ class Judge:
                 ch = t[k]
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):])
+                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.vars.values())
                 if ch == "m":
                     attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
@@ -699,7 +718,7 @@ class Judge:
         j = 0
 
         def code_at(n: int) -> bool:  # code at args[n], with the arguments after it
-            return n < len(args) and code_and_args_run_mutant(args[n].text, args[n + 1:])
+            return n < len(args) and code_and_args_run_mutant(args[n].text, args[n + 1:], self.vars.values())
 
         if prog in ("perl", "ruby"):
             return self.perl_ruby(prog, args, cmd)
@@ -708,6 +727,7 @@ class Judge:
         elif prog == "deno" and args and args[0].text == "eval":
             return code_at(1)
         evaluated = False  # -e code runs instead of a script; preloads after it still load
+        unknown = False  # an option this reader does not know was seen
         while j < len(args):
             t = args[j].text
             opt, eq, val = t.partition("=")
@@ -716,7 +736,7 @@ class Judge:
             if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
                 return True  # node -r ./mutants.js: a preloaded module runs
             if opt in ("--eval", "--print") and eq:
-                if code_and_args_run_mutant(val, args[j + 1:]):
+                if code_and_args_run_mutant(val, args[j + 1:], self.vars.values()):
                     return True  # node --eval='...'
                 evaluated = True
                 j += 1
@@ -727,6 +747,7 @@ class Judge:
                     evaluated = True
                 j += 2
             elif t.startswith("-") and t != "-":
+                unknown = unknown or "=" not in t  # it may take the next word as its value
                 j += 1
             elif evaluated:
                 j += 1  # an argument of the -e code: keep looking for options after it
@@ -735,9 +756,11 @@ class Judge:
         if evaluated:
             return False
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            # An option this reader does not know may take the next word as its value
-            # (`node --title x mutants.js`), so positional words are judged up to the first one
-            # that looks like a script file.
+            # After an option this reader does not know, any positional word may be the script
+            # (`node --some-flag x mutants.js`): one naming a mutant script is refused.
+            if unknown and names_mutant_script(args[j:]):
+                return True
+            # Otherwise positional words are judged up to the first that looks like a script file.
             for n, w in enumerate(args[j:]):
                 filelike = bool(SCRIPT_EXT.search(base(w.text))) or "/" in w.text or w.procsub is not None
                 if (n == 0 or filelike) and operand_is_mutant(w, cmd, False, self.depth):
@@ -763,7 +786,10 @@ class Judge:
             payload, rest = args[:end], args[end:]
             if any(code_runs_mutant(a.text) for a in payload):
                 return True
-            if names_mutant_script(rest) and any(CODE_RUNS.search(a.text) for a in payload):
+            # Where the switches end is not modelled exactly, so any word in the command counts
+            # as a possible argument of code that runs something.
+            if any(CODE_RUNS.search(a.text) for a in payload) and (
+                    any(mutant_named(a.text) for a in args[:last] + rest) or any(mutant_named(v) for v in self.vars.values())):
                 return True
         elif any(code_runs_mutant(a.text) for a in args if a.text.startswith("-")):
             return True
