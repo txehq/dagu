@@ -71,21 +71,29 @@ func TestTxeRepublishShape(t *testing.T) {
 
 var republishNow = time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 
-var republishJob = &registry.Job{JobID: "job_1", Version: 3, PackageDigest: "sha256:pkg"}
+// republishJob holds the decided proposal its actions carry out, as a job
+// does while such an action is in flight.
+var republishJob = &registry.Job{JobID: "job_1", Version: 3, PackageDigest: "sha256:pkg",
+	Proposals: map[string]*registry.Proposal{"prp_1": {ProposalID: "prp_1", State: registry.ProposalDecided,
+		Decision: &registry.Decision{DecisionID: "dec_1", ProposalID: "prp_1", Verdict: registry.VerdictRetry,
+			Actor: registry.Actor{Kind: registry.ActorHuman, ID: "alice"}}}}}
 
 func retryRunAction(params map[string]string) *registry.Action {
 	raw, _ := json.Marshal(params)
 	spec := registry.ActionSpec{Name: registry.ActionRetryRun, Params: raw}
 	binding, _ := registry.BindingDigest(republishJob, spec)
 	return &registry.Action{ActionID: "act_1", Attempt: 1, BindingDigest: binding, Kind: registry.ActionApproved,
-		State: registry.ActionExecuting, JobVersion: 3,
+		State: registry.ActionExecuting, JobVersion: 3, ProposalID: "prp_1", DecisionID: "dec_1",
 		Grant: &registry.Grant{GrantID: "grt_1", ActionID: "act_1", Attempt: 1, ExpiresAt: republishNow.Add(time.Minute)},
 		Spec:  spec}
 }
 
-// A republish is held to an approved dagu.retry_run of this run's expected
-// execution with step "publish", and that approval is carried out only as a
-// republish.
+// A registered job's conditional retry is held to the approved
+// dagu.retry_run of this run's expected execution it is made for, and is
+// carried out only as what was approved: a republish for step "publish",
+// a retry of the whole run for no step (TXE-7517). Every refusal of a
+// republish keeps its code; every refusal of a whole-run retry is
+// txe_retry_unbound. Both are made before anything is queued or created.
 func TestTxeRepublishBinding(t *testing.T) {
 	const run = "run-1"
 	job := republishJob
@@ -101,53 +109,90 @@ func TestTxeRepublishBinding(t *testing.T) {
 		return out
 	}
 
-	assert.NoError(t, bind(retryRunAction(publish), true))
-	assert.NoError(t, bind(retryRunAction(whole), false), "an ordinary retry stays as it was")
-	assert.NoError(t, bind(nil, false), "another follow-up is the decision service's to bind")
+	assert.NoError(t, bind(retryRunAction(publish), true), "an approved republish")
+	assert.NoError(t, bind(retryRunAction(whole), false), "an approved retry of the whole run")
 
-	other := retryRunAction(publish)
-	other.Spec.Name = "custom.action"
-	stale := retryRunAction(publish)
-	stale.Attempt = 2
-	rebound := retryRunAction(publish)
-	rebound.BindingDigest = "bd2"
-	outdated := retryRunAction(publish)
-	movedJob := *republishJob
-	movedJob.PackageDigest = "sha256:other"
-	routine := retryRunAction(publish)
-	routine.Kind = registry.ActionRoutine
-	settled := retryRunAction(publish)
-	settled.State = registry.ActionSucceeded
-	ungranted := retryRunAction(publish)
-	ungranted.Grant = nil
-	expired := retryRunAction(publish)
-	expired.Grant.ExpiresAt = republishNow
-	oldGrant := retryRunAction(publish)
-	oldGrant.Grant.Attempt = 0
-	oldVersion := retryRunAction(publish)
-	oldVersion.JobVersion = 2
+	// Each way an action can fail to bind, for each intent: the action as
+	// the intent approves it, then changed.
+	type variant struct {
+		action *registry.Action
+		job    *registry.Job
+		expect *persis.ExpectedExecution
+	}
+	cases := func(params map[string]string) map[string]variant {
+		mk := func(change func(*registry.Action)) variant {
+			a := retryRunAction(params)
+			change(a)
+			return variant{action: a}
+		}
+		movedJob := *republishJob
+		movedJob.PackageDigest = "sha256:other"
+		agentDecided := *republishJob
+		agentDecided.Proposals = map[string]*registry.Proposal{"prp_1": {ProposalID: "prp_1", State: registry.ProposalDecided,
+			Decision: &registry.Decision{DecisionID: "dec_1", Verdict: registry.VerdictRetry, Actor: registry.Actor{Kind: registry.ActorAgent, ID: "bot"}}}}
+		undecided := *republishJob
+		undecided.Proposals = nil
+		forged := retryRunAction(params)
+		return map[string]variant{
+			"no such action":                 {action: nil, expect: republishExpectation()},
+			"not a retry_run":                mk(func(a *registry.Action) { a.Spec.Name = "custom.action" }),
+			"another attempt of the action":  mk(func(a *registry.Action) { a.Attempt = 2 }),
+			"another binding":                mk(func(a *registry.Action) { a.BindingDigest = "bd2" }),
+			"a binding of the job as it was": {action: retryRunAction(params), job: &movedJob},
+			"a request for another binding":  {action: forged, expect: republishExpectation()},
+			"another run":                    {action: retryRunAction(with(params, "run_id", "run-2"))},
+			"another execution":              {action: retryRunAction(with(params, "attempt_id", "ffffff"))},
+			"another queue marker":           {action: retryRunAction(with(params, "queued_at", "2026-10-23T00:00:00Z"))},
+			"not a person's decision":        mk(func(a *registry.Action) { a.Kind = registry.ActionRoutine }),
+			"decided by an agent":            {action: retryRunAction(params), job: &agentDecided},
+			"no decided proposal":            {action: retryRunAction(params), job: &undecided},
+			"another decision":               mk(func(a *registry.Action) { a.DecisionID = "dec_2" }),
+			"settled already (a replay)":     mk(func(a *registry.Action) { a.State = registry.ActionSucceeded }),
+			"outcome uncertain":              mk(func(a *registry.Action) { a.State = registry.ActionUncertain }),
+			"no grant":                       mk(func(a *registry.Action) { a.Grant = nil }),
+			"grant expired":                  mk(func(a *registry.Action) { a.Grant.ExpiresAt = republishNow }),
+			"grant for another attempt":      mk(func(a *registry.Action) { a.Grant.Attempt = 0 }),
+			"approved for an older version":  mk(func(a *registry.Action) { a.JobVersion = 2 }),
+		}
+	}
+	for intent, c := range map[string]struct {
+		params map[string]string
+		accept bool
+		code   string
+	}{
+		"republish": {publish, true, txeRepublishUnsupported},
+		"rerun":     {whole, false, txeRetryUnbound},
+	} {
+		for name, v := range cases(c.params) {
+			j, expect := job, v.expect
+			if v.job != nil {
+				j = v.job
+			}
+			if expect == nil {
+				expect = republishExpectationFor(v.action)
+			}
+			err := txeRepublishBinding(j, v.action, run, expect, c.accept, republishNow)
+			require.Error(t, err, "%s: %s", intent, name)
+			assert.Equal(t, c.code, republishRefusalCode(t, err), "%s: %s", intent, name)
+		}
+	}
+
+	// An approval is never carried out as the other intent, nor as a step.
 	for name, err := range map[string]error{
-		"no such action":                 bind(nil, true),
-		"not a retry_run":                bind(other, true),
 		"whole-run approval republished": bind(retryRunAction(whole), true),
-		"publish approval run whole":     bind(retryRunAction(publish), false),
-		"another step approved":          bind(retryRunAction(with(whole, "step", "run")), false),
-		"another attempt of the action":  bind(stale, true),
-		"another binding":                bind(rebound, true),
-		"a binding of the job as it was": txeRepublishBinding(&movedJob, outdated, run, republishExpectationFor(outdated), true, republishNow),
-		"a request for another binding":  txeRepublishBinding(job, retryRunAction(publish), run, republishExpectation(), true, republishNow),
-		"another run":                    bind(retryRunAction(with(publish, "run_id", "run-2")), true),
-		"another execution":              bind(retryRunAction(with(publish, "attempt_id", "ffffff")), true),
-		"not a person's decision":        bind(routine, true),
-		"settled already":                bind(settled, true),
-		"no grant":                       bind(ungranted, true),
-		"grant expired":                  bind(expired, true),
-		"grant for another attempt":      bind(oldGrant, true),
-		"approved for an older version":  bind(oldVersion, true),
-		"another queue marker":           bind(retryRunAction(with(publish, "queued_at", "2026-10-23T00:00:00Z")), true),
+		"another step approved":          bind(retryRunAction(with(whole, "step", "run")), true),
 	} {
 		require.Error(t, err, name)
 		assert.Equal(t, txeRepublishUnsupported, republishRefusalCode(t, err), name)
+	}
+	for name, err := range map[string]error{
+		"publish approval run whole":          bind(retryRunAction(publish), false),
+		"another step approved, run whole":    bind(retryRunAction(with(whole, "step", "run")), false),
+		"another follow-up's action":          bind(nil, false),
+		"a request naming no action of a job": txeRepublishBinding(job, nil, run, republishExpectation(), false, republishNow),
+	} {
+		require.Error(t, err, name)
+		assert.Equal(t, txeRetryUnbound, republishRefusalCode(t, err), name)
 	}
 }
 

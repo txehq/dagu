@@ -14,12 +14,10 @@ import { I18nText } from '@/i18n/I18nText';
 import { useI18n } from '@/i18n/I18nProvider';
 
 import { isTxePerson, useTxeIdentity } from './identity';
+import { JOB_DAG_NAME } from './jobDagName';
 
 // How often the job's access is read again while a page is open.
 export const ACCESS_REFRESH_MS = 10_000;
-
-// A job's DAG is named by its job id.
-const JOB_DAG_NAME = /^job_[0-9A-Z]{26}$/;
 
 // The hub's answer for a job, as the dashboard reads it: how the caller
 // reaches the job and with which permissions. A 404 is an answer with no

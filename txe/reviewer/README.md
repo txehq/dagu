@@ -347,6 +347,24 @@ files.
   of the same execution while one is open or decided and not settled is
   refused (`retry_intent_conflict`); one settled with nothing run releases
   the execution. An older worker's executor does not have this rule.
+  The service retries a registered job's run only this way (TXE-7517).
+  `POST /dag-runs/{name}/{dagRunId}/retry` for a job's run, of the whole
+  run or of any step, is refused before anything is queued or created
+  unless it carries the `retryRequest` of a person's approved
+  `dagu.retry_run` that is executing its current attempt under a live
+  grant, for this run's execution, the job's current version and binding,
+  and as what was approved: no step for a re-run, `stepName: publish` with
+  `acceptFailedPrerequisites` for a republish. A request with none is
+  409 `txe_decision_required`, naming the job's TXE page, where a person
+  chooses "Run again" or "Publish sealed result"; one that does not bind
+  is 400 `txe_retry_unbound` (a re-run) or
+  `accept_failed_prerequisites_unsupported` (a republish). The reviewer
+  reads all three as "nothing started". The run page offers no generic
+  Retry on a job's run; it links to the TXE page. This holds only on a
+  service with this change: an older service admits a direct generic retry
+  of a job's run as before, and nothing here protects it. A retry queued
+  from the hub's own command line, outside the API, is not covered here
+  either (TXE-7518).
   The request also says which attempt of which action it is made for
   (`retryRequest`: the registry's action id, the attempt number, the
   action's binding digest, all taken from the registry's record). The

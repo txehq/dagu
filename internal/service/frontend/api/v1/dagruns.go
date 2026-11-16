@@ -3179,13 +3179,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	if err := bindRetryRequest(expect, dag.Name, retryDagRunID); err != nil {
 		return retryDAGRunResult{}, err
 	}
-	// A registered job's retry made for an action is held to what the action
-	// approved: a republish of the sealed result, or a retry of the run. A
-	// republish is dispatched with the base configuration it was checked with.
 	republishBase := executor.ResolveBaseConfig(dag.BaseConfigData, a.config.Paths.BaseConfig)
-	if err := a.txeCheckRepublish(ctx, dag, republishBase, retryDagRunID, expect, acceptFailedPrerequisites); err != nil {
-		return retryDAGRunResult{}, err
-	}
 	// A run executed locally runs a queued retry under a new attempt, which
 	// is not the execution the request admitted; provenance needs a
 	// distributed run, where the admitted execution is the one that runs.
@@ -3210,6 +3204,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		}
 	}
 
+	requestedStep := stepName
 	auditStepName := stepName
 	var retryPath dagrun.RetryPath
 	retryValidationStatus := prevStatus
@@ -3230,6 +3225,16 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 		retryValidationStatus = targetStatus
 		auditStepName = retryPath.Step
 		stepName = retryPath.RootStep()
+	}
+	// A registered job's run is retried only as the carrying out of the
+	// person's TXE decision the request is made for, as what it approved: a
+	// republish of the sealed result, or a retry of the whole run
+	// (TXE-7517). It is decided once every run on a child's path is known to
+	// be the caller's, and before anything is queued or created. A
+	// republish is dispatched with the base configuration it was checked
+	// with.
+	if err := a.txeCheckRepublish(ctx, dag, republishBase, retryDagRunID, requestedStep, expect, acceptFailedPrerequisites); err != nil {
+		return retryDAGRunResult{}, err
 	}
 	if err := humantask.ValidateRetry(retryValidationStatus, auditStepName); err != nil {
 		return retryDAGRunResult{}, &Error{

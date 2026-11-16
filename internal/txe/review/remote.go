@@ -2147,4 +2147,9 @@ var retryRefusedBeforeEffect = map[string]int{
 	// No connected worker of the job's machine can run a republish; the
 	// service checks that before it creates or dispatches the retry.
 	"worker_capability_missing": http.StatusConflict,
+	// A registered job's retry that does not bind the approved action it
+	// names (TXE-7517), or names none; the service refuses either before
+	// it queues or creates anything.
+	"txe_retry_unbound":     http.StatusBadRequest,
+	"txe_decision_required": http.StatusConflict,
 }

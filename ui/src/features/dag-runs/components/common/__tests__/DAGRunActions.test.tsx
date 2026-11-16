@@ -10,6 +10,7 @@ import {
 } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Status, StatusLabel } from '@/api/v1/schema';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import DAGRunActions from '../DAGRunActions';
 import {
   getDAGRunTerminateAction,
@@ -729,5 +730,58 @@ describe('DAGRunActions', () => {
       }
     );
     expect(h.showToast).toHaveBeenCalledWith('DAG run dequeued');
+  });
+
+  // TXE-7517: the hub refuses a generic retry of a registered TXE job's
+  // run, so the page offers no Retry that would be refused: the job's TXE
+  // page, where Run again and Publish sealed result are, stands in for it.
+  it('sends a TXE job run to its job page instead of a Retry', () => {
+    const job = 'job_01M4XEETKWKZX504BK65ADBVYB';
+    render(
+      <MemoryRouter initialEntries={['/dag-runs']}>
+        <Routes>
+          <Route
+            path="/dag-runs"
+            element={
+              <DAGRunActions
+                dagRun={{
+                  ...runningRun,
+                  name: job,
+                  status: Status.Failed,
+                  statusLabel: StatusLabel.failed,
+                }}
+                name={job}
+                displayMode="full"
+              />
+            }
+          />
+          <Route path="/txe/jobs/:jobId" element={<p>txe job page</p>} />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Retry' })
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry in TXE' }));
+    expect(screen.getByText('txe job page')).toBeInTheDocument();
+    expect(h.client.POST).not.toHaveBeenCalled();
+  });
+
+  it('keeps Retry on any other DAG run', () => {
+    render(
+      <DAGRunActions
+        dagRun={{
+          ...runningRun,
+          status: Status.Failed,
+          statusLabel: StatusLabel.failed,
+        }}
+        name="etl"
+        displayMode="full"
+      />
+    );
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Retry in TXE' })
+    ).not.toBeInTheDocument();
   });
 });

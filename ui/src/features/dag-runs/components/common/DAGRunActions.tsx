@@ -35,6 +35,8 @@ import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
+import { TxeJobRetryButton } from '@/features/txe/components/TxeJobRetryButton';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 
@@ -311,38 +313,49 @@ function DAGRunActions({
           </Tooltip>
         )}
 
-        {/* Retry Button */}
-        {(!hideUnavailable || buttonState.retry || !isRootLevel) && (
-          <Tooltip>
-            {/* On a sub-run the disabled button cannot take focus, so the
-                wrapper does, letting keyboard users read why. */}
-            <TooltipTrigger asChild>
-              <span tabIndex={isRootLevel ? undefined : 0}>
-                <ActionButton
-                  label={buttonLabel}
-                  icon={<RotateCcw className="h-4 w-4" />}
-                  disabled={!buttonState['retry']}
-                  data-ww-action={markActions ? 'retry' : undefined}
-                  onClick={() => setIsRetryModal(true)}
-                  className="cursor-pointer"
-                >
-                  <I18nText text={'Retry'} />
-                </ActionButton>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>
-                {isRootLevel ? (
-                  <I18nText text={'Retry this run'} />
-                ) : (
-                  <I18nText
-                    text={'Retry is only available on the top-level run'}
-                  />
-                )}
-              </p>
-            </TooltipContent>
-          </Tooltip>
+        {/* A registered TXE job's run is retried only through a TXE
+            decision (TXE-7517): its job page stands in for Retry. */}
+        {isRootLevel && isTxeJobDAGName(rootName) && (
+          <TxeJobRetryButton
+            jobId={rootName}
+            label={buttonLabel}
+            data-ww-action={markActions ? 'retry' : undefined}
+          />
         )}
+
+        {/* Retry Button */}
+        {!(isRootLevel && isTxeJobDAGName(rootName)) &&
+          (!hideUnavailable || buttonState.retry || !isRootLevel) && (
+            <Tooltip>
+              {/* On a sub-run the disabled button cannot take focus, so the
+                wrapper does, letting keyboard users read why. */}
+              <TooltipTrigger asChild>
+                <span tabIndex={isRootLevel ? undefined : 0}>
+                  <ActionButton
+                    label={buttonLabel}
+                    icon={<RotateCcw className="h-4 w-4" />}
+                    disabled={!buttonState['retry']}
+                    data-ww-action={markActions ? 'retry' : undefined}
+                    onClick={() => setIsRetryModal(true)}
+                    className="cursor-pointer"
+                  >
+                    <I18nText text={'Retry'} />
+                  </ActionButton>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>
+                  {isRootLevel ? (
+                    <I18nText text={'Retry this run'} />
+                  ) : (
+                    <I18nText
+                      text={'Retry is only available on the top-level run'}
+                    />
+                  )}
+                </p>
+              </TooltipContent>
+            </Tooltip>
+          )}
 
         {/* Dequeue Button */}
         {(!hideUnavailable || buttonState.dequeue) && (
