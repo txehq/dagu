@@ -573,23 +573,301 @@ func bashInput(t *testing.T, command string) string {
 	return string(raw)
 }
 
+// guardRefused are commands that execute a mutant or mutation script or tool outside
+// mutate-sandboxed. The first block is the v3 rollout's acceptance list (TXE-7549); the rest are
+// the other ways a shell can run one.
+var guardRefused = []string{
+	// TXE-7549 v3 acceptance test, §4.
+	"python3 evidence/txe-7523/mutants-7538.py",
+	"bash scripts/run-mutations.sh",
+	"mutmut run",
+	"cd /x && timeout 900 python3 docs/specs/foo/mutants.py",
+	"python3 -I <(git show origin/main:docs/x/mutants.py)",
+	"python3 mutants.py",
+	// Refused correctly on 2026-11-16 (the live fixture check's mutation-shaped command).
+	"python3 /var/folders/nm/T/tmp.mygxOzsvhO/mutants.py",
+	// Earlier unit cases.
+	"cd /x && GOFLAGS=-count=1 timeout 900 python3 -u docs/specs/foo/mutants.py --only guard",
+	"python3 -I <(git show origin/main:docs/specs/foo/mutants.py)",
+	"echo start; ./mutants.py",
+	"out=$(python3 mutants.py)",
+	"uv run mutmut run",
+	"python3 -m mutmut run",
+	"go run ./tools/mutate.go",
+	"go-mutesting ./...",
+	"env FOO=1 nohup python3 'mut''ants.py'",
+	// Shell code is read as shell code.
+	"bash -c 'python3 mutants.py'",
+	`sh -ec "timeout 60 python3 -u x/mutants.py"`,
+	"bash -lc 'cd x && python3 -I mutants.py --only one'",
+	"eval 'python3 mutants.py'",
+	"env -S 'python3 mutants.py'",
+	"bash <<'EOF'\ncd x\npython3 mutants.py\nEOF",
+	"bash <<< 'python3 mutants.py'",
+	"source ./run-mutations.sh",
+	". tools/mutants.sh",
+	// Substitutions, lists, subshells and compound commands run what they contain.
+	`echo "$(python3 mutants.py)"`,
+	"echo `python3 mutants.py`",
+	"cat <<EOF\n$(python3 mutants.py)\nEOF",
+	"(cd x && python3 mutants.py)",
+	"if true; then python3 mutants.py; fi",
+	"for f in a b; do python3 mutants.py \"$f\"; done",
+	"cd x; python3 mutants.py 2>&1 | tee log",
+	"python3 mutants.py>log",
+	"2>/dev/null python3 mutants.py",
+	"true && { python3 mutants.py; }",
+	// The program read on stdin.
+	"python3 - < mutants.py",
+	"cat mutants.py | python3 -",
+	"git show origin/main:x/mutants.py | python3 -I",
+	// Wrappers and runners.
+	"timeout -s KILL 900 python3 mutants.py",
+	"nice -n 5 python3 mutants.py",
+	"sudo -u nobody python3 mutants.py",
+	"xargs -n1 python3 mutants.py < list.txt",
+	"uvx mutmut run",
+	"poetry run python mutants.py",
+	"uv run --with pytest python mutants.py",
+	"find . -name '*.go' -exec python3 mutants.py {} \\;",
+	"PY=/usr/bin/python3; $PY -I mutants.py",
+	`"$PYTHON" -I tools/mutants.py`,
+	"python3 -W ignore mutants.py",
+	"python3 -Im mutmut run",
+	"/opt/py/bin/python3.12 -u mutants.py",
+	// Other interpreters.
+	"node tools/mutants.js",
+	"deno run mutants.ts",
+	"ruby mutants.rb",
+	"go run ./tools/mutate",
+	// Code for a non-shell interpreter that imports a mutant, or names one and runs it.
+	`python3 -c "import runpy; runpy.run_path('tools/mutants.py')"`,
+	`python3 -I -c 'import subprocess; subprocess.run(["python3", "mutants.py"])'`,
+	"python3 -I -c \"import subprocess\nprint('bash run-mutations.sh')\"",
+	`python3 -c 'import os; os.system("mutmut run")'`,
+	"python3 -c 'import mutants'",
+	"python3 -c 'from tools.mutants import main; main()'",
+	"python3 - <<'EOF'\nimport runpy\nrunpy.run_path(\"mutants.py\")\nEOF",
+	`python3 <<< 'exec(open("mutants.py").read())'`,
+	`node -e 'require("./mutants.js")'`,
+	`node -e 'require("child_process").execSync("python3 mutants.py")'`,
+	`perl -e 'system("python3 mutants.py")'`,
+	`deno eval 'await import("./mutants.ts")'`,
+	// Review findings on PR 276 (connector and security review).
+	"((python3 mutants.py) )",
+	"echo $(( $(python3 mutants.py) + 1 ))",
+	"python3 < <(cat mutants.py)",
+	"bash < <(cat run-mutations.sh)",
+	"python3 -m runpy tools/mutants.py",
+	"python3 -m pdb mutants.py",
+	"python3 -m cProfile -o prof.out mutants.py",
+	"coverage run mutants.py",
+	"function f { python3 mutants.py; }",
+	"node -r ./mutants.js app.js",
+	"node --require=./mutants.js app.js",
+	"ruby -rmutants app.rb",
+	`perl -e'system("python3 mutants.py")'`,
+	`ruby -e'system("python3 mutants.py")'`,
+	`perl -e 'print 1' -e 'system("python3 mutants.py")'`,
+	`perl -lne'system("python3 mutants.py")' notes.md`,
+	"perl -Mmutants -e 1",
+	"ruby -r ./mutants.rb app.rb",
+	`ruby -E UTF-8 -e 'system("python3 mutants.py")'`,
+	`ruby -We 'system("python3 mutants.py /x")'`,
+	`ruby -Kue 'system("python3 mutants.py")'`,
+	"perl -d:mutants app.pl",
+	"perl -dt:mutants app.pl",
+	"ruby --encoding UTF-8 mutants.rb",
+	"ruby --external-encoding=UTF-8 tools/mutants.rb",
+	`node --eval='require("./mutants.js")'`,
+	"env --split-string='python3 mutants.py'",
+	"env '-Spython3 mutants.py'",
+	"python3 < mutants.py 3< /dev/null",
+	"bash -s -- foo < run-mutations.sh",
+	"cat run-mutations.sh | bash -s x",
+	"python3 3< mutants.py <&3",
+	"python3 /dev/fd/3 3< mutants.py",
+	"bash /dev/fd/3 3<<'EOF'\npython3 mutants.py\nEOF",
+	"python3 00< mutants.py",
+	"node -e 'console.log(1)' -r ./mutants.js",
+	`ruby --some-new-option value -e 'system("python3 mutants.py")'`,
+	"bash --rcfile /dev/null run-mutations.sh",
+	"bash --init-file ~/.bashrc -- tools/mutants.sh",
+	"bash --rcfile=tools/mutants.sh -i",
+	// Descriptors are resolved when judged, after here-document bodies are read; a descriptor
+	// path the command does not set fails closed.
+	"python3 3<<'EOF' <&3\nimport runpy; runpy.run_path('mutants.py')\nEOF",
+	"bash 3<<'EOF' <&3-\npython3 mutants.py\nEOF",
+	"python3 //dev/fd/3 3< mutants.py",
+	"python3 /proc/self/../self/fd/3 3< mutants.py",
+	"python3 /proc/thread-self/fd/3 3< mutants.py",
+	"python3 /dev/fd/3 3>>mutants.py",
+	"exec 3< mutants.py; python3 /dev/fd/3",
+	"python3 <&3",
+	"python3 3< mutants.py <&3 3< app.py",
+	"python3 /dev/fd/$N 3< app.py",
+	"bash --rcfile <(cat mutants.sh) -i",
+	// Code given on the command line that runs a mutant named in its arguments.
+	`python3 -c 'exec(open(__import__("sys").argv[1]).read())' mutants.py`,
+	`node -e 'require(process.argv[1])' ./mutants.js`,
+	`ruby -e 'load ARGV[0]' mutants.rb`,
+	`perl -e 'do $ARGV[0]' mutants.pl`,
+	// The guard does not follow data flow: code that can run a process, given a mutant script as
+	// an argument, is refused even when it would not run that argument.
+	`python3 -c 'import subprocess; print(subprocess.run(["git", "status"]).returncode)' mutants.py`,
+	// Preloads and value-taking options.
+	`bun --preload=./mutants.js -e 'console.log(1)'`,
+	"bun --preload ./mutants.js app.js",
+	"node --title harmless mutants.js",
+	// Paths under /proc cannot be judged.
+	"python3 /proc/1/cwd/x.py",
+	// Security review of 93ed54893.
+	"cat mutants.py | python3 < /dev/stdin",
+	"python3 < /dev/fd/3 3< mutants.py",
+	`perl -e 'print 1' -- -e 'system($ARGV[0])' mutants.pl`,
+	"node --unknown-flag harmless app.js mutants.js",
+	`M=tools/mutants.py python3 -c 'import os, runpy; runpy.run_path(os.environ["M"])'`,
+	`env M=tools/mutants.py python3 -c 'import os, runpy; runpy.run_path(os.environ["M"])'`,
+	`python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:])' mutmut run`,
+	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' ./run-mutations`,
+	"PY=/usr/bin/python3; env PY=harmless true; $PY ./run-mutations",
+	"node inspect mutants.js",
+	"tsx watch tools/mutants.ts",
+	"deno test mutants.ts",
+	"bun test ./mutants.ts",
+	"python3 3< mutants.py < /dev/fd/3 3< /dev/null",
+	"go run -exec ./mutants.py ./cmd/dagu",
+	"go test -exec=./tools/mutants.sh ./...",
+	"go test -exec 'python3 mutants.py' ./x",
+	"go build -toolexec=./mutants.sh ./cmd/x",
+	"go vet -vettool ./tools/mutants ./...",
+	"GOFLAGS=-exec=./mutants.py go test ./...",
+	"env GOFLAGS='-count=1 -toolexec=./mutants.sh' go build ./...",
+	"go env -w GOFLAGS=-exec=./tools/mutants.py",
+	"X=./mutants.py; go test -exec $X ./...",
+	"go test -exec $UNSET ./...",
+	"export GOFLAGS=-exec=./mutants.py; go test ./...",
+	"GOENV=/tmp/x/go.env go test ./...",
+	"(python3) < mutants.py",
+	"{ python3; } < mutants.py",
+	"cat mutants.py | (python3 -)",
+	"(cd x && python3) < tools/mutants.py",
+	`perl -I ./mutants.pl -e 'do "x"'`,
+	"python3 /dev/fd/3 3< /dev/fd/4",
+	"python3 /dev/fd/3 3> /dev/fd/4",
+}
+
+// guardAllowed are commands in which the words appear only as data. The first block is the v3
+// acceptance list; then the false positives observed after the rollout (2026-11-16/17), kept in
+// their shape with local paths and ids replaced; then the data shapes TXE-7641 names.
+var guardAllowed = []string{
+	// TXE-7549 v3 acceptance test, §4.
+	"go test ./...",
+	"git commit -m 'mutants: add one'",
+	"cat mutants.py",
+	"grep -n mutant notes.md",
+	"mutate-sandboxed --mutants m.json -- go test ./...",
+	"python3 -I txe/mutate/mutate-sandboxed.py --help",
+	"ls",
+	"make check",
+	"gh pr view 266",
+	// Observed false positive 1 (cc3, 16:06Z): a python3 -c string naming the guard's hook.
+	`git -C ~/.coding_global log --oneline -2; git -C ~/.coding_global diff --stat -- AGENTS.md; python3 -c 'import json;d=json.load(open("/home/u/.claude4/settings.json"));print(sum("mutant-run-guard" in json.dumps(e) for e in d.get("hooks",{}).get("PreToolUse",[])))'; grep -n -iE 'class fix|stale' /home/u/evidence/APPLY-REPORT.md | head -8`,
+	// Observed false positive 1b (cc3, 16:09Z): a multi-line python3 -c string, then awk and ls.
+	"cd ~/evidence && S=/tmp/scratch && python3 -I -B -c '\nimport json,sys\nraw=open(sys.argv[1]).read(); d=json.loads(raw[raw.index(\"{\"):])\nwith open(sys.argv[2],\"a\") as f:\n    for m in d[\"result\"][\"messages\"]: f.write(\"\\n## \"+m[\"id\"]+\": \"+m[\"subject\"]+\"\\n\")\n' $S/inbox.txt records/SLOTS.md; awk '/^## Mutation tests/{f=1} f&&/^## /&&!/Mutation tests/{exit} f' ~/.coding_global/AGENTS.md | head -40; ls -l ~/.coding_global/bin/mutate-sandboxed 2>&1 | cut -c1-120",
+	// Observed false positive 2 (cc1, 16:09Z): a batch of pre-create gates; a grep pattern says "mutate".
+	`cd ~/evidence/packet-r1 && PY=/home/u/.pyenv/versions/vv/bin/python3; S=/tmp/scratch; shasum -a 256 -c MANIFEST.sha256 >| $S/manifest.txt 2>&1; echo "rehash rc=$? notOK=$(grep -vc ': OK$' $S/manifest.txt)"; $PY -I -B run.py selfcheck >| $S/selfcheck.txt 2>&1; $PY -I -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["violations"])' $S/selfcheck.txt; $PY -I -B run_tests.py >| $S/tests.txt 2>&1; grep -E '^(Ran|OK|FAILED)' $S/tests.txt; docker ps -a --format '{{.Names}}' | grep -ciE 'txe7522|rig|mutate|w10|cal'; docker network ls --format '{{.Name}}' | grep -c txe7522; launchctl list | grep -c txe7522r5; date -u +%FT%TZ`,
+	// Observed false positive 2b (cc1, 16:10Z): reporting the refusal, a quoted heredoc to a file.
+	"S=/tmp/scratch; cat > $S/ask-guard.txt <<'EOF'\nVerbatim refusal: \"Refused: this runs a mutation test outside the sandboxed runner. Run it through mutate-sandboxed.\"\n- a read-only sweep: docker ps -a --format '{{.Names}}' | grep -ciE 'txe7522|rig|mutate|w10|cal'\nMy guess: the word \"mutate\"; python3 mutants.py was never run.\nEOF\norca orchestration ask --from term_x --question \"$(cat $S/ask-guard.txt)\" 2>&1 | tail -2",
+	// Observed false positive 3 (cc3, 16:11Z): a brief written with printf, naming the guard and runner.
+	"D=/home/u/briefs; GUARD='The mutant-run guard (TXE-7549) is live. Any mutant check runs ONLY through ~/.coding_global/bin/mutate-sandboxed: never python3 mutants.py on the host.'\n{ printf '%s\\n' \"Your ticket: TXE-7641.\" \"Repo: txehq/dagu: txe/mutate/guard-hook.py and its tests. Run bash scripts/run-mutations.sh only through mutate-sandboxed.\" \"$GUARD\"; } >| $D/spec-TXE-7641.md\ncd $D; bash launch.sh 7641 guard-exec-only 14",
+	// Observed false positive 4 (cc14, 2026-11-17): a python3 script on a quoted heredoc that edits the guard.
+	"cd txe/mutate && python3 - <<'EOF'\np=\"guard-hook.py\"; s=open(p).read()\ns=s.replace(\"python3 mutants.py\", \"bash run-mutations.sh\")\nopen(p,\"w\").write(s)\nEOF",
+	// Observed on 2026-11-16 (the fixture check): a prompt and a printf naming mutants.py are data.
+	`D=$(mktemp -d); printf 'open(%r,"w").write("x")\n' "$D/MARKER" > $D/mutants.py; cat $D/mutants.py; cd $D && timeout 300 claude -p "Run exactly: 1) python3 $D/mutants.py 2) python3 $D/control.py" 2>&1 | tail -20`,
+	// Earlier unit cases.
+	"python3 -I txe/mutate/mutate-sandboxed.py --mutants m.json -- go test ./...",
+	"mutate-sandboxed --mutants mutants.json --tree . -- python3 -m pytest tests/test_mutants.py",
+	"python3 -I <(git show origin/main:txe/mutate/mutate-sandboxed.py) --mutants m.json -- go test ./x",
+	"~/.coding_global/bin/mutate-sandboxed --mutants m.json --tree . -- python3 mutants.py",
+	"cat docs/specs/foo/mutants.py",
+	"git add mutants.py && git commit -m 'mutants: add guard mutant'",
+	"go test ./txe/mutate/...",
+	"python3 -I txe/mutate/guard-hook.py",
+	"grep -n mutant evidence/notes.md",
+	// Data: patterns, messages, here-documents, paths and code strings of non-shell interpreters.
+	"grep -rn 'python3 mutants.py' docs/",
+	"sed -n 1,5p tools/mutants.py",
+	"shasum -a 256 tools/mutants.py run-mutations.sh",
+	"ls txe/mutate tools/mutants.py",
+	"echo python3 mutants.py",
+	"printf '%s\\n' 'bash run-mutations.sh' > notes.txt",
+	"cat > notes.md <<'EOF'\npython3 mutants.py\nbash run-mutations.sh\nEOF",
+	"cat > notes.md <<EOF\npython3 mutants.py\nmutmut run\nEOF",
+	"cat <<-EOF >> notes.md\n\tpython3 mutants.py\n\tEOF\necho done",
+	`orca orchestration send --subject x --body "run python3 mutants.py via mutate-sandboxed"`,
+	"gh pr comment 1 --body 'python3 -I <(git show x:mutants.py)'",
+	"linear comment --text \"mutmut run; bash run-mutations.sh\"",
+	`python3 -c 'import json; print("mutants.py")'`,
+	`python3 -c 'print(open("tools/mutants.py").read().count("old"))'`,
+	`node -e 'console.log("mutants.js")'`,
+	"true # ; python3 mutants.py",
+	`python3 -c 'print("example: import mutants")'`,
+	"python3 - <<'EOF'\n# import mutants\nprint(1)\nEOF",
+	"echo $((1 + 2)); ((i++))",
+	"python3 -m cProfile -o prof.out tools/report.py mutants.json",
+	"node -r ./setup.js app.js mutants.json",
+	"perl -Iexe -ne 'print if /mutants.py/' notes.md",
+	"perl -lne 'print if /run-mutations.sh/' notes.md",
+	"ruby -E UTF-8 -e 'puts 1' mutants.json",
+	"perl -d -e 1",
+	"ruby --encoding UTF-8 app.rb mutants.json",
+	`node --eval='console.log("mutants.js")'`,
+	"python3 app.py 3< mutants.py",
+	"bash -s < setup.sh -- mutants.py",
+	"cat 3<<'EOF' notes\npython3 mutants.py\nEOF",
+	`ruby -Kue 'puts File.read("mutants.rb")'`,
+	"python3 /dev/fd/3 3< app.py 4< mutants.py",
+	"python3 - 3< mutants.py",
+	"python3 app.py <&3",
+	"python3 /dev/fd/3 3< app.py",
+	"bash /dev/stdin < setup.sh",
+	"python3 3< app.py <&3 3< mutants.py",
+	"python3 /home/u/fd/app.py",
+	"cat mutants.py | python3 < /dev/null",
+	"ruby -e 'puts ARGV[0]' 'import mutants'",
+	"node app.js --title mutants.js",
+	"node --title mutants app.js",
+	"python3 /dev/fd/3 3>>app.py",
+	"python3 3< /dev/null < /dev/fd/3 3< mutants.py",
+	"go test -run TestMutants ./txe/mutate/ -exec /usr/bin/env",
+	"GOFLAGS=-count=1 go test ./txe/mutate/...",
+	"(python3 app.py) < mutants.py",
+	"{ cat; } < mutants.py",
+	"node --inspect ./app.js fixtures/mutants.js",
+	// Observed false positive 5 (cc1, 17:36Z): a python3 heredoc editing a test file, whose
+	// replacement text has a loop variable named mutate. It edits data and runs nothing.
+	"cd ~/evidence/packet-r1 && ~/.pyenv/versions/vv/bin/python3 -I - <<'PYEOF'\nimport os\np=\"tests/test_r5.py\"; s=open(p).read()\nreps=[(\"old\", '''for mutate, why in ((lambda p: p[\"ports\"].pop(\"worker_health\"), \"missing\"),):\n    bad = dict(good)\n    mutate(bad)\n''')]\nfor a, b in reps:\n    s = s.replace(a, b)\nopen(p + \".tmp\", \"w\").write(s); os.replace(p + \".tmp\", p)\nPYEOF",
+	"perl -ne 'print if /mutants.py/' notes.md",
+	"git show origin/main:txe/mutate/guard-hook.py | head",
+	"git log --grep=mutate --oneline",
+	"bash ~/.coding_global/hooks/mutant-run-guard < input.json",
+	`python3 -I -c 'import json,sys; print(json.dumps({"tool_input": {"command": sys.argv[1]}}))' "python3 mutants.py" | "$P/b/hooks/mutant-run-guard" >"$T/hook.out" 2>&1`,
+	"command -v mutmut",
+	"which mutmut && pip install mutmut",
+	"vim tools/mutants.py",
+	"python3 tools/report.py mutants.json",
+	"go run ./cmd/report mutants.json",
+	"echo ok # python3 mutants.py",
+	"x=$((1 + 2)); echo $x mutants.py",
+	"case $x in mutants) echo python3 mutants.py;; esac",
+	"for f in mutants.py run-mutations.sh; do wc -l $f; done",
+	"cat <<'A' <<'B'\npython3 mutants.py\nA\nbash run-mutations.sh\nB",
+}
+
 // The guard hook refuses a mutation run started outside mutate-sandboxed and leaves everything else.
 func TestGuardHook(t *testing.T) {
-	refused := []string{
-		"python3 evidence/txe-7523/mutants-7538.py",
-		"cd /x && GOFLAGS=-count=1 timeout 900 python3 -u docs/specs/foo/mutants.py --only guard",
-		"python3 -I <(git show origin/main:docs/specs/foo/mutants.py)",
-		"echo start; ./mutants.py",
-		"bash scripts/run-mutations.sh",
-		"out=$(python3 mutants.py)",
-		"mutmut run",
-		"uv run mutmut run",
-		"python3 -m mutmut run",
-		"go run ./tools/mutate.go",
-		"go-mutesting ./...",
-		"env FOO=1 nohup python3 'mut''ants.py'",
-	}
-	for _, c := range refused {
+	for _, c := range guardRefused {
 		code, stdout, stderr := hook(t, bashInput(t, c))
 		assert.Equal(t, 2, code, "should refuse: %s", c)
 		assert.Empty(t, stdout)
@@ -600,17 +878,7 @@ func TestGuardHook(t *testing.T) {
 		assert.NotContains(t, stderr, "main's")
 		assert.Contains(t, stderr, "do not rename anything")
 	}
-	allowed := []string{
-		"python3 -I txe/mutate/mutate-sandboxed.py --mutants m.json -- go test ./...",
-		"mutate-sandboxed --mutants mutants.json --tree . -- python3 -m pytest tests/test_mutants.py",
-		"python3 -I <(git show origin/main:txe/mutate/mutate-sandboxed.py) --mutants m.json -- go test ./x",
-		"cat docs/specs/foo/mutants.py",
-		"git add mutants.py && git commit -m 'mutants: add guard mutant'",
-		"go test ./txe/mutate/...",
-		"python3 -I txe/mutate/guard-hook.py",
-		"grep -n mutant evidence/notes.md",
-	}
-	for _, c := range allowed {
+	for _, c := range guardAllowed {
 		code, stdout, stderr := hook(t, bashInput(t, c))
 		assert.Equal(t, 0, code, "should allow: %s (%s)", c, stderr)
 		assert.Empty(t, stdout+stderr)
@@ -715,8 +983,46 @@ func TestGuardHookCodexInput(t *testing.T) {
 		assert.Equal(t, 2, code, input)
 		assert.Contains(t, stderr, "mutate-sandboxed")
 	}
-	code, _, _ := hook(t, `{"tool_name":"exec_command","tool_input":{"cmd":"go test ./..."}}`)
-	assert.Equal(t, 0, code)
+	for _, input := range []string{
+		`{"tool_name":"exec_command","tool_input":{"cmd":"go test ./..."}}`,
+		`{"tool_name":"exec_command","tool_input":{"cmd":["python3","-c","print('mutants.py')"]}}`,
+		`{"tool_name":"shell","tool_input":{"command":["bash","-lc","grep -rn 'mutate' docs | head"]}}`,
+		`{"tool_name":"shell","tool_input":{"command":["gh","pr","comment","1","--body","python3 mutants.py; mutmut run"]}}`,
+	} {
+		code, _, stderr := hook(t, input)
+		assert.Equal(t, 0, code, "%s (%s)", input, stderr)
+	}
+}
+
+// The reader never fails and never hangs, whatever the command text: random shell-ish input
+// (unbalanced quotes, substitutions and here-documents included) and deep nesting all return a
+// verdict, and a verdict on a mutation run survives being wrapped in noise.
+func TestGuardHookReaderIsTotal(t *testing.T) {
+	prog := `
+import importlib.util, random, sys, time
+spec = importlib.util.spec_from_file_location("guard", sys.argv[1])
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+rng = random.Random(7641)
+alphabet = ["'", '"', "\\", "$(", ")", "(", "` + "`" + `", "<<", "<<-", "<<<", "EOF", "\n", ";", "|", "&",
+            "&&", "<(", ">", "<", " ", "#", "$((", "{", "}", "python3", "bash", "-c", "mutants.py", "mutmut",
+            "x", "=", "$", "\t", "-", "2>", "&>", "eval", "env", "-S", "find", "-exec"]
+start = time.monotonic()
+for _ in range(4000):
+    s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
+    g.refuses(s)
+g.refuses("bash -c " + "'bash -c " * 200 + "x")
+# Nesting too deep to read fails closed, whatever it holds.
+for deep in ["$(" * 3000 + "ls" + ")" * 3000, "(" * 3000 + "ls" + ")" * 3000, "uv run " * 3000 + "ls",
+             "find . -exec " * 3000 + "ls", "echo " + "<(" * 3000 + "ls" + ")" * 3000]:
+    assert g.refuses(deep) is True, deep[:20]
+assert g.refuses("$(" * 5 + "ls" + ")" * 5) is False
+for noise in ["echo '", 'echo "', "cat <<EOF", "x=$(", "# "]:
+    assert g.refuses("python3 mutants.py; " + noise) is True, noise
+print("ok", round(time.monotonic() - start, 1) < 60)
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "guard-hook.py")).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "ok True\n", string(out))
 }
 
 // foreignContainer registers a container the run did not start: cleanup must never touch it.

@@ -112,15 +112,48 @@ result: every baseline and mutant run executes its tests.
   which is why the entry and sentinel checks exist. The container's mounts are the boundary; the
   checks are how you learn the boundary failed.
 - The guard hook (below) is a heuristic over command text, not complete enforcement: a script
-  with an ordinary name, or a command built at run time, gets past it.
+  with an ordinary name, a command built at run time, or a run from inside a script the command
+  calls gets past it.
 
 ## The forgotten-wrapper check
 
 `guard-hook.py` is a PreToolUse hook for Claude Code and Codex. It refuses (exit 2, reason on
 stderr) a shell command that runs a mutation tool, or a script whose name says mutant or
-mutation, any way other than through `mutate-sandboxed`. It does not parse shell and a renamed
-script gets past it; it catches the habit that caused the incident, and the rule in
-`~/.coding_global/AGENTS.md` is the policy.
+mutation, any way other than through `mutate-sandboxed`. It catches the habit that caused the
+incident; the rule in `~/.coding_global/AGENTS.md` is the policy.
+
+It reads the command the way a shell does (quotes, escapes, pipelines, lists, subshells, command
+and process substitution, redirections, here-documents) and judges only what would execute
+(TXE-7641):
+
+- **Refused:** a mutation tool or a mutant-named file as the program (`mutmut run`,
+  `./mutants.py`, `source run-mutations.sh`), also behind wrappers and runners (`timeout`, `env`,
+  `nohup`, `xargs`, `uv run`, `uvx`, `poetry run`, `find -exec`); an interpreter whose script is
+  one (`python3 -I tools/mutants.py`, `python3 -I <(git show x:mutants.py)`, `python3 -m mutmut`,
+  `python3 - < mutants.py`, `cat mutants.py | python3`, `go run ./tools/mutate`); and shell code
+  that does any of these (`bash -c '...'`, `eval`, a here-document or here-string to `bash`,
+  `$(...)` and backticks anywhere, an unquoted here-document's substitutions); and code for a
+  non-shell interpreter (`python3 -c`, `node -e`, `perl -e`, a here-document on python3's
+  stdin) that imports a mutant module, or names a mutant script or tool and calls something that
+  runs a file or a process (`runpy`, `exec`, `subprocess`, `os.system`, `require`, `load`, ...),
+  also when the mutant is one of the code's own arguments (`python3 -c '...' mutants.py`: the
+  guard does not follow data flow, so it errs toward refusing).
+- **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
+  `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
+  and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
+  command does not set (`/dev/fd/$N`, one opened by an earlier `exec 3<`, any `/proc` path) fails
+  closed, as does nesting deeper than the reader follows and any internal error.
+- **Allowed, because the words are only data:** grep and sed patterns, echo and printf
+  arguments, `--body`/`--text`/`-m` messages, paths given to cat, ls or shasum, a here-document
+  written to a file, comments, and interpreter code that only mentions the names (prints them,
+  counts them, edits text that contains them). `mutate-sandboxed` itself, and the guard's own
+  files (`mutant-run-guard`, `guard-hook.py`), are never refused.
+
+The case lists in `mutate_test.go` (`guardRefused`, `guardAllowed`) hold the v3 rollout's
+acceptance cases and every false positive observed since, in their observed shape. Limits: a
+renamed script, a program or file name assembled at run time, a mutation run started from inside
+a script the command calls, or one started by a tool the guard does not know gets past it. The reader
+never fails: input it cannot follow (unbalanced quotes, unknown syntax) is read as words.
 
 ## The acceptance demonstration
 
