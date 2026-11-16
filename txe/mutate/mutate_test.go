@@ -730,6 +730,7 @@ var guardRefused = []string{
 	`env M=tools/mutants.py python3 -c 'import os, runpy; runpy.run_path(os.environ["M"])'`,
 	`python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:])' mutmut run`,
 	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' ./run-mutations`,
+	"PY=/usr/bin/python3; env PY=harmless true; $PY ./run-mutations",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

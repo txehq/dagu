@@ -541,9 +541,16 @@ class Judge:
     def __init__(self, depth: int):
         self.depth = depth
         self.vars = {}
+        self.env_assigned = []
         self.nest = 0
 
+    def env_values(self) -> list:
+        """Values a command's code may read from its environment: shell assignments made so far
+        (conservatively, exported or not) and this command's own `env NAME=value` assignments."""
+        return list(self.vars.values()) + self.env_assigned
+
     def runs_mutation(self, cmd: Cmd) -> bool:
+        self.env_assigned = []  # per command; never used to resolve a program
         words = list(cmd.words)
         for w in words:  # a simple VAR=value before the command names a program later
             if ASSIGN.match(w.text) and w.procsub is None:
@@ -609,8 +616,7 @@ class Judge:
             if t.startswith("-") and len(t) > 1:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
-                k, _, v = t.partition("=")
-                self.vars[k] = v  # env NAME=value cmd: the command sees it
+                self.env_assigned.append(t.partition("=")[2])  # env NAME=value cmd: this command sees it
                 i += 1
             else:
                 break
@@ -697,7 +703,7 @@ class Judge:
                 ch = t[k]
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.vars.values())
+                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values())
                 if ch == "m":
                     attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
@@ -718,7 +724,7 @@ class Judge:
         j = 0
 
         def code_at(n: int) -> bool:  # code at args[n], with the arguments after it
-            return n < len(args) and code_and_args_run_mutant(args[n].text, args[n + 1:], self.vars.values())
+            return n < len(args) and code_and_args_run_mutant(args[n].text, args[n + 1:], self.env_values())
 
         if prog in ("perl", "ruby"):
             return self.perl_ruby(prog, args, cmd)
@@ -736,7 +742,7 @@ class Judge:
             if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
                 return True  # node -r ./mutants.js: a preloaded module runs
             if opt in ("--eval", "--print") and eq:
-                if code_and_args_run_mutant(val, args[j + 1:], self.vars.values()):
+                if code_and_args_run_mutant(val, args[j + 1:], self.env_values()):
                     return True  # node --eval='...'
                 evaluated = True
                 j += 1
@@ -789,7 +795,7 @@ class Judge:
             # Where the switches end is not modelled exactly, so any word in the command counts
             # as a possible argument of code that runs something.
             if any(CODE_RUNS.search(a.text) for a in payload) and (
-                    any(mutant_named(a.text) for a in args[:last] + rest) or any(mutant_named(v) for v in self.vars.values())):
+                    any(mutant_named(a.text) for a in args[:last] + rest) or any(mutant_named(v) for v in self.env_values())):
                 return True
         elif any(code_runs_mutant(a.text) for a in args if a.text.startswith("-")):
             return True
