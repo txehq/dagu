@@ -24,6 +24,7 @@ import { SharedWithYou } from '@/features/txe/components/identity/SharedWithYou'
 import {
   useJobDetail,
   usePersonDecisions,
+  useOwnerRepublish,
   useRetryStates,
   useTxeApi,
 } from '@/features/txe/hooks';
@@ -184,6 +185,7 @@ export default function TxeJobPage(): React.ReactElement {
   const canDecide = personDecisions && mayDecide(data?.job, roleCanExecute);
   const api = useTxeApi();
   const { data: retries, mutate: mutateRetries } = useRetryStates(jobId);
+  const { data: ownerRepublish } = useOwnerRepublish();
 
   React.useEffect(() => {
     appBarContext.setTitle(data?.job.title ?? 'Job');
@@ -338,7 +340,8 @@ export default function TxeJobPage(): React.ReactElement {
                 execution={run.execution}
                 state={retries?.get(run.dagRunId)}
                 canDecide={canDecide}
-                onRequest={async (key) => {
+                canRepublish={ownerRepublish === true}
+                onRequest={async (intent, key) => {
                   // The button is offered only for a run with a known
                   // execution; the request names exactly that one.
                   if (!run.execution) {
@@ -353,7 +356,8 @@ export default function TxeJobPage(): React.ReactElement {
                     run.dagRunId,
                     run.execution,
                     job.version,
-                    key
+                    key,
+                    intent
                   );
                   await mutateRetries();
                   return result;

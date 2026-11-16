@@ -1,12 +1,16 @@
 // Copyright (C) 2026 TXE contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import type { components, paths } from '@/api/v1/schema';
+import {
+  TxeRetryRequestMode,
+  type components,
+  type paths,
+} from '@/api/v1/schema';
 import type { Client } from 'openapi-fetch';
 
 import { toDecision, toDecisionBody, toJob, toProposal } from './adapt';
 import type { DecisionSubmitResult } from './components/DecisionPanel';
-import { retryStates, type RetryState } from './retry';
+import { retryStates, type RetryIntent, type RetryState } from './retry';
 import type {
   Decision,
   DecisionRequest,
@@ -35,17 +39,26 @@ export interface TxeApi {
     jobId: string,
     decision: Decision
   ): Promise<DecisionSubmitResult>;
-  // requestRetry asks for one exact run to be retried. It records the
-  // decision only; the reviewer runs the retry through the action journal.
-  // execution is the run execution the person reviewed; the server refuses
-  // the request if the run has since moved to another execution.
+  // requestRetry asks for one exact execution of a run to be republished
+  // or run again. It records the decision only; the job's machine carries it
+  // out through the action journal. execution is the run execution the
+  // person reviewed; the server refuses the request if the run has since
+  // moved to another execution. The intent is always named: "republish"
+  // publishes what the execution sealed and never runs the job, through the
+  // hub's own republish endpoint (an older hub has none and refuses it);
+  // "rerun" runs the job again on purpose. The dashboard never sends a
+  // retry that names no intent.
   requestRetry(
     jobId: string,
     runId: string,
     execution: Execution,
     expectedJobVersion: number,
-    idempotencyKey: string
+    idempotencyKey: string,
+    intent: RetryIntent
   ): Promise<DecisionSubmitResult>;
+  // ownerRepublish reports whether the hub takes a person's republish
+  // request (it lists the owner_republish capability).
+  ownerRepublish(): Promise<boolean>;
   // listRetryStates returns the newest retry of each run of the job.
   listRetryStates(jobId: string): Promise<Map<string, RetryState>>;
 }
@@ -163,23 +176,41 @@ export function createTxeApi(client: Client<paths>): TxeApi {
       runId,
       execution,
       expectedJobVersion,
-      idempotencyKey
+      idempotencyKey,
+      intent
     ) => {
-      const res = await client.POST(
-        '/txe/jobs/{jobId}/runs/{runId}/retry-requests',
-        {
-          params: { path: { jobId, runId } },
-          body: {
-            attempt_id: execution.attemptId,
-            queued_at: execution.queuedAt,
-            expected_job_version: expectedJobVersion,
-            idempotency_key: idempotencyKey,
-          },
-        }
-      );
+      const body = {
+        attempt_id: execution.attemptId,
+        queued_at: execution.queuedAt,
+        expected_job_version: expectedJobVersion,
+        idempotency_key: idempotencyKey,
+      };
+      // The person dashboard is the hub's own: requests go to the local
+      // node.
+      const params = {
+        path: { jobId, runId },
+        query: { remoteNode: 'local' },
+      };
+      const res =
+        intent === 'republish'
+          ? await client.POST(
+              '/txe/jobs/{jobId}/runs/{runId}/republish-requests',
+              { params, body }
+            )
+          : await client.POST('/txe/jobs/{jobId}/runs/{runId}/retry-requests', {
+              params,
+              body: { ...body, mode: TxeRetryRequestMode.rerun },
+            });
       if (res.data) return { ok: true };
       const err = failure(res.response, res.error);
       return { ok: false, status: err.status, message: err.message };
+    },
+    ownerRepublish: async () => {
+      const res = await client.GET('/txe/installation', {
+        params: { query: { remoteNode: 'local' } },
+      });
+      if (!res.data) throw failure(res.response, res.error);
+      return res.data.capabilities.includes('owner_republish');
     },
     listRetryStates: async (jobId) => {
       const [proposals, actions] = await Promise.all([

@@ -284,6 +284,10 @@ func (f *remoteFixture) reviewer(holder string) *review.Reviewer {
 	return &review.Reviewer{
 		Registry: f.remote, Effector: f.fx, Opener: f.opener, Holder: holder,
 		AgentClient: "fixture-agent 1.0", DecideDAG: review.DecideDAGName(f.remote.MachineID), ClaimTTL: 10 * time.Minute,
+		// Every execution has been assessed as sealing nothing unless a
+		// test says otherwise: a reviewer that cannot assess seals retries
+		// nothing it was not told to run again.
+		Seals: seals{},
 	}
 }
 

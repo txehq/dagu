@@ -1677,10 +1677,12 @@ var ErrNotSealed = errors.New("txe review: the execution has no intact sealed re
 // and the service republishes: the retry is a republish. Otherwise a
 // non-empty unusable says why e's result, sealed or possibly sealed, cannot
 // be republished; such a run is not retried from here. Both are zero only
-// when e sealed nothing, or no seal reader is set: the retry re-runs the job.
+// when e is known to have sealed nothing: the retry re-runs the job. A
+// reviewer with no seal reader cannot know that, so for it every execution
+// is unusable: a retry it cannot assess never re-runs a job by default.
 func (r *Reviewer) republishable(ctx context.Context, jobID, runID string, e Execution) (sealed bool, unusable string) {
 	if r.Seals == nil {
-		return false, ""
+		return false, fmt.Sprintf("this reviewer cannot read what execution %s sealed on this machine", e.Ref())
 	}
 	switch _, err := r.Seals.RetriedSeal(jobID, runID, e); {
 	case errors.Is(err, ErrNotSealed):
@@ -1786,6 +1788,17 @@ const (
 // dispatch whose outcome was not observed is unknown; it is never reported
 // from the service's acceptance alone, and never repeated.
 func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectResult {
+	var note string
+	res := r.retryRunNoted(ctx, job, action, &note)
+	if res.Status != EffectNotApplied {
+		res.Detail += note
+	}
+	return res
+}
+
+// retryRunNoted is retryRun; note is set to what the result's detail adds
+// once anything was dispatched.
+func (r *Reviewer) retryRunNoted(ctx context.Context, job Job, action Action, note *string) EffectResult {
 	runID := action.Params[RetryRunParam]
 	bound, complete := retriedExecution(action.Params)
 	if !complete {
@@ -1812,6 +1825,33 @@ func (r *Reviewer) retryRun(ctx context.Context, job Job, action Action) EffectR
 	request := RetryRequest{ActionID: action.ID, ActionAttempt: strconv.Itoa(action.Attempt), BindingDigest: action.BindingDigest, Step: action.Params[RetryRunStepParam]}
 	if action.Attempt <= 0 || action.BindingDigest == "" {
 		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the registry's record of action " + action.ID + " gives no attempt number or binding digest to make the retry of run " + runID + " for"}
+	}
+	rerun := action.Params[RetryRunRerunParam]
+	switch {
+	case rerun != "" && (rerun != "true" || request.Step != ""):
+		return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: the decision about run " + runID + " names " + RetryRunRerunParam + "=" + rerun + " with step " + agentText(request.Step) + "; a retry either runs the job again or republishes, never both"}
+	case rerun == "true":
+		// The person asked for a new execution of the job on purpose: it
+		// runs whatever the retried execution sealed. A sealed result is
+		// superseded and never published, and the detail says so.
+		if r.Seals == nil {
+			break
+		}
+		if _, err := r.Seals.RetriedSeal(job.ID, runID, bound); err == nil {
+			*note = " The person asked to run the job again: the sealed result of execution " + bound.Ref() + " is superseded and was not published."
+		}
+	case request.Step == "":
+		// No intent was named. The job runs again only when the execution
+		// is known to have sealed nothing: a sealed result, or one that
+		// cannot be read, already had its effect, and running the job again
+		// would repeat it without anyone having asked for that.
+		sealed, unusable := r.republishable(ctx, job.ID, runID, bound)
+		switch {
+		case sealed:
+			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: execution " + bound.Ref() + " of run " + runID + " sealed its result, and a retry that names no intent would run the job again. Ask for a republish to publish that result, or for an explicit rerun to run the job again"}
+		case unusable != "":
+			return EffectResult{Status: EffectNotApplied, Detail: "not dispatched: a retry of run " + runID + " that names no intent runs the job again only for an execution known to have sealed nothing, and " + unusable + ". Ask for a republish, or for an explicit rerun to run the job again"}
+		}
 	}
 	switch request.Step {
 	case "":

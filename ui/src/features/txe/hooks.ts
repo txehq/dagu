@@ -159,6 +159,15 @@ export function useRetryStates(jobId: string | undefined) {
   );
 }
 
+// useOwnerRepublish reports whether the hub takes a person's republish of a
+// sealed result; the dashboard offers it only then.
+export function useOwnerRepublish() {
+  const api = useTxeApi();
+  return useSWR(['txe', 'installation', 'owner_republish'], () =>
+    api.ownerRepublish()
+  );
+}
+
 export type JobDetailData = {
   job: TxeJob;
   proposals: Proposal[];

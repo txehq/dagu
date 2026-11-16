@@ -409,6 +409,10 @@ func (f *fixture) reviewer(holder string) *review.Reviewer {
 		DecideDAG:   "txe-decide-mch",
 		ClaimTTL:    10 * time.Minute,
 		Now:         f.clock.Now,
+		// Every execution has been assessed as sealing nothing unless a
+		// test says otherwise: a reviewer that cannot assess seals retries
+		// nothing it was not told to run again.
+		Seals: seals{},
 	}
 }
 
