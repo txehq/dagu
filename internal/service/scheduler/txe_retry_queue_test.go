@@ -25,18 +25,19 @@ import (
 // txeQueueJob is a ready registered job in a file registry of its own, and
 // the job's DAG as the registry recorded it.
 type txeQueueJob struct {
-	store *registry.Store
-	job   *registry.Job
-	dag   *ir.DAG
+	store   *registry.Store
+	job     *registry.Job
+	dag     *ir.DAG
+	machine string
 }
 
-func newTxeQueueJob(t *testing.T) txeQueueJob {
+func newTxeQueueJob(t *testing.T, opts ...registry.Option) txeQueueJob {
 	t.Helper()
 	ctx := context.Background()
 	by := registry.Actor{Kind: registry.ActorCLI, ID: "txe-7518-test", Session: "txe-7518-test"}
 	dir := t.TempDir()
 	dags := registry.NewDAGStore(persis.NewDAGRepository(dagstore.NewStore(filepath.Join(dir, "dags")), persis.DAGRepositoryOptions{}))
-	s, err := registry.NewFileStore(filepath.Join(dir, "data"), registry.WithDAGStore(dags))
+	s, err := registry.NewFileStore(filepath.Join(dir, "data"), append([]registry.Option{registry.WithDAGStore(dags)}, opts...)...)
 	require.NoError(t, err)
 	mint := func(p registry.Prefix) string {
 		id, err := registry.NewID(p, time.Now())
@@ -71,7 +72,7 @@ func newTxeQueueJob(t *testing.T) txeQueueJob {
 		Steps:          []ir.Step{{Name: "run", Command: "/pkg/run.sh"}},
 	}
 	require.Equal(t, job.DAGSpecSHA256, specDigest(dag), "the DAG must be the job's current version")
-	return txeQueueJob{store: s, job: job, dag: dag}
+	return txeQueueJob{store: s, job: job, dag: dag, machine: machine}
 }
 
 // finishedRun records one execution of dag's run that has ended: a sealed
@@ -148,7 +149,8 @@ func assertRetryDropped(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir
 	retained, err := f.dagRunRepository.ListRetainedExecutions(f.ctx, queued.DAGRun())
 	require.NoError(t, err)
 	require.Len(t, retained, 1, "the retried execution is kept")
-	assert.Equal(t, ir.Succeeded.String(), retained[0].Status)
+	assert.Equal(t, queued.AttemptID, retained[0].AttemptID)
+	assert.NotEqual(t, ir.Queued.String(), retained[0].Status)
 	events, err := j.store.ListEvents(f.ctx, j.job.JobID, 10)
 	require.NoError(t, err)
 	require.NotEmpty(t, events)
@@ -214,12 +216,10 @@ func TestQueueDispatch_TxeRetryRequestForAnotherExecutionIsRefused(t *testing.T)
 	}
 }
 
-// Pending the TXE-7517 binding: a request derived correctly for the retried
-// execution passes the request check, even for an action the job does not
-// have. The registry binding (approved, executing under a live grant,
-// current attempt, version and binding) is what refuses it; until that step
-// lands, this test pins the gap.
-func TestQueueDispatch_TxeUnknownActionAwaitsBinding(t *testing.T) {
+// A request derived correctly for the retried execution, but naming an
+// action the job does not have, is refused by the registry's binding at
+// dispatch (TXE-7518 characterization on 47b89206c: admitted).
+func TestQueueDispatch_TxeUnknownActionIsRefused(t *testing.T) {
 	j := newTxeQueueJob(t)
 	f := newQueueFixture(t)
 	sealed := finishedRun(t, f, j.dag, "run-sealed", ir.Succeeded)
@@ -228,9 +228,8 @@ func TestQueueDispatch_TxeUnknownActionAwaitsBinding(t *testing.T) {
 	queued := cliEnqueueRetry(t, f, j.dag, sealed, forged)
 
 	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
-	assert.True(t, admitted)
-	_, has := j.job.Actions["act_forged"]
-	assert.False(t, has)
+
+	assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
 }
 
 // A registered job's first run, queued by any other trigger, is not a retry

@@ -3,10 +3,21 @@
 
 package registry
 
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/dagucloud/dagu/v2/internal/ir"
+)
+
 // Refusals of a queued retry of a registered job's run (TXE-7518). A queued
 // retry runs an execution of the job again; it starts only for the retry
 // request of a person's approved dagu.retry_run decision, recorded on the
-// queued status by the hub that admitted it.
+// queued status by the hub that admitted it, and only while that decision
+// still binds when the queue dispatches it.
 const (
 	// AdmitRetryUnbound refuses a queued retry that carries no retry request:
 	// nothing approved it. The local CLI cannot carry one.
@@ -15,4 +26,70 @@ const (
 	// made for this run's retried execution: it names no execution of the
 	// run, or its ID is not the one the hub derives for it.
 	AdmitRetryMismatch AdmitCode = "retry_request_mismatch"
+	// AdmitRetryNotApproved refuses a queued retry whose request no longer
+	// binds an approved dagu.retry_run action to rerun this execution: the
+	// action is unknown, another attempt, for another version, run or
+	// execution, not executing under a live grant (it may have expired while
+	// the retry waited), or approved for another intent.
+	AdmitRetryNotApproved AdmitCode = "retry_not_approved"
 )
+
+// QueuedRetry is a queued retry of a registered job's run as queue dispatch
+// found it: the run, the execution the retry replaced (AttemptID and
+// QueuedAt, which the action's params must name), and the retry request the
+// queued status records, already checked to be the one derived for that
+// execution (ir.NewRetryRequest).
+type QueuedRetry struct {
+	RunID     string
+	AttemptID string
+	QueuedAt  string
+	Request   ir.RetryRequest
+}
+
+// checkRetryRun binds a queued retry to its action as the hub binds a retry
+// it admits: the one validator TXE-7517 exports, CheckRetryRun, called with
+// the rerun intent. Until it is wired, it is nil and every queued retry of a
+// registered job is refused.
+var checkRetryRun func(job *Job, action *Action, q QueuedRetry, now time.Time) error
+
+// AdmitQueuedRetry decides, when the queue dispatches it, whether a queued
+// retry of job jobID's run may run that execution again. A queued retry is
+// always a rerun of the whole run: Dagu queues no step retry. So an action a
+// person approved as a republish of the sealed result (step "publish") is
+// refused here and never carried out as a rerun; a republish is dispatched
+// by the hub alone. The rest of the binding (attempt, binding digest, run
+// and execution, approval, live grant, version) is checkRetryRun's, read
+// now rather than when the retry was queued. An error is returned only when
+// the registry cannot be read; callers must then leave the retry queued.
+func (s *Store) AdmitQueuedRetry(ctx context.Context, jobID string, q QueuedRetry) (Admission, error) {
+	job, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		if ErrorCode(err) == CodeNotFound {
+			return refuseRun(jobID, AdmitUnregistered, "job is not registered"), nil
+		}
+		return Admission{}, err
+	}
+	refuse := func(reason string) (Admission, error) {
+		return refuseRun(jobID, AdmitRetryNotApproved, reason), nil
+	}
+	action := job.Actions[q.Request.ActionID]
+	if action != nil && action.Spec.Name == ActionRetryRun {
+		var params RetryRunParams
+		if err := json.Unmarshal(action.Spec.Params, &params); err != nil {
+			return refuse(fmt.Sprintf("action %s has unreadable params", action.ActionID))
+		}
+		if params.Step != "" {
+			return refuse(fmt.Sprintf("action %s was approved to retry step %q, not to rerun the run; a queued retry only reruns, so it is not carried out", action.ActionID, params.Step))
+		}
+	}
+	if checkRetryRun == nil {
+		return refuse("the registry cannot bind a queued retry to its decision in this version")
+	}
+	if err := checkRetryRun(job, action, q, s.clock()); err != nil {
+		if _, ok := errors.AsType[*Error](err); ok {
+			return refuse(err.Error())
+		}
+		return Admission{}, err
+	}
+	return Admission{Admit: true, JobID: jobID}, nil
+}

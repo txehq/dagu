@@ -22,6 +22,7 @@ import (
 // start only when it admits them; other DAGs are unaffected.
 type RunAdmitter interface {
 	AdmitRun(ctx context.Context, dagName, specSHA256 string) (registry.Admission, error)
+	AdmitQueuedRetry(ctx context.Context, jobID string, q registry.QueuedRetry) (registry.Admission, error)
 	RecordDroppedRun(ctx context.Context, jobID, runID string, adm registry.Admission) error
 	ReconcileExpired(ctx context.Context) ([]string, error)
 	ReconcileEffects(ctx context.Context) error
@@ -134,8 +135,10 @@ func (d *queueDispatcher) admitQueuedRun(
 // run that the queued retry replaced and kept, and its ID must be the one the
 // hub derives from that execution and the action attempt
 // (ir.NewRetryRequest), so a request cannot be moved to another run or
-// execution. The action itself is then bound by the registry, as the hub
-// binds it.
+// execution. The registry then binds that request to its action now, at
+// dispatch, as the hub binds it at admission (registry.AdmitQueuedRetry):
+// the action, attempt, version, run and execution, a grant that is still
+// live, and the rerun intent.
 //
 // Trust boundary: this binds what a supported command can queue. It does not
 // defend against anyone who can write the data dir, who can edit the
@@ -170,7 +173,9 @@ func (d *queueDispatcher) admitQueuedRetry(ctx context.Context, jobID string, ru
 	if err != nil || derived.ID != request.ID || derived.RetryOf != request.RetryOf {
 		return mismatch(fmt.Sprintf("retry request %s was not made for execution %s of run %s", request.ID, request.RetryOf, run.ID))
 	}
-	return registry.Admission{Admit: true, JobID: jobID}, nil
+	return d.runAdmitter.AdmitQueuedRetry(ctx, jobID, registry.QueuedRetry{
+		RunID: run.ID, AttemptID: retried.AttemptID, QueuedAt: retried.QueuedAt, Request: *request,
+	})
 }
 
 // startTxeReconciler keeps the registry and Dagu converged: it indexes the
