@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -97,6 +99,8 @@ type sourceProvenance struct {
 	Command     []string `json:"command"`
 	Env         []string `json:"env"`
 	PassThrough []string `json:"pass_through"`
+	// ModVerify is what go mod verify said of the module cache.
+	ModVerify string `json:"mod_verify"`
 	// Revision and Modified are the binary's own VCS stamp, which must agree.
 	Revision  string `json:"vcs_revision"`
 	Modified  string `json:"vcs_modified"`
@@ -495,6 +499,10 @@ type sourceSpec struct {
 	Version string `json:"version"`
 	GOOS    string `json:"goos"`
 	GOARCH  string `json:"goarch"`
+	// Parallel bounds the build's CPU use: go build -p and GOMAXPROCS for the
+	// go command and the compilers it starts. Required, so a build on a shared
+	// host is always bounded.
+	Parallel int `json:"parallel"`
 	// Installed is another machine's own record of what it runs, when read.
 	Installed *installedRecord `json:"installed,omitempty"`
 	// OutDir gets dagu and provenance.json; it must not hold them yet.
@@ -502,19 +510,22 @@ type sourceSpec struct {
 }
 
 // passThrough are the only variables of the caller's environment the build
-// sees, besides what it sets: where tools, temporary files, caches and the
-// module proxy are, and what Windows needs to start a process. Their values are
-// not recorded (a proxy URL may carry a credential). The caches are
-// content-addressed and the module cache is held to go.sum, so sharing them
-// does not let them choose what is built.
+// sees, besides what it sets: where tools, temporary files, the module cache
+// and the module proxy are, and what Windows needs to start a process. Their
+// values are not recorded (a proxy URL may carry a credential). The shared
+// module cache is not trusted as it stands: -mod=readonly does not rehash
+// extracted files, so the build runs go mod verify (every cached module
+// against go.sum) before and after it. The build cache is never shared: a
+// writer of a shared GOCACHE could plant compiled packages under the keys a
+// build looks up, so each build gets a fresh, private one.
 var passThrough = []string{"PATH", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PATHEXT", "COMSPEC",
-	"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
+	"GOPATH", "GOMODCACHE", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
 
 // resolvedGoEnv is what the caller's go command resolves for the variables a
 // build with GOENV=off would otherwise lose (the caller's go env file may set
-// the proxy; the caches would move under the build's own HOME).
+// the proxy; the module cache would move under the build's own HOME).
 var resolvedGoEnv = sync.OnceValue(func() map[string]string {
-	out, err := exec.Command("go", "env", "-json", "GOMODCACHE", "GOCACHE", "GOPROXY", "GOSUMDB").Output()
+	out, err := exec.Command("go", "env", "-json", "GOMODCACHE", "GOPROXY", "GOSUMDB").Output()
 	vals := map[string]string{}
 	if err == nil {
 		_ = json.Unmarshal(out, &vals)
@@ -611,6 +622,16 @@ func checkBuildInfo(info *debug.BuildInfo, spec sourceSpec, pkg string) (map[str
 // the binary and its record into the spec's directory. It never builds in
 // the caller's checkout and never records a binary it did not build.
 func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
+	return buildFromSourceIn(spec, callerEnv())
+}
+
+// modulesVerified is what go mod verify prints when every cached module of
+// the build matches go.sum.
+const modulesVerified = "all modules verified"
+
+// buildFromSourceIn is buildFromSource with the caller's environment given
+// (its tests point the module proxy and cache at fixtures of their own).
+func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error) {
 	pkg := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(spec.Package)), "./")
 	switch {
 	case spec.Name == "" || spec.Repo == "" || spec.Tag == "" || spec.Module == "" || spec.Package == "" || spec.Version == "" ||
@@ -620,6 +641,8 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 		return nil, fmt.Errorf("source record: commit %q is not a full commit id", spec.Commit)
 	case !filepath.IsAbs(spec.OutDir):
 		return nil, errors.New("source record: out_dir must be absolute")
+	case spec.Parallel < 1 || spec.Parallel > 64:
+		return nil, fmt.Errorf("source record: parallel %d must be between 1 and 64: the build is always bounded", spec.Parallel)
 	case !filepath.IsLocal(filepath.FromSlash(pkg)) && pkg != ".":
 		return nil, fmt.Errorf("source record: package %q must be a path inside the clone", spec.Package)
 	}
@@ -663,13 +686,35 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 	}
 	built := filepath.Join(work, "dagu")
 	set := []string{"GOOS=" + spec.GOOS, "GOARCH=" + spec.GOARCH, "CGO_ENABLED=0", "GOTOOLCHAIN=auto", "GOFLAGS=", "GOWORK=off", "GOENV=off",
-		"HOME=" + work}
-	command := []string{"build", "-mod=readonly", "-buildvcs=true", "-ldflags", "-X 'main.version=" + spec.Version + "'", "-o", built, "./" + pkg}
+		"HOME=" + work, "GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOCACHE=" + filepath.Join(work, "gocache")}
+	env := append(slices.Clone(base), set...)
+	// Every module the build needs is in the cache and matches go.sum: a
+	// download is checked as it lands, and verify rehashes what was there.
+	verify := func(when string) error {
+		if _, err := runIn(clone, env, 20*time.Minute, "go", "mod", "download"); err != nil {
+			return fmt.Errorf("source record: %s the build: module download: %w", when, err)
+		}
+		out, err := runIn(clone, env, 20*time.Minute, "go", "mod", "verify")
+		if err != nil {
+			return fmt.Errorf("source record: %s the build: go mod verify: %w", when, err)
+		}
+		if out != modulesVerified {
+			return fmt.Errorf("source record: %s the build: go mod verify says %q", when, truncateText(out, 300))
+		}
+		return nil
+	}
+	if err := verify("before"); err != nil {
+		return nil, err
+	}
+	command := []string{"build", "-p", strconv.Itoa(spec.Parallel), "-mod=readonly", "-buildvcs=true", "-ldflags", "-X 'main.version=" + spec.Version + "'", "-o", built, "./" + pkg}
 	if pkg == "." {
 		command[len(command)-1] = "."
 	}
-	if _, err := runIn(clone, append(callerEnv(), set...), 30*time.Minute, "go", command...); err != nil {
+	if _, err := runIn(clone, env, 30*time.Minute, "go", command...); err != nil {
 		return nil, fmt.Errorf("source record: build: %w", err)
+	}
+	if err := verify("after"); err != nil {
+		return nil, err
 	}
 	if err := cleanTree(clone); err != nil {
 		return nil, fmt.Errorf("source record: after the build: %w", err)
@@ -693,8 +738,14 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 		return nil, err
 	}
 	var names []string
-	for _, kv := range callerEnv() {
+	for _, kv := range base {
 		names = append(names, strings.SplitN(kv, "=", 2)[0])
+	}
+	recorded := slices.Clone(set)
+	for i, kv := range recorded {
+		if strings.HasPrefix(kv, "GOCACHE=") {
+			recorded[i] = "GOCACHE=<a fresh private cache of this build>"
+		}
 	}
 	scope := fmt.Sprintf("built by %s from a verified clean clone of tag %s at commit %s (tree %s) for %s/%s; it is NOT the installed binary of any machine (the live worker runs its own build on its own platform)",
 		controlledBuilder, spec.Tag, spec.Commit, tree, spec.GOOS, spec.GOARCH)
@@ -703,7 +754,7 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 	}
 	rec := &provenanceRecord{Schema: provenanceSchema, Kind: "source", Name: spec.Name, BinarySHA256: sha256Hex(raw), BinarySize: int64(len(raw)),
 		Source: &sourceProvenance{Builder: controlledBuilder, Tag: spec.Tag, Commit: spec.Commit, Tree: tree, Module: info.Main.Path, Package: info.Path,
-			Command: append([]string{"go"}, command...), Env: set, PassThrough: names,
+			Command: append([]string{"go"}, command...), Env: recorded, PassThrough: names, ModVerify: modulesVerified + " (before and after the build)",
 			Revision: settings["vcs.revision"], Modified: settings["vcs.modified"], GoVersion: info.GoVersion,
 			GOOS: settings["GOOS"], GOARCH: settings["GOARCH"], CGO: settings["CGO_ENABLED"], LDFlags: settings["-ldflags"], Installed: spec.Installed},
 		Scope: scope}

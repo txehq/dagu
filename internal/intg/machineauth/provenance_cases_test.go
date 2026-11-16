@@ -5,16 +5,21 @@ package machineauth_test
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"debug/buildinfo"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -332,7 +337,7 @@ func fixtureRepo(t *testing.T) (string, string) {
 
 func fixtureSpec(t *testing.T, repo, commit string) sourceSpec {
 	return sourceSpec{Name: "w18", Repo: repo, Tag: "txe-v2.18.2-18", Commit: commit, Module: "fixture", Package: "./cmd",
-		Version: "2.18.2-txe.18", GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, OutDir: filepath.Join(t.TempDir(), "w18")}
+		Version: "2.18.2-txe.18", GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Parallel: 2, OutDir: filepath.Join(t.TempDir(), "w18")}
 }
 
 func TestSourceBuildFromAVerifiedClone(t *testing.T) {
@@ -352,7 +357,8 @@ func TestSourceBuildFromAVerifiedClone(t *testing.T) {
 	assert.Equal(t, "0", src.CGO)
 	assert.Contains(t, src.Env, "GOENV=off", "the caller's go env file does not reach the build")
 	assert.Contains(t, src.Env, "GOFLAGS=", "the caller's GOFLAGS do not reach the build")
-	assert.Equal(t, []string{"go", "build", "-mod=readonly", "-buildvcs=true", "-ldflags", "-X 'main.version=2.18.2-txe.18'", "-o"}, src.Command[:7])
+	assert.Equal(t, []string{"go", "build", "-p", "2", "-mod=readonly", "-buildvcs=true", "-ldflags", "-X 'main.version=2.18.2-txe.18'", "-o"}, src.Command[:9])
+	assert.Contains(t, src.Env, "GOMAXPROCS=2", "the go command and its compilers are bounded")
 	assert.NotEmpty(t, src.Tree)
 	assert.Contains(t, rec.Scope, "NOT the installed binary of any machine")
 	assert.Contains(t, rec.Scope, "corroborates the tag, commit and version only, not the bytes")
@@ -424,6 +430,7 @@ func TestSourceBuildRefusesWhatItCannotVerify(t *testing.T) {
 		}, "the installed record names"},
 		"a short commit":       {func(s *sourceSpec) { s.Commit = commit[:8] }, "is not a full commit id"},
 		"a relative directory": {func(s *sourceSpec) { s.OutDir = "w18" }, "out_dir must be absolute"},
+		"an unbounded build":   {func(s *sourceSpec) { s.Parallel = 0 }, "parallel 0 must be between 1 and 64"},
 	} {
 		spec := fixtureSpec(t, repo, commit)
 		tc.mutate(&spec)
@@ -507,4 +514,116 @@ func TestCheckBuildInfo(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.want, name)
 		}
 	}
+}
+
+// h1 is the go.sum hash of a set of files (dirhash.Hash1): the sha256 of the
+// sorted "sha256  name" lines, base64.
+func h1(files map[string]string) string {
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	var summary strings.Builder
+	for _, n := range names {
+		sum := sha256.Sum256([]byte(files[n]))
+		fmt.Fprintf(&summary, "%x  %s\n", sum, n)
+	}
+	sum := sha256.Sum256([]byte(summary.String()))
+	return "h1:" + base64.StdEncoding.EncodeToString(sum[:])
+}
+
+// depFixture makes a module proxy on disk serving example.com/dep v1.0.0, a
+// tagged repository whose main package imports it (go.sum included), and the
+// environment that points a build at that proxy and at a module cache of the
+// test's own.
+type depRig struct {
+	repo, commit, cache string
+	env                 []string
+}
+
+func depFixture(t *testing.T) depRig {
+	t.Helper()
+	repo, _ := fixtureRepo(t)
+	proxy, cache := t.TempDir(), t.TempDir()
+	const mod, ver = "example.com/dep", "v1.0.0"
+	depMod := "module " + mod + "\n\ngo 1.22\n"
+	depSrc := "package dep\n\nfunc Name() string { return \"dep\" }\n"
+	dir := filepath.Join(proxy, "example.com", "dep", "@v")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	for name, body := range map[string]string{"go.mod": depMod, "dep.go": depSrc} {
+		w, err := zw.Create(mod + "@" + ver + "/" + name)
+		require.NoError(t, err)
+		_, err = w.Write([]byte(body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, zw.Close())
+	for name, body := range map[string][]byte{
+		"list":        []byte(ver + "\n"),
+		ver + ".info": []byte(`{"Version":"` + ver + `","Time":"2026-01-01T00:00:00Z"}`),
+		ver + ".mod":  []byte(depMod),
+		ver + ".zip":  zbuf.Bytes(),
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), body, 0o600))
+	}
+	zipSum := h1(map[string]string{mod + "@" + ver + "/go.mod": depMod, mod + "@" + ver + "/dep.go": depSrc})
+	modSum := h1(map[string]string{"go.mod": depMod})
+	write := func(rel, body string) {
+		require.NoError(t, os.WriteFile(filepath.Join(repo, filepath.FromSlash(rel)), []byte(body), 0o600))
+	}
+	write("go.mod", "module fixture\n\ngo 1.22\n\nrequire "+mod+" "+ver+"\n")
+	write("go.sum", mod+" "+ver+" "+zipSum+"\n"+mod+" "+ver+"/go.mod "+modSum+"\n")
+	write("cmd/main.go", "package main\n\nimport \""+mod+"\"\n\nvar version = \"dev\"\n\nfunc main() { println(dep.Name(), version) }\n")
+	git := func(args ...string) string {
+		out, err := runIn(repo, gitEnv(), time.Minute, "git", append([]string{"-c", "user.name=fixture", "-c", "user.email=fixture@rig.test", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"}, args...)...)
+		require.NoError(t, err)
+		return out
+	}
+	git("add", "-A")
+	git("commit", "-q", "-m", "depend on example.com/dep")
+	git("tag", "-f", "txe-v2.18.2-18")
+	commit := git("rev-parse", "HEAD")
+	proxyURL := "file://" + filepath.ToSlash(proxy)
+	if !strings.HasPrefix(filepath.ToSlash(proxy), "/") {
+		proxyURL = "file:///" + filepath.ToSlash(proxy)
+	}
+	var env []string
+	for _, kv := range callerEnv() {
+		switch strings.SplitN(kv, "=", 2)[0] {
+		case "GOMODCACHE", "GOPROXY", "GOSUMDB", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE":
+		default:
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "GOPROXY="+proxyURL, "GOSUMDB=off", "GOMODCACHE="+cache)
+	// The module cache's files are read-only; clear it before TempDir removes it.
+	t.Cleanup(func() {
+		_, _ = runIn(repo, append(slices.Clone(env), "GOENV=off", "GOFLAGS="), time.Minute, "go", "clean", "-modcache")
+	})
+	return depRig{repo: repo, commit: commit, cache: cache, env: env}
+}
+
+// A dependency changed in the shared module cache after it was downloaded is
+// refused: -mod=readonly would build it, go mod verify does not pass it.
+func TestSourceBuildRefusesATamperedModuleCache(t *testing.T) {
+	t.Parallel()
+	d := depFixture(t)
+	spec := fixtureSpec(t, d.repo, d.commit)
+	rec, err := buildFromSourceIn(spec, d.env)
+	require.NoError(t, err)
+	assert.Equal(t, modulesVerified+" (before and after the build)", rec.Source.ModVerify)
+	assert.Contains(t, rec.Source.Env, "GOCACHE=<a fresh private cache of this build>")
+	assert.NotContains(t, rec.Source.PassThrough, "GOCACHE", "the build cache is never shared")
+
+	src := filepath.Join(d.cache, "example.com", "dep@v1.0.0", "dep.go")
+	require.NoError(t, os.Chmod(src, 0o600))
+	require.NoError(t, os.WriteFile(src, []byte("package dep\n\nfunc Name() string { return \"tampered\" }\n"), 0o600))
+	spec2 := fixtureSpec(t, d.repo, d.commit)
+	_, err = buildFromSourceIn(spec2, d.env)
+	require.Error(t, err, "a tampered cached module was built and recorded")
+	assert.Contains(t, err.Error(), "before the build: go mod verify")
+	_, statErr := os.Stat(filepath.Join(spec2.OutDir, "provenance.json"))
+	assert.True(t, errors.Is(statErr, os.ErrNotExist), "no record")
 }

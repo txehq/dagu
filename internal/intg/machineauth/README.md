@@ -102,7 +102,7 @@ DAGU_MACHINEAUTH_EXTRACT=/abs/extract-c.json go test ./internal/intg/machineauth
 # a build from source, done by the command itself from a fresh, verified clone of the tag
 DAGU_MACHINEAUTH_SOURCE_RECORD=/abs/source-w18.json go test ./internal/intg/machineauth -run MachineAuthSourceRecord -v
 #   {"name":"w18","repo":"/abs/dagu","tag":"txe-v2.18.2-18","commit":"5b011eba…","module":"github.com/dagucloud/dagu/v2",
-#    "package":"./cmd","version":"2.18.2-txe.18","goos":"linux","goarch":"amd64","out_dir":"/abs/w18",
+#    "package":"./cmd","version":"2.18.2-txe.18","goos":"linux","goarch":"amd64","parallel":2,"out_dir":"/abs/w18",
 #    "installed":{"tag":"…","commit":"…","version":"…","read_from":"…"}}   (optional)
 ```
 
@@ -124,13 +124,19 @@ checkout carries the checkout's revision and `vcs.modified=false`. The command:
 - checks that `git status --porcelain --ignored` is empty before and after the build;
 - builds the package the way the worker kit builds dagu: `go build -ldflags "-X
   'main.version=<version>'"` for the spec's platform, with cgo off, `-mod=readonly`,
-  `GOENV=off` and no `GOFLAGS`;
+  `GOENV=off` and no `GOFLAGS`, bounded by the spec's required `parallel` (`go build -p` and
+  `GOMAXPROCS`);
 - checks the binary's build information: the module and package, the platform, the
   version flag, and a git stamp of that commit on a clean tree.
 
 The caller's environment reaches the build only through a fixed list of variables: tools,
-temporary files, the module proxy and the content-checked caches. The list's names are
-recorded and its values are not. The record names the clone's commit and tree, the command,
+temporary files, the module proxy and the module cache. The list's names are recorded and
+its values are not.
+
+The shared module cache is not trusted as it stands, because `-mod=readonly` does not rehash
+extracted files. `go mod download` and `go mod verify` must report every module matching
+go.sum before the build and again after it. The build cache is never shared: each build
+gets a fresh private `GOCACHE`, so the first build compiles cold. The record names the clone's commit and tree, the command,
 the variables the command set, and the Go version. A narrowed build's record must come from
 this builder (`machineauth-controlled-clone-v1`), for the module `narrowedScopes` lists.
 
