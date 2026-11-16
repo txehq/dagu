@@ -22,6 +22,8 @@ jobs:
       - run: rm -rf ${{ vars.SHARED_DIR }}/build # want:env-path-delete
       - run: rm -rf "${{ env['CACHE_ROOT'] }}" # want:env-path-delete
       - run: rm -rf "${{runner.temp}}/cache" # want:env-path-delete
+      - run: rm -rf "${{ inputs.cache || vars.CACHE_ROOT }}" # want:env-path-delete
+      - run: rm -rf ${{ inputs.cache || 'build' }}; echo done # want:env-path-delete
       - run: |
           root="${{ env.CACHE_ROOT }}"
           rm -rf "$root" # want:env-path-delete
@@ -36,6 +38,7 @@ jobs:
     steps:
       - run: echo "${{ env.CACHE_ROOT }}"
       - run: rm -f "${{ env.CACHE_ROOT }}/lock"
+      - run: echo "${{ inputs.cache || 'none' }}" && rm -rf ./build
       - run: go clean -modcache=false
       - run: |
           scratch="$(mktemp -d "${{ runner.temp }}/x.XXXXXX")"

@@ -399,9 +399,10 @@ var goValueFlags = map[string]bool{
 
 // cleanFlagsCache reads go clean's arguments as Go's flag package does: flags
 // end at the first argument that is not one, or at --, and a flag in
-// goValueFlags written without = takes the next argument. A word holding an
-// unexpanded variable ($EXTRA) may be any number of flags, so the scan reads
-// past it; a cache flag set from a variable (-modcache=$v) is reported.
+// goValueFlags written without = takes the next argument, unless that is a
+// cache flag. A word holding an unexpanded variable ($EXTRA) may be any
+// number of flags, so the scan reads past it; a cache flag set from a
+// variable (-modcache=$v) is reported.
 func cleanFlagsCache(args []string) bool {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -417,6 +418,13 @@ func cleanFlagsCache(args []string) bool {
 		}
 		name := strings.TrimLeft(a, "-")
 		if !strings.Contains(name, "=") && goValueFlags[name] {
+			// The next word is this flag's value, unless it is a cache
+			// flag: an empty argument ('', or a variable that expands to
+			// nothing) leaves no word behind, so -tags '' -modcache reads
+			// as -tags -modcache here.
+			if i+1 < len(args) && cleansCache(args[i+1]) {
+				return true
+			}
 			i++
 		}
 	}

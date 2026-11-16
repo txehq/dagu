@@ -353,7 +353,13 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 			idx += 1 + next
 		}
 	}
-	sc := &scriptScan{l: s.lang, logical: joinLines(s.lang, phys), tainted: map[string]bool{}, defined: map[string]bool{}}
+	logicals := joinLines(s.lang, phys)
+	if s.lang != langPython {
+		for i := range logicals {
+			logicals[i].text = maskWorkflowExprs(logicals[i].text)
+		}
+	}
+	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}}
 	sc.collectAssignments()
 	sc.propagate()
 
@@ -508,6 +514,14 @@ func (sc *scriptScan) varTainted(name string) bool {
 // chose the value: every context is a source, as an upper-case variable the
 // script never assigns is.
 var workflowExprRe = regexp.MustCompile(`\$\{\{.*?\}\}`)
+
+// maskWorkflowExprs replaces the inside of each ${{ }} expression, so that
+// its operators and quotes (${{ inputs.dir || vars.DIR }}, env['X']) are not
+// read as shell: they would otherwise end a command or a delete's target in
+// the middle of the expression. The masked expression is still a source.
+func maskWorkflowExprs(text string) string {
+	return workflowExprRe.ReplaceAllString(text, "${{expr}}")
+}
 
 // textTainted reports whether text reads the environment directly or through
 // a tainted variable.
