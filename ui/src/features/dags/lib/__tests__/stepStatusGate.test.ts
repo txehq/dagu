@@ -145,3 +145,38 @@ describe('canRetryStep', () => {
     ).toBe('Retry unavailable while the root DAG run is running.');
   });
 });
+
+// TXE-7517: the hub retries a registered TXE job's run only through a TXE
+// decision of the whole run, so no step of it, nor of a run on its path, is
+// offered for retry.
+describe('canRetryStep on a TXE job run', () => {
+  const job = 'job_01M4XEETKWKZX504BK65ADBVYB';
+  const p = { runDags: true, rootRunning: false };
+  it('offers no step retry on a job run', () => {
+    const gate = canRetryStep(
+      { status: Status.Failed, name: job },
+      node(NodeStatus.Failed),
+      p
+    );
+    expect(gate.ok).toBe(false);
+    expect(gate.reason).toContain('Run again');
+  });
+  it('offers no step retry on a run under a job run', () => {
+    expect(
+      canRetryStep(
+        { status: Status.Failed, name: 'helper', rootDAGRunName: job },
+        node(NodeStatus.Failed),
+        p
+      ).ok
+    ).toBe(false);
+  });
+  it('keeps step retry on any other DAG', () => {
+    expect(
+      canRetryStep(
+        { status: Status.Failed, name: 'etl', rootDAGRunName: 'etl' },
+        node(NodeStatus.Failed),
+        p
+      ).ok
+    ).toBe(true);
+  });
+});

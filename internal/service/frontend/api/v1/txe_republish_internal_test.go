@@ -71,84 +71,174 @@ func TestTxeRepublishShape(t *testing.T) {
 
 var republishNow = time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
 
-var republishJob = &registry.Job{JobID: "job_1", Version: 3, PackageDigest: "sha256:pkg"}
+// republishJob holds the decided proposal its actions carry out, as a job
+// does while such an action is in flight.
+var republishJob = &registry.Job{JobID: "job_1", Version: 3, PackageDigest: "sha256:pkg",
+	Proposals: map[string]*registry.Proposal{"prp_1": {ProposalID: "prp_1", State: registry.ProposalDecided,
+		Decision: &registry.Decision{DecisionID: "dec_1", ProposalID: "prp_1", Verdict: registry.VerdictRetry,
+			Actor: registry.Actor{Kind: registry.ActorHuman, ID: "alice"}}}}}
 
-func retryRunAction(params map[string]string) *registry.Action {
+func retryRunAction(params map[string]any) *registry.Action {
 	raw, _ := json.Marshal(params)
 	spec := registry.ActionSpec{Name: registry.ActionRetryRun, Params: raw}
 	binding, _ := registry.BindingDigest(republishJob, spec)
 	return &registry.Action{ActionID: "act_1", Attempt: 1, BindingDigest: binding, Kind: registry.ActionApproved,
-		State: registry.ActionExecuting, JobVersion: 3,
+		State: registry.ActionExecuting, JobVersion: 3, ProposalID: "prp_1", DecisionID: "dec_1",
 		Grant: &registry.Grant{GrantID: "grt_1", ActionID: "act_1", Attempt: 1, ExpiresAt: republishNow.Add(time.Minute)},
 		Spec:  spec}
 }
 
-// A republish is held to an approved dagu.retry_run of this run's expected
-// execution with step "publish", and that approval is carried out only as a
-// republish.
+// A registered job's conditional retry is held to the approved
+// dagu.retry_run of this run's expected execution it is made for, and is
+// carried out only in the form that decision approved (TXE-7517): a
+// republish as the publish step alone, an explicit rerun from the job's
+// step with includeDownstream, a retry naming neither as the whole run.
+// Every refusal has the code every reviewer reads as "nothing started"; one
+// in a form other than a republish also says retry_unbound.
 func TestTxeRepublishBinding(t *testing.T) {
 	const run = "run-1"
 	job := republishJob
-	bind := func(action *registry.Action, accept bool) error {
-		return txeRepublishBinding(job, action, run, republishExpectationFor(action), accept, republishNow)
+	bind := func(action *registry.Action, form registry.RetryForm) error {
+		return txeRepublishBinding(job, action, run, republishExpectationFor(action), form, republishNow)
 	}
-	publish := map[string]string{"run_id": run, "attempt_id": "a1b2c3", "queued_at": "", "step": "publish"}
-	whole := map[string]string{"run_id": run, "attempt_id": "a1b2c3", "queued_at": ""}
-	with := func(base map[string]string, k, v string) map[string]string {
-		out := map[string]string{}
-		maps.Copy(out, base)
-		out[k] = v
+	base := map[string]any{"run_id": run, "attempt_id": "a1b2c3", "queued_at": ""}
+	with := func(params map[string]any, kv ...any) map[string]any {
+		out := map[string]any{}
+		maps.Copy(out, params)
+		for i := 0; i < len(kv); i += 2 {
+			out[kv[i].(string)] = kv[i+1]
+		}
 		return out
 	}
+	publish, rerun, unspecified := with(base, "step", "publish"), with(base, "rerun", true), base
 
-	assert.NoError(t, bind(retryRunAction(publish), true))
-	assert.NoError(t, bind(retryRunAction(whole), false), "an ordinary retry stays as it was")
-	assert.NoError(t, bind(nil, false), "another follow-up is the decision service's to bind")
+	assert.NoError(t, bind(retryRunAction(publish), registry.RetryFormPublish), "an approved republish")
+	assert.NoError(t, bind(retryRunAction(rerun), registry.RetryFormFromJobStep), "an approved rerun, from the job's step")
+	assert.NoError(t, bind(retryRunAction(unspecified), registry.RetryFormWholeRun), "an approved retry naming no intent, of the whole run")
 
-	other := retryRunAction(publish)
-	other.Spec.Name = "custom.action"
-	stale := retryRunAction(publish)
-	stale.Attempt = 2
-	rebound := retryRunAction(publish)
-	rebound.BindingDigest = "bd2"
-	outdated := retryRunAction(publish)
-	movedJob := *republishJob
-	movedJob.PackageDigest = "sha256:other"
-	routine := retryRunAction(publish)
-	routine.Kind = registry.ActionRoutine
-	settled := retryRunAction(publish)
-	settled.State = registry.ActionSucceeded
-	ungranted := retryRunAction(publish)
-	ungranted.Grant = nil
-	expired := retryRunAction(publish)
-	expired.Grant.ExpiresAt = republishNow
-	oldGrant := retryRunAction(publish)
-	oldGrant.Grant.Attempt = 0
-	oldVersion := retryRunAction(publish)
-	oldVersion.JobVersion = 2
+	// Each way an action can fail to bind, for each form: the action as the
+	// form approves it, then changed.
+	type variant struct {
+		action *registry.Action
+		job    *registry.Job
+		expect *persis.ExpectedExecution
+	}
+	cases := func(params map[string]any) map[string]variant {
+		mk := func(change func(*registry.Action)) variant {
+			a := retryRunAction(params)
+			change(a)
+			return variant{action: a}
+		}
+		movedJob := *republishJob
+		movedJob.PackageDigest = "sha256:other"
+		agentDecided := *republishJob
+		agentDecided.Proposals = map[string]*registry.Proposal{"prp_1": {ProposalID: "prp_1", State: registry.ProposalDecided,
+			Decision: &registry.Decision{DecisionID: "dec_1", Verdict: registry.VerdictRetry, Actor: registry.Actor{Kind: registry.ActorAgent, ID: "bot"}}}}
+		undecided := *republishJob
+		undecided.Proposals = nil
+		return map[string]variant{
+			"no such action":                 {action: nil, expect: republishExpectation()},
+			"not a retry_run":                mk(func(a *registry.Action) { a.Spec.Name = "custom.action" }),
+			"another attempt of the action":  mk(func(a *registry.Action) { a.Attempt = 2 }),
+			"another binding":                mk(func(a *registry.Action) { a.BindingDigest = "bd2" }),
+			"a binding of the job as it was": {action: retryRunAction(params), job: &movedJob},
+			"a request for another binding":  {action: retryRunAction(params), expect: republishExpectation()},
+			"another run":                    {action: retryRunAction(with(params, "run_id", "run-2"))},
+			"another execution":              {action: retryRunAction(with(params, "attempt_id", "ffffff"))},
+			"another queue marker":           {action: retryRunAction(with(params, "queued_at", "2026-10-23T00:00:00Z"))},
+			"not a person's decision":        mk(func(a *registry.Action) { a.Kind = registry.ActionRoutine }),
+			"decided by an agent":            {action: retryRunAction(params), job: &agentDecided},
+			"no decided proposal":            {action: retryRunAction(params), job: &undecided},
+			"another decision":               mk(func(a *registry.Action) { a.DecisionID = "dec_2" }),
+			"settled already (a replay)":     mk(func(a *registry.Action) { a.State = registry.ActionSucceeded }),
+			"outcome uncertain":              mk(func(a *registry.Action) { a.State = registry.ActionUncertain }),
+			"no grant":                       mk(func(a *registry.Action) { a.Grant = nil }),
+			"grant expired":                  mk(func(a *registry.Action) { a.Grant.ExpiresAt = republishNow }),
+			"grant for another attempt":      mk(func(a *registry.Action) { a.Grant.Attempt = 0 }),
+			"approved for an older version":  mk(func(a *registry.Action) { a.JobVersion = 2 }),
+		}
+	}
+	for form, params := range map[registry.RetryForm]map[string]any{
+		registry.RetryFormPublish:     publish,
+		registry.RetryFormFromJobStep: rerun,
+		registry.RetryFormWholeRun:    unspecified,
+	} {
+		for name, v := range cases(params) {
+			j, expect := job, v.expect
+			if v.job != nil {
+				j = v.job
+			}
+			if expect == nil {
+				expect = republishExpectationFor(v.action)
+			}
+			err := txeRepublishBinding(j, v.action, run, expect, form, republishNow)
+			require.Error(t, err, "%s: %s", form, name)
+			assert.Equal(t, txeRepublishUnsupported, republishRefusalCode(t, err), "%s: %s", form, name)
+			assert.Equal(t, form != registry.RetryFormPublish, refusalReason(err) == txeRetryUnbound, "%s: %s", form, name)
+		}
+	}
+
+	// A decision is carried out only in its own form. In particular a rerun
+	// sent with no step, as an older machine that ignores rerun sends it,
+	// is refused: Dagu would keep a job step that succeeded and publish the
+	// old seal instead of running the job again.
 	for name, err := range map[string]error{
-		"no such action":                 bind(nil, true),
-		"not a retry_run":                bind(other, true),
-		"whole-run approval republished": bind(retryRunAction(whole), true),
-		"publish approval run whole":     bind(retryRunAction(publish), false),
-		"another step approved":          bind(retryRunAction(with(whole, "step", "run")), false),
-		"another attempt of the action":  bind(stale, true),
-		"another binding":                bind(rebound, true),
-		"a binding of the job as it was": txeRepublishBinding(&movedJob, outdated, run, republishExpectationFor(outdated), true, republishNow),
-		"a request for another binding":  txeRepublishBinding(job, retryRunAction(publish), run, republishExpectation(), true, republishNow),
-		"another run":                    bind(retryRunAction(with(publish, "run_id", "run-2")), true),
-		"another execution":              bind(retryRunAction(with(publish, "attempt_id", "ffffff")), true),
-		"not a person's decision":        bind(routine, true),
-		"settled already":                bind(settled, true),
-		"no grant":                       bind(ungranted, true),
-		"grant expired":                  bind(expired, true),
-		"grant for another attempt":      bind(oldGrant, true),
-		"approved for an older version":  bind(oldVersion, true),
-		"another queue marker":           bind(retryRunAction(with(publish, "queued_at", "2026-10-23T00:00:00Z")), true),
+		"a rerun sent with no step":              bind(retryRunAction(rerun), registry.RetryFormWholeRun),
+		"a rerun sent as a republish":            bind(retryRunAction(rerun), registry.RetryFormPublish),
+		"no intent sent from the job step":       bind(retryRunAction(unspecified), registry.RetryFormFromJobStep),
+		"no intent sent as a republish":          bind(retryRunAction(unspecified), registry.RetryFormPublish),
+		"a republish sent with no step":          bind(retryRunAction(publish), registry.RetryFormWholeRun),
+		"a republish sent from the job step":     bind(retryRunAction(publish), registry.RetryFormFromJobStep),
+		"both republish and rerun":               bind(retryRunAction(with(publish, "rerun", true)), registry.RetryFormPublish),
+		"another step approved":                  bind(retryRunAction(with(base, "step", "run")), registry.RetryFormFromJobStep),
+		"a request naming no action, no step":    txeRepublishBinding(job, nil, run, republishExpectation(), registry.RetryFormWholeRun, republishNow),
+		"a request naming no action, as a rerun": txeRepublishBinding(job, nil, run, republishExpectation(), registry.RetryFormFromJobStep, republishNow),
 	} {
 		require.Error(t, err, name)
 		assert.Equal(t, txeRepublishUnsupported, republishRefusalCode(t, err), name)
 	}
+}
+
+// The form of a registered job's retry is read from what it asks of Dagu;
+// a step retry that is no decision's form is refused before anything else.
+func TestTxeRetryForm(t *testing.T) {
+	for name, c := range map[string]struct {
+		step, sub          string
+		downstream, bypass bool
+		accept             bool
+		want               registry.RetryForm
+	}{
+		"no step":                          {want: registry.RetryFormWholeRun},
+		"the job step with what follows":   {step: "run", downstream: true, want: registry.RetryFormFromJobStep},
+		"the publish step, its failure ok": {step: "publish", accept: true, want: registry.RetryFormPublish},
+	} {
+		form, err := txeRetryForm(c.step, c.sub, c.downstream, c.bypass, c.accept)
+		require.NoError(t, err, name)
+		assert.Equal(t, c.want, form, name)
+	}
+	for name, c := range map[string]struct {
+		step, sub          string
+		downstream, bypass bool
+	}{
+		"the job step alone":             {step: "run"},
+		"the publish step alone":         {step: "publish"},
+		"the job step, bypassing":        {step: "run", downstream: true, bypass: true},
+		"a step of a sub-DAG":            {step: "run", sub: "child-1", downstream: true},
+		"another step with what follows": {step: "other", downstream: true},
+	} {
+		_, err := txeRetryForm(c.step, c.sub, c.downstream, c.bypass, false)
+		require.Error(t, err, name)
+		assert.Equal(t, txeRepublishUnsupported, republishRefusalCode(t, err), name)
+		assert.Equal(t, txeRetryUnbound, refusalReason(err), name)
+	}
+}
+
+func refusalReason(err error) string {
+	if apiErr, ok := errors.AsType[*Error](err); ok {
+		reason, _ := apiErr.Details["reason"].(string)
+		return reason
+	}
+	return ""
 }
 
 // The job's DAG must be exactly what the TXE renderer writes, as written

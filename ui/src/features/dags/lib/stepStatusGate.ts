@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 import { components, NodeStatus, Status } from '@/api/v1/schema';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
 
 type Node = components['schemas']['Node'];
 
@@ -59,7 +60,7 @@ export function canChangeStepStatus(
  * cannot retry its steps while its root run is running.
  */
 export function canRetryStep(
-  run: { status: Status } | null,
+  run: { status: Status; name?: string; rootDAGRunName?: string } | null,
   node: Node,
   p: { runDags: boolean; rootRunning: boolean }
 ): StepRetryGate {
@@ -72,6 +73,17 @@ export function canRetryStep(
   }
   if (!run) {
     return { ok: false, disabled: true, reason: 'No DAG run is selected.' };
+  }
+  // The hub retries a registered TXE job's run, or a run on its path, only
+  // by carrying out a TXE decision of the whole run (TXE-7517): a step of it
+  // is never retried alone, so no step retry is offered.
+  if (isTxeJobDAGName(run.rootDAGRunName || run.name)) {
+    return {
+      ok: false,
+      disabled: true,
+      reason:
+        "A TXE job's run is retried from its job page: Run again or Publish sealed result",
+    };
   }
   if (run.status === Status.Waiting || run.status === Status.Queued) {
     return {

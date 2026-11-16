@@ -347,6 +347,30 @@ files.
   of the same execution while one is open or decided and not settled is
   refused (`retry_intent_conflict`); one settled with nothing run releases
   the execution. An older worker's executor does not have this rule.
+  The service retries a registered job's run only this way (TXE-7517).
+  `POST /dag-runs/{name}/{dagRunId}/retry` for a job's run, of the whole
+  run or of any step, is refused before anything is queued or created
+  unless it carries the `retryRequest` of a person's approved
+  `dagu.retry_run` that is executing its current attempt under a live
+  grant, for this run's execution, the job's current version and binding,
+  and in the one form that decision approved: a republish as
+  `stepName: publish` with `acceptFailedPrerequisites`; an explicit rerun
+  (`rerun: true`) as `stepName: run` with `includeDownstream`, so the job
+  runs again even when its step had succeeded; a retry naming neither with
+  no step. A rerun sent with no step, as a machine that ignores `rerun`
+  sends it, is refused: Dagu would keep a job step that succeeded and only
+  publish the old seal again. A request with no `retryRequest` is 409
+  `txe_decision_required`, naming the job's TXE page, where a person
+  chooses "Run again" or "Publish sealed result". One that does not carry
+  its decision out as approved is 400
+  `accept_failed_prerequisites_unsupported` (with `details.reason`
+  `retry_unbound` unless it was a republish), which every reviewer build
+  reads as "nothing started", so the action is recorded as not applied.
+  The run page offers no generic Retry on a job's run; it links to the TXE
+  page. This holds only on a service with this change: an older service
+  admits a direct generic retry of a job's run as before, and nothing here
+  protects it. A retry queued from the hub's own command line, outside the
+  API, is not covered here either (TXE-7518).
   The request also says which attempt of which action it is made for
   (`retryRequest`: the registry's action id, the attempt number, the
   action's binding digest, all taken from the registry's record). The

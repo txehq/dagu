@@ -469,7 +469,11 @@ func TestTxeNativeChildRetryIsDecidedOnItsWholePath(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, statusOf(retry(personA, "grandchild", "deep")), "a path through another owner's run")
 	require.Empty(t, recorder.dispatched)
 
-	// A's own path, through an ownerless helper, is A's to retry.
-	require.NoError(t, retry(personA, "child-h", "h"))
-	require.Len(t, recorder.dispatched, 1)
+	// A's own path, through an ownerless helper, is A's: but a registered
+	// job's run is retried only through a TXE decision (TXE-7517), so even
+	// A's own direct step retry is refused, and nothing is dispatched.
+	err = retry(personA, "child-h", "h")
+	require.Equal(t, http.StatusConflict, statusOf(err))
+	require.Equal(t, txeDecisionRequired, republishRefusalCode(t, err))
+	require.Empty(t, recorder.dispatched)
 }

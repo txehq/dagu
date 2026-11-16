@@ -1665,6 +1665,9 @@ const baseEnglish = {
   'Results will appear here as each request finishes.':
     'Results will appear here as each request finishes.',
   Retry: 'Retry',
+  'Retry in TXE': 'Retry in TXE',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    "A TXE job's run is retried from its job page: Run again or Publish sealed result",
   'Retry is only available on the top-level run':
     'Retry is only available on the top-level run',
   'Retry as a new run': 'Retry as a new run',
@@ -4893,6 +4896,9 @@ const baseChinese = {
   'Results will appear here as each request finishes.':
     '结果将在每个请求完成后显示在这里。',
   Retry: '重试',
+  'Retry in TXE': '在 TXE 中重试',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    'TXE 作业的运行需在其作业页面重试：再次运行或发布已封存的结果',
   'Retry is only available on the top-level run': '仅可在顶层运行上重试',
   'Retry as a new run': '作为新运行重试',
   'Retry continues the existing OpenCode conversation and sends the step prompt again. Use “Start clean session” in the Agent session tab to begin a new conversation.':
@@ -8121,6 +8127,9 @@ const baseJapanese = {
   'Results will appear here as each request finishes.':
     '各リクエストが完了すると、ここに結果が表示されます。',
   Retry: '再試行',
+  'Retry in TXE': 'TXE で再試行',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    'TXE ジョブの実行はジョブページから再試行します：再実行、または封印済みの結果を公開',
   'Retry is only available on the top-level run':
     '再試行は最上位の実行でのみ可能です',
   'Retry as a new run': '新しい実行として再試行',

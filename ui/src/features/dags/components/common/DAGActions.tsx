@@ -54,6 +54,8 @@ import {
   useJobRunAllowed,
   ViewOnly,
 } from '@/features/txe/runAccess';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
+import { TxeJobRetryButton } from '@/features/txe/components/TxeJobRetryButton';
 
 import {
   StartUnconfirmedError,
@@ -445,8 +447,18 @@ function DAGActions({
             </Tooltip>
           ))}
 
+        {/* A registered TXE job's run is retried only through a TXE
+            decision (TXE-7517): its job page stands in for Retry. */}
+        {shows('retry') && !isSubDAGRun && isTxeJobDAGName(fileName) && (
+          <TxeJobRetryButton
+            jobId={fileName}
+            label={displayMode !== 'compact'}
+            data-ww-action={mark('retry')}
+          />
+        )}
+
         {/* Retry Button */}
-        {shows('retry') && !isSubDAGRun && (
+        {shows('retry') && !isSubDAGRun && !isTxeJobDAGName(fileName) && (
           <Tooltip>
             <TooltipTrigger asChild>
               <ActionButton
