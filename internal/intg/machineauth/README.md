@@ -143,6 +143,16 @@ files in the shared cache are never read, so the build works offline when the ca
 already holds the downloads. `go mod verify` must report every module matching before and
 after the build. The first build compiles cold.
 
+The build never sets `HOME`. It names owned `GOPATH`, `GOMODCACHE` and `GOCACHE` directories,
+which it creates exclusively inside one work directory. Before every go command it checks
+that each of the three resolves to its own directory; a value that is missing or points
+elsewhere refuses the command. It removes the work directory by the identity recorded at
+creation: the directory and its parent, by device and inode, plus the path. It refuses a
+target that is unknown, replaced, turned into a link, or has a different parent. Nothing in
+the package cleans a module cache through go, or derives a path to remove from the
+environment or from `go env`, and `TestNoModuleCacheCleanOrHomeOverride` enforces that
+(TXE-7538).
+
 The record names the clone's commit and tree, the command,
 the variables the command set, and the Go version. A narrowed build's record must come from
 this builder (`machineauth-controlled-clone-v1`), for the module `narrowedScopes` lists.

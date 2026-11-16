@@ -386,7 +386,7 @@ func TestSourceBuildRefusesABorrowedStamp(t *testing.T) {
 	repo, commit := fixtureRepo(t)
 	// The threat is real: built in place, the ignored module wears the stamp.
 	borrowed := filepath.Join(t.TempDir(), "borrowed")
-	_, err := runIn(filepath.Join(repo, ".local", "evil"), append(callerEnv(), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0", "HOME="+t.TempDir()),
+	_, err := runIn(filepath.Join(repo, ".local", "evil"), append(append(callerEnv(), testGoEnv(t)...), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0"),
 		5*time.Minute, "go", "build", "-buildvcs=true", "-o", borrowed, "./cmd")
 	require.NoError(t, err)
 	info, err := buildinfo.ReadFile(borrowed)
@@ -470,7 +470,7 @@ func TestCheckBuildInfo(t *testing.T) {
 	build := func(dir string, args ...string) *debug.BuildInfo {
 		t.Helper()
 		out := filepath.Join(t.TempDir(), "bin")
-		_, err := runIn(dir, append(callerEnv(), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0", "HOME="+t.TempDir()), 5*time.Minute,
+		_, err := runIn(dir, append(append(callerEnv(), testGoEnv(t)...), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0"), 5*time.Minute,
 			"go", append(append([]string{"build"}, args...), "-ldflags", "-X 'main.version=2.18.2-txe.18'", "-o", out, "./cmd")...)
 		require.NoError(t, err)
 		info, err := buildinfo.ReadFile(out)
@@ -561,7 +561,7 @@ func depFixture(t *testing.T) depRig {
 	repo, _ := fixtureRepo(t)
 	// The shared cache's path holds URL-significant characters and the proxy
 	// list's separator: the file proxy URL must still name it.
-	proxy, cache := t.TempDir(), filepath.Join(t.TempDir(), "cache#one,two %x")
+	proxy, cache := t.TempDir(), ownedTestDir(t, "cache#one,two %x-").path
 	const mod, ver = "example.com/dep", "v1.0.0"
 	depMod := "module " + mod + "\n\ngo 1.22\n"
 	depSrc := "package dep\n\nfunc Name() string { return \"dep\" }\n"
@@ -611,9 +611,6 @@ func depFixture(t *testing.T) depRig {
 		}
 	}
 	env = append(env, "GOPROXY="+proxyURL, "GOSUMDB=off", "GOMODCACHE="+cache)
-	// The cache's directories are read-only; make the tree removable before
-	// TempDir removes it. The path is the test's own, never the environment's.
-	t.Cleanup(func() { _ = removeTree(cache) })
 	return depRig{repo: repo, commit: commit, cache: cache, env: env}
 }
 
@@ -626,7 +623,7 @@ func TestSourceBuildReadsOnlyAPrivateModuleCache(t *testing.T) {
 	t.Parallel()
 	d := depFixture(t)
 	// Fill the shared cache, as a caller's earlier work would.
-	_, err := runIn(d.repo, append(slices.Clone(d.env), "GOENV=off", "GOFLAGS=", "GOWORK=off", "HOME="+t.TempDir()), 5*time.Minute, "go", "mod", "download")
+	_, err := runIn(d.repo, append(append(slices.Clone(d.env), ownedGoDirsExcept(t, "GOMODCACHE")...), "GOENV=off", "GOFLAGS=", "GOWORK=off"), 5*time.Minute, "go", "mod", "download")
 	require.NoError(t, err)
 
 	first := fixtureSpec(t, d.repo, d.commit)
@@ -708,4 +705,36 @@ func TestModuleProxyChain(t *testing.T) {
 	assert.Equal(t, fileURL(filepath.Join(shared, "cache", "download"))+",https://proxy.golang.org,direct",
 		moduleProxyChain([]string{"GOMODCACHE=" + shared}), "go's default proxy when the caller names none")
 	assert.Equal(t, "off", moduleProxyChain([]string{"GOPROXY=off"}))
+}
+
+// ownedTestDir is an owned directory under the test's temporary directory,
+// removed (read-only files included) by its record before TempDir's own
+// cleanup runs.
+func ownedTestDir(t *testing.T, pattern string) *ownedDir {
+	t.Helper()
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	d, err := createOwnedDir(parent, pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.remove() })
+	return d
+}
+
+// testGoEnv names owned GOPATH, GOMODCACHE and GOCACHE for a go command a
+// test runs. HOME is never set (TestNoHomeOverride).
+func testGoEnv(t *testing.T) []string { return ownedGoDirsExcept(t) }
+
+func ownedGoDirsExcept(t *testing.T, skip ...string) []string {
+	t.Helper()
+	root := ownedTestDir(t, "go-")
+	var env []string
+	for _, key := range privateGoDirs {
+		if slices.Contains(skip, key) {
+			continue
+		}
+		d, err := root.sub(strings.ToLower(key))
+		require.NoError(t, err)
+		env = append(env, key+"="+d.path)
+	}
+	return env
 }
