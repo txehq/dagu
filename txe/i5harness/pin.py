@@ -136,10 +136,12 @@ def go_list_deps(src, pkg):
     out = run(["go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}} {{.Dir}}{{end}}", pkg], cwd=src,
               env=dict(os.environ, GOFLAGS="-mod=readonly"))
     deps = {}
+    # go list reports resolved directories (/private/var/... on macOS for /var/...).
+    root = os.path.realpath(src)
     for line in out.decode().splitlines():
         if line.strip():
             ip, _, d = line.partition(" ")
-            deps[os.path.relpath(d, src)] = ip
+            deps[os.path.relpath(os.path.realpath(d), root)] = ip
     return deps
 
 

@@ -309,6 +309,15 @@ func TestPinClosureFlagsChangesOutsideTheReviewer(t *testing.T) {
 	m = report(reviewOnly, outside)
 	assert.Equal(t, true, m["assessment_required"])
 	assert.Equal(t, []any{"other/other.go"}, m["outside_reviewer_package"])
+	rows := map[string]map[string]any{}
+	for _, r := range m["changed"].([]any) {
+		row := r.(map[string]any)
+		rows[row["file"].(string)] = row
+	}
+	assert.Equal(t, true, rows["internal/txe/review/review.go"]["in_reviewer_closure"])
+	assert.Equal(t, "example.com/m/internal/txe/review", rows["internal/txe/review/review.go"]["package"])
+	assert.Equal(t, false, rows["other/other.go"]["in_reviewer_closure"])
+	assert.Equal(t, true, rows["other/other.go"]["in_binary"])
 }
 
 func TestPinBuildRecordsSourceAndBinary(t *testing.T) {
