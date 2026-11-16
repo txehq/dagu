@@ -36,3 +36,4 @@ go clean '-modcache=true' # want:go-clean-cache
 go clean -tags integration -modcache # want:go-clean-cache
 go clean -cache=false -modcache # want:go-clean-cache
 go clean $EXTRA_FLAGS -cache # want:go-clean-cache
+go clean -modcache="$want" # want:go-clean-cache

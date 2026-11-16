@@ -401,19 +401,19 @@ var goValueFlags = map[string]bool{
 // end at the first argument that is not one, or at --, and a flag in
 // goValueFlags written without = takes the next argument. A word holding an
 // unexpanded variable ($EXTRA) may be any number of flags, so the scan reads
-// past it.
+// past it; a cache flag set from a variable (-modcache=$v) is reported.
 func cleanFlagsCache(args []string) bool {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
 		case a == "--":
 			return false
+		case cleansCache(a):
+			return true
 		case strings.Contains(a, "$"):
 			continue
 		case !strings.HasPrefix(a, "-") || a == "-":
 			return false
-		case cleansCache(a):
-			return true
 		}
 		name := strings.TrimLeft(a, "-")
 		if !strings.Contains(name, "=") && goValueFlags[name] {
