@@ -108,7 +108,10 @@ caches. Neither step reads the real module cache, and the image is named by its 
 pulled).
 
 - `fixture-demo.py sandboxed <evidence> <image-id> [--deadline 300]`: through the real sandbox.
-  Expected: exit 0, the mutant SURVIVED, the fake caches and sentinels unchanged.
+  Expected: exit 0, the mutant SURVIVED, the fake caches and sentinels unchanged, and, from the
+  fixture test's own `go test -v` lines kept in the report (each result's `output_tail`), the
+  mutant's `go clean` returned nil and its sandbox GOMODCACHE is gone while the baseline's is
+  still there. Those lines are what was observed inside the sandbox, not an inference.
 - `fixture-demo.py outer-negative <evidence> <image-id> [--deadline 180]`: the alarm, with the
   boundary removed, proven inside an outer container with no network, no capabilities, no Docker
   socket, no credentials and no mount but a read-only copy of this directory. There

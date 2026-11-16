@@ -404,16 +404,43 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
     return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
-def dir_bytes(d: Path) -> int:
-    """Bytes allocated under d, not following links (a vanished entry counts as nothing)."""
-    total = 0
-    for root, _dirs, files in os.walk(d):
-        for f in files:
+def output_tail(log_path: Path, size: int = 8192) -> str:
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(max(0, log_path.stat().st_size - size))
+            return f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return f"<unreadable: {e}>"
+
+
+def dir_usage(d: Path, max_entries: int, budget: float) -> tuple[int, int, str | None]:
+    """Bytes allocated and entries under d, not following links. The tree is written by sandboxed
+    code, so the walk fails closed: an entry it cannot read, more than max_entries entries, or a
+    walk longer than budget seconds is returned as a reason to stop the run."""
+    total, count, problem = 0, 0, []
+    started = time.monotonic()
+
+    def unreadable(err: OSError) -> None:
+        problem.append(f"unreadable entry in the run directory: {err}")
+
+    for root, dirs, files in os.walk(d, onerror=unreadable):
+        for name in dirs + files:
+            count += 1
             try:
-                total += os.lstat(os.path.join(root, f)).st_blocks * 512
-            except (FileNotFoundError, AttributeError):
+                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+            except FileNotFoundError:
                 continue
-    return total
+            except OSError as e:
+                return total, count, f"unreadable entry in the run directory: {e}"
+            except AttributeError:  # no st_blocks on this platform
+                continue
+        if problem:
+            return total, count, problem[0]
+        if count > max_entries:
+            return total, count, f"run directory over {max_entries} entries"
+        if time.monotonic() - started > budget:
+            return total, count, f"run directory took over {budget:.0f}s to measure"
+    return total, count, problem[0] if problem else None
 
 
 def docker_client_env() -> dict[str, str]:
@@ -430,6 +457,8 @@ class Result:
     exit_code: int | None
     seconds: float
     log: str
+    output_tail: str = ""  # the last 8 KiB of the run's output, kept in the report
+    dir: str = ""  # the run's own directory (its /work)
 
 
 class Runner:
@@ -525,7 +554,9 @@ class Runner:
         cidfile.parent.mkdir(exist_ok=True)
         argv = self.docker_argv(d, name, cidfile)
         limit = self.remaining(label)
-        log_path = d / "output.log"
+        # Outside every mount: sandboxed code cannot truncate or replace its own output log.
+        log_path = self.work.path / "logs" / f"{self.seq:03d}.log"
+        log_path.parent.mkdir(exist_ok=True)
         start = time.monotonic()
         code, outcome = None, None
         self.pending[name] = cidfile
@@ -533,7 +564,7 @@ class Runner:
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env())
             try:
-                code = self.watch_run(proc, d, log_path, start, limit)
+                code = self.watch_run(proc, d, log, start, limit)
             except BaseException:
                 proc.kill()
                 proc.wait()
@@ -567,12 +598,12 @@ class Runner:
                 outcome = "ERROR"
             else:
                 outcome = "FAILED" if mutant is None else "KILLED"
-        return Result(label, outcome, code, round(secs, 2), str(log_path))
+        return Result(label, outcome, code, round(secs, 2), str(log_path), output_tail(log_path), str(d))
 
     def docker_env(self) -> dict[str, str]:
         return docker_client_env()
 
-    def watch_run(self, proc: subprocess.Popen, d: Path, log_path: Path, start: float, limit: float) -> int | None:
+    def watch_run(self, proc: subprocess.Popen, d: Path, log, start: float, limit: float) -> int | None:
         """Wait for the docker client, bounding what the run may consume on the host: its time,
         its captured output, the size of its own directory (the only host path it can write),
         and the free space left beside it. Past a bound, kill the client and return None, with
@@ -586,11 +617,14 @@ class Runner:
             now = time.monotonic()
             if now - start >= limit:
                 self.overrun = "time"
-            elif log_path.stat().st_size > self.args.max_output_mib * 2**20:
+            elif os.fstat(log.fileno()).st_size > self.args.max_output_mib * 2**20:
                 self.overrun = f"output over {self.args.max_output_mib} MiB"
             elif now - last_size_check >= 5.0:
                 last_size_check = now
-                if dir_bytes(d) > self.args.max_disk_mib * 2**20:
+                used, _entries, problem = dir_usage(d, self.args.max_files, 10.0)
+                if problem:
+                    self.overrun = problem
+                elif used > self.args.max_disk_mib * 2**20:
                     self.overrun = f"run directory over {self.args.max_disk_mib} MiB"
                 elif shutil.disk_usage(d).free < self.args.min_free_mib * 2**20:
                     self.overrun = f"free space under {self.args.min_free_mib} MiB"
@@ -663,6 +697,8 @@ def parse(argv: list[str]):
                    help="a run whose captured output passes this is stopped as ERROR")
     p.add_argument("--max-disk-mib", type=int, default=16384,
                    help="a run whose own directory (its only writable host path) passes this is stopped as ERROR")
+    p.add_argument("--max-files", type=int, default=500000,
+                   help="a run whose own directory passes this many entries is stopped as ERROR")
     p.add_argument("--min-free-mib", type=int, default=2048,
                    help="a run is stopped as ERROR when free space beside the work directory falls under this")
     p.add_argument("--workdir-root", type=Path, default=Path(tempfile.gettempdir()))
@@ -706,7 +742,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
         return EXIT_BASELINE
     if args.warm_gocache:
-        clone_dir(Path(base.log).parent / "sandbox" / "gocache", runner.work.path / "warm-gocache")
+        clone_dir(Path(base.dir) / "sandbox" / "gocache", runner.work.path / "warm-gocache")
 
     findings = []
     for mu in mutants:

@@ -122,7 +122,7 @@ class Demo:
                 "--tree", str(root / "fixture"), "--shared-modcache", str(modcache), "--shared-gocache", str(gocache),
                 "--workdir-root", str(root / "work"), "--image", self.args.image, "--docker", self.args.docker,
                 "--no-seed", "--memory", "2g", "--cpus", "2", "--pids", "512", "--timeout", "600",
-                "--deadline", str(runner_deadline), "--report", str(report), "--", "go", "test", "./..."]
+                "--deadline", str(runner_deadline), "--report", str(report), "--", "go", "test", "-v", "./..."]
         self.say("runner: " + " ".join(argv))
         with open(self.evidence / f"{self.args.step}.runner.log", "wb") as out:
             proc = subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT)
@@ -130,14 +130,26 @@ class Demo:
         after = self.fake_state(modcache, gocache)
         self.say("fake caches after: " + json.dumps(after, default=str))
         self.say(f"runner exit {rc} (expected 0)")
-        outcome = {}
+        outcome, tails = {}, {}
         try:
-            outcome = {r["name"]: r["outcome"] for r in json.loads(report.read_text())["results"]}
+            results = json.loads(report.read_text())["results"]
+            outcome = {r["name"]: r["outcome"] for r in results}
+            tails = {r["name"]: r.get("output_tail", "") for r in results}
         except (OSError, ValueError, KeyError):
             pass
         self.say(f"outcomes {outcome}")
-        survived = outcome.get("cleanup cleans the env module cache") == "SURVIVED"
-        return rc == 0 and survived and before == after
+        mutant = "cleanup cleans the env module cache"
+        survived = outcome.get(mutant) == "SURVIVED"
+        # What the mutant did inside the sandbox, as the fixture test logged it (go test -v):
+        # observed, not inferred. The baseline's line is the positive control.
+        for name in ("baseline", mutant):
+            lines = [ln.strip() for ln in tails.get(name, "").splitlines() if "cleanup" in ln.lower()]
+            self.say(f"{name} reported: {lines}")
+        cleaned = "cleanup returned: <nil>" in tails.get(mutant, "") and "exists=false" in tails.get(mutant, "")
+        control = "exists=true" in tails.get("baseline", "")
+        self.say(f"inside the sandbox: mutant's go clean returned nil and its GOMODCACHE is gone: {cleaned}; "
+                 f"baseline's GOMODCACHE still there: {control}")
+        return rc == 0 and survived and before == after and cleaned and control
 
     # -- step 2
     def outer_negative(self) -> bool:

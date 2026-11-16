@@ -140,12 +140,38 @@ if "fill" in image:
     with open(os.path.join(mounts["/work"], "filler"), "wb") as fh:
         fh.write(os.urandom(3 << 20))
     time.sleep(60)
+if "manyfiles" in image:
+    for n in range(50):
+        open(os.path.join(mounts["/work"], "f%d" % n), "w").close()
+    time.sleep(60)
+if "lockdir" in image:
+    locked = os.path.join(mounts["/work"], "locked")
+    os.makedirs(os.path.join(locked, "inner"))
+    os.chmod(locked, 0)
+    time.sleep(60)
+if "truncatelog" in image:
+    sys.stdout.buffer.write(b"y" * (3 << 20))
+    sys.stdout.flush()
+    for name in os.listdir(mounts["/work"]):
+        if name.endswith(".log"):
+            open(os.path.join(mounts["/work"], name), "w").close()
+    time.sleep(60)
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
 if "hang" in image:
     time.sleep(120)  # a container whose client is killed stays registered, as a detached one would
 if "noexec" in image:
+    # Runs nothing: prints the lines the fixture test logs, chosen by whether the copied source
+    # carries the cleanup mutant.
+    src = os.path.join(mounts.get("/work", "/nonexistent"), "src", "cleanup.go")
+    mutated = os.path.exists(src) and "clean" in open(src).read().split("func Cleanup")[-1]
+    if mutated:
+        print("    cleanup_test.go:13: cleanup returned: <nil>")
+        print("    cleanup_test.go:16: GOMODCACHE /work/sandbox/gomodcache after cleanup: exists=false (stat: no such file)")
+    else:
+        print("    cleanup_test.go:13: cleanup returned: <nil>")
+        print("    cleanup_test.go:16: GOMODCACHE /work/sandbox/gomodcache after cleanup: exists=true (<nil>)")
     code = 0
 else:
     def host(p):
@@ -700,10 +726,10 @@ func TestDeadlineStopsRun(t *testing.T) {
 	f := newFixture(t, passingCheck)
 	foreignContainer(t, f.log)
 	start := time.Now()
-	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "2")
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
 	assert.Less(t, time.Since(start), 20*time.Second)
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	assert.Contains(t, o.stderr, "whole-run deadline (2s) passed during baseline")
+	assert.Contains(t, o.stderr, "whole-run deadline (6s) passed during baseline")
 	workdir := o.report["workdir"].(string)
 	assert.DirExists(t, workdir)
 	ids := recordedCIDs(t, workdir)
@@ -991,7 +1017,7 @@ func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
 // (exit 3), not exit 6: the host check runs on every exit path.
 func TestStoppedRunStillChecksSharedState(t *testing.T) {
 	f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
-	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "3")
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
 	require.Equal(t, 3, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "stopped:")
 	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
@@ -1019,13 +1045,26 @@ func TestWriteBoundsStopRun(t *testing.T) {
 	cases := map[string]struct{ image, flag, want string }{
 		"output": {"flood", "--max-output-mib", "output over 1 MiB"},
 		"disk":   {"fill", "--max-disk-mib", "run directory over 1 MiB"},
+		// The log is outside the run's mount and measured by the runner's own descriptor.
+		"output despite tamper": {"truncatelog", "--max-output-mib", "output over 1 MiB"},
+		"entries":               {"manyfiles", "--max-files", "run directory over 10 entries"},
+		// An unreadable entry fails the measurement closed rather than being skipped.
+		"unreadable": {"lockdir", "--max-files", "unreadable entry in the run directory"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t, passingCheck)
 			foreignContainer(t, f.log)
 			start := time.Now()
-			o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", c.image, c.flag, "1")
+			val := "1"
+			switch c.flag {
+			case "--max-files":
+				val = map[string]string{"manyfiles": "10", "lockdir": "100000"}[c.image]
+			}
+			t.Cleanup(func() {
+				_ = filepath.Walk(f.root, func(p string, _ os.FileInfo, _ error) error { _ = os.Chmod(p, 0o755); return nil })
+			})
+			o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", c.image, c.flag, val)
 			assert.Less(t, time.Since(start), 30*time.Second)
 			assert.Equal(t, 4, o.code, o.stdout+o.stderr)
 			assert.Equal(t, "ERROR", o.outcomes()["baseline"])

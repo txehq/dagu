@@ -34,7 +34,7 @@ echo "-- fake caches before"
 state
 python3 -I /runner/mutate-sandboxed.py --mutants "$fake/fixture/mutants.json" --tree "$fake/fixture" \
   --docker /runner/testdata/leaky-docker.py --image outer-image --no-seed --workdir-root "$fake/work" \
-  --timeout 300 --report "$fake/report.json" -- go test ./...
+  --timeout 300 --report "$fake/report.json" -- go test -v ./...
 rc=$?
 echo "-- runner exit $rc (expected 3)"
 echo "-- fake caches after"
