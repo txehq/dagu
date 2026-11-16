@@ -43,6 +43,7 @@ func TestFixtures(t *testing.T) {
 		{"harness.ps1.txt", "scripts/ci/harness.ps1"},
 		{"harness_test.py.txt", "txe/tests/harness_test.py"},
 		{"workflow.yml.txt", ".github/workflows/x.yaml"},
+		{"workflow_steps.yml.txt", ".github/workflows/steps.yaml"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {

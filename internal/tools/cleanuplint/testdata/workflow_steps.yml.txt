@@ -1,0 +1,93 @@
+env:
+  shared_root: /var/cache/shared
+jobs:
+  steps-scope:
+    env:
+      CACHE_ROOT: ${{ runner.temp }}/cache
+    steps:
+      - name: a safe assignment in one step
+        run: |
+          CACHE_ROOT="$(mktemp -d)"
+          rm -rf "$CACHE_ROOT"
+      - name: does not clear a delete in another step
+        run: rm -rf "$CACHE_ROOT" # want:env-path-delete
+      - run: |
+          scratch="$(mktemp -d)"
+          echo "$scratch"
+      - run: |
+          rm -rf "$scratch"
+          rm -rf "$shared_root" # want:env-path-delete
+      - env:
+          step_dir: ${{ inputs.dir }}
+        run: rm -rf "$step_dir" # want:env-path-delete
+      - env: { flow_dir: "${{ inputs.dir }}" }
+        run: >-
+          rm -rf "$flow_dir" # want:env-path-delete
+  other-job:
+    steps:
+      - run: |
+          CACHE_ROOT="$(mktemp -d)"
+          echo "$CACHE_ROOT"
+      - shell: bash
+        run: |
+          go build ./...
+          rm -rf "${CACHE_ROOT}/x" # want:env-path-delete
+      - run: |
+          own="$(mktemp -d)"
+          shared_root="$own"
+          rm -rf "$shared_root"
+  quoted-arguments:
+    steps:
+      - run: go clean -tags "a b" -modcache # want:go-clean-cache
+      - run: go clean -tags 'integration e2e' -cache=true # want:go-clean-cache
+      - run: go clean -tags "a b" -modcache=false
+      - run: sh -c "go clean -fuzzcache" # want:go-clean-cache
+      - run: go clean -tags "a b" ./pkg -modcache
+  github-env:
+    steps:
+      - run: |
+          cache_dir="$HOME/.cache/shared"
+          echo "cache_dir=$cache_dir" >> "$GITHUB_ENV"
+      - run: rm -rf "$cache_dir" # want:env-path-delete
+      - run: |
+          cache_dir="$(mktemp -d)"
+          rm -rf "$cache_dir"
+      - run: |
+          clean_flags="-modcache"
+          echo "clean_flags=$clean_flags" >> "$GITHUB_ENV"
+      - run: go clean $clean_flags # want:go-clean-cache
+      - run: |
+          build_flags="-tags x"
+          go clean $build_flags ./...
+      - run: |
+          subcmd=clean
+          go $subcmd -modcache # want:go-clean-cache
+      - run: |
+          {
+            echo "multi_dir<<EOF"
+            echo "$HOME/.cache/multi"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+      - run: rm -rf "$multi_dir" # want:env-path-delete
+      - run: |
+          clean_flags="$clean_flags -x"
+          go clean $clean_flags # want:go-clean-cache
+      - run: |
+          if [ -n "$verbose" ]; then clean_flags=-x; fi
+          go clean $clean_flags # want:go-clean-cache
+      - run: |
+          tool=build
+          go $tool -modcache
+      - run: |
+          cache_dir="$cache_dir/subdir"
+          rm -rf "$cache_dir" # want:env-path-delete
+      - run: |
+          own_dir="$(mktemp -d)"
+          own_dir="$own_dir/sub"
+          rm -rf "$own_dir"
+      - run: |
+          a=-n
+          a=-modcache
+          b=-n; b=-x; c=-n; c=-x; d=-n; d=-x; e=-n; e=-x
+          f=-n; f=-x; g=-n; g=-x; h=-n; h=-x; i=-n; i=-x
+          go clean $a $b $c $d $e $f $g $h $i # want:go-clean-cache

@@ -5,6 +5,7 @@ package main
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -367,10 +368,21 @@ type scriptScan struct {
 	assigns []assignment
 	tainted map[string]bool
 	defined map[string]bool
+	// envNames are names the environment sets: in a workflow, the keys of
+	// its env: maps. Nil outside a workflow.
+	envNames map[string]bool
+	// argAssigns are assignments from outside the script that expansions
+	// also reads. They define nothing: they only add go clean readings.
+	argAssigns []assignment
 }
 
 func lintScript(s source) ([]Finding, []directiveAt) {
 	phys := lines(s.data)
+	return scanScript(s, phys, nil, nil), scriptDirectives(phys)
+}
+
+// scriptDirectives finds the cleanuplint:allow directives in a file's lines.
+func scriptDirectives(phys []string) []directiveAt {
 	var dirs []directiveAt
 	for i, p := range phys {
 		for idx := strings.Index(p, "#"); idx >= 0; {
@@ -385,13 +397,23 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 			idx += 1 + next
 		}
 	}
+	return dirs
+}
+
+// scanScript reports the findings in one script's lines. envNames are
+// names the environment sets for this script beyond the ones the lint
+// already treats as sources: a workflow's env: maps. argAssigns are
+// assignments made outside this script whose values may still reach its
+// go clean arguments: in a workflow, every step's, since a step can export
+// a value through $GITHUB_ENV to the steps after it.
+func scanScript(s source, phys []string, envNames map[string]bool, argAssigns []assignment) []Finding {
 	logicals := joinLines(s.lang, phys)
 	if s.lang != langPython {
 		for i := range logicals {
 			logicals[i].text = maskWorkflowExprs(logicals[i].text)
 		}
 	}
-	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}}
+	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}, envNames: envNames, argAssigns: argAssigns}
 	sc.collectAssignments()
 	sc.propagate()
 
@@ -404,7 +426,7 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 		if s.lang == langPython {
 			text = lg.text // Python # inside strings is common; full-line comments were skipped
 		}
-		if goCleanIn(text) || goCleanIn(sc.expandArgs(text)) {
+		if goCleanIn(text) || slices.ContainsFunc(sc.expansions(text), goCleanIn) {
 			out = append(out, Finding{Path: s.rel, Line: lg.line, Rule: ruleGoClean, Msg: goCleanMsg})
 		}
 		if !isHarness(s.rel) {
@@ -415,29 +437,117 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 				Msg: "recursive delete of a path the environment chooses (" + strings.TrimSpace(target) + "); delete only a directory this code created, such as mktemp -d"})
 		}
 	}
-	return out, dirs
+	return out
 }
 
-// expandArgs replaces each reference to a shell or make variable with the
-// values the file assigns it, so an argument array is read whole:
-// args=(clean -modcache); go "${args[@]}".
-func (sc *scriptScan) expandArgs(text string) string {
+// Expansion bounds: rounds of substitution (a value can reference another
+// variable, or its own old value: flags="$flags -x"), and readings in all.
+const (
+	maxExpandRounds = 3
+	maxExpansions   = 256
+)
+
+// expansions returns readings of text with its shell or make variable
+// references replaced by values assigned to them, so an argument array is
+// read whole (args=(clean -modcache); go "${args[@]}"). A variable can hold
+// any of the values assigned to it: the script may assign it on a branch
+// that does not run, or keep a value another step exported through
+// $GITHUB_ENV (argAssigns). So each combination of values is its own
+// reading, as is all of a variable's values joined, and a go clean is
+// reported when any reading clears a cache. It can only report more.
+func (sc *scriptScan) expansions(text string) []string {
 	if sc.l != langShell && sc.l != langMake {
-		return text
+		return nil
 	}
-	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
-		name := argRefRe.FindStringSubmatch(ref)[1]
-		var vals []string
-		for _, a := range sc.assigns {
-			if a.name == name {
-				vals = append(vals, a.rhs)
+	var out []string
+	cur := []string{text}
+	for range maxExpandRounds {
+		var next []string
+		for _, t := range cur {
+			for _, e := range sc.expandOnce(t) {
+				if len(out)+len(next) >= maxExpansions {
+					break
+				}
+				if !slices.Contains(out, e) && !slices.Contains(next, e) {
+					next = append(next, e)
+				}
 			}
 		}
-		if len(vals) == 0 {
-			return ref
+		if len(next) == 0 {
+			break
 		}
-		return " " + strings.Join(vals, " ") + " "
-	})
+		out = append(out, next...)
+		cur = next
+	}
+	return out
+}
+
+// expandOnce returns text with its references substituted once: one
+// reading with each variable's values joined, then one per combination of
+// the referenced variables' values. It returns nil when no reference has
+// a value.
+func (sc *scriptScan) expandOnce(text string) []string {
+	vals := map[string][]string{}
+	var names []string
+	for _, m := range argRefRe.FindAllStringSubmatch(text, -1) {
+		if _, seen := vals[m[1]]; seen {
+			continue
+		}
+		v := assignedValues(append(slices.Clip(sc.assigns), sc.argAssigns...), m[1])
+		vals[m[1]] = v
+		if len(v) > 0 {
+			names = append(names, m[1])
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	subst := func(pick map[string]string) string {
+		return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
+			if v, ok := pick[argRefRe.FindStringSubmatch(ref)[1]]; ok {
+				return " " + v + " "
+			}
+			return ref
+		})
+	}
+	// The reading with each variable's values joined comes first, so the
+	// reading cap never drops it: it is the reading the lint made before
+	// readings per combination, so the lint never reports less than that.
+	joined := map[string]string{}
+	for _, n := range names {
+		joined[n] = strings.Join(vals[n], " ")
+	}
+	out := []string{subst(joined)}
+	pick := map[string]string{}
+	var walk func(i int)
+	walk = func(i int) {
+		if len(out) >= maxExpansions {
+			return
+		}
+		if i == len(names) {
+			out = append(out, subst(pick))
+			return
+		}
+		for _, v := range vals[names[i]] {
+			pick[names[i]] = v
+			walk(i + 1)
+		}
+	}
+	walk(0)
+	return out
+}
+
+// assignedValues returns the distinct values assigns gives name, in order.
+// A value assigned twice is read once: subcmd=clean in two places must
+// expand go $subcmd to go clean, not go clean clean.
+func assignedValues(assigns []assignment, name string) []string {
+	var vals []string
+	for _, a := range assigns {
+		if a.name == name && !slices.Contains(vals, a.rhs) {
+			vals = append(vals, a.rhs)
+		}
+	}
+	return vals
 }
 
 // argRefRe is a variable reference: $x, ${x}, ${x[@]}, ${x[*]}, $(x).
@@ -496,8 +606,21 @@ func (sc *scriptScan) collectAssignments() {
 
 // propagate marks every variable whose value can come from the environment.
 func (sc *scriptScan) propagate() {
+	// A name every assignment of which reads its own old value
+	// (dir="$dir/sub") never gets a value of the script's own, so it keeps
+	// whatever the environment gave it. One assignment that does not read
+	// it (dir="$(mktemp -d)", S="$TMP/s") is the base the others extend.
+	onlySelf := map[string]bool{}
 	for _, a := range sc.assigns {
-		if a.overridden {
+		if _, seen := onlySelf[a.name]; !seen {
+			onlySelf[a.name] = true
+		}
+		if !sc.refersToSelf(a) {
+			onlySelf[a.name] = false
+		}
+	}
+	for _, a := range sc.assigns {
+		if a.overridden || (onlySelf[a.name] && sc.envSource(a.name)) {
 			sc.tainted[a.name] = true
 		}
 	}
@@ -527,8 +650,42 @@ func (sc *scriptScan) varTainted(name string) bool {
 	if sc.defined[name] {
 		return false
 	}
+	return sc.envSource(name)
+}
+
+// refersToSelf reports an assignment whose value reads the variable it
+// assigns, outside any expression that creates a fresh temporary path.
+func (sc *scriptScan) refersToSelf(a assignment) bool {
+	var re *regexp.Regexp
+	switch sc.l {
+	case langShell:
+		re = shellRefRe
+	case langMake:
+		re = argRefRe
+	case langPowerShell:
+		re = psRefRe
+	case langNone, langGo, langPython:
+		return false
+	}
+	for _, m := range re.FindAllStringSubmatch(stripCreated(a.rhs), -1) {
+		if m[1] == a.name || (sc.l == langPowerShell && strings.EqualFold(m[1], a.name)) {
+			return true
+		}
+	}
+	return false
+}
+
+// envSource reports whether a variable the script never assigned would
+// name a path the environment chose.
+func (sc *scriptScan) envSource(name string) bool {
+	if sc.l == langPowerShell {
+		name = strings.ToLower(name)
+	}
 	switch sc.l {
 	case langShell, langMake:
+		if sc.envNames[name] {
+			return true
+		}
 		if shellSpecial[name] {
 			return false
 		}
