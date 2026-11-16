@@ -666,6 +666,8 @@ var guardRefused = []string{
 	"node -r ./mutants.js app.js",
 	"node --require=./mutants.js app.js",
 	"ruby -rmutants app.rb",
+	`perl -e'system("python3 mutants.py")'`,
+	`ruby -e'system("python3 mutants.py")'`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

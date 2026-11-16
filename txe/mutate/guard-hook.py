@@ -611,8 +611,9 @@ class Judge:
                 if t in ("-e", "--eval", "-p", "--print", "-E"):
                     return code_at(j + 1)
                 j += 2
-            elif prog in ("perl", "ruby") and t.startswith("-") and not t.startswith("--") and re.search("[eE]", t):
-                return code_at(j + 1)
+            elif prog in ("perl", "ruby") and t.startswith("-") and not t.startswith("--") and (em := re.search("[eE]", t)):
+                attached = t[em.end():]  # perl -e'code', perl -ne'code'
+                return code_runs_mutant(attached) if attached else code_at(j + 1)
             elif prog in ("perl", "ruby") and t in ("-I", "-r", "-M", "-x"):
                 j += 2
             elif t.startswith("-") and t != "-":
