@@ -132,6 +132,14 @@ save(r)
 if cidfile:
     open(cidfile, "w").write(cid)
 ` + effect + `
+if "flood" in image:
+    sys.stdout.buffer.write(b"x" * (3 << 20))
+    sys.stdout.flush()
+    time.sleep(60)
+if "fill" in image:
+    with open(os.path.join(mounts["/work"], "filler"), "wb") as fh:
+        fh.write(os.urandom(3 << 20))
+    time.sleep(60)
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -1003,4 +1011,27 @@ func TestUnreadableWatchFailsClosed(t *testing.T) {
 	require.Equal(t, 3, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
 	assert.Contains(t, o.stderr, "unreadable")
+}
+
+// A run's host footprint is bounded: past its captured-output cap or its directory-size cap it
+// is stopped as ERROR (never a kill) and its container is removed by the recorded id.
+func TestWriteBoundsStopRun(t *testing.T) {
+	cases := map[string]struct{ image, flag, want string }{
+		"output": {"flood", "--max-output-mib", "output over 1 MiB"},
+		"disk":   {"fill", "--max-disk-mib", "run directory over 1 MiB"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			foreignContainer(t, f.log)
+			start := time.Now()
+			o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", c.image, c.flag, "1")
+			assert.Less(t, time.Since(start), 30*time.Second)
+			assert.Equal(t, 4, o.code, o.stdout+o.stderr)
+			assert.Equal(t, "ERROR", o.outcomes()["baseline"])
+			assert.Contains(t, o.stderr, c.want)
+			assert.Len(t, removals(t, f.log), 1)
+			assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
+		})
+	}
 }

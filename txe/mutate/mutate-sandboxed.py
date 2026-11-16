@@ -404,6 +404,18 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
     return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
+def dir_bytes(d: Path) -> int:
+    """Bytes allocated under d, not following links (a vanished entry counts as nothing)."""
+    total = 0
+    for root, _dirs, files in os.walk(d):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_blocks * 512
+            except (FileNotFoundError, AttributeError):
+                continue
+    return total
+
+
 def docker_client_env() -> dict[str, str]:
     """What the docker client itself needs from the caller, unchanged; none of it reaches a
     container (docker run passes only --env values)."""
@@ -517,22 +529,31 @@ class Runner:
         start = time.monotonic()
         code, outcome = None, None
         self.pending[name] = cidfile
+        self.overrun = None
         with open(log_path, "wb") as log:
+            proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env())
             try:
-                proc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env(),
-                                      timeout=limit)
-                code = proc.returncode
-                if code < 0:
-                    # The docker client died by a signal: nothing shows the container finished.
-                    self.remove_pending()
-                    outcome = "ERROR"
-                else:
-                    del self.pending[name]
-            except subprocess.TimeoutExpired:
-                self.remove_pending()
+                code = self.watch_run(proc, d, log_path, start, limit)
+            except BaseException:
+                proc.kill()
+                proc.wait()
+                raise
+        if code is None:  # stopped by the watchdog: time, output or disk
+            self.remove_pending()
+            if self.overrun == "time":
                 if limit < self.args.timeout:
                     raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed during {label}")
                 outcome = "TIMEOUT"
+            else:
+                outcome = "ERROR"
+                self.cleanup_log.append(f"{name}: stopped: {self.overrun}")
+                print(f"mutate-sandboxed: {label}: stopped: {self.overrun}", file=sys.stderr)
+        elif code < 0:
+            # The docker client died by a signal: nothing shows the container finished.
+            self.remove_pending()
+            outcome = "ERROR"
+        else:
+            del self.pending[name]
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
@@ -550,6 +571,33 @@ class Runner:
 
     def docker_env(self) -> dict[str, str]:
         return docker_client_env()
+
+    def watch_run(self, proc: subprocess.Popen, d: Path, log_path: Path, start: float, limit: float) -> int | None:
+        """Wait for the docker client, bounding what the run may consume on the host: its time,
+        its captured output, the size of its own directory (the only host path it can write),
+        and the free space left beside it. Past a bound, kill the client and return None, with
+        self.overrun saying which bound."""
+        last_size_check = 0.0
+        while True:
+            try:
+                return proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if now - start >= limit:
+                self.overrun = "time"
+            elif log_path.stat().st_size > self.args.max_output_mib * 2**20:
+                self.overrun = f"output over {self.args.max_output_mib} MiB"
+            elif now - last_size_check >= 5.0:
+                last_size_check = now
+                if dir_bytes(d) > self.args.max_disk_mib * 2**20:
+                    self.overrun = f"run directory over {self.args.max_disk_mib} MiB"
+                elif shutil.disk_usage(d).free < self.args.min_free_mib * 2**20:
+                    self.overrun = f"free space under {self.args.min_free_mib} MiB"
+            if self.overrun:
+                proc.kill()
+                proc.wait()
+                return None
 
 
 # The caller's resolved go settings the seed keeps (read from `go env`, never inherited raw).
@@ -611,6 +659,12 @@ def parse(argv: list[str]):
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
     p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
     p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
+    p.add_argument("--max-output-mib", type=int, default=64,
+                   help="a run whose captured output passes this is stopped as ERROR")
+    p.add_argument("--max-disk-mib", type=int, default=16384,
+                   help="a run whose own directory (its only writable host path) passes this is stopped as ERROR")
+    p.add_argument("--min-free-mib", type=int, default=2048,
+                   help="a run is stopped as ERROR when free space beside the work directory falls under this")
     p.add_argument("--workdir-root", type=Path, default=Path(tempfile.gettempdir()))
     p.add_argument("--exclude", action="append", default=list(DEFAULT_EXCLUDES),
                    help="top-level or nested names not copied into the sandbox tree")
