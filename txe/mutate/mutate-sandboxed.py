@@ -167,6 +167,20 @@ class Mutant:
     count: int = 1
 
 
+def plain_target(root: Path, rel: str) -> Path:
+    """root/rel, refused unless every component under root is a real directory or file (no
+    symlink anywhere on the path) and it resolves inside root. A link on the path could point
+    back into the live tree, and writing through it would edit the live file."""
+    target, cur = root / rel, root
+    for part in Path(rel).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise Refused(f"{rel} runs through the symlink {cur.relative_to(root)}")
+    if not within(real(target), real(root)):
+        raise Refused(f"{rel} resolves outside {root}")
+    return target
+
+
 def load_mutants(path: Path, tree: Path) -> list[Mutant]:
     try:
         raw = json.loads(path.read_text())
@@ -193,9 +207,10 @@ def load_mutants(path: Path, tree: Path) -> list[Mutant]:
         rel = Path(mu.file)
         if rel.is_absolute() or ".." in rel.parts:
             raise Refused(f"mutant {mu.name!r}: file must be relative to the tree, without '..'")
-        target = tree / rel
-        if not within(real(target), real(tree)):
-            raise Refused(f"mutant {mu.name!r}: {mu.file} resolves outside the tree")
+        try:
+            target = plain_target(tree, mu.file)
+        except Refused as e:
+            raise Refused(f"mutant {mu.name!r}: {e}") from e
         try:
             text = target.read_text()
         except OSError as e:
@@ -208,9 +223,10 @@ def load_mutants(path: Path, tree: Path) -> list[Mutant]:
 
 
 def apply_mutant(copy: Path, mu: Mutant) -> None:
-    target = copy / mu.file
-    if target.is_symlink():
-        raise Refused(f"mutant {mu.name!r}: {mu.file} is a symlink in the copy")
+    try:
+        target = plain_target(copy, mu.file)
+    except Refused as e:
+        raise Refused(f"mutant {mu.name!r} in the copy: {e}") from e
     text = target.read_text()
     if text.count(mu.old) != mu.count:
         raise Refused(f"mutant {mu.name!r}: copy of {mu.file} no longer matches")

@@ -109,6 +109,21 @@ def refuses(command: str) -> bool:
     return False
 
 
+def command_of(data: dict):
+    """The shell command a tool call runs, or None. Claude's Bash and Codex's shell tools carry
+    it as tool_input.command or tool_input.cmd, as a string or an argv list."""
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    for key in ("command", "cmd"):
+        value = tool_input.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list) and value:
+            return " ".join(map(str, value))
+    return None
+
+
 def main() -> int:
     try:
         data = json.load(sys.stdin)
@@ -116,14 +131,8 @@ def main() -> int:
         return 0
     if not isinstance(data, dict):
         return 0
-    tool = data.get("tool_name") or ""
-    command = (data.get("tool_input") or {}).get("command")
-    if tool not in ("Bash", "shell", "exec_command", "local_shell") or not isinstance(command, str):
-        if isinstance(command, list):
-            command = " ".join(map(str, command))
-        else:
-            return 0
-    if refuses(command):
+    command = command_of(data)
+    if command is not None and refuses(command):
         print(REASON, file=sys.stderr)
         return 2
     return 0

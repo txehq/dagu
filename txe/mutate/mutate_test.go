@@ -478,3 +478,34 @@ elif sys.argv[1:3] == ["mod", "download"]:
 		assert.NotContains(t, joined, realMod)
 	}
 }
+
+// A mutant whose path runs through a directory symlink back into the live tree is refused before
+// anything is written: the copy keeps the link, and writing through it would edit the live file.
+func TestSymlinkedTargetRefused(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	real := filepath.Join(f.tree, "real")
+	require.NoError(t, os.MkdirAll(real, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(real, "code.sh"), []byte(": GUARD\n"), 0o644))
+	require.NoError(t, os.Symlink(real, filepath.Join(f.tree, "alias"))) // absolute, into the live tree
+	o := f.run(t, f.mutants(t, []map[string]any{{"name": "via alias", "file": "alias/code.sh", "old": ": GUARD", "new": "exit 1"}}))
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "refused")
+	live, err := os.ReadFile(filepath.Join(real, "code.sh"))
+	require.NoError(t, err)
+	assert.Equal(t, ": GUARD\n", string(live), "the live tree is never edited")
+}
+
+// Codex's exec_command carries the command as cmd (a string or an argv list).
+func TestGuardHookCodexInput(t *testing.T) {
+	for _, input := range []string{
+		`{"tool_name":"exec_command","tool_input":{"cmd":"python3 mutants.py"}}`,
+		`{"tool_name":"shell","tool_input":{"command":["bash","-lc","python3 mutants.py"]}}`,
+		`{"tool_name":"local_shell","tool_input":{"cmd":["python3","mutants.py"]}}`,
+	} {
+		code, _, stderr := hook(t, input)
+		assert.Equal(t, 2, code, input)
+		assert.Contains(t, stderr, "mutate-sandboxed")
+	}
+	code, _, _ := hook(t, `{"tool_name":"exec_command","tool_input":{"cmd":"go test ./..."}}`)
+	assert.Equal(t, 0, code)
+}
