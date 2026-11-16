@@ -451,17 +451,30 @@ func (sc *scriptScan) expandArgs(text string) string {
 	}
 	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
 		name := argRefRe.FindStringSubmatch(ref)[1]
-		var vals []string
-		for _, a := range append(slices.Clip(sc.assigns), sc.argAssigns...) {
-			if a.name == name {
-				vals = append(vals, a.rhs)
-			}
+		vals := assignedValues(sc.assigns, name)
+		if len(vals) == 0 {
+			// Only a name this script never assigns can come from another
+			// step: a step's own assignment is the value it uses.
+			vals = assignedValues(sc.argAssigns, name)
 		}
 		if len(vals) == 0 {
 			return ref
 		}
 		return " " + strings.Join(vals, " ") + " "
 	})
+}
+
+// assignedValues returns the distinct values assigns gives name, in order.
+// A value assigned twice is read once: subcmd=clean in two places must
+// expand go $subcmd to go clean, not go clean clean.
+func assignedValues(assigns []assignment, name string) []string {
+	var vals []string
+	for _, a := range assigns {
+		if a.name == name && !slices.Contains(vals, a.rhs) {
+			vals = append(vals, a.rhs)
+		}
+	}
+	return vals
 }
 
 // argRefRe is a variable reference: $x, ${x}, ${x[@]}, ${x[*]}, $(x).

@@ -59,3 +59,13 @@ jobs:
       - run: |
           build_flags="-tags x"
           go clean $build_flags ./...
+      - run: |
+          subcmd=clean
+          go $subcmd -modcache # want:go-clean-cache
+      - run: |
+          {
+            echo "multi_dir<<EOF"
+            echo "$HOME/.cache/multi"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+      - run: rm -rf "$multi_dir" # want:env-path-delete

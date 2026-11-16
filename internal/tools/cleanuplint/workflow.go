@@ -131,13 +131,15 @@ func workflowEnvNames(phys []string) map[string]bool {
 	return names
 }
 
-// githubEnvNameRe is a name written as name=value: in a step that writes
-// $GITHUB_ENV, any such text may be what it exports (echo "x=$v" >>
-// "$GITHUB_ENV", a heredoc, printf), and it cannot tell which.
-var githubEnvNameRe = regexp.MustCompile(`(?:^|[^\w$-])([A-Za-z_]\w*)=`)
+// githubEnvNameRe is a name written as name=value, or as name<<delimiter,
+// the environment file's multiline form: in a step that writes $GITHUB_ENV,
+// any such text may be what it exports (echo "x=$v" >> "$GITHUB_ENV",
+// echo "x<<EOF", a heredoc, printf), and it cannot tell which.
+var githubEnvNameRe = regexp.MustCompile(`(?:^|[^\w$-])([A-Za-z_]\w*)(?:=|<<)`)
 
 // githubEnvNames returns every name a run: block that writes $GITHUB_ENV
-// may export to the steps after it: each name=value text in that block.
+// may export to the steps after it: each name=value or name<<delimiter text
+// in that block.
 // It over-collects, which can only report more: a name the reading step
 // assigns itself is still defined there.
 func githubEnvNames(segs [][]string) map[string]bool {
