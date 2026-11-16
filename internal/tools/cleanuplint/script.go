@@ -5,6 +5,7 @@ package main
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -370,11 +371,14 @@ type scriptScan struct {
 	// envNames are names the environment sets: in a workflow, the keys of
 	// its env: maps. Nil outside a workflow.
 	envNames map[string]bool
+	// argAssigns are assignments from outside the script that expandArgs
+	// also reads. They define nothing: they only add go clean readings.
+	argAssigns []assignment
 }
 
 func lintScript(s source) ([]Finding, []directiveAt) {
 	phys := lines(s.data)
-	return scanScript(s, phys, nil), scriptDirectives(phys)
+	return scanScript(s, phys, nil, nil), scriptDirectives(phys)
 }
 
 // scriptDirectives finds the cleanuplint:allow directives in a file's lines.
@@ -398,15 +402,18 @@ func scriptDirectives(phys []string) []directiveAt {
 
 // scanScript reports the findings in one script's lines. envNames are
 // names the environment sets for this script beyond the ones the lint
-// already treats as sources: a workflow's env: maps.
-func scanScript(s source, phys []string, envNames map[string]bool) []Finding {
+// already treats as sources: a workflow's env: maps. argAssigns are
+// assignments made outside this script whose values may still reach its
+// go clean arguments: in a workflow, every step's, since a step can export
+// a value through $GITHUB_ENV to the steps after it.
+func scanScript(s source, phys []string, envNames map[string]bool, argAssigns []assignment) []Finding {
 	logicals := joinLines(s.lang, phys)
 	if s.lang != langPython {
 		for i := range logicals {
 			logicals[i].text = maskWorkflowExprs(logicals[i].text)
 		}
 	}
-	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}, envNames: envNames}
+	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}, envNames: envNames, argAssigns: argAssigns}
 	sc.collectAssignments()
 	sc.propagate()
 
@@ -435,7 +442,9 @@ func scanScript(s source, phys []string, envNames map[string]bool) []Finding {
 
 // expandArgs replaces each reference to a shell or make variable with the
 // values the file assigns it, so an argument array is read whole:
-// args=(clean -modcache); go "${args[@]}".
+// args=(clean -modcache); go "${args[@]}". In a workflow it reads every
+// step's assignments (argAssigns), so a flag exported through $GITHUB_ENV
+// by one step is read in the go clean of a later one.
 func (sc *scriptScan) expandArgs(text string) string {
 	if sc.l != langShell && sc.l != langMake {
 		return text
@@ -443,7 +452,7 @@ func (sc *scriptScan) expandArgs(text string) string {
 	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
 		name := argRefRe.FindStringSubmatch(ref)[1]
 		var vals []string
-		for _, a := range sc.assigns {
+		for _, a := range append(slices.Clip(sc.assigns), sc.argAssigns...) {
 			if a.name == name {
 				vals = append(vals, a.rhs)
 			}

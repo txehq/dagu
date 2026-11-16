@@ -52,3 +52,10 @@ jobs:
       - run: |
           cache_dir="$(mktemp -d)"
           rm -rf "$cache_dir"
+      - run: |
+          clean_flags="-modcache"
+          echo "clean_flags=$clean_flags" >> "$GITHUB_ENV"
+      - run: go clean $clean_flags # want:go-clean-cache
+      - run: |
+          build_flags="-tags x"
+          go clean $build_flags ./...

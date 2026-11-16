@@ -164,12 +164,19 @@ func lintWorkflow(s source) ([]Finding, []directiveAt) {
 	for n := range githubEnvNames(segs[:len(segs)-1]) {
 		envNames[n] = true
 	}
+	// Every step's assignments, for go clean's arguments only: a value one
+	// step exports through $GITHUB_ENV reaches the go clean of a later one.
+	whole := &scriptScan{l: langShell, logical: joinLines(langShell, phys), defined: map[string]bool{}}
+	for i := range whole.logical {
+		whole.logical[i].text = maskWorkflowExprs(whole.logical[i].text)
+	}
+	whole.collectAssignments()
 	var out []Finding
 	for _, seg := range segs {
-		out = mergeFindings(out, scanScript(s, seg, envNames))
+		out = mergeFindings(out, scanScript(s, seg, envNames, whole.assigns))
 		ps := s
 		ps.lang = langPowerShell
-		out = mergeFindings(out, scanScript(ps, seg, nil))
+		out = mergeFindings(out, scanScript(ps, seg, nil, nil))
 	}
 	return out, scriptDirectives(phys)
 }
