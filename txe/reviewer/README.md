@@ -381,6 +381,29 @@ files.
   names this request's execution only if it carries the request's id
   (`retryRequestId`, derived by the service's own function); an answer
   without it, or with another id, names none.
+  A retry the service queues, instead of handing it to the coordinator,
+  is bound again when the queue dispatches it, from the request it
+  recorded (TXE-7518). The run starts only if that request was derived
+  for the execution the retry replaced, and if the registry still binds
+  it at that moment: an approved `dagu.retry_run` to re-run that execution,
+  of the job's current version, executing its current attempt under a
+  live grant. A grant that expired while the retry waited refuses it. A
+  queued retry names no step, so it carries out only a retry that names
+  no intent: an approved republish, or an approved explicit rerun (sent
+  only as a retry of step `run` with its downstream), is refused there as
+  not applied, never carried out as a whole-run retry. A refused retry
+  ends aborted with the reason, is noted on the job, and leaves the
+  retried execution as it was; an action whose grant lapsed becomes
+  uncertain and is put to the owner. A retry queued with no request is
+  refused the same way. On the host that holds the service's data, the
+  `dagu retry` command does not queue a retry of a job's run either. A
+  plain `dagu retry` was already refused by the worker-selector rule. The
+  path that reached the queue needed the worker's `--worker-id` and
+  `--attempt-id` flags and a global queue, configured by hand, named for
+  the job's queue group; a default installation has none. That path now
+  refuses before anything is written and names the job's controls. None
+  of this guards against someone who can write the service's data or run
+  code on its host.
   When the answer is lost (the request fails, the service says the
   dispatch is uncertain, the reviewer dies first, or the answer names no
   execution), the reviewer asks the service for its record of the request
