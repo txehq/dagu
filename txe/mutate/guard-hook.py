@@ -766,7 +766,13 @@ class Judge:
             # (`node --some-flag x mutants.js`): one naming a mutant script is refused.
             if unknown and names_mutant_script(args[j:]):
                 return True
-            return operand_is_mutant(args[j], cmd, False, self.depth)
+            first = args[j]
+            if first.procsub is None and not SCRIPT_EXT.search(base(first.text)) and "/" not in first.text:
+                # Not a script file: a subcommand that runs one (node inspect, tsx watch, deno test,
+                # bun test x.ts), so a later word naming a mutant script is refused.
+                if names_mutant_script(args[j + 1:]):
+                    return True
+            return operand_is_mutant(first, cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
     def perl_ruby(self, prog: str, args: list, cmd) -> bool:

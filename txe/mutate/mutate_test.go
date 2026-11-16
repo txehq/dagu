@@ -731,6 +731,10 @@ var guardRefused = []string{
 	`python3 -c 'import subprocess, sys; subprocess.run(sys.argv[1:])' mutmut run`,
 	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' ./run-mutations`,
 	"PY=/usr/bin/python3; env PY=harmless true; $PY ./run-mutations",
+	"node inspect mutants.js",
+	"tsx watch tools/mutants.ts",
+	"deno test mutants.ts",
+	"bun test ./mutants.ts",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
