@@ -387,9 +387,18 @@ func verifyProvenance(mb manifestBuild, add func(string, ...any)) {
 		return
 	}
 	_, n, _ := resolveScope(mb)
-	if n != nil && (rec.Kind != "source" || rec.Source.Commit != n.Commit) {
+	if n == nil {
+		return
+	}
+	switch {
+	case rec.Kind != "source" || rec.Source.Commit != n.Commit:
 		add("build %s runs narrowed as version %s, which needs a source record of commit %s; its record is a %s record%s",
 			mb.Name, mb.Version, n.Commit, rec.Kind, commitSuffix(rec))
+	case rec.Source.Builder != controlledBuilder:
+		add("build %s runs narrowed, which needs a record of the controlled build %s; its record names builder %q",
+			mb.Name, controlledBuilder, rec.Source.Builder)
+	case rec.Source.Module != n.Module:
+		add("build %s runs narrowed, which needs a build of module %s; its record names module %q", mb.Name, n.Module, rec.Source.Module)
 	}
 }
 
