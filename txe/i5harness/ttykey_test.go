@@ -168,6 +168,8 @@ if mode == "silent":
     time.sleep(30)
 if mode == "eof":
     sys.exit(0)
+if mode == "stdout-first":
+    sys.stdout.write("unexpected startup output\n"); sys.stdout.flush()
 if mode == "warn":
     sys.stderr.write('time=2026-11-16T00:00:00Z level=WARN msg="No auth.mode configured"\n')
 attrs = termios.tcgetattr(0)
@@ -234,6 +236,8 @@ func TestTTYKeyRefusesWithoutWritingTheKey(t *testing.T) {
 		"silent":  {[]string{"--prompt-timeout", "1"}, "no key prompt within 1"},
 		"eof":     {nil, "ended before its key prompt"},
 		"echo-on": {nil, "echo is on at the pty"},
+		// stdout output and the prompt together, so one read can carry both.
+		"stdout-first": {nil, "unexpected output before the key prompt"},
 	} {
 		t.Run(mode, func(t *testing.T) {
 			script, record := standIn(t, t.TempDir())

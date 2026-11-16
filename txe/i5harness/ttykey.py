@@ -151,7 +151,9 @@ def run(a, key):
         deadline = time.monotonic() + a.prompt_timeout
         while True:
             accepted, rest = prelude(child.err)
-            if accepted and rest.startswith(prompt):
+            # stdout is checked first: output there and the prompt can arrive
+            # in the same read, and neither may hide the other.
+            if accepted and rest.startswith(prompt) and not child.out:
                 break
             if not accepted or (rest and not prompt.startswith(rest)) or child.out:
                 write_log(a.log, child, key)
@@ -168,7 +170,9 @@ def run(a, key):
                 return 2
             child.pump(min(left, 0.2))
 
-        if rest != prompt or child.echoed:
+        child.pump(0)  # whatever is already readable is judged before the key goes in
+        accepted, rest = prelude(child.err)
+        if not accepted or rest != prompt or child.out or child.echoed:
             write_log(a.log, child, key)
             status(ok=False, reason="the prompt was not alone, or the pty already carried output; nothing was written")
             return 2
