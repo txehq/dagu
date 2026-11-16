@@ -131,6 +131,13 @@ The slot starts no earlier than 2026-11-17 00:10Z, after window-10's recovery ha
 - `curl` reads them from files (`-H @file`, `-d @file`), so they never appear in any process's arguments. `rig_test.go` checks every `curl` line.
 - One residual is stated rather than hidden: `dagu context add` accepts the key only as a flag or from a terminal prompt. That single sub-second call carries the synthetic, loopback-only API key in its argv.
 
+**Coordinator authentication is off, as in J17.**
+- The test coordinator's gRPC port is loopback only and unauthenticated: coordinator authentication needs `txe.authn`, an identity provider, which root's ruling D1 excludes.
+- A process of **another local account** could therefore dispatch work to the test worker while the slot runs. This Mac has one human account (uid 501, checked with `dscl` before the slot).
+- Peer mutual TLS would close this, at the cost of a transport the deployed route does not use. It is root's choice, not added silently.
+
+**One loss per rig.** `loss` records its attempt before it enqueues the fixture, and refuses a second attempt even after a failure. An inconclusive loss ends the slot.
+
 Evidence lives in `$RIG/evidence/`. At the end it is copied to
 `~/Projects/k8sconfig/onprem-k3s/evidence/txe-7516/run-<UTC>/`, after the
 secret-redaction filter from the common brief. The rig root keeps the synthetic

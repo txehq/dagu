@@ -361,3 +361,23 @@ func TestRigReviewTickNeverEnqueuesTwice(t *testing.T) {
 	assert.Contains(t, out, "step tick1 already ran")
 	assert.EqualValues(t, 1, enqueued.Load())
 }
+
+// A loss runs once per rig: a failed first attempt (here the fixture never
+// starts) still blocks a second enqueue.
+func TestRigLossNeverEnqueuesTwice(t *testing.T) {
+	f := initialisedRig(t)
+	mark(t, f, "up")
+	var enqueued atomic.Int32
+	fakeHub(t, map[string]func(http.ResponseWriter, *http.Request){
+		"POST /api/v1/dags/job_X/enqueue": func(w http.ResponseWriter, r *http.Request) {
+			enqueued.Add(1)
+			reply(500, map[string]any{"error": "boom"})(w, r)
+		},
+	})
+	out, code := rig(t, "loss", "--rig", f.root)
+	assert.NotEqual(t, 0, code, out)
+	out, code = rig(t, "loss", "--rig", f.root)
+	assert.NotEqual(t, 0, code)
+	assert.Contains(t, out, "there is no second loss")
+	assert.EqualValues(t, 1, enqueued.Load())
+}

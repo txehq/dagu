@@ -244,9 +244,16 @@ owner_lost() { grep -q 'Owner coordinator unreachable' "$RIG/logs/worker.log"; }
 
 cmd_loss() {
   need up; once loss; ids
+  # One loss per rig: an attempt is recorded before the fixture is enqueued, and
+  # a second attempt is refused whatever happened to the first (README P3).
+  if [ -e "$RIG/control/loss-attempted" ]; then
+    die "a loss was already attempted at $(cat "$RIG/control/loss-attempted"); there is no second loss. Run 'rig.sh down'."
+  fi
+  date -u +%FT%TZ > "$RIG/control/loss-attempted"
   local out="$RIG/evidence/loss"; mkdir -p "$out"
   cp "$RIG/control/counter" "$out/counter-before" 2>/dev/null || echo 0 > "$out/counter-before"
-  RUN=$(post "/dags/$JOB/enqueue" '{}' | json 'd["dagRunId"]'); echo "$RUN" > "$out/run-id"; echo "RUN=$RUN" >> "$RIG/ids.env"
+  RUN=$(post "/dags/$JOB/enqueue" '{}' | json 'd["dagRunId"]') || die "loss: the fixture run was not enqueued"
+  echo "$RUN" > "$out/run-id"; echo "RUN=$RUN" >> "$RIG/ids.env"
   wait_for 120 "fixture started" started || die "the fixture did not start in 120 s"
   get "/dag-runs/$JOB/$RUN" > "$out/status-running.json"
   relayctl cut > "$out/relay-cut.json"
