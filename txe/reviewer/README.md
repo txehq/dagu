@@ -333,8 +333,20 @@ files.
   after the seal and the capability are checked again; otherwise nothing is
   sent. A seal that cannot be republished, because it changed, cannot be
   read, or the service lacks the capability, is put to the owner as a
-  question. It is never offered as a re-run. A person's own retry from the
-  dashboard always re-runs the job.
+  question. It is never offered as a re-run. A reviewer with no seal reader
+  cannot tell, so its retry is a question too.
+  A person asks the hub for one of two things (TXE-7515): a republish of an
+  execution's sealed result (`republish-requests`, stored as
+  `step: publish`), or an explicit rerun (`retry-requests` with
+  `mode: rerun`, stored as `rerun: true`), which runs the job again even
+  when a result was sealed; that result is superseded and never published.
+  A retry that names neither is unspecified: the job's machine runs it
+  again only for an execution known to have sealed nothing. A sealed,
+  changed or unreadable seal, or no seal reader, leaves it not dispatched,
+  and the detail names the two explicit requests. A retry of another intent
+  of the same execution while one is open or decided and not settled is
+  refused (`retry_intent_conflict`); one settled with nothing run releases
+  the execution. An older worker's executor does not have this rule.
   The request also says which attempt of which action it is made for
   (`retryRequest`: the registry's action id, the attempt number, the
   action's binding digest, all taken from the registry's record). The

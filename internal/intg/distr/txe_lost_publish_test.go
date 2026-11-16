@@ -171,6 +171,44 @@ func (l *txeLostPublish) nextExecution(t *testing.T, what string) ir.DAGRunStatu
 	})
 }
 
+// TXE-7515: below the job machine's executor nothing refuses a step-less
+// retry of the lost execution. Dispatched as the hub dispatches an approved
+// dagu.retry_run that names no step (conditional on the lost execution,
+// with the action's retry request, no step), it runs the job's script again:
+// the worker admits it because it is a new execution, although the lost one
+// sealed a result that is intact, the run's latest and never published.
+// The new execution seals and publishes its own result. The refusal of an
+// unspecified retry of a sealed execution is the executor's
+// (txe_owner_recovery_test.go), which reads the seal on the machine; an
+// executor without that rule, such as an older worker's, is not protected.
+func TestTXELostPublish_StepLessRetryRunsTheJobAgain(t *testing.T) {
+	lost := txeStartLostPublish(t)
+	run, failed := lost.run, lost.failed
+
+	dag := run.f.dagWrapper.DAG
+	task := executor.CreateTask(dag.Name, string(dag.YamlData), dispatch.DispatchOperationRetry, failed.DAGRunID,
+		executor.WithWorkerSelector(dag.WorkerSelector), executor.WithPreviousStatus(&failed),
+		executor.WithRequireLatestIsPrevious(true), executor.WithRetryRequest("act_rerun", "1", "sha256:binding"))
+	admitted := &dispatch.AdmittedExecution{}
+	require.NoError(t, run.f.coord.GetCoordinatorClient(t).Dispatch(run.f.coord.Context, dispatch.DispatchRequest{Task: task, Admitted: admitted}))
+	rerun := lost.nextExecution(t, "the step-less retry did not finish")
+	require.Equal(t, admitted.AttemptID, rerun.AttemptID)
+	require.NotNil(t, rerun.RetryRequest)
+	assert.Equal(t, txeExecution(failed).Ref(), rerun.RetryRequest.RetryOf, "it was admitted as the retry of the sealed execution")
+
+	assert.Equal(t, 2, txeExecutions(t, lost.control), "the job's script ran again")
+	assert.Equal(t, ir.Succeeded, rerun.Status)
+	manifest, ok := run.registry.execution(rerun)
+	require.True(t, ok, "the re-run published nothing")
+	assert.Equal(t, txeExecution(rerun), manifest.ProducedIn, "what was published is the re-run's own result")
+	assert.Equal(t, txeDigest(txeExecutionContent(2)), manifest.Artifacts[0].SHA256)
+	_, published := run.registry.execution(failed)
+	assert.False(t, published, "the sealed result was published")
+	latest, err := txeclient.Outputs{Home: run.home}.Sealed(txeTestJob, failed.DAGRunID)
+	require.NoError(t, err)
+	assert.Equal(t, txeExecution(rerun), latest.Execution, "the re-run's seal replaced the lost one as the run's result")
+}
+
 // TXE-5067: the republish publishes what the lost execution sealed, from a
 // new execution of the run. The job's script does not run again, the
 // manifest names the lost execution as the producer with the sealed bytes'

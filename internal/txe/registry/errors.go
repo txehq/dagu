@@ -34,6 +34,10 @@ const (
 	CodeIntentUnresolved Code = "intent_unresolved"
 	CodeReviewConflict   Code = "review_conflict"
 	CodeArtifactConflict Code = "artifact_conflict"
+	// CodeRetryIntentConflict refuses a retry of an execution that already
+	// has a retry with another intent open or decided and not yet settled: a
+	// republish and a re-run of one execution are never both in flight.
+	CodeRetryIntentConflict Code = "retry_intent_conflict"
 )
 
 // Error is a refused registry operation. Current, when set, is the record

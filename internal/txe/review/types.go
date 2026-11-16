@@ -123,10 +123,17 @@ const (
 	RetryRunQueuedParam  = "queued_at"
 	// RetryRunStepParam, set to RetryStepPublish, makes the retry a
 	// republish: only the job's publish step runs, for the result the failed
-	// execution sealed, and the job does not run again. The reviewer sets it,
-	// never the agent, and only when that seal is on this machine.
+	// execution sealed, and the job does not run again. The reviewer sets it
+	// when that seal is on this machine, and a person may ask for it; the
+	// agent never does.
 	RetryRunStepParam = "step"
 	RetryStepPublish  = registry.RetryStepPublish
+	// RetryRunRerunParam, "true", is a person's explicit request to run the
+	// job again as a new execution, even when the retried execution sealed
+	// a result (TXE-7515). A retry with neither it nor RetryRunStepParam is
+	// unspecified, and runs the job again only for an execution that sealed
+	// nothing.
+	RetryRunRerunParam = "rerun"
 	// CapabilityRepublishSealed is what the service's installation lists
 	// when it runs a retry of only the publish step for a sealed result.
 	CapabilityRepublishSealed = registry.CapabilityRepublishSealed
