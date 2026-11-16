@@ -31,7 +31,9 @@ package registry
 //     as documented; a documented failure that no longer happens fails too,
 //     so the list never goes stale. Only temporary stores are used.
 //
-// rollback-floor.md has the rules for changing any of this.
+// rollback_floor_rewrite_test.go adds the rewrite check (TXE-7559): every
+// field of every record a floor rewrites. rollback-floor.md has the rules for
+// changing any of this.
 
 import (
 	"bytes"
@@ -210,6 +212,9 @@ type floorReport struct {
 	// Results are each path's outcome by record ("store" for the store-wide
 	// reads): "ok", or "ERR <code>: <error>".
 	Results map[string]map[string]string `json:"results"`
+	// Rewrites are each rewritten record's outcome by store ("real",
+	// "planted") and key: "ok", or "ERR ..." (TXE-7559).
+	Rewrites map[string]map[string]string `json:"rewrites"`
 }
 
 // floorStoreRecord is the report's record for the store-wide reads.
@@ -746,6 +751,7 @@ func TestRollbackFloorReadersReadCurrentRecords(t *testing.T) {
 	for _, j := range man.Jobs {
 		records = append(records, j.Record)
 	}
+	rewriteBase, rewriteBefore, rewriteCur := prepareRewriteStores(t, fixtureDir, man.Now)
 
 	for _, floor := range rollbackFloors {
 		t.Run(floor.Name, func(t *testing.T) {
@@ -763,10 +769,13 @@ func TestRollbackFloorReadersReadCurrentRecords(t *testing.T) {
 			in := t.TempDir()
 			require.NoError(t, os.CopyFS(in, os.DirFS(fixtureDir)), "the floor reads a copy of the store, never the one written")
 			out := filepath.Join(t.TempDir(), "report.json")
+			dirs := floorRewriteCopies(t, rewriteBase)
+			rewrite, err := json.Marshal(dirs)
+			require.NoError(t, err)
 
 			cmd := exec.Command("go", "test", "-count=1", "-run", "^TestRollbackFloorReader$", "./internal/txe/registry/")
 			cmd.Dir = tree
-			cmd.Env = append(os.Environ(), "DAGU_ROLLBACK_FLOOR_IN="+in, "DAGU_ROLLBACK_FLOOR_OUT="+out)
+			cmd.Env = append(os.Environ(), "DAGU_ROLLBACK_FLOOR_IN="+in, "DAGU_ROLLBACK_FLOOR_OUT="+out, "DAGU_ROLLBACK_FLOOR_REWRITE="+string(rewrite))
 			output, err := cmd.CombinedOutput()
 			require.NoError(t, err, "floor %s reader:\n%s", floor.Name, output)
 
@@ -780,6 +789,7 @@ func TestRollbackFloorReadersReadCurrentRecords(t *testing.T) {
 				}
 			}
 			require.Empty(t, checkFloorReport(floor.Name, rep, strictParamFields, knownFloorFailures, records))
+			checkFloorRewrites(t, floor.Name, dirs, rewriteBefore, rewriteCur, rep.Rewrites)
 		})
 	}
 }
