@@ -117,8 +117,8 @@ GO_VALUE_FLAGS = {"-C", "-o", "-p", "-tags", "-ldflags", "-gcflags", "-asmflags"
 MAX_DEPTH = 24
 # go's flags that name a program go runs, alone (value in the next word) or with =value, also
 # inside a GOFLAGS=... word.
+DECLARERS = {"export", "declare", "typeset", "readonly", "local"}
 GO_EXEC_FLAG = re.compile(r"(?:^|=)--?(?:exec|toolexec|vettool)(?:=(.*))?$")
-VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 # Code given to a non-shell interpreter (`python3 -c`, `node -e`, a here-document on python3's
 # stdin) runs a mutant when it imports one, or when it names a mutant script or tool AND calls
 # something that runs a file or a process.
@@ -160,6 +160,7 @@ class Cmd:
         # ("unknown", descriptor) for a duplication of a descriptor this command does not set.
         self.fds: dict = {}
         self.piped_from: "Cmd | None" = None
+        self.group: "list[Cmd] | None" = None  # the commands of a `( ... )` this command is
 
     def source(self, key: str):
         """What descriptor `key` reads, as (kind, value), or None when the command does not set it."""
@@ -187,6 +188,7 @@ class Parser:
         self.cmds = []  # every simple command found, nested ones included
         self.heredocs = []  # (cmd, delimiter, strip_tabs, quoted) waiting for the next newline
         self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
+        self.braces = []  # where each open `{ ...` group starts in self.cmds
 
     def parse(self) -> list:
         self.seq(None)
@@ -217,6 +219,20 @@ class Parser:
 
         def finish():
             nonlocal cur
+            first = cur.words[0].text if cur.words else None
+            group = cur.group
+            if first == "{":
+                self.braces.append(len(self.cmds))
+            elif first == "}" and self.braces:
+                group = self.cmds[self.braces.pop():]
+            if group:
+                # `(python3) < x.py`, `{ python3; } < x.py`, `cat x.py | (python3)`: the group's
+                # redirections and pipe apply to every command inside it (an inner one wins).
+                for c in group:
+                    for k, v in cur.fds.items():
+                        c.fds.setdefault(k, v)
+                    if c.piped_from is None:
+                        c.piped_from = cur.piped_from
             if cur.words or cur.fds:
                 self.cmds.append(cur)
             done, cur = cur, Cmd()
@@ -255,7 +271,7 @@ class Parser:
                     self.i += 1
                     if self.deeper():
                         self.depth += 1
-                        self.seq(")")
+                        cur.group = self.seq(")")
                         self.depth -= 1
             elif c == "(":
                 self.i += 1  # a function definition's () or a stray bracket
@@ -555,6 +571,7 @@ class Judge:
         self.depth = depth
         self.vars = {}
         self.env_assigned = []
+        self.env_assigned_names = []
         self.nest = 0
 
     def env_values(self) -> list:
@@ -564,7 +581,13 @@ class Judge:
 
     def runs_mutation(self, cmd: Cmd) -> bool:
         self.env_assigned = []  # per command; never used to resolve a program
+        self.env_assigned_names = []
         words = list(cmd.words)
+        if words and words[0].text in DECLARERS:  # export NAME=value, declare -x NAME=value, ...
+            for w in words[1:]:
+                if ASSIGN.match(w.text) and w.procsub is None:
+                    k, _, v = w.text.partition("=")
+                    self.vars[k.rstrip("+")] = v
         for w in words:  # a simple VAR=value before the command names a program later
             if ASSIGN.match(w.text) and w.procsub is None:
                 k, _, v = w.text.partition("=")
@@ -630,6 +653,7 @@ class Judge:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
                 self.env_assigned.append(t.partition("=")[2])  # env NAME=value cmd: this command sees it
+                self.env_assigned_names.append(t)
                 i += 1
             else:
                 break
@@ -876,14 +900,15 @@ class Judge:
             if not m:
                 continue
             value = m.group(1) if m.group(1) is not None else (tokens[n + 1] if n + 1 < len(tokens) else "")
-            value = VAR_REF.sub(lambda v: self.vars.get(v.group(1) or v.group(2), "\0"), value)
-            if "\0" in value or "$" in value or "`" in value:
-                return True
+            if "$" in value or "`" in value:
+                return True  # a variable or substitution in the program go runs cannot be judged
             if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
                 return True
         return False
 
     def go_run(self, args: list) -> bool:
+        if "GOENV" in self.vars or any(v.startswith("GOENV=") for v in self.env_assigned_names):
+            return True  # another go env file may set GOFLAGS=-exec=...: it cannot be judged
         if self.go_exec_runs_mutant([a.text for a in args], self.env_values()):
             return True
         if not args or args[0].text not in ("run", "test"):
