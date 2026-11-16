@@ -84,6 +84,11 @@ result: every baseline and mutant run executes its tests.
 ## Limits
 
 - Tests that need `.git` in the tree, network access or a host service do not run unchanged.
+- Host-side copies of a tree a container wrote (the baseline's build cache) copy only
+  directories, regular files and symlinks: a special file (a FIFO would block the copy) is refused.
+  The source path may hold no symlink and must resolve inside the run's own directory; links
+  nested below it are copied as links, never followed. The host reads a run's directory only
+  after confirming its container is gone or stopped.
 - A tree holding a symlink that resolves outside it is refused: a host-side step (the seed's
   `go mod download` updating `go.sum`, say) could write through it into live files.
 - On Linux the identity is device and inode only: Python's `os.stat` has no birth time there.

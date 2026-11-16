@@ -53,6 +53,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -310,10 +311,30 @@ def check_deadline(deadline: float | None, what: str) -> None:
         raise Stopped(f"the whole-run deadline passed while {what}")
 
 
+def refuse_special(path: str) -> None:
+    """Only directories, regular files and symlinks are copied on the host. A FIFO would block the
+    copy forever; sockets and devices have no place in a source tree or a build cache."""
+    mode = os.lstat(path).st_mode
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+        raise Refused(f"{path} is a special file (mode {oct(stat.S_IFMT(mode))}); a host-side copy refuses it")
+
+
+def scan_tree(root: Path, deadline: float | None, what: str) -> None:
+    """Before a host-side copy: every entry under root (not following links) is a directory, a
+    regular file or a symlink."""
+    refuse_special(str(root))
+    for d, dirs, files in os.walk(root):
+        check_deadline(deadline, what)
+        for n in dirs + files:
+            refuse_special(os.path.join(d, n))
+
+
 def checked_copy(deadline: float | None, what: str):
-    """A shutil copy function that stops the copy at the deadline, file by file."""
+    """A shutil copy function that stops the copy at the deadline, file by file, and refuses
+    special files."""
     def copy(s, d):
         check_deadline(deadline, what)
+        refuse_special(s)
         return shutil.copy2(s, d)
     return copy
 
@@ -343,6 +364,7 @@ def clone_dir(src: Path, dst: Path, deadline: float | None = None) -> None:
     """Copy src to dst, with copy-on-write clones on APFS when cp supports them, inside the
     deadline."""
     check_deadline(deadline, f"copying {src.name}")
+    scan_tree(src, deadline, f"checking {src.name} before copying it")
     if sys.platform == "darwin":
         limit = None if deadline is None else max(0.1, deadline - time.monotonic())
         try:
@@ -501,6 +523,8 @@ class Runner:
         self.live = {m.file: file_digest(args.tree / m.file) for m in live_targets}
         # (name, cidfile) of every container started whose docker client has not returned.
         self.pending: dict[str, Path] = {}
+        # label -> (cidfile, name) of every container started, for checks after the run.
+        self.containers: dict[str, tuple[Path, str]] = {}
         self.cleanup_log: list[str] = []
 
     def room(self, what: str) -> None:
@@ -513,6 +537,24 @@ class Runner:
             raise Stopped(f"before {what}: the work directory is over {self.args.max_work_mib} MiB")
         if shutil.disk_usage(self.work.path).free < self.args.min_free_mib * 2**20:
             raise Stopped(f"before {what}: free space is under {self.args.min_free_mib} MiB")
+
+    def assert_stopped(self, result: "Result") -> None:
+        """Before the host reads a run's directory: the run's container is gone, or exists and is
+        not running. A container still running could change the paths between check and read."""
+        cidfile, name = self.containers.get(result.name, (None, None))
+        if cidfile is None:
+            raise Refused(f"no container recorded for {result.name}")
+        target = name
+        try:
+            cid = cidfile.read_text().strip()
+            if CONTAINER_ID.match(cid):
+                target = cid
+        except OSError:
+            pass
+        probe = subprocess.run([self.docker, "inspect", "--format", "{{.State.Running}}", target],
+                               capture_output=True, text=True, env=self.docker_env(), timeout=15)
+        if probe.returncode == 0 and probe.stdout.strip() != "false":
+            raise Refused(f"the container of {result.name} ({target}) is still running; the host will not read its files")
 
     def discard(self, result: "Result") -> None:
         """A finished run's directory goes once its result is recorded (its log, outside it, stays),
@@ -602,6 +644,7 @@ class Runner:
         start = time.monotonic()
         code, outcome = None, None
         self.pending[name] = cidfile
+        self.containers[label] = (cidfile, name)
         self.overrun = None
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env())
@@ -805,6 +848,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         # The baseline's container wrote this tree: no symlink may lie on the path to it, and it
         # must resolve inside the baseline's own directory, or the host-side clone could read a
         # host directory into every later mutant's mount.
+        runner.assert_stopped(base)  # nothing may still be changing the paths read below
         cache = plain_target(Path(base.dir), "sandbox/gocache")
         if not cache.is_dir():
             raise Refused("the baseline left no build cache directory to warm from")

@@ -88,7 +88,10 @@ if args[:1] == ["inspect"]:
     r = reg()
     if args[-1] not in r:
         sys.exit(1)
-    print("/%s %s" % tuple(r[args[-1]]))
+    if "{{.State.Running}}" in args:
+        print("true")  # a registered container is a running one
+    else:
+        print("/%s %s" % tuple(r[args[-1]]))
     sys.exit(0)
 if args[:2] == ["rm", "-f"]:
     r = reg()
@@ -169,6 +172,16 @@ if "swapcache" in image:
     gc = os.path.join(mounts["/work"], "sandbox", "gocache")
     _sh.rmtree(gc)
     os.symlink(SECRET_DIR, gc)
+if "fifocache" in image:
+    os.mkfifo(os.path.join(mounts["/work"], "sandbox", "gocache", "pipe"))
+if "nestedlink" in image:
+    nested = os.path.join(mounts["/work"], "sandbox", "gocache", "nested")
+    if not os.path.lexists(nested):  # later runs inherit it, as a link, through the warm cache
+        os.symlink(SECRET_DIR, nested)
+if "staysup" in image:
+    # Exits as a client but leaves its container registered (still running) after a pass.
+    print("ok")
+    sys.exit(0)
 if "selfkill" in image:
     import signal
     os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
@@ -1151,4 +1164,48 @@ func TestWarmCacheRefusesSwappedLink(t *testing.T) {
 	})
 	assert.Empty(t, leaked, "the host file was never copied into the work directory")
 	assert.Len(t, dockerRuns(t, f.log), 1, "no mutant ran after the refusal")
+}
+
+// A FIFO left in the baseline's build cache is refused before the host copies it (a copy would
+// block on it forever), and the run stops inside its deadline.
+func TestWarmCacheRefusesSpecialFile(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "fifocache", "--deadline", "30")
+	assert.Less(t, time.Since(start), 20*time.Second)
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "is a special file")
+}
+
+// A link nested below the cache root is copied as a link, never followed: the host directory it
+// names is not read into the warm cache or any mutant's directory.
+func TestWarmCacheKeepsNestedLinkAsLink(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	secret := filepath.Join(f.root, "host-private")
+	require.NoError(t, os.MkdirAll(secret, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(secret, "private.txt"), []byte("host secret\n"), 0o600))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "nestedlink", "--keep")
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	workdir := o.report["workdir"].(string)
+	var leaked []string
+	_ = filepath.Walk(workdir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.Name() == "private.txt" {
+			leaked = append(leaked, p)
+		}
+		return nil
+	})
+	assert.Empty(t, leaked, "the nested link was never followed")
+	link := filepath.Join(workdir, "warm-gocache", "nested")
+	fi, err := os.Lstat(link)
+	require.NoError(t, err)
+	assert.NotZero(t, fi.Mode()&os.ModeSymlink, "the nested entry stays a link")
+}
+
+// The host reads a run's directory only once its container is gone or stopped.
+func TestBaselineMustBeStoppedBeforeCacheRead(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "staysup")
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "is still running; the host will not read its files")
+	assert.Len(t, dockerRuns(t, f.log), 1, "no mutant ran")
 }
