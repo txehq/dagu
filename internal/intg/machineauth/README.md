@@ -133,10 +133,27 @@ The caller's environment reaches the build only through a fixed list of variable
 temporary files, the module proxy and the module cache. The list's names are recorded and
 its values are not.
 
-The shared module cache is not trusted as it stands, because `-mod=readonly` does not rehash
-extracted files. `go mod download` and `go mod verify` must report every module matching
-go.sum before the build and again after it. The build cache is never shared: each build
-gets a fresh private `GOCACHE`, so the first build compiles cold. The record names the clone's commit and tree, the command,
+Neither of the caller's caches is used by the build. A writer of a shared module cache
+could change an extracted file during the build and restore it afterwards, and a writer of
+a shared build cache could plant compiled packages. Each build gets a fresh private
+`GOCACHE` and a fresh private `GOMODCACHE`. The module cache is filled only through Go's
+download path, which checks every zip against go.sum. Modules come from the caller's module
+cache downloads, served as a read-only file proxy, then from the caller's proxy. Extracted
+files in the shared cache are never read, so the build works offline when the caller's cache
+already holds the downloads. `go mod verify` must report every module matching before and
+after the build. The first build compiles cold.
+
+The build never sets `HOME`. It names owned `GOPATH`, `GOMODCACHE` and `GOCACHE` directories,
+which it creates exclusively inside one work directory, itself made inside the spec's `out_dir`, so nothing about where it lives comes from the environment, not even `TMPDIR`. Before every go command it checks
+that each of the three resolves to its own directory; a value that is missing or points
+elsewhere refuses the command. It removes the work directory by the identity recorded at
+creation: the directory and its parent, by device and inode, plus the path. It refuses a
+target that is unknown, replaced, turned into a link, or has a different parent. Nothing in
+the package cleans a module cache through go, or derives a path to remove from the
+environment or from `go env`, and `TestNoModuleCacheCleanOrHomeOverride` enforces that
+(TXE-7538).
+
+The record names the clone's commit and tree, the command,
 the variables the command set, and the Go version. A narrowed build's record must come from
 this builder (`machineauth-controlled-clone-v1`), for the module `narrowedScopes` lists.
 

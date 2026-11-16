@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -512,12 +513,14 @@ type sourceSpec struct {
 // passThrough are the only variables of the caller's environment the build
 // sees, besides what it sets: where tools, temporary files, the module cache
 // and the module proxy are, and what Windows needs to start a process. Their
-// values are not recorded (a proxy URL may carry a credential). The shared
-// module cache is not trusted as it stands: -mod=readonly does not rehash
-// extracted files, so the build runs go mod verify (every cached module
-// against go.sum) before and after it. The build cache is never shared: a
-// writer of a shared GOCACHE could plant compiled packages under the keys a
-// build looks up, so each build gets a fresh, private one.
+// values are not recorded (a proxy URL may carry a credential). Neither cache
+// is shared with the build. A writer of a shared GOCACHE could plant compiled
+// packages under the keys a build looks up, and a writer of a shared
+// GOMODCACHE could change an extracted file during the build and restore it
+// after (a check before and after sees nothing). Each build gets a fresh
+// private build cache and a fresh private module cache, filled through go's
+// own download path (moduleProxyChain), which checks every zip against go.sum;
+// go mod verify runs before and after as well.
 var passThrough = []string{"PATH", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PATHEXT", "COMSPEC",
 	"GOPATH", "GOMODCACHE", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
 
@@ -536,7 +539,7 @@ var resolvedGoEnv = sync.OnceValue(func() map[string]string {
 // gitEnv runs git with no user or system configuration: no filters, hooks,
 // templates or rewrites can change what a clone checks out.
 func gitEnv() []string {
-	return append(callerEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "HOME="+os.TempDir())
+	return append(callerEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 }
 
 func callerEnv() []string {
@@ -625,6 +628,205 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 	return buildFromSourceIn(spec, callerEnv())
 }
 
+// ownedDir is a directory this package created exclusively (MkdirTemp or
+// Mkdir, which fail on an existing name), bound by the identity it had at
+// creation: its own file and its parent's (device and inode on Unix, volume
+// and index on Windows, compared by os.SameFile), and its path. Removal acts
+// on that record alone: no environment variable or go env output can name
+// what is removed. It refuses a record it does not hold, a target replaced
+// or turned into a link, and a parent that is no longer the one it was
+// created under (TXE-7538: a cleanup that resolved the module cache from the
+// environment deleted the host's shared cache when a mutant dropped the
+// private one).
+type ownedDir struct {
+	path       string
+	info       os.FileInfo
+	parent     string
+	parentInfo os.FileInfo
+}
+
+// createOwnedDir makes a new directory under parent, an existing real
+// directory given by absolute path.
+func createOwnedDir(parent, pattern string) (*ownedDir, error) {
+	if !filepath.IsAbs(parent) {
+		return nil, fmt.Errorf("owned dir: parent %q is not absolute", parent)
+	}
+	pinfo, err := os.Lstat(parent)
+	if err != nil {
+		return nil, fmt.Errorf("owned dir: parent: %w", err)
+	}
+	if pinfo.Mode()&os.ModeSymlink != 0 || !pinfo.IsDir() {
+		return nil, fmt.Errorf("owned dir: parent %s is not a real directory", parent)
+	}
+	path, err := os.MkdirTemp(parent, pattern)
+	if err != nil {
+		return nil, fmt.Errorf("owned dir: %w", err)
+	}
+	return bindOwned(path, parent, pinfo)
+}
+
+// sub makes the directory name inside d. os.Mkdir refuses a name that exists,
+// so a pre-existing target is never adopted.
+func (d *ownedDir) sub(name string) (*ownedDir, error) {
+	if err := d.check(); err != nil {
+		return nil, err
+	}
+	if name == "" || name != filepath.Base(name) || !filepath.IsLocal(name) {
+		return nil, fmt.Errorf("owned dir: %q is not one plain name", name)
+	}
+	path := filepath.Join(d.path, name)
+	if err := os.Mkdir(path, 0o700); err != nil {
+		return nil, fmt.Errorf("owned dir: %w", err)
+	}
+	return bindOwned(path, d.path, d.info)
+}
+
+func bindOwned(path, parent string, pinfo os.FileInfo) (*ownedDir, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("owned dir: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, fmt.Errorf("owned dir: %s is not a real directory", path)
+	}
+	// Pin the identity now. On Windows a FileInfo from Lstat loads its volume
+	// and file index lazily, by path, on the first SameFile; left unloaded, a
+	// record compared after the directory was replaced would read the
+	// replacement's identity and match it. Comparing each with itself loads
+	// and caches it (on Unix device and inode are already in the FileInfo).
+	if !os.SameFile(info, info) || !os.SameFile(pinfo, pinfo) {
+		return nil, fmt.Errorf("owned dir: cannot read the identity of %s or its parent", path)
+	}
+	return &ownedDir{path: path, info: info, parent: parent, parentInfo: pinfo}, nil
+}
+
+// check holds the directory on disk now to its record.
+func (d *ownedDir) check() error {
+	if d == nil || d.path == "" || d.info == nil || d.parentInfo == nil || d.parent == "" {
+		return errors.New("owned dir: no record of a directory this package created; refusing")
+	}
+	if filepath.Dir(d.path) != d.parent {
+		return fmt.Errorf("owned dir: %s is not in its recorded parent %s; refusing", d.path, d.parent)
+	}
+	for _, c := range []struct {
+		path string
+		was  os.FileInfo
+		what string
+	}{{d.parent, d.parentInfo, "its parent"}, {d.path, d.info, "the directory"}} {
+		now, err := os.Lstat(c.path)
+		if err != nil {
+			return fmt.Errorf("owned dir: %s (%s): %w; refusing", c.path, c.what, err)
+		}
+		switch {
+		case now.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf("owned dir: %s (%s) is now a link; refusing", c.path, c.what)
+		case !now.IsDir():
+			return fmt.Errorf("owned dir: %s (%s) is no longer a directory; refusing", c.path, c.what)
+		case !os.SameFile(c.was, now):
+			return fmt.Errorf("owned dir: %s (%s) is not the directory that was created; refusing", c.path, c.what)
+		}
+	}
+	return nil
+}
+
+// remove removes the directory and what it holds, the read-only files of a
+// private module cache included, after check. WalkDir does not follow links,
+// so only the tree itself is made writable.
+func (d *ownedDir) remove() error {
+	if err := d.check(); err != nil {
+		return err
+	}
+	_ = filepath.WalkDir(d.path, func(p string, e os.DirEntry, err error) error {
+		if err == nil && e.IsDir() {
+			_ = os.Chmod(p, 0o700) //nolint:gosec // a directory this package created, made removable
+		}
+		return nil
+	})
+	return os.RemoveAll(d.path)
+}
+
+// privateGoDirs are the go command's directories a build owns. Every go
+// invocation of the build must name each of them as its own (checkPrivateEnv):
+// a value missing or pointing elsewhere refuses the command instead of
+// letting go fall back to the caller's.
+var privateGoDirs = []string{"GOPATH", "GOMODCACHE", "GOCACHE"}
+
+// envValue is the value go sees for key: the last one in env.
+func envValue(env []string, key string) (string, bool) {
+	v, found := "", false
+	for _, kv := range env {
+		if k, rest, ok := strings.Cut(kv, "="); ok && k == key {
+			v, found = rest, true
+		}
+	}
+	return v, found
+}
+
+// checkPrivateEnv refuses an environment in which any of the build's go
+// directories is not the owned directory recorded for it.
+func checkPrivateEnv(env []string, owned map[string]*ownedDir) error {
+	for _, key := range privateGoDirs {
+		d := owned[key]
+		if err := d.check(); err != nil {
+			return fmt.Errorf("source record: %s: %w", key, err)
+		}
+		v, ok := envValue(env, key)
+		if !ok || v != d.path {
+			return fmt.Errorf("source record: the build's %s is %q, not its own %s; refusing to run go", key, v, d.path)
+		}
+	}
+	return nil
+}
+
+// moduleProxyChain is where the build's private module cache is filled from:
+// the caller's module cache downloads (zips and go.mod files, served as a
+// file proxy, so nothing need be fetched again), then the caller's proxy. Go
+// checks every zip against go.sum as it lands in the private cache; the
+// shared cache's extracted files are never read, so a change made to them,
+// at any moment, cannot reach the build.
+func moduleProxyChain(base []string) string {
+	value := func(key string) string {
+		v := ""
+		for _, kv := range base {
+			if k, rest, ok := strings.Cut(kv, "="); ok && k == key {
+				v = rest
+			}
+		}
+		return v
+	}
+	callerProxy := value("GOPROXY")
+	if callerProxy == "" {
+		callerProxy = "https://proxy.golang.org,direct"
+	}
+	if shared := value("GOMODCACHE"); shared != "" {
+		return fileURL(filepath.Join(shared, "cache", "download")) + "," + callerProxy
+	}
+	return callerProxy
+}
+
+// fileURL is a file:// URL of an absolute path, on Unix and Windows, with
+// every URL-significant character of the path escaped, and the go proxy
+// list's separators (comma, pipe) too, so a path such as "cache#one,two"
+// stays one path of one proxy.
+func fileURL(p string) string {
+	slashed := filepath.ToSlash(p)
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed // a Windows drive path: file:///C:/...
+	}
+	u := (&url.URL{Scheme: "file", Path: slashed}).String()
+	return strings.NewReplacer(",", "%2C", "|", "%7C").Replace(u)
+}
+
+// buildSet is what the build sets over the caller's variables: the platform,
+// cgo off, no go env file or GOFLAGS, the parallelism bound, the owned go
+// directories, and the module proxy chain. HOME is never set: the go
+// directories are named explicitly instead.
+func buildSet(spec sourceSpec, base []string, owned map[string]*ownedDir) []string {
+	return []string{"GOOS=" + spec.GOOS, "GOARCH=" + spec.GOARCH, "CGO_ENABLED=0", "GOTOOLCHAIN=auto", "GOFLAGS=", "GOWORK=off", "GOENV=off",
+		"GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOPATH=" + owned["GOPATH"].path, "GOCACHE=" + owned["GOCACHE"].path,
+		"GOMODCACHE=" + owned["GOMODCACHE"].path, "GOPROXY=" + moduleProxyChain(base)}
+}
+
 // modulesVerified is what go mod verify prints when every cached module of
 // the build matches go.sum.
 const modulesVerified = "all modules verified"
@@ -656,11 +858,24 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 			return nil, fmt.Errorf("source record: %s exists; a build never overwrites", p)
 		}
 	}
-	work, err := os.MkdirTemp("", "machineauth-source-")
+	// The work directory (clone, private caches) is made inside the spec's
+	// own out_dir, an explicit absolute path: no part of where it lives, or of
+	// what cleanup removes, comes from the environment (not even TMPDIR).
+	if err := os.MkdirAll(spec.OutDir, 0o700); err != nil {
+		return nil, err
+	}
+	workDir, err := createOwnedDir(spec.OutDir, ".machineauth-source-")
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = os.RemoveAll(work) }()
+	defer func() { _ = workDir.remove() }()
+	owned := map[string]*ownedDir{}
+	for key, name := range map[string]string{"GOPATH": "gopath", "GOMODCACHE": "gomodcache", "GOCACHE": "gocache"} {
+		if owned[key], err = workDir.sub(name); err != nil {
+			return nil, err
+		}
+	}
+	work := workDir.path
 	clone := filepath.Join(work, "src")
 	if _, err := runIn(work, gitEnv(), 10*time.Minute, "git", "-c", "advice.detachedHead=false", "clone", "--quiet", "--no-hardlinks",
 		"--branch", spec.Tag, "--", spec.Repo, clone); err != nil {
@@ -685,16 +900,21 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 		return nil, fmt.Errorf("source record: before the build: %w", err)
 	}
 	built := filepath.Join(work, "dagu")
-	set := []string{"GOOS=" + spec.GOOS, "GOARCH=" + spec.GOARCH, "CGO_ENABLED=0", "GOTOOLCHAIN=auto", "GOFLAGS=", "GOWORK=off", "GOENV=off",
-		"HOME=" + work, "GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOCACHE=" + filepath.Join(work, "gocache")}
+	set := buildSet(spec, base, owned)
 	env := append(slices.Clone(base), set...)
+	goCmd := func(timeout time.Duration, args ...string) (string, error) {
+		if err := checkPrivateEnv(env, owned); err != nil {
+			return "", err
+		}
+		return runIn(clone, env, timeout, "go", args...)
+	}
 	// Every module the build needs is in the cache and matches go.sum: a
 	// download is checked as it lands, and verify rehashes what was there.
 	verify := func(when string) error {
-		if _, err := runIn(clone, env, 20*time.Minute, "go", "mod", "download"); err != nil {
+		if _, err := goCmd(20*time.Minute, "mod", "download"); err != nil {
 			return fmt.Errorf("source record: %s the build: module download: %w", when, err)
 		}
-		out, err := runIn(clone, env, 20*time.Minute, "go", "mod", "verify")
+		out, err := goCmd(20*time.Minute, "mod", "verify")
 		if err != nil {
 			return fmt.Errorf("source record: %s the build: go mod verify: %w", when, err)
 		}
@@ -710,7 +930,7 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 	if pkg == "." {
 		command[len(command)-1] = "."
 	}
-	if _, err := runIn(clone, env, 30*time.Minute, "go", command...); err != nil {
+	if _, err := goCmd(30*time.Minute, command...); err != nil {
 		return nil, fmt.Errorf("source record: build: %w", err)
 	}
 	if err := verify("after"); err != nil {
@@ -743,8 +963,15 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 	}
 	recorded := slices.Clone(set)
 	for i, kv := range recorded {
-		if strings.HasPrefix(kv, "GOCACHE=") {
-			recorded[i] = "GOCACHE=<a fresh private cache of this build>"
+		switch strings.SplitN(kv, "=", 2)[0] {
+		case "GOCACHE":
+			recorded[i] = "GOCACHE=<a fresh private build cache of this build>"
+		case "GOMODCACHE":
+			recorded[i] = "GOMODCACHE=<a fresh private module cache of this build>"
+		case "GOPATH":
+			recorded[i] = "GOPATH=<a fresh private GOPATH of this build>"
+		case "GOPROXY":
+			recorded[i] = "GOPROXY=<the caller's module cache downloads as a file proxy, then the caller's proxy>"
 		}
 	}
 	scope := fmt.Sprintf("built by %s from a verified clean clone of tag %s at commit %s (tree %s) for %s/%s; it is NOT the installed binary of any machine (the live worker runs its own build on its own platform)",

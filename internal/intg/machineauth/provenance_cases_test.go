@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -385,7 +386,7 @@ func TestSourceBuildRefusesABorrowedStamp(t *testing.T) {
 	repo, commit := fixtureRepo(t)
 	// The threat is real: built in place, the ignored module wears the stamp.
 	borrowed := filepath.Join(t.TempDir(), "borrowed")
-	_, err := runIn(filepath.Join(repo, ".local", "evil"), append(callerEnv(), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0", "HOME="+t.TempDir()),
+	_, err := runIn(filepath.Join(repo, ".local", "evil"), append(append(callerEnv(), testGoEnv(t)...), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0"),
 		5*time.Minute, "go", "build", "-buildvcs=true", "-o", borrowed, "./cmd")
 	require.NoError(t, err)
 	info, err := buildinfo.ReadFile(borrowed)
@@ -469,7 +470,7 @@ func TestCheckBuildInfo(t *testing.T) {
 	build := func(dir string, args ...string) *debug.BuildInfo {
 		t.Helper()
 		out := filepath.Join(t.TempDir(), "bin")
-		_, err := runIn(dir, append(callerEnv(), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0", "HOME="+t.TempDir()), 5*time.Minute,
+		_, err := runIn(dir, append(append(callerEnv(), testGoEnv(t)...), "GOFLAGS=", "GOWORK=off", "GOENV=off", "CGO_ENABLED=0"), 5*time.Minute,
 			"go", append(append([]string{"build"}, args...), "-ldflags", "-X 'main.version=2.18.2-txe.18'", "-o", out, "./cmd")...)
 		require.NoError(t, err)
 		info, err := buildinfo.ReadFile(out)
@@ -539,13 +540,28 @@ func h1(files map[string]string) string {
 // test's own.
 type depRig struct {
 	repo, commit, cache string
-	env                 []string
+	// env points go at the fixture proxy and the shared cache.
+	env []string
+}
+
+// offline is the caller's environment with the shared cache and no proxy at
+// all: a build must find everything in the shared cache's downloads.
+func (d depRig) offline() []string {
+	var env []string
+	for _, kv := range d.env {
+		if !strings.HasPrefix(kv, "GOPROXY=") {
+			env = append(env, kv)
+		}
+	}
+	return append(env, "GOPROXY=off")
 }
 
 func depFixture(t *testing.T) depRig {
 	t.Helper()
 	repo, _ := fixtureRepo(t)
-	proxy, cache := t.TempDir(), t.TempDir()
+	// The shared cache's path holds URL-significant characters and the proxy
+	// list's separator: the file proxy URL must still name it.
+	proxy, cache := t.TempDir(), ownedTestDir(t, "cache#one,two %x-").path
 	const mod, ver = "example.com/dep", "v1.0.0"
 	depMod := "module " + mod + "\n\ngo 1.22\n"
 	depSrc := "package dep\n\nfunc Name() string { return \"dep\" }\n"
@@ -585,10 +601,7 @@ func depFixture(t *testing.T) depRig {
 	git("commit", "-q", "-m", "depend on example.com/dep")
 	git("tag", "-f", "txe-v2.18.2-18")
 	commit := git("rev-parse", "HEAD")
-	proxyURL := "file://" + filepath.ToSlash(proxy)
-	if !strings.HasPrefix(filepath.ToSlash(proxy), "/") {
-		proxyURL = "file:///" + filepath.ToSlash(proxy)
-	}
+	proxyURL := fileURL(proxy)
 	var env []string
 	for _, kv := range callerEnv() {
 		switch strings.SplitN(kv, "=", 2)[0] {
@@ -598,32 +611,130 @@ func depFixture(t *testing.T) depRig {
 		}
 	}
 	env = append(env, "GOPROXY="+proxyURL, "GOSUMDB=off", "GOMODCACHE="+cache)
-	// The module cache's files are read-only; clear it before TempDir removes it.
-	t.Cleanup(func() {
-		_, _ = runIn(repo, append(slices.Clone(env), "GOENV=off", "GOFLAGS="), time.Minute, "go", "clean", "-modcache")
-	})
 	return depRig{repo: repo, commit: commit, cache: cache, env: env}
 }
 
-// A dependency changed in the shared module cache after it was downloaded is
-// refused: -mod=readonly would build it, go mod verify does not pass it.
-func TestSourceBuildRefusesATamperedModuleCache(t *testing.T) {
+// The build reads only a private module cache filled through go's verified
+// download path. A change to an extracted file of the shared cache never
+// reaches it (the binary is the same); a changed zip in the shared cache is
+// refused on its way into the private one. The shared cache's downloads are
+// enough: the caller's proxy is off.
+func TestSourceBuildReadsOnlyAPrivateModuleCache(t *testing.T) {
 	t.Parallel()
 	d := depFixture(t)
-	spec := fixtureSpec(t, d.repo, d.commit)
-	rec, err := buildFromSourceIn(spec, d.env)
+	// Fill the shared cache, as a caller's earlier work would.
+	_, err := runIn(d.repo, append(append(slices.Clone(d.env), ownedGoDirsExcept(t, "GOMODCACHE")...), "GOENV=off", "GOFLAGS=", "GOWORK=off"), 5*time.Minute, "go", "mod", "download")
 	require.NoError(t, err)
-	assert.Equal(t, modulesVerified+" (before and after the build)", rec.Source.ModVerify)
-	assert.Contains(t, rec.Source.Env, "GOCACHE=<a fresh private cache of this build>")
-	assert.NotContains(t, rec.Source.PassThrough, "GOCACHE", "the build cache is never shared")
 
+	first := fixtureSpec(t, d.repo, d.commit)
+	rec, err := buildFromSourceIn(first, d.offline())
+	require.NoError(t, err, "built offline from the shared cache's downloads")
+	assert.Equal(t, modulesVerified+" (before and after the build)", rec.Source.ModVerify)
+	assert.Contains(t, rec.Source.Env, "GOCACHE=<a fresh private build cache of this build>")
+	assert.Contains(t, rec.Source.Env, "GOMODCACHE=<a fresh private module cache of this build>")
+	assert.Contains(t, rec.Source.Env, "GOPROXY=<the caller's module cache downloads as a file proxy, then the caller's proxy>")
+
+	// An extracted file of the shared cache changed: never read.
 	src := filepath.Join(d.cache, "example.com", "dep@v1.0.0", "dep.go")
 	require.NoError(t, os.Chmod(src, 0o600))
 	require.NoError(t, os.WriteFile(src, []byte("package dep\n\nfunc Name() string { return \"tampered\" }\n"), 0o600))
-	spec2 := fixtureSpec(t, d.repo, d.commit)
-	_, err = buildFromSourceIn(spec2, d.env)
-	require.Error(t, err, "a tampered cached module was built and recorded")
-	assert.Contains(t, err.Error(), "before the build: go mod verify")
-	_, statErr := os.Stat(filepath.Join(spec2.OutDir, "provenance.json"))
+	second := fixtureSpec(t, d.repo, d.commit)
+	_, err = buildFromSourceIn(second, d.offline())
+	require.NoError(t, err)
+	// The build embeds its work directory's path (no -trimpath, as the worker
+	// kit builds), so two builds differ in bytes; what the code does is what
+	// must not change. The fixture binary is for this platform.
+	runBinary := func(spec sourceSpec) string {
+		bin := filepath.Join(spec.OutDir, "dagu")
+		if runtime.GOOS == "windows" {
+			raw, err := os.ReadFile(bin)
+			require.NoError(t, err)
+			bin += ".exe"
+			require.NoError(t, os.WriteFile(bin, raw, 0o700))
+		}
+		out, err := exec.Command(bin).CombinedOutput()
+		require.NoError(t, err)
+		return strings.TrimSpace(string(out))
+	}
+	assert.Equal(t, "dep 2.18.2-txe.18", runBinary(first))
+	assert.Equal(t, "dep 2.18.2-txe.18", runBinary(second), "the shared cache's extracted files reached the build")
+
+	// A changed zip of the shared cache: refused as it lands in the private cache.
+	zipPath := filepath.Join(d.cache, "cache", "download", "example.com", "dep", "@v", "v1.0.0.zip")
+	var zbuf bytes.Buffer
+	zw := zip.NewWriter(&zbuf)
+	for name, body := range map[string]string{"go.mod": "module example.com/dep\n\ngo 1.22\n", "dep.go": "package dep\n\nfunc Name() string { return \"tampered\" }\n"} {
+		w, err := zw.Create("example.com/dep@v1.0.0/" + name)
+		require.NoError(t, err)
+		_, err = w.Write([]byte(body))
+		require.NoError(t, err)
+	}
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.Chmod(zipPath, 0o600))
+	require.NoError(t, os.WriteFile(zipPath, zbuf.Bytes(), 0o600))
+	_ = os.Remove(zipPath[:len(zipPath)-len(".zip")] + ".ziphash")
+	third := fixtureSpec(t, d.repo, d.commit)
+	_, err = buildFromSourceIn(third, d.offline())
+	require.Error(t, err, "a changed zip in the shared cache was built")
+	assert.Contains(t, err.Error(), "before the build: module download")
+	_, statErr := os.Stat(filepath.Join(third.OutDir, "provenance.json"))
 	assert.True(t, errors.Is(statErr, os.ErrNotExist), "no record")
+}
+
+func TestFileURLEscapesThePath(t *testing.T) {
+	t.Parallel()
+	for _, p := range []string{"/tmp/plain", "/tmp/cache#one", "/tmp/a%20b", "/tmp/x,y", "/tmp/p|q", "/tmp/with space", "/tmp/q?x=1"} {
+		u := fileURL(p)
+		assert.NotContains(t, u, ",", "%q: a comma would split the proxy list", p)
+		assert.NotContains(t, u, "|", "%q: a pipe would split the proxy list", p)
+		parsed, err := url.Parse(u)
+		require.NoError(t, err, p)
+		assert.Equal(t, "file", parsed.Scheme, p)
+		assert.Empty(t, parsed.Fragment, "%q: no fragment", p)
+		assert.Empty(t, parsed.RawQuery, "%q: no query", p)
+		assert.Equal(t, p, parsed.Path, "%q: the URL names the path", p)
+	}
+	assert.Equal(t, "file:///C:/Users/me/go/pkg/mod", fileURL(`C:/Users/me/go/pkg/mod`), "a Windows drive path")
+}
+
+func TestModuleProxyChain(t *testing.T) {
+	t.Parallel()
+	shared := filepath.Join(t.TempDir(), "mod")
+	assert.Equal(t, fileURL(filepath.Join(shared, "cache", "download"))+",https://goproxy.example,direct",
+		moduleProxyChain([]string{"GOMODCACHE=" + shared, "GOPROXY=https://goproxy.example,direct"}))
+	assert.Equal(t, fileURL(filepath.Join(shared, "cache", "download"))+",https://proxy.golang.org,direct",
+		moduleProxyChain([]string{"GOMODCACHE=" + shared}), "go's default proxy when the caller names none")
+	assert.Equal(t, "off", moduleProxyChain([]string{"GOPROXY=off"}))
+}
+
+// ownedTestDir is an owned directory under the test's temporary directory,
+// removed (read-only files included) by its record before TempDir's own
+// cleanup runs.
+func ownedTestDir(t *testing.T, pattern string) *ownedDir {
+	t.Helper()
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	d, err := createOwnedDir(parent, pattern)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = d.remove() })
+	return d
+}
+
+// testGoEnv names owned GOPATH, GOMODCACHE and GOCACHE for a go command a
+// test runs. HOME is never set (TestNoHomeOverride).
+func testGoEnv(t *testing.T) []string { return ownedGoDirsExcept(t) }
+
+func ownedGoDirsExcept(t *testing.T, skip ...string) []string {
+	t.Helper()
+	root := ownedTestDir(t, "go-")
+	var env []string
+	for _, key := range privateGoDirs {
+		if slices.Contains(skip, key) {
+			continue
+		}
+		d, err := root.sub(strings.ToLower(key))
+		require.NoError(t, err)
+		env = append(env, key+"="+d.path)
+	}
+	return env
 }

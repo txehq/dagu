@@ -133,6 +133,10 @@ var ports struct {
 	lo, hi int
 	next   int
 	err    error
+	// listen binds one port of the block; nil binds 127.0.0.1:<port>. The
+	// allocator's tests set it, so they never race other processes for real
+	// ports.
+	listen func(port int) (net.Listener, error)
 }
 
 func portBlock() (lo, hi int, err error) {
@@ -188,7 +192,11 @@ func allocLoopback() (net.Listener, error) {
 		if ports.next > hi {
 			ports.next = lo
 		}
-		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+		listen := ports.listen
+		if listen == nil {
+			listen = func(port int) (net.Listener, error) { return net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)) }
+		}
+		if ln, err := listen(port); err == nil {
 			return ln, nil
 		}
 	}
