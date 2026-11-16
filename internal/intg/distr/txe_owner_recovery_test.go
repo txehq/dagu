@@ -173,7 +173,7 @@ func TestTXEOwnerRecovery_UnspecifiedRetryOfASealedRunIsNotDispatched(t *testing
 func TestTXEOwnerRecovery_ExplicitRerunRunsTheJobAgain(t *testing.T) {
 	lost := txeStartLostPublish(t)
 
-	out := txeOwnerRetry(t, lost, map[string]string{review.RetryRunRerunParam: "true"})
+	out := txeOwnerRetry(t, lost, map[string]string{review.RetryRunStepParam: review.RetryStepRun})
 	require.NotEmpty(t, out.Action.ID, "nothing was begun: %s", out.Skipped)
 	assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
 	assert.Contains(t, out.Action.Detail, "superseded and was not published")
@@ -244,7 +244,7 @@ func TestTXEOwnerRecovery_ExplicitRerunRunsAJobStepThatSucceeded(t *testing.T) {
 	run.registry.setDown(false)
 
 	lost := &txeLostPublish{run: run, control: control, failed: failed}
-	out := txeOwnerRetry(t, lost, map[string]string{review.RetryRunRerunParam: "true"})
+	out := txeOwnerRetry(t, lost, map[string]string{review.RetryRunStepParam: review.RetryStepRun})
 	require.NotEmpty(t, out.Action.ID, "nothing was begun: %s", out.Skipped)
 	assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
 	assert.Contains(t, out.Action.Detail, "superseded and was not published")

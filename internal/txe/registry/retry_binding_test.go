@@ -48,7 +48,7 @@ func TestCheckRetryRun(t *testing.T) {
 	check := func(a *registry.Action, form registry.RetryForm) error { return at(a, "run-1", form, now) }
 
 	unspecified := action(nil)
-	rerun := action(map[string]any{"rerun": true})
+	rerun := action(map[string]any{"step": registry.RetryStepRun})
 	publish := action(map[string]any{"step": registry.RetryStepPublish})
 	require.NoError(t, check(unspecified, registry.RetryFormWholeRun), "a retry naming no intent, of the whole run")
 	require.NoError(t, check(rerun, registry.RetryFormFromJobStep), "an explicit rerun, from the job's step")
@@ -58,16 +58,21 @@ func TestCheckRetryRun(t *testing.T) {
 	replayed.State = registry.ActionSucceeded
 	for name, err := range map[string]error{
 		"no action": check(nil, registry.RetryFormWholeRun),
-		// An older machine ignores rerun and retries with no step: Dagu
-		// then keeps a job step that succeeded and only publishes again.
-		"a rerun carried out with no step":         check(rerun, registry.RetryFormWholeRun),
-		"a rerun carried out as a republish":       check(rerun, registry.RetryFormPublish),
-		"no intent carried out from the job step":  check(unspecified, registry.RetryFormFromJobStep),
-		"no intent carried out as a republish":     check(unspecified, registry.RetryFormPublish),
-		"a republish carried out with no step":     check(publish, registry.RetryFormWholeRun),
-		"a republish carried out from the job":     check(publish, registry.RetryFormFromJobStep),
-		"both republish and rerun":                 check(action(map[string]any{"step": registry.RetryStepPublish, "rerun": true}), registry.RetryFormPublish),
-		"another step":                             check(action(map[string]any{"step": "run"}), registry.RetryFormFromJobStep),
+		// A retry with no step: Dagu then keeps a job step that succeeded
+		// and only publishes again.
+		"a rerun carried out with no step":        check(rerun, registry.RetryFormWholeRun),
+		"a rerun carried out as a republish":      check(rerun, registry.RetryFormPublish),
+		"no intent carried out from the job step": check(unspecified, registry.RetryFormFromJobStep),
+		"no intent carried out as a republish":    check(unspecified, registry.RetryFormPublish),
+		"a republish carried out with no step":    check(publish, registry.RetryFormWholeRun),
+		"a republish carried out from the job":    check(publish, registry.RetryFormFromJobStep),
+		"another step":                            check(action(map[string]any{"step": "check"}), registry.RetryFormFromJobStep),
+		// TXE-7629: the legacy key is refused in every form, never read as
+		// an unspecified retry.
+		"a legacy rerun key, whole run":            check(action(map[string]any{"rerun": true}), registry.RetryFormWholeRun),
+		"a legacy rerun key, from the job":         check(action(map[string]any{"rerun": true}), registry.RetryFormFromJobStep),
+		"a legacy rerun key with a republish":      check(action(map[string]any{"step": registry.RetryStepPublish, "rerun": true}), registry.RetryFormPublish),
+		"a legacy rerun false":                     check(action(map[string]any{"rerun": false}), registry.RetryFormWholeRun),
 		"no form":                                  check(unspecified, ""),
 		"a replay of a settled one":                check(replayed, registry.RetryFormWholeRun),
 		"another run":                              at(unspecified, "run-2", registry.RetryFormWholeRun, now),

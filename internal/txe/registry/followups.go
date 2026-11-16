@@ -58,24 +58,33 @@ type RetryRunParams struct {
 	QueuedAt      string `json:"queued_at"`
 	RunSpecSHA256 string `json:"run_spec_sha256"`
 	PackageDigest string `json:"package_digest"`
-	// Step, when set, is RetryStepPublish: the retry runs only the job's
-	// publish step, for the result the retried execution sealed, and never
-	// the job again. It is part of the action's binding, so a decision to
-	// re-run a run never authorizes a republish, nor the reverse.
+	// Step, when set, names the intent and is part of the action's
+	// binding, so a decision to re-run a run never authorizes a republish,
+	// nor the reverse:
+	//
+	//   - RetryStepPublish: the retry runs only the job's publish step, for
+	//     the result the retried execution sealed, and never the job again;
+	//   - RetryStepRun: a person's explicit request for a new execution of
+	//     the job (TXE-7515). It runs the job again from its job step even
+	//     when the retried execution sealed a result, which is then
+	//     superseded and never published.
+	//
+	// A retry with no step is unspecified, and the job's machine runs it
+	// again only when the execution sealed nothing. The rerun is a step, not
+	// a field of its own (TXE-7629): the rollback floors decode these
+	// parameters strictly and know step, so they read a rerun's record.
 	Step string `json:"step,omitempty"`
-	// Rerun, when set, is a person's explicit request for a new execution
-	// of the job: it runs the job again even when the retried execution
-	// sealed a result, which is then superseded and never published. A
-	// retry that sets neither Step nor Rerun is unspecified, and the job's
-	// machine runs it again only when the execution sealed nothing. Rerun is
-	// part of the binding like Step; omitted when false, so an unspecified
-	// retry binds as it always has.
-	Rerun bool `json:"rerun,omitempty"`
 }
 
-// RetryStepPublish is the only step a dagu.retry_run may name: the TXE job's
-// publish step, retried for a sealed result whose publication was lost.
-const RetryStepPublish = txepkg.PublishStepName
+// The steps a dagu.retry_run may name.
+const (
+	// RetryStepPublish is the TXE job's publish step, retried for a sealed
+	// result whose publication was lost.
+	RetryStepPublish = txepkg.PublishStepName
+	// RetryStepRun is the TXE job's own step: a person's explicit rerun,
+	// retried from it with every step after it.
+	RetryStepRun = txepkg.RunStepName
+)
 
 // The intents of a dagu.retry_run: what the person or reviewer asked for.
 const (
@@ -90,10 +99,10 @@ const (
 
 // Intent is the retry's intent.
 func (p RetryRunParams) Intent() string {
-	switch {
-	case p.Step == RetryStepPublish:
+	switch p.Step {
+	case RetryStepPublish:
 		return RetryIntentRepublish
-	case p.Rerun:
+	case RetryStepRun:
 		return RetryIntentRerun
 	}
 	return RetryIntentUnspecified
@@ -240,11 +249,16 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		if rp.RunID == "" {
 			return refuse(CodeInvalid, "dagu.retry_run needs run_id")
 		}
-		if rp.Step != "" && rp.Step != RetryStepPublish {
-			return refuse(CodeInvalid, "dagu.retry_run retries the whole run or only its %q step, not %q", RetryStepPublish, rp.Step)
-		}
-		if rp.Step != "" && rp.Rerun {
-			return refuse(CodeInvalid, "dagu.retry_run either republishes the sealed result or runs the job again, not both")
+		switch rp.Step {
+		case "", RetryStepPublish:
+		case RetryStepRun:
+			// Only a person asks to run the job again whatever its
+			// execution sealed; a reviewer or agent never proposes it.
+			if tx.actor.Kind != ActorHuman {
+				return refuse(CodeNotPermitted, "dagu.retry_run from the %q step is a person's explicit rerun, not proposed by %s", RetryStepRun, tx.actor.Kind)
+			}
+		default:
+			return refuse(CodeInvalid, "dagu.retry_run retries the whole run, from its %q step as a person's rerun, or only its %q step, not %q", RetryStepRun, RetryStepPublish, rp.Step)
 		}
 		if err := tx.checkRunBinding(rp, true); err != nil {
 			return err

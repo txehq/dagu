@@ -600,8 +600,24 @@ func TestTxeRunRepublishAndRerunRequests(t *testing.T) {
 	c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-rerun-1"), rerun2).
 		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &reran)
 	require.NotNil(t, reran.Proposal)
-	require.Contains(t, string(reran.Proposal.Action.Params), `"rerun":true`)
-	require.NotContains(t, string(reran.Proposal.Action.Params), `"step"`)
+	// TXE-7629: stored as the job's step, with no rerun key, so the
+	// rollback floors, which decode these params strictly, read it.
+	require.Contains(t, string(reran.Proposal.Action.Params), `"step":"run"`)
+	require.NotContains(t, string(reran.Proposal.Action.Params), `"rerun"`)
+
+	// What is on disk, read by a fresh registry over the same data
+	// directory, is that encoding too.
+	reopened, err := registry.NewFileStore(server.Config.Paths.DataDir)
+	require.NoError(t, err)
+	stored, err := reopened.GetJob(t.Context(), jobID)
+	require.NoError(t, err)
+	onDisk := stored.Proposals[reran.Proposal.ProposalId]
+	require.NotNil(t, onDisk, "the rerun's proposal is not on disk")
+	require.Contains(t, string(onDisk.Action.Params), `"step":"run"`)
+	require.NotContains(t, string(onDisk.Action.Params), `"rerun"`)
+	var params registry.RetryRunParams
+	require.NoError(t, json.Unmarshal(onDisk.Action.Params, &params))
+	require.Equal(t, registry.RetryIntentRerun, params.Intent())
 }
 
 // TXE-7515: a hub without the republish endpoint must answer a request for
