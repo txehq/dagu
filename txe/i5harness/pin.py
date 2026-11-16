@@ -18,6 +18,7 @@ Usage:
   pin.py build   --repo D --base REF [--pick SHA..] --version V --workdir D --out F --record F
   pin.py closure --repo D --base REF --pick SHA.. --workdir D --record F
                  [--review-pkg ./internal/txe/review] [--main-pkg ./cmd]
+  pin.py prompt  --reviewer-bin R --base-bin C (--commit A [--repo D] | --prompt-file F) --workdir D --record F
   pin.py manifest --out F --harness-dir D --record F.. [--extra NAME=JSONFILE..]
 """
 
@@ -25,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -177,6 +179,61 @@ def cmd_closure(a):
     return 0
 
 
+PROMPT_LINE = re.compile(r'^\s+prompt: (".*")\s*$')
+RENDER_MACHINE = "mch_01M00000000000000000000000"  # synthetic: render never contacts a hub
+
+
+def rendered_prompt(binary, workdir, label):
+    """The agent prompt `txe review render` (local only) writes into the reviewer DAG."""
+    root = os.path.join(workdir, label)
+    for d in ("home", "dagu-home", "state", "out", "txe-home"):
+        os.makedirs(os.path.join(root, d))
+    env = {"PATH": "/usr/bin:/bin", "HOME": os.path.join(root, "home")}
+    run([binary, "txe", "review", "render", "--machine", RENDER_MACHINE, "--state-dir", os.path.join(root, "state"),
+         "--out-dir", os.path.join(root, "out"), "--schedule", "0 4 1 1 *", "--agent-model", "claude-opus-5-5",
+         "--review-command", binary + " txe review", "--txe-home", os.path.join(root, "txe-home"),
+         "--dagu-home", os.path.join(root, "dagu-home")], env=env)
+    dags = [f for f in os.listdir(os.path.join(root, "out")) if f.startswith("txe-reviewer-") and f.endswith(".yaml")]
+    if len(dags) != 1:
+        raise SystemExit(f"pin: {label} rendered {len(dags)} reviewer DAGs, want 1")
+    found = [PROMPT_LINE.match(line) for line in open(os.path.join(root, "out", dags[0]))]
+    found = [m for m in found if m]
+    if len(found) != 1:
+        raise SystemExit(f"pin: {label}'s reviewer DAG has {len(found)} prompt lines, want 1")
+    text = json.loads(found[0].group(1))
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def cmd_prompt(a):
+    """R must render exactly the pinned prompt, and C must not: the install is R's."""
+    if a.prompt_file:
+        raw = open(a.prompt_file, "rb").read()
+        source = {"prompt_file": os.path.abspath(a.prompt_file)}
+    else:
+        raw = run(["git", "-C", a.repo, "show", f"{a.commit}:txe/reviewer/prompt.md"])
+        source = {"repo_commit": run(["git", "-C", a.repo, "rev-parse", f"{a.commit}^{{commit}}"]).decode().strip()}
+    # RenderDAGs embeds strings.TrimSpace(unixLines(prompt.md)); Go's TrimSpace and
+    # Python's strip agree on the whitespace prompt.md can hold.
+    expected = hashlib.sha256(raw.decode().replace("\r\n", "\n").strip().encode()).hexdigest()
+    os.makedirs(a.workdir, exist_ok=False)
+    r = rendered_prompt(a.reviewer_bin, a.workdir, "reviewer")
+    c = rendered_prompt(a.base_bin, a.workdir, "base")
+    ok = r == expected and c != expected
+    rec = {"role": "prompt", "ok": ok, "expected_rendered_sha256": expected,
+           "prompt_file_sha256": hashlib.sha256(raw).hexdigest(), **source,
+           "reviewer": {"binary": os.path.abspath(a.reviewer_bin), "binary_sha256": sha256_file(a.reviewer_bin),
+                        "rendered_prompt_sha256": r},
+           "base": {"binary": os.path.abspath(a.base_bin), "binary_sha256": sha256_file(a.base_bin),
+                    "rendered_prompt_sha256": c}}
+    write_record(a.record, rec)
+    if not ok:
+        why = "R does not render the pinned prompt" if r != expected else "C renders the same prompt as R"
+        print(f"pin: prompt check failed: {why}")
+        return 2
+    print(f"pin: R renders the pinned prompt {expected[:12]}; C renders {c[:12]}")
+    return 0
+
+
 def cmd_manifest(a):
     if os.path.exists(a.out):
         raise SystemExit(f"pin: {a.out} exists; a manifest is written once")
@@ -223,14 +280,22 @@ def main(argv):
     k.add_argument("--pick", action="append", default=[])
     k.add_argument("--review-pkg", default="./internal/txe/review")
     k.add_argument("--main-pkg", default="./cmd")
+    q = sub.add_parser("prompt")
+    for f in ("--reviewer-bin", "--base-bin", "--workdir", "--record"):
+        q.add_argument(f, required=True)
+    q.add_argument("--prompt-file")
+    q.add_argument("--repo", default=".")
+    q.add_argument("--commit")
     m = sub.add_parser("manifest")
     m.add_argument("--out", required=True)
     m.add_argument("--harness-dir", required=True)
     m.add_argument("--record", action="append", default=[])
     m.add_argument("--extra", action="append", default=[])
     a = p.parse_args(argv)
+    if a.cmd == "prompt" and not (a.prompt_file or a.commit):
+        raise SystemExit("pin: prompt needs --prompt-file or --commit")
     return {"copy-installed": cmd_copy_installed, "build": cmd_build, "closure": cmd_closure,
-            "manifest": cmd_manifest}[a.cmd](a)
+            "prompt": cmd_prompt, "manifest": cmd_manifest}[a.cmd](a)
 
 
 if __name__ == "__main__":

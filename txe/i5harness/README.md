@@ -45,6 +45,7 @@ TXE-3401 root ruling (msg_f64163e22ee5) fixed:
 | `pin.py` | copies the installed W/C read-only, builds H and R from `git archive` plus picks, reports A's changed files against the reviewer's dependency closure, writes the manifest |
 | `actions.py` | the state of the action a decided proposal created: `succeeded` with an admitted execution, still in flight, or settled otherwise |
 | `check_proof.py` | P8 on the run itself: a succeeded action only says the retry was dispatched. Checks that the admitted execution finished `succeeded` as a `retryOf` the sealed one, publish ran and run did not, the artifacts record `produced_in` = the sealed execution with exactly the sealed digests, and the counter did not move |
+| `ttykey.py` | enters the API key at `dagu context add`'s own no-echo prompt through a pty it owns, with echo off and checked, the key never in argv or a log (TXE-7529) |
 | `check_seal.py` | one begun execution, one seal, `attempts/` empty, and every sealed file still hashing to its seal |
 | `fixture-job.yaml.tmpl`, `fixture-run.sh` | the harmless fixture: it counts itself, waits for the harness's go marker, then writes one result unique to its run |
 
@@ -59,6 +60,7 @@ TXE-3401 root ruling (msg_f64163e22ee5) fixed:
 - TXE-7514 changes that prompt (`txe/reviewer/prompt.md`).
 - So `rig.sh` installs with R, and every review step calls R through `--review-command`. Installed by C, the agent would read the base prompt whatever R's code does.
 - `TestRigInstallsTheReviewerWithTheReviewerBinary` holds this.
+- `pin.py prompt` proves it offline, before any runtime. It runs R's and C's local-only `txe review render`, and requires R's rendered prompt to hash to A's prompt (`TrimSpace` of `prompt.md` with CRLF as LF) and C's not to. `rig.sh init` refuses a manifest without that passing record for its exact R (`preflight.py prompt`).
 
 ## Ports and paths
 
@@ -94,9 +96,12 @@ python3 -I $H/pin.py build --role R --repo . --base <B worker tag> --pick <A sha
   --workdir $PIN/work-r --out $PIN/bin/dagu-r --record $PIN/r.json
 # A's delta against the reviewer's dependency closure: returned for assessment, never acted on.
 python3 -I $H/pin.py closure --repo . --base <B worker tag> --pick <A sha>.. --workdir $PIN/work-c --record $PIN/closure.json
+# The prompt R installs: R must render A's txe/reviewer/prompt.md and C must not (TXE-7529).
+python3 -I $H/pin.py prompt --reviewer-bin $PIN/bin/dagu-r --base-bin $PIN/bin/dagu-wc --commit <A sha> \
+  --workdir $PIN/work-p --record $PIN/prompt.json
 python3 -I $H/pin.py manifest --out $PIN/manifest.json --harness-dir $H \
   --record $PIN/wc.json --record $PIN/h.json --record $PIN/r.json --record $PIN/closure.json \
-  --extra profile=$PIN/profile.json --extra slot=$PIN/slot.json
+  --extra prompt=$PIN/prompt.json --extra profile=$PIN/profile.json --extra slot=$PIN/slot.json
 ```
 
 Then:
@@ -129,7 +134,13 @@ The slot starts no earlier than 2026-11-17 00:10Z, after window-10's recovery ha
 **Credentials.**
 - The synthetic admin password, the person token and the API key live in 0600 files under the rig root.
 - `curl` reads them from files (`-H @file`, `-d @file`), so they never appear in any process's arguments. `rig_test.go` checks every `curl` line.
-- One residual is stated rather than hidden: `dagu context add` accepts the key only as a flag or from a terminal prompt. That single sub-second call carries the synthetic, loopback-only API key in its argv.
+- `dagu context add` takes its key from `--api-key` or, when stdin is a terminal, from its own no-echo prompt; nothing else (TXE-7529). `ttykey.py` answers that prompt:
+  - the CLI's stdin is a pty the helper owns; its stdout and stderr are pipes;
+  - echo is turned off and read back from termios before any key byte is written;
+  - the key is written only after the exact prompt, preceded by nothing but dagu's own log lines;
+  - any byte coming back on the pty, or the key in the CLI's output, fails the step, and the output is then withheld from the log;
+  - every wait has a deadline, and on failure only the CLI's own process group is stopped.
+- The CLI stores the key encrypted (`api_key_enc`) in the rig's own `machine-home/client`. `ttykey_test.go` drives the real `context add` and checks the stored key is the entered one.
 
 **Coordinator authentication is off, as in J17.**
 - The test coordinator's gRPC port is loopback only and unauthenticated: coordinator authentication needs `txe.authn`, an identity provider, which root's ruling D1 excludes.

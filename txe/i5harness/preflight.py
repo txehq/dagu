@@ -22,6 +22,7 @@ state: it reads files, lsof output and the local port table only.
   logs     --forbid PORT[,..] FILE..
   ports    --free PORT[,..]
   pins     --manifest F
+  prompt   --manifest F --reviewer-bin R
 """
 
 import argparse
@@ -261,6 +262,33 @@ def cmd_pins(a):
     return 0
 
 
+def cmd_prompt(a):
+    """The manifest's prompt record (pin.py prompt) is a pass for this exact R."""
+    m = json.load(open(a.manifest))
+    rec = m.get("prompt")
+    if not isinstance(rec, dict):
+        return fail(["the manifest has no prompt record: run pin.py prompt and add it with --extra prompt=..."])
+    errs = []
+    if rec.get("ok") is not True:
+        errs.append("the prompt record is not a pass")
+    want = (rec.get("reviewer") or {}).get("binary_sha256")
+    got = sha256(a.reviewer_bin)
+    if want != got:
+        errs.append(f"the prompt record was made for reviewer sha256 {str(want)[:12]}, not {got[:12]}")
+    pinned = (m.get("binaries", {}).get("R") or {}).get("sha256")
+    if pinned != got:
+        errs.append(f"the manifest pins R at {str(pinned)[:12]}, not {got[:12]}")
+    r = (rec.get("reviewer") or {}).get("rendered_prompt_sha256")
+    if not r or r != rec.get("expected_rendered_sha256"):
+        errs.append("R's rendered prompt is not the pinned one")
+    if (rec.get("base") or {}).get("rendered_prompt_sha256") == r:
+        errs.append("C renders the same prompt as R, so the install binary is not shown to matter")
+    if errs:
+        return fail(errs)
+    print(f"PREFLIGHT OK: R renders the pinned prompt {r[:12]}; C does not")
+    return 0
+
+
 def main(argv):
     p = argparse.ArgumentParser(prog="preflight.py")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -285,11 +313,14 @@ def main(argv):
     c.add_argument("files", nargs="+")
     c = sub.add_parser("ports")
     c.add_argument("--free", required=True)
+    c = sub.add_parser("prompt")
+    c.add_argument("--manifest", required=True)
+    c.add_argument("--reviewer-bin", required=True)
     c = sub.add_parser("pins")
     c.add_argument("--manifest", required=True)
     a = p.parse_args(argv)
     fn = {"config": cmd_config, "hub-log": cmd_hub_log, "registry": cmd_registry, "conns": cmd_conns,
-          "logs": cmd_logs, "ports": cmd_ports, "pins": cmd_pins}[a.cmd]
+          "logs": cmd_logs, "ports": cmd_ports, "pins": cmd_pins, "prompt": cmd_prompt}[a.cmd]
     try:
         return fn(a)
     except (Failed, OSError, ValueError) as err:
