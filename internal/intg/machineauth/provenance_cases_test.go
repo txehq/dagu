@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -558,7 +559,9 @@ func (d depRig) offline() []string {
 func depFixture(t *testing.T) depRig {
 	t.Helper()
 	repo, _ := fixtureRepo(t)
-	proxy, cache := t.TempDir(), t.TempDir()
+	// The shared cache's path holds URL-significant characters and the proxy
+	// list's separator: the file proxy URL must still name it.
+	proxy, cache := t.TempDir(), filepath.Join(t.TempDir(), "cache#one,two %x")
 	const mod, ver = "example.com/dep", "v1.0.0"
 	depMod := "module " + mod + "\n\ngo 1.22\n"
 	depSrc := "package dep\n\nfunc Name() string { return \"dep\" }\n"
@@ -608,10 +611,9 @@ func depFixture(t *testing.T) depRig {
 		}
 	}
 	env = append(env, "GOPROXY="+proxyURL, "GOSUMDB=off", "GOMODCACHE="+cache)
-	// The module cache's files are read-only; clear it before TempDir removes it.
-	t.Cleanup(func() {
-		_, _ = runIn(repo, append(slices.Clone(env), "GOENV=off", "GOFLAGS="), time.Minute, "go", "clean", "-modcache")
-	})
+	// The cache's directories are read-only; make the tree removable before
+	// TempDir removes it. The path is the test's own, never the environment's.
+	t.Cleanup(func() { _ = removeTree(cache) })
 	return depRig{repo: repo, commit: commit, cache: cache, env: env}
 }
 
@@ -680,6 +682,22 @@ func TestSourceBuildReadsOnlyAPrivateModuleCache(t *testing.T) {
 	assert.Contains(t, err.Error(), "before the build: module download")
 	_, statErr := os.Stat(filepath.Join(third.OutDir, "provenance.json"))
 	assert.True(t, errors.Is(statErr, os.ErrNotExist), "no record")
+}
+
+func TestFileURLEscapesThePath(t *testing.T) {
+	t.Parallel()
+	for _, p := range []string{"/tmp/plain", "/tmp/cache#one", "/tmp/a%20b", "/tmp/x,y", "/tmp/p|q", "/tmp/with space", "/tmp/q?x=1"} {
+		u := fileURL(p)
+		assert.NotContains(t, u, ",", "%q: a comma would split the proxy list", p)
+		assert.NotContains(t, u, "|", "%q: a pipe would split the proxy list", p)
+		parsed, err := url.Parse(u)
+		require.NoError(t, err, p)
+		assert.Equal(t, "file", parsed.Scheme, p)
+		assert.Empty(t, parsed.Fragment, "%q: no fragment", p)
+		assert.Empty(t, parsed.RawQuery, "%q: no query", p)
+		assert.Equal(t, p, parsed.Path, "%q: the URL names the path", p)
+	}
+	assert.Equal(t, "file:///C:/Users/me/go/pkg/mod", fileURL(`C:/Users/me/go/pkg/mod`), "a Windows drive path")
 }
 
 func TestModuleProxyChain(t *testing.T) {

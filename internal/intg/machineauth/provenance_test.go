@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -627,6 +628,37 @@ func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
 	return buildFromSourceIn(spec, callerEnv())
 }
 
+// removeTree removes a directory this package created, the read-only files
+// of a private module cache included: it makes the tree writable, then
+// removes it. It is given a path, never an environment, and refuses anything
+// but an absolute path under the system's temporary directory. Nothing in
+// this package cleans a module cache through go (TestNoModuleCacheClean): a
+// cache named by the environment can be the caller's.
+func removeTree(dir string) error {
+	tmp, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return err
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	rel, err := filepath.Rel(tmp, real)
+	if err != nil || !filepath.IsAbs(dir) || rel == "." || !filepath.IsLocal(rel) {
+		return fmt.Errorf("removeTree: %s is not under the temporary directory %s; refusing", dir, tmp)
+	}
+	_ = filepath.WalkDir(real, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700) //nolint:gosec // a directory this package created, made removable
+		}
+		return nil
+	})
+	return os.RemoveAll(real)
+}
+
 // moduleProxyChain is where the build's private module cache is filled from:
 // the caller's module cache downloads (zips and go.mod files, served as a
 // file proxy, so nothing need be fetched again), then the caller's proxy. Go
@@ -653,13 +685,17 @@ func moduleProxyChain(base []string) string {
 	return callerProxy
 }
 
-// fileURL is a file:// URL of an absolute path, on Unix and Windows.
+// fileURL is a file:// URL of an absolute path, on Unix and Windows, with
+// every URL-significant character of the path escaped, and the go proxy
+// list's separators (comma, pipe) too, so a path such as "cache#one,two"
+// stays one path of one proxy.
 func fileURL(p string) string {
 	slashed := filepath.ToSlash(p)
-	if strings.HasPrefix(slashed, "/") {
-		return "file://" + slashed
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed // a Windows drive path: file:///C:/...
 	}
-	return "file:///" + slashed
+	u := (&url.URL{Scheme: "file", Path: slashed}).String()
+	return strings.NewReplacer(",", "%2C", "|", "%7C").Replace(u)
 }
 
 // modulesVerified is what go mod verify prints when every cached module of
@@ -697,7 +733,7 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = os.RemoveAll(work) }()
+	defer func() { _ = removeTree(work) }()
 	clone := filepath.Join(work, "src")
 	if _, err := runIn(work, gitEnv(), 10*time.Minute, "git", "-c", "advice.detachedHead=false", "clone", "--quiet", "--no-hardlinks",
 		"--branch", spec.Tag, "--", spec.Repo, clone); err != nil {
@@ -726,9 +762,6 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 		"HOME=" + work, "GOMAXPROCS=" + strconv.Itoa(spec.Parallel), "GOCACHE=" + filepath.Join(work, "gocache"),
 		"GOMODCACHE=" + filepath.Join(work, "gomodcache"), "GOPROXY=" + moduleProxyChain(base)}
 	env := append(slices.Clone(base), set...)
-	// The private module cache's files are read-only; go clears it before the
-	// work directory goes.
-	defer func() { _, _ = runIn(work, env, 5*time.Minute, "go", "clean", "-modcache") }()
 	// Every module the build needs is in the cache and matches go.sum: a
 	// download is checked as it lands, and verify rehashes what was there.
 	verify := func(when string) error {
