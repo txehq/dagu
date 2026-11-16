@@ -98,6 +98,9 @@ if args[:1] == ["inspect"]:
         print("/%s %s" % tuple(r[args[-1]]))
     sys.exit(0)
 if args[:2] == ["rm", "-f"]:
+    if os.path.exists(LOG + ".rmfail"):
+        print("Error response from daemon: removal failed", file=sys.stderr)
+        sys.exit(1)
     r = reg()
     if args[2] not in r:
         sys.exit(1)
@@ -1225,4 +1228,19 @@ func TestStoppedCheckFailsClosed(t *testing.T) {
 	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
 	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "cannot establish that the container of baseline")
+}
+
+// A container whose removal fails stays pending: no further run starts, the finalizer retries,
+// and the run says loudly which containers it could not confirm removed.
+func TestFailedRemovalStaysPending(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmfail", nil, 0o644))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "1")
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "a container could not be confirmed removed")
+	assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
+	assert.Len(t, dockerRuns(t, f.log), 1, "no further run started")
+	raw, err := os.ReadFile(f.log)
+	require.NoError(t, err)
+	assert.Equal(t, 2, strings.Count(string(raw), `["rm", "-f"`), "the removal was tried, then retried by the finalizer")
 }

@@ -585,14 +585,26 @@ class Runner:
             raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed before {what}")
         return min(float(self.args.timeout), left)
 
-    def remove_pending(self) -> None:
+    def remove_pending(self) -> bool:
+        """Remove every pending container. An entry leaves pending only when its removal or its
+        absence is confirmed; anything else stays, for the finalizer's retry. Returns whether
+        nothing is left pending."""
         for name, cidfile in list(self.pending.items()):
             try:
-                self.cleanup_log.append(remove_owned_container(self.docker, cidfile, name, self.work.token,
-                                                               self.docker_env(), self.hard_end))
+                outcome = remove_owned_container(self.docker, cidfile, name, self.work.token,
+                                                 self.docker_env(), self.hard_end)
             except (OSError, subprocess.TimeoutExpired) as e:
-                self.cleanup_log.append(f"{name}: cleanup error {e}")
-            del self.pending[name]
+                outcome = f"{name}: cleanup error {e}"
+            self.cleanup_log.append(outcome)
+            if outcome.endswith(": removed") or outcome.endswith(": absent"):
+                del self.pending[name]
+        return not self.pending
+
+    def clear_pending(self) -> None:
+        """After a run that stopped abnormally: no further run starts while one of its
+        containers may still be running."""
+        if not self.remove_pending():
+            raise Stopped("a container could not be confirmed removed: " + ", ".join(self.pending))
 
     # A run gets its own directory: src (the tree copy) and sandbox/<env dirs>.
     def prepare(self, label: str, pristine: Path, mutant: Mutant | None) -> Path:
@@ -668,7 +680,7 @@ class Runner:
                 proc.wait()
                 raise
         if code is None:  # stopped by the watchdog: time, output or disk
-            self.remove_pending()
+            self.clear_pending()
             if self.overrun == "time":
                 if limit < self.args.timeout:
                     raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed during {label}")
@@ -679,7 +691,7 @@ class Runner:
                 print(f"mutate-sandboxed: {label}: stopped: {self.overrun}", file=sys.stderr)
         elif code < 0:
             # The docker client died by a signal: nothing shows the container finished.
-            self.remove_pending()
+            self.clear_pending()
             outcome = "ERROR"
         else:
             del self.pending[name]
@@ -979,7 +991,13 @@ def main(argv: list[str]) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
         if runner:
-            runner.remove_pending()
+            if not runner.remove_pending():  # the retry of anything an earlier attempt left
+                left = ", ".join(runner.pending)
+                report["containers_left"] = left
+                print(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "
+                      "after checking their owner label", file=sys.stderr)
+                if code == EXIT_OK:
+                    code = EXIT_FINDINGS
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
                 print(f"mutate-sandboxed: container {line}", file=sys.stderr)
