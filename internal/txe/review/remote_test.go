@@ -1783,28 +1783,25 @@ func TestRemoteRerunRetriesFromTheJobStep(t *testing.T) {
 	assert.NotContains(t, sent, "stepName", "an unspecified retry is a native retry of the run")
 }
 
-// TXE-7517: the service refuses a registered job's retry that does not bind
-// the approved action it names (txe_retry_unbound, 400) or names none
-// (txe_decision_required, 409) before it queues or creates anything, so
-// either is "nothing started", and only with its own status.
+// TXE-7517: the service refuses a registered job's retry made for no action
+// (txe_decision_required, 409) before it queues or creates anything, so it
+// is "nothing started", and only with its own status. One that does not
+// carry out its action as approved keeps accept_failed_prerequisites_unsupported,
+// which TestRemoteRepublishNamesThePublishStep covers.
 func TestRemoteRetryUnboundIsRefusedBeforeEffect(t *testing.T) {
 	path := "/dag-runs/job_1/run-1/retry"
 	stub := &stubTransport{t: t, replies: map[string]string{path: `{}`}}
 	runs := review.RemoteRuns(stub)
 	queued := review.Execution{AttemptID: "a1", QueuedAt: "2026-10-09T16:36:43.039647Z"}
 	request := review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d"}
-	for code, status := range map[string]int{"txe_retry_unbound": http.StatusBadRequest, "txe_decision_required": http.StatusConflict} {
-		stub.fail = map[string]*review.TransportError{path: {Status: status, Code: code, Message: "refused"}}
-		_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
-		require.ErrorIs(t, err, review.ErrRunNotRetryable, code)
-		other := http.StatusConflict
-		if status == http.StatusConflict {
-			other = http.StatusBadRequest
-		}
-		stub.fail = map[string]*review.TransportError{path: {Status: other, Code: code}}
+	stub.fail = map[string]*review.TransportError{path: {Status: http.StatusConflict, Code: "txe_decision_required", Message: "refused"}}
+	_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
+	require.ErrorIs(t, err, review.ErrRunNotRetryable)
+	for _, code := range []string{"txe_decision_required", "txe_retry_unbound"} {
+		stub.fail = map[string]*review.TransportError{path: {Status: http.StatusBadRequest, Code: code}}
 		_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 		require.Error(t, err)
-		require.NotErrorIs(t, err, review.ErrRunNotRetryable, "%s means nothing started only with its own status", code)
+		require.NotErrorIs(t, err, review.ErrRunNotRetryable, "%s under 400 is no documented refusal before effect", code)
 	}
 }
 

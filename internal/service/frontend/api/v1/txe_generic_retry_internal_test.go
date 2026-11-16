@@ -15,6 +15,7 @@ import (
 
 	apigen "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
@@ -119,7 +120,7 @@ func (g *genericRetry) decideAndGrant(t *testing.T) (*registry.Action, *registry
 func TestTxeGenericRetryOfAJobsRunNeedsADecision(t *testing.T) {
 	g := newGenericRetry(t)
 	w := g.w
-	step := "run"
+	step, downstream := "run", true
 	for name, c := range map[string]struct {
 		ctx  context.Context
 		body *apigen.RetryDAGRunJSONRequestBody
@@ -128,6 +129,8 @@ func TestTxeGenericRetryOfAJobsRunNeedsADecision(t *testing.T) {
 		"an administrator's key":            {w.legacy, nil},
 		"the owner's CLI":                   {w.cliA, &apigen.RetryDAGRunJSONRequestBody{DagRunId: g.run}},
 		"a step of the run":                 {w.personA, &apigen.RetryDAGRunJSONRequestBody{DagRunId: g.run, StepName: &step}},
+		"the job step with what follows": {w.personA, &apigen.RetryDAGRunJSONRequestBody{DagRunId: g.run, StepName: &step,
+			IncludeDownstream: &downstream}},
 		"conditional, made for no action": {w.personA, &apigen.RetryDAGRunJSONRequestBody{DagRunId: g.run,
 			ExpectedAttemptId: &g.attemptID, ExpectedQueuedAt: &g.queuedAt}},
 	} {
@@ -152,6 +155,11 @@ func TestTxeGenericRetryCarriesOutOnlyTheBoundDecision(t *testing.T) {
 	step := "run"
 	stepped := g.conditional(action.ActionID, attempt, action.BindingDigest)
 	stepped.StepName = &step
+	// The person's decision names no intent: it is carried out only as a
+	// retry of the whole run, not from the job's step.
+	downstream := true
+	fromJobStep := g.conditional(action.ActionID, attempt, action.BindingDigest)
+	fromJobStep.StepName, fromJobStep.IncludeDownstream = &step, &downstream
 	otherExecution := g.conditional(action.ActionID, attempt, action.BindingDigest)
 	other := "ffffff"
 	otherExecution.ExpectedAttemptId = &other
@@ -160,18 +168,28 @@ func TestTxeGenericRetryCarriesOutOnlyTheBoundDecision(t *testing.T) {
 		"another attempt":           g.conditional(action.ActionID, "2", action.BindingDigest),
 		"another binding":           g.conditional(action.ActionID, attempt, "sha256:forged"),
 		"a step of the run":         stepped,
+		"from the job step":         fromJobStep,
 		"the approval as republish": republishBody(g.conditional(action.ActionID, attempt, action.BindingDigest)),
 	} {
 		err := g.retry(w.reviewerA, body)
 		require.Error(t, err, name)
-		assert.Contains(t, []string{txeRetryUnbound, txeRepublishUnsupported}, detailOf(err), "%s: %v", name, err)
+		assert.Equal(t, txeRepublishUnsupported, detailOf(err), "%s: %v", name, err)
 	}
 	// Another execution is refused as one that changed, before the binding.
 	require.Equal(t, "execution_changed", detailOf(g.retry(w.reviewerA, otherExecution)))
 	require.Empty(t, g.recorder.dispatched, "a request that does not bind the decision was dispatched")
 
+	// The legacy retry, a decision naming no intent carried out with no
+	// step, is admitted and dispatched exactly as before TXE-7517: a retry of
+	// the whole run, no step, nothing downstream, no failure accepted.
 	require.NoError(t, g.retry(w.reviewerA, g.conditional(action.ActionID, attempt, action.BindingDigest)))
 	require.Len(t, g.recorder.dispatched, 1, "the bound decision was not carried out")
+	task := g.recorder.dispatched[0]
+	assert.Equal(t, dispatch.DispatchOperationRetry, task.Operation)
+	assert.Empty(t, task.Step, "a retry naming no intent was given a step")
+	assert.False(t, task.IncludeDownstream)
+	assert.False(t, task.AcceptFailedPrerequisites)
+	assert.True(t, task.RequireLatestIsPrevious, "the retry is conditional on the decided execution")
 
 	// Once the action is settled, the same request is a replay: refused.
 	_, err := w.reg.WithJobTx(context.Background(), w.jobA, registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer-a"}, func(tx *registry.JobTx) error {
@@ -181,7 +199,8 @@ func TestTxeGenericRetryCarriesOutOnlyTheBoundDecision(t *testing.T) {
 	})
 	require.NoError(t, err)
 	err = g.retry(w.reviewerA, g.conditional(action.ActionID, attempt, action.BindingDigest))
-	require.Equal(t, txeRetryUnbound, detailOf(err), "%v", err)
+	require.Equal(t, txeRepublishUnsupported, detailOf(err), "%v", err)
+	require.Equal(t, txeRetryUnbound, refusalReason(err), "%v", err)
 	require.Len(t, g.recorder.dispatched, 1, "a replayed request was dispatched")
 }
 

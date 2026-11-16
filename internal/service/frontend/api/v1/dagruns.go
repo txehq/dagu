@@ -3233,7 +3233,7 @@ func (a *API) retryDAGRun(ctx context.Context, dagName, dagRunID, retryDagRunID,
 	// be the caller's, and before anything is queued or created. A
 	// republish is dispatched with the base configuration it was checked
 	// with.
-	if err := a.txeCheckRepublish(ctx, dag, republishBase, retryDagRunID, requestedStep, expect, acceptFailedPrerequisites); err != nil {
+	if err := a.txeCheckRepublish(ctx, dag, republishBase, retryDagRunID, requestedStep, subDAGRunID, includeDownstream, bypassPreconditions, expect, acceptFailedPrerequisites); err != nil {
 		return retryDAGRunResult{}, err
 	}
 	if err := humantask.ValidateRetry(retryValidationStatus, auditStepName); err != nil {
