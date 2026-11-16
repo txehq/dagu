@@ -198,15 +198,13 @@ func lintSources(srcs []source) Result {
 			goPkgs[path.Dir(s.rel)] = append(goPkgs[path.Dir(s.rel)], s)
 			continue
 		}
-		fs, ds := lintScript(s)
 		if isYAML(s.rel) {
-			// A workflow step may run under shell: pwsh, so its run:
-			// blocks are read as PowerShell as well.
-			ps := s
-			ps.lang = langPowerShell
-			more, _ := lintScript(ps)
-			fs = mergeFindings(fs, more)
+			fs, ds := lintWorkflow(s)
+			raw = append(raw, fs...)
+			dirs[s.rel] = ds
+			continue
 		}
+		fs, ds := lintScript(s)
 		raw = append(raw, fs...)
 		dirs[s.rel] = ds
 	}
@@ -383,8 +381,40 @@ func normArgv(text string) string {
 }
 
 // goCleanIn reports text that runs go clean with a flag that empties a whole
-// Go cache.
+// Go cache. It reads the text twice: once with every quote a word break, so
+// an argv written as a list ("go", "clean") and a command inside a quoted
+// string (sh -c "go clean -modcache") are read, and once with each quoted
+// string one word, as the shell reads it, so a quoted flag value with spaces
+// (-tags "a b") stays one argument and the scan reaches the flags after it.
 func goCleanIn(text string) bool {
+	return goCleanInWords(text) || goCleanInWords(joinQuoted(text))
+}
+
+// quotedSpace stands for a space inside a quoted string that joinQuoted
+// keeps in one word. It is not a space to strings.Fields or to \s.
+const quotedSpace = "\x1f"
+
+// joinQuoted replaces the spaces and tabs inside each '...' or "..." string
+// with quotedSpace, so the string is one word once its quotes are removed.
+func joinQuoted(text string) string {
+	var b strings.Builder
+	var z quoter
+	for i := 0; i < len(text); {
+		next, _ := z.step(text, i)
+		for j := i; j < next && j < len(text); j++ {
+			c := text[j]
+			if (c == ' ' || c == '\t') && (z.q == '"' || z.q == '\'') {
+				b.WriteString(quotedSpace)
+				continue
+			}
+			b.WriteByte(c)
+		}
+		i = next
+	}
+	return b.String()
+}
+
+func goCleanInWords(text string) bool {
 	norm := normArgv(quotedFlagValueRe.ReplaceAllString(text, "=$1$2"))
 	for _, loc := range goCleanCmdRe.FindAllStringIndex(norm, -1) {
 		args := norm[loc[1]:]

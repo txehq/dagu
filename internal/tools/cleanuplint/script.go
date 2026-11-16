@@ -367,10 +367,18 @@ type scriptScan struct {
 	assigns []assignment
 	tainted map[string]bool
 	defined map[string]bool
+	// envNames are names the environment sets: in a workflow, the keys of
+	// its env: maps. Nil outside a workflow.
+	envNames map[string]bool
 }
 
 func lintScript(s source) ([]Finding, []directiveAt) {
 	phys := lines(s.data)
+	return scanScript(s, phys, nil), scriptDirectives(phys)
+}
+
+// scriptDirectives finds the cleanuplint:allow directives in a file's lines.
+func scriptDirectives(phys []string) []directiveAt {
 	var dirs []directiveAt
 	for i, p := range phys {
 		for idx := strings.Index(p, "#"); idx >= 0; {
@@ -385,13 +393,20 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 			idx += 1 + next
 		}
 	}
+	return dirs
+}
+
+// scanScript reports the findings in one script's lines. envNames are
+// names the environment sets for this script beyond the ones the lint
+// already treats as sources: a workflow's env: maps.
+func scanScript(s source, phys []string, envNames map[string]bool) []Finding {
 	logicals := joinLines(s.lang, phys)
 	if s.lang != langPython {
 		for i := range logicals {
 			logicals[i].text = maskWorkflowExprs(logicals[i].text)
 		}
 	}
-	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}}
+	sc := &scriptScan{l: s.lang, logical: logicals, tainted: map[string]bool{}, defined: map[string]bool{}, envNames: envNames}
 	sc.collectAssignments()
 	sc.propagate()
 
@@ -415,7 +430,7 @@ func lintScript(s source) ([]Finding, []directiveAt) {
 				Msg: "recursive delete of a path the environment chooses (" + strings.TrimSpace(target) + "); delete only a directory this code created, such as mktemp -d"})
 		}
 	}
-	return out, dirs
+	return out
 }
 
 // expandArgs replaces each reference to a shell or make variable with the
@@ -529,6 +544,9 @@ func (sc *scriptScan) varTainted(name string) bool {
 	}
 	switch sc.l {
 	case langShell, langMake:
+		if sc.envNames[name] {
+			return true
+		}
 		if shellSpecial[name] {
 			return false
 		}

@@ -1,0 +1,45 @@
+env:
+  shared_root: /var/cache/shared
+jobs:
+  steps-scope:
+    env:
+      CACHE_ROOT: ${{ runner.temp }}/cache
+    steps:
+      - name: a safe assignment in one step
+        run: |
+          CACHE_ROOT="$(mktemp -d)"
+          rm -rf "$CACHE_ROOT"
+      - name: does not clear a delete in another step
+        run: rm -rf "$CACHE_ROOT" # want:env-path-delete
+      - run: |
+          scratch="$(mktemp -d)"
+          echo "$scratch"
+      - run: |
+          rm -rf "$scratch"
+          rm -rf "$shared_root" # want:env-path-delete
+      - env:
+          step_dir: ${{ inputs.dir }}
+        run: rm -rf "$step_dir" # want:env-path-delete
+      - env: { flow_dir: "${{ inputs.dir }}" }
+        run: >-
+          rm -rf "$flow_dir" # want:env-path-delete
+  other-job:
+    steps:
+      - run: |
+          CACHE_ROOT="$(mktemp -d)"
+          echo "$CACHE_ROOT"
+      - shell: bash
+        run: |
+          go build ./...
+          rm -rf "${CACHE_ROOT}/x" # want:env-path-delete
+      - run: |
+          own="$(mktemp -d)"
+          shared_root="$own"
+          rm -rf "$shared_root"
+  quoted-arguments:
+    steps:
+      - run: go clean -tags "a b" -modcache # want:go-clean-cache
+      - run: go clean -tags 'integration e2e' -cache=true # want:go-clean-cache
+      - run: go clean -tags "a b" -modcache=false
+      - run: sh -c "go clean -fuzzcache" # want:go-clean-cache
+      - run: go clean -tags "a b" ./pkg -modcache
