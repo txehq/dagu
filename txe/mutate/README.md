@@ -36,7 +36,9 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   either failing stops the run (exit 6). GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
   XDG_CACHE_HOME and XDG_CONFIG_HOME point under `/work/sandbox`. HOME is never set, here or
   anywhere in the runner: the container keeps its image user's default. Every `docker run` has
-  `--pull never`, and an image that is not present locally is refused: name it by its id. A mount
+  `--pull never`, and an image that is not present locally is refused: name it by its id. An
+  image that declares a `VOLUME` is refused too: Docker would give every run an anonymous
+  writable host volume outside the sandbox's bounds. A mount
   that would be, contain or lie inside the shared caches, GOPATH, HOME, the Docker socket or the
   live tree is refused before docker runs.
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod

@@ -524,6 +524,22 @@ def dir_usage(d: Path, max_entries: int, budget: float, max_depth: int = 256) ->
     return tally[0], tally[1], None
 
 
+def refuse_declared_volumes(image: str, volumes_json: str) -> None:
+    """An image that declares a VOLUME gets an anonymous host-backed writable volume on every run,
+    even with --read-only: a writable path outside the run's own mount and its disk bounds. Such
+    an image is refused. volumes_json is `docker image inspect --format '{{json .Config.Volumes}}'`."""
+    text = volumes_json.strip()
+    if text in ("", "null", "{}"):
+        return
+    try:
+        declared = sorted(json.loads(text))
+    except (ValueError, TypeError):
+        raise Refused(f"cannot read the volumes image {image} declares: {text[:200]!r}") from None
+    if declared:
+        raise Refused(f"image {image} declares VOLUME {', '.join(declared)}: each would be a writable host "
+                      "path outside the sandbox's bounds; use an image without declared volumes")
+
+
 def docker_client_env() -> dict[str, str]:
     """What the docker client itself needs from the caller, unchanged; none of it reaches a
     container (docker run passes only --env values)."""
@@ -989,13 +1005,15 @@ def main(argv: list[str]) -> int:
         if left <= 0:
             raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
         try:
-            inspected = subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True,
+            inspected = subprocess.run([args.docker, "image", "inspect", "--format", "{{json .Config.Volumes}}",
+                                        args.image], capture_output=True, text=True,
                                        env=docker_client_env(), timeout=min(left, 60.0))
         except subprocess.TimeoutExpired as e:
             raise Stopped(f"docker image inspect took longer than {min(left, 60.0):.0f}s") from e
         if inspected.returncode != 0:
             raise Refused(f"image {args.image} is not present locally (or {args.docker} cannot reach a daemon); "
                           "this runner never pulls")
+        refuse_declared_volumes(args.image, inspected.stdout)
         work = WorkDir(args.workdir_root)
         report["workdir"] = str(work.path)
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})

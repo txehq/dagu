@@ -221,13 +221,19 @@ def main(argv) -> int:
         print("--deadline must be at least 30 seconds", file=sys.stderr)
         return 2
     try:
-        inspected = subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True,
+        inspected = subprocess.run([args.docker, "image", "inspect", "--format", "{{json .Config.Volumes}}",
+                                    args.image], capture_output=True, text=True,
                                    env=ms.docker_client_env(), timeout=min(60.0, (end - time.monotonic()) / 3))
     except subprocess.TimeoutExpired:
         print("docker image inspect did not answer inside the deadline's preflight budget", file=sys.stderr)
         return 1
     if inspected.returncode != 0:
         print(f"image {args.image} is not present locally; this demonstration pulls nothing", file=sys.stderr)
+        return 2
+    try:
+        ms.refuse_declared_volumes(args.image, inspected.stdout)
+    except ms.Refused as e:
+        print(f"refused: {e}", file=sys.stderr)
         return 2
     args.evidence.mkdir(parents=True, exist_ok=True)
     demo = Demo(args, end)

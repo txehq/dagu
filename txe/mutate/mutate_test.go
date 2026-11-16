@@ -78,10 +78,13 @@ def reg():
 def save(r):
     json.dump(r, open(REG + ".tmp", "w"))
     os.replace(REG + ".tmp", REG)
-if args[:3] == ["image", "inspect", "missing"]:
+if args[:2] == ["image", "inspect"] and args[-1] == "missing":
     sys.exit(1)
-if args[:2] == ["image", "inspect"] and "slowinspect" in args[2]:
+if args[:2] == ["image", "inspect"] and "slowinspect" in args[-1]:
     time.sleep(30)
+if args[:2] == ["image", "inspect"]:
+    print('{"/data":{}}' if "volimage" in args[-1] else "null")
+    sys.exit(0)
 if args[:1] == ["inspect"]:
     if os.path.exists(LOG + ".slowclean"):
         time.sleep(30)
@@ -1297,4 +1300,18 @@ used, n, problem = ms.dir_usage(root / "absent", 100, 60.0); print(n, problem)
 	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "11 run directory over 10 entries\n1 None True\nrun directory nested over 5 levels\n0 None\n", string(out))
+}
+
+// An image that declares a VOLUME is refused by the runner and the demo before any container
+// runs: Docker would give each run an anonymous writable host volume outside its bounds.
+func TestImageWithDeclaredVolumeRefused(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "volimage")
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "declares VOLUME /data")
+	assert.Empty(t, dockerRuns(t, f.log))
+
+	cmd, out := demo(t, f.docker, "sandboxed", filepath.Join(f.root, "evidence"), "sha256:volimage")
+	assert.Equal(t, 2, exitCode(t, cmd.Run()), out.String())
+	assert.Contains(t, out.String(), "declares VOLUME /data")
 }
