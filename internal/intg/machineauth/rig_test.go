@@ -56,11 +56,14 @@ type build struct {
 }
 
 type machineHome struct {
-	name   string // A or B
+	name   string // A, B, or w-<build> for a worker-only build's machine
 	person string // alice or bob
 	owner  string
 	id     string
 	root   string // <rig>/machines/<name>
+	// cli is the build whose CLI the machine's person runs; nil: the hub's.
+	// A worker-only build's machine is enrolled through its own CLI.
+	cli *build
 }
 
 func (m *machineHome) txe() string  { return filepath.Join(m.root, "txe") }
@@ -119,18 +122,88 @@ func mintID(t *testing.T, prefix registry.Prefix) string {
 	return id
 }
 
+// DAGU_MACHINEAUTH_PORTS=<lo>-<hi> keeps every port the rig listens on (hub,
+// coordinator, issuer, TLS edge, worker health) inside an assigned block, for
+// a host shared with other rigs; unset, the ports are ephemeral. The block is
+// walked round and round: a port is handed out only if it can be bound now,
+// so a port a stopped worker freed is used again and one still held is not.
+var ports struct {
+	once   sync.Once
+	mu     sync.Mutex
+	lo, hi int
+	next   int
+	err    error
+}
+
+func portBlock() (lo, hi int, err error) {
+	ports.once.Do(func() {
+		spec := os.Getenv("DAGU_MACHINEAUTH_PORTS")
+		if spec == "" {
+			return
+		}
+		if _, err := fmt.Sscanf(spec, "%d-%d", &ports.lo, &ports.hi); err != nil || ports.lo < 1024 || ports.hi > 65535 || ports.lo > ports.hi {
+			ports.err = fmt.Errorf("DAGU_MACHINEAUTH_PORTS=%q is not <lo>-<hi> within 1024-65535", spec)
+			return
+		}
+		ports.next = ports.lo
+	})
+	return ports.lo, ports.hi, ports.err
+}
+
+// listenLoopback listens on a loopback port: the next free one of the block,
+// or an ephemeral one.
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
+	lo, _, err := portBlock()
+	require.NoError(t, err)
+	if lo == 0 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		return ln
+	}
+	ports.mu.Lock()
+	defer ports.mu.Unlock()
+	for range ports.hi - ports.lo + 1 {
+		port := ports.next
+		ports.next++
+		if ports.next > ports.hi {
+			ports.next = ports.lo
+		}
+		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+			return ln
+		}
+	}
+	t.Fatalf("DAGU_MACHINEAUTH_PORTS: every port of the block %d-%d is in use", ports.lo, ports.hi)
+	return nil
+}
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
+	ln := listenLoopback(t)
 	port := ln.Addr().(*net.TCPAddr).Port
 	require.NoError(t, ln.Close())
 	return port
 }
 
+// startLoopbackServer starts an httptest server on a rig port.
+func startLoopbackServer(t *testing.T, h http.Handler, tls bool) *httptest.Server {
+	t.Helper()
+	s := httptest.NewUnstartedServer(h)
+	_ = s.Listener.Close()
+	s.Listener = listenLoopback(t)
+	if tls {
+		s.StartTLS()
+	} else {
+		s.Start()
+	}
+	return s
+}
+
 // newRig makes the directories, mints two owners and two machines, and starts
-// the issuer that knows their clients.
-func newRig(t *testing.T) *rig {
+// the issuer that knows their clients. Each worker-only build gets a machine
+// of its own, owned by B's owner and enrolled through the build's own CLI, so
+// its cells (the issuer's revocation among them) never touch A or B.
+func newRig(t *testing.T, workerOnly ...build) *rig {
 	t.Helper()
 	r := &rig{t: t, dir: t.TempDir(), machines: map[string]*machineHome{}, tokens: map[string]string{},
 		adminPassword: randomSecret(t), browserSecret: randomSecret(t),
@@ -142,6 +215,14 @@ func newRig(t *testing.T) *rig {
 			require.NoError(t, os.MkdirAll(d, 0o700))
 		}
 		r.machines[m.name] = h
+	}
+	for _, b := range workerOnly {
+		h := &machineHome{name: "w-" + b.name, person: "bob", owner: r.machines["B"].owner, id: mintID(t, registry.PrefixMachine),
+			root: filepath.Join(r.dir, "machines", "w-"+b.name), cli: &b}
+		for _, d := range []string{h.txe(), h.home(), h.dagu()} {
+			require.NoError(t, os.MkdirAll(d, 0o700))
+		}
+		r.machines[h.name] = h
 	}
 	clients := map[string]string{cliClient: "cli"}
 	for _, m := range r.machines {
@@ -163,6 +244,16 @@ func (r *rig) coord() string   { return fmt.Sprintf("127.0.0.1:%d", r.coordPort)
 func (r *rig) A() *machineHome { return r.machines["A"] }
 func (r *rig) B() *machineHome { return r.machines["B"] }
 
+// machineNames lists the rig's machines in a fixed order.
+func (r *rig) machineNames() []string {
+	names := make([]string, 0, len(r.machines))
+	for name := range r.machines {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
 func (r *rig) workerClient(m *machineHome) string { return "dagu-worker-" + m.id }
 
 // hubConfig is the hub's configuration: builtin person auth with the browser
@@ -172,7 +263,7 @@ func (r *rig) workerClient(m *machineHome) string { return "dagu-worker-" + m.id
 func (r *rig) hubConfig() string {
 	var clients strings.Builder
 	fmt.Fprintf(&clients, "      - id: %s\n        class: cli\n", cliClient)
-	for _, name := range []string{"A", "B"} {
+	for _, name := range r.machineNames() {
 		m := r.machines[name]
 		fmt.Fprintf(&clients, "      - id: dagu-worker-%s\n        class: worker\n      - id: dagu-reviewer-%s\n        class: reviewer\n", m.id, m.id)
 	}
@@ -632,7 +723,11 @@ const cliTimeout = 120 * time.Second
 // command is still running then.
 func (r *rig) cliCommand(m *machineHome, args ...string) (*exec.Cmd, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), cliTimeout)
-	cmd := exec.CommandContext(ctx, r.hubBuild.path, args...)
+	bin := r.hubBuild.path
+	if m.cli != nil {
+		bin = m.cli.path
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Env = r.cliEnv(m)
 	cmdutil.SetupCommand(cmd)
 	cmd.Cancel = func() error { return cmdutil.TerminateProcessGroup(cmd, cmdutil.ForceTermination()) }
@@ -791,7 +886,11 @@ func (r *rig) startWorker(name string, b build, m *machineHome, route string, o 
 		}
 		env = append(env, "DAGU_WORKER_AUTH_CREDENTIAL_FILE="+cred)
 	}
-	args := []string{"worker", "--worker.id", id, "--worker.labels", "txe.machine=" + label, "--worker.health-port=0"}
+	healthPort := 0
+	if lo, _, _ := portBlock(); lo != 0 {
+		healthPort = freePort(r.t)
+	}
+	args := []string{"worker", "--worker.id", id, "--worker.labels", "txe.machine=" + label, fmt.Sprintf("--worker.health-port=%d", healthPort)}
 	if o.maxRuns > 0 {
 		args = append(args, "--worker.max-active-runs", fmt.Sprint(o.maxRuns))
 	}
@@ -823,7 +922,7 @@ func (r *rig) startEdge() {
 	proxy := httputil.NewSingleHostReverseProxy(origin)
 	proxy.FlushInterval = -1
 	proxy.ErrorLog = log.New(io.Discard, "", 0) // a worker's cancelled stream is not a finding
-	r.edge = httptest.NewTLSServer(proxy)
+	r.edge = startLoopbackServer(r.t, proxy, true)
 	r.caFile = filepath.Join(r.dir, "edge-ca.pem")
 	require.NoError(r.t, os.WriteFile(r.caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: r.edge.Certificate().Raw}), 0o600))
 }

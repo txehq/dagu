@@ -36,48 +36,115 @@ DAGU_MACHINEAUTH_MATRIX=source go test ./internal/intg/machineauth -run ReleaseM
 DAGU_MACHINEAUTH_MATRIX=/path/manifest.json go test ./internal/intg/machineauth -run ReleaseMatrix -v -timeout 90m
 ```
 
-The manifest names each build exactly, with the binary's path, its full sha256 and
-(optionally) the version it must report; `long: true` asks for the two slow cells.
-The test refuses to start if a binary's digest is not the manifest's.
+The manifest names each build exactly: the binary's path, its full sha256, the version
+it must report (`dagu version`, and `/health` for a hub), and its provenance record by
+path and sha256 (below). `long: true` asks for the long cells. Unknown fields are
+refused. Before any cell the test checks each binary's digest, its provenance record,
+its version and whether its worker lists `--worker.hub-url`. A build that does not hold
+stops the run.
 
 ```json
 {
   "builds": [
-    {"name": "release", "path": "/abs/dagu-release", "sha256": "<64 hex>", "version": "2.18.2-txe.20"},
-    {"name": "previous", "path": "/abs/dagu-previous", "sha256": "<64 hex>"}
+    {"name": "c", "path": "/abs/c/dagu", "sha256": "<64 hex>", "version": "2.25.8-txe.1",
+     "provenance": {"record": "/abs/c/provenance.json", "sha256": "<64 hex>"}},
+    {"name": "w18", "path": "/abs/w18/dagu", "sha256": "<64 hex>", "version": "2.18.2-txe.18",
+     "roles": ["worker"], "routes": ["native"],
+     "provenance": {"record": "/abs/w18/provenance.json", "sha256": "<64 hex>"}}
   ],
   "long": true,
   "results_dir": "/abs/results"
 }
 ```
 
-For each build it runs the cells below with that build as hub and as worker, and with
-several builds the pair cell (`pair-native`) for every ordered pair. It writes
-`machineauth-results-<utc>.json` with each binary's digest and reported version and the
-status of every cell: `pass`, `fail` or `not_run`. The test fails on any failed cell. With
-`long: false` the long cells are recorded `not_run` and the result is **partial**: a
-smoke of the build, never release acceptance.
+**Scope.** A build runs the full scope: hub and worker, over native gRPC, the channel and
+the channel through TLS. Only a build listed in `narrowedScopes` (`scope_test.go`, keyed by
+the version it reports and the source commit its record must name) may declare `roles`
+and `routes`, and only exactly as listed. The reason is the file's, reviewed with it; a
+manifest cannot give one. Today the only entry is `txe-v2.18.2-18`, the worker the Mac
+runs: it predates the worker channel, so it is a worker over native gRPC only. The
+capability probe corroborates a scope but never sets one. A full build whose worker
+lacks `--worker.hub-url` fails, and a narrowed one whose worker has it fails too.
+
+For each hub build the test runs the cells below with that build as hub and as worker,
+and the pair cell (`pair-native`) with every other build as worker. A worker-only build
+gets a machine of its own, owner B, under every hub build. It is enrolled through **its
+own CLI**, and runs `w-setup`, `pos-native`, `neg-worker-start`, `neg-worker-nocred`,
+`cancel`, `revoke-owner`, `reenrol`, and with `long: true` `stale` and `revoke-issuer`.
+Its issuer revocation refuses only its own machine's client.
+
+The test writes `machineauth-results-<utc>.json` (schema 2): the manifest's sha256; for
+each build its digest, version, scope, the binary's own account, its provenance reference
+and, for a narrowed build, what it excludes and why; and the status of every cell: `pass`,
+`fail` or `not_run`. It prints one `SCOPE` line per build at the end, NARROWED with its
+exclusions where they apply. "FULL" means full **for the manifest's scope**. The test fails
+on any failed cell. With `long: false` the long cells are recorded `not_run` and the result
+is **partial**: a smoke of the build, never release acceptance. The source mode is a smoke
+too, because it has no manifest or provenance.
 
 To run it inside a Linux container without a Go toolchain, cross-compile the test and copy
-it in: `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o machineauth.test
-./internal/intg/machineauth`, then `DAGU_MACHINEAUTH_MATRIX=manifest.json ./machineauth.test
--test.run ReleaseMatrix -test.v -test.timeout 90m`.
+it in: `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o machineauth.test
+./internal/intg/machineauth` (the architecture of the builds under test), then
+`DAGU_MACHINEAUTH_MATRIX=manifest.json ./machineauth.test -test.run ReleaseMatrix -test.v
+-test.timeout 150m`. `DAGU_MACHINEAUTH_PORTS=<lo>-<hi>` keeps every port the rig listens on
+inside an assigned block. `DAGU_MACHINEAUTH_MANIFEST_SHA256` refuses any manifest other than
+the approved one.
+
+**Provenance (`TestMachineAuthExtract`, `TestMachineAuthSourceRecord`):**
+
+```sh
+# a binary out of a published image: pull the index by digest into an OCI layout first
+# (crane pull --format=oci <repo>@<index digest> <layout>); nothing is run from the image
+DAGU_MACHINEAUTH_EXTRACT=/abs/extract-c.json go test ./internal/intg/machineauth -run MachineAuthExtract -v
+#   {"name":"c","layout":"/abs/layout-c","ref":"ghcr.io/…","index":"sha256:…","platform":"linux/amd64",
+#    "manifest":"sha256:<the platform manifest the publication recorded>","path":"/usr/local/bin/dagu","out_dir":"/abs/c"}
+
+# a build from source: the tag's commit, the binary's own build information
+DAGU_MACHINEAUTH_SOURCE_RECORD=/abs/source-w18.json go test ./internal/intg/machineauth -run MachineAuthSourceRecord -v
+#   {"name":"w18","repo":"/abs/dagu","tag":"txe-v2.18.2-18","commit":"5b011eba…","binary":"/abs/w18/dagu",
+#    "version":"2.18.2-txe.18","goos":"linux","goarch":"amd64","out":"/abs/w18/provenance.json",
+#    "installed":{"tag":"…","commit":"…","version":"…","read_from":"…"}}   (optional)
+```
+
+The extraction follows the chain index → the platform's manifest (exactly one; the
+expected digest when given) → config (the platform, one diff id per layer) → every layer
+(blob digest and uncompressed diff id) → the file's last state across layers (whiteouts and
+opaque directories honoured, a link refused). It stops at the first link that does not hold
+and leaves no binary or record behind. It never overwrites. The source record checks the
+tag's commit with git, and checks the binary's build information for platform and
+`-X main.version`. Its scope says it is **not** the installed binary of any machine. An
+installed record (the worker kit's `dagu-<version>.json`) corroborates the tag, commit and
+version only, not the bytes.
 
 **Verify (`TestMachineAuthVerify`, the release gate's command):**
 
 ```sh
 DAGU_MACHINEAUTH_VERIFY=/abs/results/machineauth-results-….json \
 DAGU_MACHINEAUTH_MATRIX=/path/manifest.json \
+DAGU_MACHINEAUTH_MANIFEST_SHA256=<the approved manifest's sha256> \
 go test ./internal/intg/machineauth -run MachineAuthVerify -v
 ```
 
-It holds a recorded run to the manifest and to the binaries on disk now, and fails on: a
-build the manifest does not name, a build missing from the results, a recorded digest that
-is not the manifest's, a binary whose digest is no longer the recorded one (or cannot be
-read), a reported version that is not the manifest's, a cell that failed or was not run, a
-missing or unknown or duplicated cell, a cell attributed to two builds, a missing pair, a
-status that is not `pass`/`fail`/`not_run`, a results schema it does not read, and a
-manifest with `long: false`. A pass cannot be carried by hand.
+It holds a recorded run to the approved manifest, to the binaries and records on disk now,
+and to `narrowedScopes`. It fails on any of these:
+
+- a manifest that is not the approved one, or results recorded under another;
+- a build the manifest does not name, or a build missing from the results;
+- a recorded digest that is not the manifest's, or a binary whose digest is no longer the
+  recorded one (or cannot be read);
+- a reported version, a recorded scope, its exclusions or reason, or the binary's own
+  account that does not agree with the manifest and `narrowedScopes`;
+- a provenance record that is not the bound one, or not for the build's binary;
+- a narrowed build whose record is not a source record of the listed commit;
+- a cell that failed or was not run;
+- a missing, unknown or duplicated cell, a cell attributed to two builds, or a missing pair;
+- a worker-only build recorded as a hub, or a missing worker-only cell under any hub;
+- a status that is not `pass`/`fail`/`not_run`;
+- a results schema it does not read;
+- a manifest with `long: false`.
+
+A pass cannot be carried by hand. It prints the `SCOPE` lines and each build's provenance
+scope.
 
 ## The cells
 
@@ -102,10 +169,12 @@ threshold; its late status and streams are refused as stale) and `revoke-issuer`
 provider refuses the refresh; the worker presents nothing more). Each takes minutes.
 
 Budget: about 3 minutes per build without the long cells, about 15 with them, plus a few
-seconds per pair.
+seconds per pair. A worker-only build adds about 13 minutes under each hub build with the long
+cells. These are native-speed figures, and emulation is slower.
 
 ## What it does not cover
 
 A real identity provider, person onboarding in a browser, the live hub and its tunnel,
-Cloudflare, Windows (a machine credential is refused there), and threats from the same
-user on the machine.
+Cloudflare, Windows (a machine credential is refused there), threats from the same user on
+the machine, and the bytes of an installed worker on another platform: a source build of its
+tag stands for its source, not for its binary.

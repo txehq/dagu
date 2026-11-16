@@ -94,7 +94,7 @@ func newIssuer(t *testing.T, clients map[string]string, browserClient, browserSe
 	mux.HandleFunc("/token", s.token)
 	mux.HandleFunc("/userinfo", s.userinfo)
 	mux.HandleFunc("/revoke", s.revoke)
-	s.server = httptest.NewServer(mux)
+	s.server = startLoopbackServer(t, mux, false)
 	t.Cleanup(s.server.Close)
 	return s
 }
