@@ -149,23 +149,23 @@ class Cmd:
     def __init__(self):
         self.words: list[Word] = []
         # Descriptor ("0" is stdin, "3", "{name}") -> ("file", path) | ("procsub", cmds) |
-        # ("text", here-document or here-string) | ("dup", other descriptor, resolved when judged,
-        # after every here-document body has been read).
+        # ("text", here-string) | ["text", here-document body] (a list, filled in when the body
+        # is read at the next newline, so a duplication made before then shares it) |
+        # ("unknown", descriptor) for a duplication of a descriptor this command does not set.
         self.fds: dict = {}
         self.piped_from: "Cmd | None" = None
 
-    def source(self, key: str, hops: int = 0):
-        """What descriptor `key` reads, as (kind, value), or None when the command does not set it.
-        A duplication that cannot be resolved is ("unknown", key)."""
-        src = self.fds.get(key)
-        if src is None or src[0] != "dup":
-            return src
-        if hops > 16 or src[1] not in self.fds:
-            return ("unknown", src[1])
-        return self.source(src[1], hops + 1)
+    def source(self, key: str):
+        """What descriptor `key` reads, as (kind, value), or None when the command does not set it."""
+        return self.fds.get(key)
 
     def set_source(self, key: str, src):
         self.fds[key] = src
+
+    def duplicate(self, key: str, other: str):
+        """`key<&other`: key reads what `other` holds NOW (redirections apply left to right, so a
+        later change to `other` does not change key)."""
+        self.fds[key] = self.fds.get(other) or ("unknown", other)
 
 
 REDIRECT = re.compile(r"(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)")
@@ -281,12 +281,13 @@ class Parser:
         src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
-            self.heredocs.append((cur, key, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
+            pending = ["text", ""]  # its body is read at the next newline
+            cur.set_source(key, pending)
+            self.heredocs.append((pending, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
         elif op == "<<<":
             cur.set_source(key, ("text", target.text))
         elif op in ("<&", ">&") and re.fullmatch(r"[0-9]+-?", target.text):
-            # `<&3` or `<&3-` (move): this descriptor reads what fd 3 holds, resolved when judged.
-            cur.set_source(key, ("dup", str(int(target.text.rstrip("-")))))
+            cur.duplicate(key, str(int(target.text.rstrip("-"))))  # `<&3` or `<&3-` (move)
         elif op in ("<&", ">&") and target.text == "-":
             cur.fds.pop(key, None)  # closed
         elif op in ("&>", "&>>") or (op == ">&" and not fd):
@@ -297,7 +298,7 @@ class Parser:
 
     def read_heredocs(self):
         s = self.s
-        for cmd, key, delim, strip_tabs, quoted in self.heredocs:
+        for pending, delim, strip_tabs, quoted in self.heredocs:
             lines = []
             while self.i < len(s):
                 nl = s.find("\n", self.i)
@@ -307,7 +308,7 @@ class Parser:
                     break
                 lines.append(line)
             body = "\n".join(lines)
-            cmd.set_source(key, ("text", body))
+            pending[1] = body
             if not quoted:  # an unquoted body expands $(...) and backticks: those commands run
                 p = Parser(body, self.depth)
                 p.dquote(None)
@@ -435,20 +436,24 @@ def names_mutant_script(words) -> bool:
     return any(mutant_named(w.text, need_ext=True) for w in words)
 
 
+FD_DIR = re.compile(r"^/(?:dev/fd|proc/[^/]+/fd)(?:/|$)")
 FD_PATH = re.compile(r"^/(?:dev/fd|proc/[^/]+/fd)/([0-9]+)$")
 STDIN_PATHS = {"/dev/stdin"}
 
 
 def fd_of_path(text: str):
     """The descriptor a /dev/fd/N, /proc/<pid|self|thread-self>/fd/N or /dev/stdin path names
-    (after normalising `//`, `.` and `..`), or None for any other path."""
+    (after normalising `//`, `.` and `..`); "?" for any other path in a descriptor directory (a
+    variable, `/dev/fd/$N`), which cannot be judged; None for any other path."""
     if not text.startswith("/"):
         return None
     p = os.path.normpath("/" + text.lstrip("/"))
     if p in STDIN_PATHS:
         return "0"
     m = FD_PATH.match(p)
-    return str(int(m.group(1))) if m else None
+    if m:
+        return str(int(m.group(1)))
+    return "?" if FD_DIR.match(p) else None
 
 
 def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) -> bool:
@@ -618,10 +623,16 @@ class Judge:
                 j += 1
                 break
             if t in SHELL_LONG_VALUE or t.split("=")[0] in SHELL_LONG_VALUE:
-                # --rcfile FILE / --rcfile=FILE: an interactive shell runs FILE first
-                value = t.split("=", 1)[1] if "=" in t else (args[j + 1].text if j + 1 < len(args) else "")
-                if mutant_named(value):
-                    return True
+                # --rcfile FILE / --rcfile=FILE: an interactive shell runs FILE first, so it is
+                # judged as a script operand (process substitution and /dev/fd paths included)
+                if "=" in t:
+                    value = Word()
+                    value.text = t.split("=", 1)[1]
+                else:
+                    value = args[j + 1] if j + 1 < len(args) else Word()
+                if value.text or value.procsub is not None:
+                    if operand_is_mutant(value, cmd, True, self.depth):
+                        return True
                 j += 1 if "=" in t else 2
             elif t in ("-o", "+o", "-O", "+O"):
                 j += 2
