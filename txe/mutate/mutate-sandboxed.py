@@ -318,8 +318,14 @@ def clone_dir(src: Path, dst: Path) -> None:
 # ---------------------------------------------------------------- host go facts
 
 
-def go_env(names: list[str], env: dict[str, str]) -> dict[str, str]:
-    out = subprocess.run(["go", "env", "-json", *names], capture_output=True, text=True, env=env, timeout=60)
+def go_env(names: list[str], env: dict[str, str], deadline_at: float | None = None) -> dict[str, str]:
+    limit = min(60.0, deadline_at - time.monotonic()) if deadline_at else 60.0
+    if limit <= 0:
+        raise Stopped("the whole-run deadline passed before go env")
+    try:
+        out = subprocess.run(["go", "env", "-json", *names], capture_output=True, text=True, env=env, timeout=limit)
+    except subprocess.TimeoutExpired as e:
+        raise Stopped(f"go env took longer than {limit:.0f}s") from e
     if out.returncode != 0:
         raise Refused(f"go env failed: {out.stderr.strip()}")
     return json.loads(out.stdout)
@@ -358,12 +364,12 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
     except OSError:
         pass
     probe = subprocess.run([docker, "inspect", "--format", "{{.Name}} {{index .Config.Labels \"" + OWNER_LABEL + "\"}}",
-                            target], capture_output=True, text=True, env=env, timeout=30)
+                            target], capture_output=True, text=True, env=env, timeout=15)
     if probe.returncode != 0:
         return f"{target}: absent"
     if probe.stdout.strip() != f"/{name} {token}":
         return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
-    rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env, timeout=60)
+    rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env, timeout=30)
     return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
@@ -569,7 +575,7 @@ def parse(argv: list[str]):
 
 def resolve_shared(args) -> tuple[Path, Path, Path, str]:
     """The shared GOMODCACHE, GOCACHE and GOPATH, and the caller's GOPROXY."""
-    facts = go_env(["GOMODCACHE", "GOCACHE", "GOPATH", "GOPROXY"], dict(os.environ))
+    facts = go_env(["GOMODCACHE", "GOCACHE", "GOPATH", "GOPROXY"], dict(os.environ), args.deadline_at)
     modcache = real(args.shared_modcache or facts["GOMODCACHE"])
     gocache = real(args.shared_gocache or facts["GOCACHE"])
     gopath = real(facts["GOPATH"].split(os.pathsep)[0])
@@ -629,6 +635,9 @@ def main(argv: list[str]) -> int:
     except Refused as e:
         print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
         return EXIT_REFUSED
+    except Stopped as e:
+        print(f"mutate-sandboxed: stopped: {e}", file=sys.stderr)
+        return EXIT_STOPPED
     home = real(os.environ.get("HOME") or Path.home())
     forbidden = {"shared GOMODCACHE": modcache, "shared GOCACHE": gocache, "GOPATH": gopath, "HOME": home,
                  "live tree": args.tree, "docker socket": Path("/var/run/docker.sock")}

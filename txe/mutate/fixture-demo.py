@@ -51,9 +51,9 @@ SENTINEL_TEXT = "TXE-7549 fixture sentinel\n"
 
 
 class Demo:
-    def __init__(self, args):
+    def __init__(self, args, end: float):
         self.args = args
-        self.end = time.monotonic() + args.deadline
+        self.end = end
         self.margin = min(45.0, args.deadline / 3)
         self.evidence = args.evidence
         self.log_path = self.evidence / f"{args.step}.log"
@@ -200,18 +200,24 @@ def parse(argv):
 
 def main(argv) -> int:
     args = parse(argv)
+    end = time.monotonic() + args.deadline  # the clock starts before any preflight
     if not args.image.startswith("sha256:"):
         print("give the image by its immutable id (sha256:...), not a tag", file=sys.stderr)
         return 2
     if args.deadline < 30:
         print("--deadline must be at least 30 seconds", file=sys.stderr)
         return 2
-    if subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True,
-                      env=ms.docker_client_env()).returncode != 0:
+    try:
+        inspected = subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True,
+                                   env=ms.docker_client_env(), timeout=min(60.0, (end - time.monotonic()) / 3))
+    except subprocess.TimeoutExpired:
+        print("docker image inspect did not answer inside the deadline's preflight budget", file=sys.stderr)
+        return 1
+    if inspected.returncode != 0:
         print(f"image {args.image} is not present locally; this demonstration pulls nothing", file=sys.stderr)
         return 2
     args.evidence.mkdir(parents=True, exist_ok=True)
-    demo = Demo(args)
+    demo = Demo(args, end)
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, ms.stop_on_signal)
     ok = False

@@ -875,3 +875,14 @@ func TestDeadlineCoversImageCheck(t *testing.T) {
 	assert.Contains(t, o.stderr, "docker image inspect took longer than")
 	assert.Empty(t, dockerRuns(t, f.log))
 }
+
+// The demo's clock also starts before its own image check: a hung check ends inside the deadline.
+func TestDemoDeadlineCoversImageCheck(t *testing.T) {
+	root := t.TempDir()
+	docker := fakeDocker(t, root, filepath.Join(root, "docker.log"))
+	start := time.Now()
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:slowinspect", "--deadline", "30")
+	assert.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
+	assert.Less(t, time.Since(start), 20*time.Second)
+	assert.Contains(t, out.String(), "did not answer inside the deadline")
+}
