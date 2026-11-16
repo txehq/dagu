@@ -388,7 +388,10 @@ files.
   it at that moment: an approved `dagu.retry_run` to re-run that execution,
   of the job's current version, executing its current attempt under a
   live grant. A grant that expired while the retry waited refuses it. A
-  republish approval is never carried out as a re-run. A refused retry
+  queued retry names no step, so it carries out only a retry that names
+  no intent: an approved republish, or an approved explicit rerun (sent
+  only as a retry of step `run` with its downstream), is refused there as
+  not applied, never carried out as a whole-run retry. A refused retry
   ends aborted with the reason, is noted on the job, and leaves the
   retried execution as it was; an action whose grant lapsed becomes
   uncertain and is put to the owner. A retry queued with no request is

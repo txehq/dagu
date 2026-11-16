@@ -48,19 +48,32 @@ type QueuedRetry struct {
 
 // checkRetryRun binds a queued retry to its action as the hub binds a retry
 // it admits: the one validator TXE-7517 exports, CheckRetryRun, called with
-// the rerun intent. Until it is wired, it is nil and every queued retry of a
-// registered job is refused.
+// the only intent a queued retry can carry, an unspecified (whole-run) retry.
+// Until it is wired, it is nil and every queued retry of a registered job is
+// refused.
 var checkRetryRun func(job *Job, action *Action, q QueuedRetry, now time.Time) error
+
+// queuedRetryForm is the part of a dagu.retry_run action's params that names
+// its intent (RetryRunParams Step, and Rerun from TXE-7515): read apart so
+// that a field this version does not know cannot be dropped silently.
+type queuedRetryForm struct {
+	Step  string `json:"step"`
+	Rerun bool   `json:"rerun"`
+}
 
 // AdmitQueuedRetry decides, when the queue dispatches it, whether a queued
 // retry of job jobID's run may run that execution again. A queued retry is
-// always a rerun of the whole run: Dagu queues no step retry. So an action a
-// person approved as a republish of the sealed result (step "publish") is
-// refused here and never carried out as a rerun; a republish is dispatched
-// by the hub alone. The rest of the binding (attempt, binding digest, run
-// and execution, approval, live grant, version) is checkRetryRun's, read
-// now rather than when the retry was queued. An error is returned only when
-// the registry cannot be read; callers must then leave the retry queued.
+// always a retry of the whole run with no step: Dagu queues no step retry.
+// So it carries out only an unspecified dagu.retry_run, the form a person's
+// retry has always had. An approval of a republish (step "publish", which
+// the hub sends as a retry of that step accepting failed prerequisites) or
+// of an explicit rerun (rerun, which the hub sends as a retry of step "run"
+// with its downstream) is never carried out as a queued whole-run retry: it
+// is refused, not applied, before anything runs. The rest of the binding
+// (attempt, binding digest, run and execution, approval, live grant,
+// version) is checkRetryRun's, read now rather than when the retry was
+// queued. An error is returned only when the registry cannot be read;
+// callers must then leave the retry queued.
 func (s *Store) AdmitQueuedRetry(ctx context.Context, jobID string, q QueuedRetry) (Admission, error) {
 	job, err := s.GetJob(ctx, jobID)
 	if err != nil {
@@ -70,16 +83,21 @@ func (s *Store) AdmitQueuedRetry(ctx context.Context, jobID string, q QueuedRetr
 		return Admission{}, err
 	}
 	refuse := func(reason string) (Admission, error) {
-		return refuseRun(jobID, AdmitRetryNotApproved, reason), nil
+		return refuseRun(jobID, AdmitRetryNotApproved, "not applied: "+reason), nil
 	}
 	action := job.Actions[q.Request.ActionID]
 	if action != nil && action.Spec.Name == ActionRetryRun {
-		var params RetryRunParams
-		if err := json.Unmarshal(action.Spec.Params, &params); err != nil {
+		var form queuedRetryForm
+		if err := json.Unmarshal(action.Spec.Params, &form); err != nil {
 			return refuse(fmt.Sprintf("action %s has unreadable params", action.ActionID))
 		}
-		if params.Step != "" {
-			return refuse(fmt.Sprintf("action %s was approved to retry step %q, not to rerun the run; a queued retry only reruns, so it is not carried out", action.ActionID, params.Step))
+		switch {
+		case form.Step == RetryStepPublish:
+			return refuse(fmt.Sprintf("action %s was approved as a republish of the sealed result; a queued retry re-runs the whole run, so it is not carried out", action.ActionID))
+		case form.Step != "":
+			return refuse(fmt.Sprintf("action %s names step %q, which no queued retry carries", action.ActionID, form.Step))
+		case form.Rerun:
+			return refuse(fmt.Sprintf("action %s was approved as an explicit rerun, which runs only as a retry of step %q with its downstream; a queued retry names no step, so it is not carried out", action.ActionID, "run"))
 		}
 	}
 	if checkRetryRun == nil {

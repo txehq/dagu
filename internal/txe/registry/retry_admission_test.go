@@ -23,46 +23,78 @@ func withCheckRetryRun(t *testing.T, check func(*Job, *Action, QueuedRetry, time
 	t.Cleanup(func() { checkRetryRun = saved })
 }
 
-// putRetryAction stores a dagu.retry_run action with params on the job, as
-// an approval would leave it executing.
-func putRetryAction(t *testing.T, f *fixture, jobID, actionID string, params RetryRunParams) {
+func queuedRetry(actionID string) QueuedRetry {
+	return QueuedRetry{RunID: "run-1", AttemptID: "a1", QueuedAt: "q1",
+		Request: ir.RetryRequest{ID: "req", ActionID: actionID, ActionAttempt: "1", BindingDigest: "sha256:b", RetryOf: ir.ExecutionRef("a1", "q1")}}
+}
+
+// putRetryForm stores a dagu.retry_run action whose params are raw.
+func putRetryForm(t *testing.T, f *fixture, jobID, actionID, raw string) {
 	t.Helper()
-	raw, err := json.Marshal(params)
-	require.NoError(t, err)
-	_, err = f.tx(jobID, agent, func(tx *JobTx) error {
+	_, err := f.tx(jobID, agent, func(tx *JobTx) error {
 		if tx.Job.Actions == nil {
 			tx.Job.Actions = map[string]*Action{}
 		}
 		tx.Job.Actions[actionID] = &Action{ActionID: actionID, Kind: ActionApproved, State: ActionExecuting, Attempt: 1,
-			JobVersion: tx.Job.Version, Spec: ActionSpec{Name: ActionRetryRun, Params: raw}}
+			JobVersion: tx.Job.Version, Spec: ActionSpec{Name: ActionRetryRun, Params: json.RawMessage(raw)}}
 		tx.touch()
 		return nil
 	})
 	require.NoError(t, err)
 }
 
-func queuedRetry(actionID string) QueuedRetry {
-	return QueuedRetry{RunID: "run-1", AttemptID: "a1", QueuedAt: "q1",
-		Request: ir.RetryRequest{ID: "req", ActionID: actionID, ActionAttempt: "1", BindingDigest: "sha256:b", RetryOf: ir.ExecutionRef("a1", "q1")}}
+// A queued retry re-runs the whole run with no step. An approval of a
+// republish, of an explicit rerun (TXE-7515's rerun, carried out only as a
+// retry of step "run" with its downstream) or of any other step is refused
+// as not applied, whatever the binding would say: neither is coerced into a
+// whole-run retry.
+func TestAdmitQueuedRetryRefusesFormsAQueueDoesNotCarry(t *testing.T) {
+	for name, tc := range map[string]struct{ params, reason string }{
+		"republish":      {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"publish"}`, "republish"},
+		"explicit rerun": {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","rerun":true}`, "explicit rerun"},
+		"another step":   {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"run"}`, `step "run"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			job := f.ready("k")
+			putRetryForm(t, f, job.JobID, "act_form", tc.params)
+			bound := false
+			withCheckRetryRun(t, func(*Job, *Action, QueuedRetry, time.Time) error { bound = true; return nil })
+
+			adm, err := f.store.AdmitQueuedRetry(f.ctx, job.JobID, queuedRetry("act_form"))
+
+			require.NoError(t, err)
+			assert.False(t, adm.Admit)
+			assert.Equal(t, AdmitRetryNotApproved, adm.Code)
+			assert.Contains(t, adm.Reason, "not applied")
+			assert.Contains(t, adm.Reason, tc.reason)
+			assert.False(t, bound, "the form is refused before the binding")
+		})
+	}
 }
 
-// A queued retry only reruns the whole run. An action a person approved as a
-// republish of the sealed result is refused, not carried out as a rerun,
-// whatever the binding would say.
-func TestAdmitQueuedRetryRefusesPublishIntent(t *testing.T) {
-	f := newFixture(t)
-	job := f.ready("k")
-	putRetryAction(t, f, job.JobID, "act_publish", RetryRunParams{RunID: "run-1", AttemptID: "a1", QueuedAt: "q1", Step: RetryStepPublish})
-	bound := false
-	withCheckRetryRun(t, func(*Job, *Action, QueuedRetry, time.Time) error { bound = true; return nil })
+// The legacy form, a person's retry that names no intent (no step, no
+// rerun), is what a queued retry carries: it goes to the binding unchanged,
+// so the explicit forms do not redefine an unspecified action.
+func TestAdmitQueuedRetryLegacyUnspecifiedReachesTheBinding(t *testing.T) {
+	for name, params := range map[string]string{
+		"no intent fields": `{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","run_spec_sha256":"sha256:s","package_digest":"sha256:p"}`,
+		"rerun false":      `{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","rerun":false}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			job := f.ready("k")
+			putRetryForm(t, f, job.JobID, "act_legacy", params)
+			bound := false
+			withCheckRetryRun(t, func(*Job, *Action, QueuedRetry, time.Time) error { bound = true; return nil })
 
-	adm, err := f.store.AdmitQueuedRetry(f.ctx, job.JobID, queuedRetry("act_publish"))
+			adm, err := f.store.AdmitQueuedRetry(f.ctx, job.JobID, queuedRetry("act_legacy"))
 
-	require.NoError(t, err)
-	assert.False(t, adm.Admit)
-	assert.Equal(t, AdmitRetryNotApproved, adm.Code)
-	assert.Contains(t, adm.Reason, `step "publish"`)
-	assert.False(t, bound, "a publish intent never reaches the rerun binding")
+			require.NoError(t, err)
+			assert.True(t, adm.Admit)
+			assert.True(t, bound)
+		})
+	}
 }
 
 // The binding decides the rest, at dispatch, with the job and action as they
@@ -70,7 +102,7 @@ func TestAdmitQueuedRetryRefusesPublishIntent(t *testing.T) {
 func TestAdmitQueuedRetryAsksTheBinding(t *testing.T) {
 	f := newFixture(t)
 	job := f.ready("k")
-	putRetryAction(t, f, job.JobID, "act_rerun", RetryRunParams{RunID: "run-1", AttemptID: "a1", QueuedAt: "q1"})
+	putRetryForm(t, f, job.JobID, "act_rerun", `{"run_id":"run-1","attempt_id":"a1","queued_at":"q1"}`)
 	q := queuedRetry("act_rerun")
 
 	var got QueuedRetry
