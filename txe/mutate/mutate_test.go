@@ -1121,22 +1121,36 @@ func TestWriteBoundsStopRun(t *testing.T) {
 	}
 }
 
-// Source preparation is inside the whole-run deadline: a tree too large to copy in time stops
-// the run (exit 6) without starting a container, close to the deadline.
+// Source preparation is inside the whole-run deadline: the host-side copies check it per file,
+// so a copy whose deadline passes stops promptly instead of running to the end, and a copy whose
+// deadline has already passed copies nothing.
 func TestTreeCopyInsideDeadline(t *testing.T) {
-	f := newFixture(t, passingCheck)
-	big := filepath.Join(f.tree, "big")
-	require.NoError(t, os.MkdirAll(big, 0o755))
-	for i := range 20000 {
-		require.NoError(t, os.WriteFile(filepath.Join(big, fmt.Sprintf("f%05d", i)), nil, 0o644))
-	}
-	start := time.Now()
-	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--deadline", "3")
-	elapsed := time.Since(start)
-	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	assert.Contains(t, o.stderr, "whole-run deadline passed while")
-	assert.Less(t, elapsed, 8*time.Second)
-	assert.Empty(t, dockerRuns(t, f.log))
+	root := t.TempDir()
+	prog := `
+import importlib.util, os, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+src = root / "src"; (src / "big").mkdir(parents=True)
+for i in range(20000):
+    open(src / "big" / ("f%05d" % i), "w").close()
+def attempt(fn):
+    start = time.monotonic()
+    try:
+        fn()
+        return "completed", time.monotonic() - start
+    except ms.Stopped:
+        return "stopped", time.monotonic() - start
+full, full_secs = attempt(lambda: ms.copy_tree(src, root / "full", ()))
+cut, cut_secs = attempt(lambda: ms.copy_tree(src, root / "cut", (), time.monotonic() + 0.05))
+copied = sum(1 for _ in (root / "cut" / "big").iterdir()) if (root / "cut" / "big").exists() else 0
+gone, _ = attempt(lambda: ms.clone_dir(src, root / "late", time.monotonic() - 1))
+print(full, cut, gone, copied < 20000, cut_secs < full_secs, (root / "late").exists())
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "completed stopped stopped True True False\n", string(out))
 }
 
 // Run directories do not accumulate: each is discarded once its result is recorded, and the

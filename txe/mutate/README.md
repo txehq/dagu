@@ -91,6 +91,12 @@ result: every baseline and mutant run executes its tests.
   after confirming its container is gone or stopped.
 - A tree holding a symlink that resolves outside it is refused: a host-side step (the seed's
   `go mod download` updating `go.sum`, say) could write through it into live files.
+- **Seeding trusts the tree.** The seed's `go mod download` fetches every module the tree's
+  `go.mod` requires from the shared cache (private modules included), and code in the sandbox can
+  read them, and could encode them into its verdicts. The runner's threat is its own mutants
+  breaking guards in the caller's own tree, not a hostile tree. For a tree you do not trust, run
+  with `--no-seed`: nothing is read from the shared module cache and the sandbox has
+  `GOPROXY=off`.
 - On Linux the identity is device and inode only: Python's `os.stat` has no birth time there.
 - **The host checks are an alarm, not proof that nothing changed.** They see a watched directory
   replaced, an entry one level inside a shared cache removed or replaced, and a sentinel's content
