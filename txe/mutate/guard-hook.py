@@ -115,6 +115,10 @@ FIND_EXEC = {"-exec", "-execdir", "-ok", "-okdir"}
 GO_VALUE_FLAGS = {"-C", "-o", "-p", "-tags", "-ldflags", "-gcflags", "-asmflags", "-exec", "-mod",
                   "-modfile", "-overlay", "-pkgdir", "-toolexec", "-pgo", "-covermode", "-coverpkg"}
 MAX_DEPTH = 24
+# go's flags that name a program go runs, alone (value in the next word) or with =value, also
+# inside a GOFLAGS=... word.
+GO_EXEC_FLAG = re.compile(r"(?:^|=)--?(?:exec|toolexec|vettool)(?:=(.*))?$")
+VAR_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 # Code given to a non-shell interpreter (`python3 -c`, `node -e`, a here-document on python3's
 # stdin) runs a mutant when it imports one, or when it names a mutant script or tool AND calls
 # something that runs a file or a process.
@@ -861,7 +865,27 @@ class Judge:
             return operand_is_mutant(args[j], cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
+    def go_exec_runs_mutant(self, words: list, env: list) -> bool:
+        """`-exec XPROG`, `-toolexec XPROG` and `-vettool XPROG` make go run XPROG, on any go
+        subcommand and also through GOFLAGS (in the environment or `go env -w GOFLAGS=...`): each
+        value is judged as a command. A variable in it is resolved from this command's assignments;
+        one that cannot be resolved cannot be judged and is refused."""
+        tokens = list(words) + [w for v in env for w in v.split()]  # GOFLAGS is split on spaces
+        for n, tok in enumerate(tokens):
+            m = GO_EXEC_FLAG.search(tok)
+            if not m:
+                continue
+            value = m.group(1) if m.group(1) is not None else (tokens[n + 1] if n + 1 < len(tokens) else "")
+            value = VAR_REF.sub(lambda v: self.vars.get(v.group(1) or v.group(2), "\0"), value)
+            if "\0" in value or "$" in value or "`" in value:
+                return True
+            if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
+                return True
+        return False
+
     def go_run(self, args: list) -> bool:
+        if self.go_exec_runs_mutant([a.text for a in args], self.env_values()):
+            return True
         if not args or args[0].text not in ("run", "test"):
             return False
         j, ops = 1, []
@@ -870,11 +894,6 @@ class Judge:
             if t == "--":
                 j += 1
                 continue
-            if t in ("-exec", "--exec") or t.startswith(("-exec=", "--exec=")):
-                # go run|test -exec XPROG: go runs `XPROG a.out args`, so XPROG is a command
-                value = t.split("=", 1)[1] if "=" in t else (args[j + 1].text if j + 1 < len(args) else "")
-                if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
-                    return True
             if t.startswith("-"):
                 j += 2 if t in GO_VALUE_FLAGS and "=" not in t else 1
                 continue
