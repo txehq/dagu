@@ -7,3 +7,12 @@ jobs:
       - run: |
           scratch="$(mktemp -d)"
           rm -rf "$scratch"
+  windows:
+    steps:
+      - shell: pwsh
+        run: Remove-Item -Recurse -Force $env:GOCACHE # want:env-path-delete
+      - shell: pwsh
+        run: |
+          $cache = go env GOMODCACHE
+          Remove-Item -Recurse -Force $cache # want:env-path-delete
+          Remove-Item -Recurse -Force .\build

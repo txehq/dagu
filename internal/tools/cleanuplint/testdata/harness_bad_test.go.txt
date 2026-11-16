@@ -63,6 +63,15 @@ func TestPlanted(t *testing.T) {
 
 func cacheDir() string { return filepath.Join(os.Getenv("HOME"), ".cache") }
 
+func namedCacheDir() (dir string) {
+	dir = os.Getenv("GOCACHE")
+	return
+}
+
+func TestNamedReturn(t *testing.T) {
+	_ = os.RemoveAll(namedCacheDir()) // want:env-path-delete
+}
+
 func removeTree(dir string) {
 	_ = os.RemoveAll(dir) // want:env-path-delete
 }

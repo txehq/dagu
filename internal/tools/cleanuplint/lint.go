@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -197,6 +198,14 @@ func lintSources(srcs []source) Result {
 			continue
 		}
 		fs, ds := lintScript(s)
+		if isYAML(s.rel) {
+			// A workflow step may run under shell: pwsh, so its run:
+			// blocks are read as PowerShell as well.
+			ps := s
+			ps.lang = langPowerShell
+			more, _ := lintScript(ps)
+			fs = mergeFindings(fs, more)
+		}
 		raw = append(raw, fs...)
 		dirs[s.rel] = ds
 	}
@@ -214,6 +223,21 @@ func lintSources(srcs []source) Result {
 	}
 	res.Findings, res.Allowed = applyDirectives(raw, dirs)
 	return res
+}
+
+func isYAML(rel string) bool {
+	ext := path.Ext(rel)
+	return ext == ".yml" || ext == ".yaml"
+}
+
+// mergeFindings adds to a the findings of b on a line and rule a lacks.
+func mergeFindings(a, b []Finding) []Finding {
+	for _, f := range b {
+		if !slices.ContainsFunc(a, func(g Finding) bool { return g.Line == f.Line && g.Rule == f.Rule }) {
+			a = append(a, f)
+		}
+	}
+	return a
 }
 
 type directiveAt struct {

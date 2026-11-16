@@ -221,7 +221,16 @@ func (p *goPkg) solveFunc(gf *goFile, fd *ast.FuncDecl) bool {
 			}
 		case *ast.ReturnStmt:
 			if fd.Recv == nil && !p.retTainted[fd.Name.Name] {
-				for _, r := range n.Results {
+				results := n.Results
+				if len(results) == 0 && fd.Type.Results != nil {
+					// A bare return returns the named results.
+					for _, field := range fd.Type.Results.List {
+						for _, name := range field.Names {
+							results = append(results, name)
+						}
+					}
+				}
+				for _, r := range results {
 					if p.tainted(gf, local, r) {
 						p.retTainted[fd.Name.Name] = true
 						changed = true
