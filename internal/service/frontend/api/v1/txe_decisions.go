@@ -102,15 +102,76 @@ func (a *API) DecideTxeProposal(ctx context.Context, req api.DecideTxeProposalRe
 	return out, nil
 }
 
+// txeRetryBody is what a person's retry or republish request carries.
+type txeRetryBody struct {
+	IdempotencyKey     string
+	ExpectedJobVersion int
+	AttemptID          *string
+	QueuedAt           *string
+	RunSpecSHA256      *string
+	Actor              *api.TxeActor
+}
+
 // RequestTxeRunRetry records a person's request to retry one exact run of a
 // job. The request becomes a decided dagu.retry_run proposal; the reviewer
 // performs the retry under an execution claim through the action journal, so
-// this records the decision and runs nothing.
+// this records the decision and runs nothing. Without a mode the retry is
+// unspecified; mode rerun runs the job again on purpose. A republish is never
+// asked for here (see RequestTxeRunRepublish).
 func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetryRequestObject) (api.RequestTxeRunRetryResponseObject, error) {
 	body, err := txeBody(req.Body)
 	if err != nil {
 		return nil, err
 	}
+	intent := registry.RetryIntentUnspecified
+	if body.Mode != nil {
+		if *body.Mode != api.TxeRetryRequestModeRerun {
+			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
+				Message: fmt.Sprintf("mode %q is not a retry mode; only %q is, and a republish has its own endpoint", *body.Mode, api.TxeRetryRequestModeRerun),
+				Details: map[string]any{"code": "invalid_mode"}}
+		}
+		intent = registry.RetryIntentRerun
+	}
+	res, err := a.txeRequestRetry(ctx, req.JobId, req.RunId, txeRetryBody{
+		IdempotencyKey: body.IdempotencyKey, ExpectedJobVersion: body.ExpectedJobVersion,
+		AttemptID: body.AttemptId, QueuedAt: body.QueuedAt, RunSpecSHA256: body.RunSpecSha256, Actor: body.Actor,
+	}, intent)
+	if err != nil {
+		return nil, err
+	}
+	out, err := txeRetryResponse(res)
+	if err != nil {
+		return nil, err
+	}
+	return api.RequestTxeRunRetry200JSONResponse(out), nil
+}
+
+// RequestTxeRunRepublish records a person's request to publish what one
+// execution of a run sealed, without running the job again (TXE-7515): a
+// decided dagu.retry_run proposal with step publish. It has its own path so
+// that a hub without it answers 404 and never records a re-run instead.
+func (a *API) RequestTxeRunRepublish(ctx context.Context, req api.RequestTxeRunRepublishRequestObject) (api.RequestTxeRunRepublishResponseObject, error) {
+	body, err := txeBody(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	res, err := a.txeRequestRetry(ctx, req.JobId, req.RunId, txeRetryBody{
+		IdempotencyKey: body.IdempotencyKey, ExpectedJobVersion: body.ExpectedJobVersion,
+		AttemptID: body.AttemptId, QueuedAt: body.QueuedAt, RunSpecSHA256: body.RunSpecSha256, Actor: body.Actor,
+	}, registry.RetryIntentRepublish)
+	if err != nil {
+		return nil, err
+	}
+	out, err := txeRetryResponse(res)
+	if err != nil {
+		return nil, err
+	}
+	return api.RequestTxeRunRepublish200JSONResponse(out), nil
+}
+
+// txeRequestRetry records a person's retry of one exact execution of a
+// job's run with the given intent.
+func (a *API) txeRequestRetry(ctx context.Context, jobID, runID string, body txeRetryBody, intent string) (*decision.Result, error) {
 	store, err := a.txeStore()
 	if err != nil {
 		return nil, err
@@ -119,27 +180,28 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if err != nil {
 		return nil, err
 	}
-	if _, err := a.txeVisibleJob(ctx, store, req.JobId); err != nil {
+	if _, err := a.txeVisibleJob(ctx, store, jobID); err != nil {
 		return nil, err
 	}
-	if err := a.txeAuthorizeJob(ctx, req.JobId, authz.PermissionApprove, txeNeed{}); err != nil {
+	if err := a.txeAuthorizeJob(ctx, jobID, authz.PermissionApprove, txeNeed{}); err != nil {
 		return nil, err
 	}
 	// The person decides on the execution they reviewed, so the request must
 	// name it completely: a request without it would bind whatever execution
 	// is latest, one they may never have seen. An empty queued_at is a value
 	// (never queued), distinct from an absent one.
-	if body.AttemptId == nil || *body.AttemptId == "" || body.QueuedAt == nil {
+	if body.AttemptID == nil || *body.AttemptID == "" || body.QueuedAt == nil {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest,
 			Message: "attempt_id and queued_at of the execution you reviewed are required",
 			Details: map[string]any{"code": "missing_execution"}}
 	}
 	retry := decision.RetryRequest{
-		RunID:              req.RunId,
-		AttemptID:          *body.AttemptId,
+		RunID:              runID,
+		AttemptID:          *body.AttemptID,
 		QueuedAt:           *body.QueuedAt,
 		ExpectedJobVersion: body.ExpectedJobVersion,
 		IdempotencyKey:     body.IdempotencyKey,
+		Intent:             intent,
 	}
 	if err := retry.ValidateShape(); err != nil {
 		return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
@@ -152,20 +214,20 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	// every path, the caller must be able to see the run by its own saved
 	// workspace before anything is answered: a job that moved workspace
 	// says nothing about an execution saved in its old one.
-	res, found, err := svc.ReplayRetry(ctx, req.JobId, retry, actor)
+	res, found, err := svc.ReplayRetry(ctx, jobID, retry, actor)
 	if err != nil && !found {
 		return nil, txeError(err)
 	}
-	if _, verr := a.txeJobRunStatus(ctx, req.JobId, req.RunId); verr != nil {
+	if _, verr := a.txeJobRunStatus(ctx, jobID, runID); verr != nil {
 		return nil, verr
 	}
 	if found {
 		if err != nil {
 			return nil, txeError(err)
 		}
-		return txeRetryResponse(res)
+		return res, nil
 	}
-	run, err := a.txeRunFacts(ctx, req.JobId, req.RunId)
+	run, err := a.txeRunFacts(ctx, jobID, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -176,42 +238,42 @@ func (a *API) RequestTxeRunRetry(ctx context.Context, req api.RequestTxeRunRetry
 	if retry.AttemptID != run.attemptID || retry.QueuedAt != run.queuedAt {
 		return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 			Message: fmt.Sprintf("run %s is now at execution %s, not the execution %s you reviewed; review it again",
-				req.RunId, registry.ExecutionRef(run.attemptID, run.queuedAt), registry.ExecutionRef(retry.AttemptID, retry.QueuedAt)),
+				runID, registry.ExecutionRef(run.attemptID, run.queuedAt), registry.ExecutionRef(retry.AttemptID, retry.QueuedAt)),
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
 	// A client that saw a different snapshot of the run is acting on stale
 	// information; refuse rather than retry something else.
-	if body.RunSpecSha256 != nil && *body.RunSpecSha256 != run.specSHA256 {
+	if body.RunSpecSHA256 != nil && *body.RunSpecSHA256 != run.specSHA256 {
 		return nil, &Error{HTTPStatus: http.StatusConflict, Code: api.ErrorCodeConflict,
 			Message: "the run's DAG snapshot differs from the one in the request",
 			Details: map[string]any{"code": string(decision.CodeRunStale)}}
 	}
 	retry.RunSpecSHA256, retry.RunStartedAt = run.specSHA256, run.startedAt
-	res, err = svc.RequestRetry(ctx, req.JobId, retry, actor)
+	res, err = svc.RequestRetry(ctx, jobID, retry, actor)
 	if err != nil {
 		if errors.Is(err, decision.ErrInvalid) {
 			return nil, &Error{HTTPStatus: http.StatusBadRequest, Code: api.ErrorCodeBadRequest, Message: err.Error()}
 		}
 		return nil, txeError(err)
 	}
-	return txeRetryResponse(res)
+	return res, nil
 }
 
-func txeRetryResponse(res *decision.Result) (api.RequestTxeRunRetryResponseObject, error) {
-	out := api.RequestTxeRunRetry200JSONResponse{Replayed: res.AlreadyRecorded}
+func txeRetryResponse(res *decision.Result) (api.TxeDecisionResponse, error) {
+	out := api.TxeDecisionResponse{Replayed: res.AlreadyRecorded}
 	var err error
 	if out.Decision, err = txeConvert[api.TxeDecision](res.Decision); err != nil {
-		return nil, err
+		return api.TxeDecisionResponse{}, err
 	}
 	job, err := txeConvert[api.TxeJob](res.Job)
 	if err != nil {
-		return nil, err
+		return api.TxeDecisionResponse{}, err
 	}
 	out.Job = &job
 	if res.Proposal != nil {
 		p, err := txeConvert[api.TxeProposal](res.Proposal)
 		if err != nil {
-			return nil, err
+			return api.TxeDecisionResponse{}, err
 		}
 		out.Proposal = &p
 	}

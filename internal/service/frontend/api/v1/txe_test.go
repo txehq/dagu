@@ -1031,7 +1031,11 @@ func TestTxeAPIInstallationCapabilities(t *testing.T) {
 	a := newTxeTestAPI(t)
 	resp, err := a.GetTxeInstallation(context.Background(), apigen.GetTxeInstallationRequestObject{})
 	require.NoError(t, err)
-	assert.Contains(t, resp.(apigen.GetTxeInstallation200JSONResponse).Capabilities, "param_schema")
+	caps := resp.(apigen.GetTxeInstallation200JSONResponse).Capabilities
+	assert.Contains(t, caps, "param_schema")
+	// TXE-7515: a client offers a person's republish only to a hub that
+	// lists this; the endpoint is the guarantee, the capability the offer.
+	assert.Contains(t, caps, "owner_republish")
 }
 
 // Through the registry API end to end (request bodies decoded as the server

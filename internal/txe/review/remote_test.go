@@ -284,6 +284,10 @@ func (f *remoteFixture) reviewer(holder string) *review.Reviewer {
 	return &review.Reviewer{
 		Registry: f.remote, Effector: f.fx, Opener: f.opener, Holder: holder,
 		AgentClient: "fixture-agent 1.0", DecideDAG: review.DecideDAGName(f.remote.MachineID), ClaimTTL: 10 * time.Minute,
+		// Every execution has been assessed as sealing nothing unless a
+		// test says otherwise: a reviewer that cannot assess seals retries
+		// nothing it was not told to run again.
+		Seals: seals{},
 	}
 }
 
@@ -1751,6 +1755,32 @@ func TestRemoteRepublishNamesThePublishStep(t *testing.T) {
 	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued, request)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, review.ErrRunNotRetryable, "the code means nothing started only with its own status")
+}
+
+// TXE-7515: an explicit rerun is sent as a retry from the job's step with
+// everything after it, so a job step that succeeded runs again; a native
+// retry of the run would keep it and run only publish.
+func TestRemoteRerunRetriesFromTheJobStep(t *testing.T) {
+	path := "/dag-runs/job_1/run-1/retry"
+	stub := &stubTransport{t: t, replies: map[string]string{path: `{}`}}
+	var sent map[string]any
+	runs := review.RemoteRuns(captureTransport{Transport: stub, path: path, into: &sent})
+	queued := review.Execution{AttemptID: "a1"}
+
+	_, err := runs.RetryRun(context.Background(), "job_1", "run-1", queued,
+		review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d", Rerun: true})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{
+		"dagRunId": "run-1", "expectedAttemptId": "a1", "expectedQueuedAt": "",
+		"retryRequest": map[string]any{"actionId": "act-1", "actionAttempt": "1", "bindingDigest": "sha256:d"},
+		"stepName":     "run", "includeDownstream": true,
+	}, sent)
+
+	sent = nil
+	_, err = runs.RetryRun(context.Background(), "job_1", "run-1", queued,
+		review.RetryRequest{ActionID: "act-1", ActionAttempt: "1", BindingDigest: "sha256:d"})
+	require.NoError(t, err)
+	assert.NotContains(t, sent, "stepName", "an unspecified retry is a native retry of the run")
 }
 
 // The service republishes only when its installation lists the capability.

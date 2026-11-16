@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1421,6 +1422,30 @@ func TestPacketMarksAnUnpublishedSeal(t *testing.T) {
 	}
 }
 
+// TXE-7515: a reviewer that cannot read this machine's seals cannot tell a
+// run that sealed nothing from one whose result is waiting to be published,
+// so an agent's retry is a question for the owner, never an offer to run
+// the job again.
+func TestRetryWithoutASealReaderIsAQuestion(t *testing.T) {
+	f := newFixture(t)
+	f.addRun("run-1", "failed")
+	service := newRuns()
+	service.fail("run-1", "att-1")
+	service.republishes = true
+	r := f.reviewer("reviewer-a")
+	r.Runs, r.Seals = service, nil
+	_, err := r.Apply(context.Background(), f.prepare("reviewer-a"), review.AgentDecision{
+		Outcome: review.OutcomeAct, Reasoning: "It failed once.", EvidenceRunIDs: []string{"run-1"},
+		Actions: []review.AgentAction{{Name: review.RetryRunAction, Params: map[string]string{"run_id": "run-1"}, Reason: "lost publish"}},
+	})
+	require.NoError(t, err)
+	proposals := f.state().Proposals[jobID]
+	require.Len(t, proposals, 1)
+	assert.Equal(t, review.ProposalQuestion, proposals[0].Kind)
+	assert.Contains(t, proposals[0].Question, "cannot read what execution")
+	assert.NotContains(t, proposals[0].Question, "The job runs again")
+}
+
 // The owner's retry of a republish sends only the publish step, after
 // checking again that the sealed result is still there and the service
 // still republishes; when either changed, nothing is sent and the job is
@@ -1483,6 +1508,142 @@ func TestRetryOfAnUnsealedExecutionSendsNoStep(t *testing.T) {
 	assert.Equal(t, review.ActionSucceeded, out.Action.State)
 	assert.Equal(t, []string{""}, f.runs.steps)
 	assert.Contains(t, f.proposal.Question, "The job runs again")
+}
+
+// personRetry records a person's decided dagu.retry_run of execution att-1
+// of run-1, as the hub's retry or republish request records one: a decided
+// proposal no reviewer made, with the intent's parameters (TXE-7515).
+func personRetry(t *testing.T, f *retryFixture, extra map[string]string) (review.Proposal, review.Decision) {
+	t.Helper()
+	params := map[string]string{}
+	maps.Copy(params, f.proposal.Params)
+	delete(params, review.RetryRunStepParam)
+	maps.Copy(params, extra)
+	proposal := review.Proposal{ID: "prop-person-" + fmt.Sprint(len(extra)) + params[review.RetryRunStepParam] + params[review.RetryRunRerunParam],
+		JobID: jobID, Kind: review.ProposalAction, ActionName: review.RetryRunAction, Params: params, Question: "person"}
+	require.NoError(t, f.registry.Update(func(s *reviewtest.State) error {
+		proposal.State = review.ProposalOpen
+		proposal.BindingDigest = reviewtest.BindingDigest(s.Jobs[jobID], proposal.ActionName, proposal.TargetID, proposal.Params)
+		s.Proposals[jobID] = append(s.Proposals[jobID], proposal)
+		return nil
+	}))
+	decided, err := f.registry.Decide(jobID, proposal.ID, review.VerdictRetry, "", "connor")
+	require.NoError(t, err)
+	return proposal, decided
+}
+
+// TXE-7515: what the job's machine does with a decided retry, by the
+// retry's intent and what the execution it is about sealed. A republish
+// publishes only an intact sealed result; an explicit rerun runs the job
+// again whatever was sealed, and says a sealed result was superseded; a
+// retry that names no intent runs the job again only for an execution known
+// to have sealed nothing, so a sealed result is never re-run by default,
+// and neither is one this machine cannot assess (no seal reader, a changed
+// or unreadable seal).
+func TestRetryIntentAgainstTheSeal(t *testing.T) {
+	ref := review.ExecutionRef("att-1", "")
+	const (
+		nothing   = "sealed nothing"
+		intact    = "sealed, intact"
+		changed   = "sealed, changed since"
+		unread    = "seal unreadable"
+		noReader  = "no seal reader"
+		noService = "sealed, service cannot republish"
+	)
+	sealsFor := func(state string) review.SealReader {
+		switch state {
+		case nothing:
+			return seals{}
+		case intact, noService:
+			return seals{ref: nil}
+		case changed:
+			return seals{ref: errors.New("output.json changed after it was sealed")}
+		case unread:
+			return seals{ref: errors.New("seals.json of run run-1 is not readable")}
+		}
+		return nil
+	}
+	type want struct {
+		step   string // the step sent; "-" when nothing is sent
+		detail string
+	}
+	intents := map[string]map[string]string{
+		"unspecified": {},
+		"republish":   {review.RetryRunStepParam: review.RetryStepPublish},
+		"rerun":       {review.RetryRunRerunParam: "true"},
+	}
+	grid := map[string]map[string]want{
+		"unspecified": {
+			nothing:   {step: ""},
+			intact:    {step: "-", detail: "sealed its result, and a retry that names no intent would run the job again"},
+			noService: {step: "-", detail: review.CapabilityRepublishSealed},
+			changed:   {step: "-", detail: "changed after it was sealed"},
+			unread:    {step: "-", detail: "is not readable"},
+			noReader:  {step: "-", detail: "cannot read what execution"},
+		},
+		"republish": {
+			nothing:   {step: "-", detail: "holds no sealed result"},
+			intact:    {step: review.RetryStepPublish},
+			noService: {step: "-", detail: review.CapabilityRepublishSealed},
+			changed:   {step: "-", detail: "changed after it was sealed"},
+			unread:    {step: "-", detail: "is not readable"},
+			noReader:  {step: "-", detail: "cannot read what execution"},
+		},
+		"rerun": {
+			nothing:   {step: ""},
+			intact:    {step: "", detail: "superseded and was not published"},
+			noService: {step: "", detail: "superseded and was not published"},
+			changed:   {step: ""},
+			unread:    {step: ""},
+			noReader:  {step: ""},
+		},
+	}
+	for intent, states := range grid {
+		for state, w := range states {
+			t.Run(intent+"/"+state, func(t *testing.T) {
+				f := newRetryFixture(t)
+				f.runs.republishes = state != noService
+				proposal, decided := personRetry(t, f, intents[intent])
+				r := f.executor("executor")
+				r.Seals = sealsFor(state)
+
+				out, err := r.Execute(context.Background(), jobID, proposal.ID, decided.ID)
+				require.NoError(t, err)
+				if w.step == "-" {
+					assert.Equal(t, review.ActionFailed, out.Action.State)
+					assert.Contains(t, out.Action.Detail, "not dispatched")
+					assert.Empty(t, f.runs.requested, "the service was never asked")
+				} else {
+					assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
+					assert.Equal(t, []string{w.step}, f.runs.steps)
+					// Only an explicit rerun is sent as a rerun of the job's
+					// step: the service then runs the job step again.
+					assert.Equal(t, []bool{intent == "rerun"}, f.runs.reruns)
+				}
+				assert.Contains(t, out.Action.Detail, w.detail)
+			})
+		}
+	}
+}
+
+// A decision that names both a rerun and the publish step, or a rerun value
+// other than "true", is not carried out: its intent is not one.
+func TestRetryWithAnUnclearIntentIsNotDispatched(t *testing.T) {
+	for name, extra := range map[string]map[string]string{
+		"rerun and publish": {review.RetryRunRerunParam: "true", review.RetryRunStepParam: review.RetryStepPublish},
+		"rerun not true":    {review.RetryRunRerunParam: "yes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newRetryFixture(t)
+			f.runs.republishes = true
+			proposal, decided := personRetry(t, f, extra)
+			out, err := f.executor("executor").Execute(context.Background(), jobID, proposal.ID, decided.ID)
+			require.NoError(t, err)
+			assert.Equal(t, review.ActionFailed, out.Action.State)
+			assert.Contains(t, out.Action.Detail, "never both")
+			assert.Empty(t, f.runs.requested)
+		})
+	}
 }
 
 // A decision is about one failed attempt. When the run has moved on since,

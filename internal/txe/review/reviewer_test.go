@@ -179,6 +179,7 @@ type runs struct {
 	republishes  bool
 	republishErr error
 	steps        []string
+	reruns       []bool
 	// recorded is the retry request the service recorded on each execution
 	// it admitted, by the request's id.
 	recorded map[string]recordedRetry
@@ -267,6 +268,7 @@ func (r *runs) RetryRun(_ context.Context, jobID, runID string, expected review.
 	defer r.mu.Unlock()
 	r.requested = append(r.requested, expected)
 	r.steps = append(r.steps, request.Step)
+	r.reruns = append(r.reruns, request.Rerun)
 	if now := r.state[runID].Execution(); now != expected {
 		return review.Execution{}, fmt.Errorf("%w: 409 execution_changed: run %s is at %s, not %s", review.ErrRunNotRetryable, runID, now.Ref(), expected.Ref())
 	}
@@ -409,6 +411,10 @@ func (f *fixture) reviewer(holder string) *review.Reviewer {
 		DecideDAG:   "txe-decide-mch",
 		ClaimTTL:    10 * time.Minute,
 		Now:         f.clock.Now,
+		// Every execution has been assessed as sealing nothing unless a
+		// test says otherwise: a reviewer that cannot assess seals retries
+		// nothing it was not told to run again.
+		Seals: seals{},
 	}
 }
 

@@ -63,6 +63,7 @@ function baseApi(overrides: Partial<TxeApi> = {}): TxeApi {
     decide: vi.fn(),
     replayDecision: vi.fn(),
     requestRetry: vi.fn(),
+    ownerRepublish: async () => true,
     listRetryStates: async () => new Map(),
     ...overrides,
   };
@@ -188,23 +189,57 @@ describe('run retry', () => {
     ],
   });
 
-  it('asks for a retry of the exact failed execution at the job version', async () => {
+  it('asks for a republish of the exact failed execution at the job version', async () => {
     const requestRetry = vi.fn().mockResolvedValue({ ok: true });
     renderAt(
       baseApi({ getJob: async () => failedJob, requestRetry }),
       '/txe/jobs/job_volume_monitor'
     );
     fireEvent.click(
-      await screen.findByRole('button', { name: 'Retry this run' })
+      await screen.findByRole('button', { name: 'Publish sealed result' })
     );
     await waitFor(() => expect(requestRetry).toHaveBeenCalledTimes(1));
-    // The execution the person reviewed is sent so a moved run is refused.
+    // The execution the person reviewed is sent so a moved run is refused,
+    // with the intent the person chose.
     expect(requestRetry.mock.calls[0]?.slice(0, 4)).toEqual([
       'job_volume_monitor',
       'run-0003',
       { attemptId: 'run-0003-a1', queuedAt: '2026-10-09T12:00:00.000000001Z' },
       failedJob.version,
     ]);
+    expect(requestRetry.mock.calls[0]?.[5]).toBe('republish');
+  });
+
+  // TXE-7515: running the job again is its own, confirmed request.
+  it('asks for an explicit rerun only after confirmation', async () => {
+    const requestRetry = vi.fn().mockResolvedValue({ ok: true });
+    renderAt(
+      baseApi({ getJob: async () => failedJob, requestRetry }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Run again' }));
+    expect(requestRetry).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Run the job again' }));
+    await waitFor(() => expect(requestRetry).toHaveBeenCalledTimes(1));
+    expect(requestRetry.mock.calls[0]?.[5]).toBe('rerun');
+  });
+
+  // Where the hub does not take a person's republish, only the explicit
+  // rerun is offered.
+  it('offers no republish where the hub does not take one', async () => {
+    renderAt(
+      baseApi({
+        getJob: async () => failedJob,
+        ownerRepublish: async () => false,
+      }),
+      '/txe/jobs/job_volume_monitor'
+    );
+    expect(
+      await screen.findByRole('button', { name: 'Run again' })
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Publish sealed result' })
+    ).not.toBeInTheDocument();
   });
 
   // Dagu's queued retry keeps the attempt ID and records a later queue
@@ -232,6 +267,7 @@ describe('run retry', () => {
               'run-0003',
               {
                 runId: 'run-0003',
+                intent: 'unspecified' as const,
                 proposalId: 'prp_r',
                 attemptId: 'run-0003-a1',
                 queuedAt: '2026-10-09T12:00:00.000000001Z',
@@ -244,7 +280,7 @@ describe('run retry', () => {
       '/txe/jobs/job_volume_monitor'
     );
     expect(
-      await screen.findByRole('button', { name: 'Retry this run' })
+      await screen.findByRole('button', { name: 'Run again' })
     ).toBeInTheDocument();
   });
 
@@ -267,6 +303,7 @@ describe('run retry', () => {
                   'run-0003',
                   {
                     runId: 'run-0003',
+                    intent: 'unspecified' as const,
                     proposalId: 'prp_r',
                     attemptId: 'run-0003-a1',
                     queuedAt: '2026-10-09T12:00:00.000000001Z',
@@ -279,7 +316,7 @@ describe('run retry', () => {
       '/txe/jobs/job_volume_monitor'
     );
     fireEvent.click(
-      await screen.findByRole('button', { name: 'Retry this run' })
+      await screen.findByRole('button', { name: 'Publish sealed result' })
     );
     expect(
       await screen.findByText(
@@ -288,7 +325,7 @@ describe('run retry', () => {
     ).toBeInTheDocument();
     await waitFor(() =>
       expect(
-        screen.queryByRole('button', { name: 'Retry this run' })
+        screen.queryByRole('button', { name: 'Publish sealed result' })
       ).not.toBeInTheDocument()
     );
   });
@@ -305,6 +342,7 @@ describe('run retry', () => {
               'run-0003',
               {
                 runId: 'run-0003',
+                intent: 'unspecified' as const,
                 proposalId: 'prp_r',
                 attemptId: 'run-0003-a1',
                 queuedAt: '2026-10-09T12:00:00.000000001Z',
@@ -354,6 +392,7 @@ describe('dispatched retry', () => {
               'run-0003',
               {
                 runId: 'run-0003',
+                intent: 'unspecified' as const,
                 proposalId: 'prp_r',
                 attemptId: 'run-0003-a1',
                 queuedAt: '',

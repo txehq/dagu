@@ -63,11 +63,41 @@ type RetryRunParams struct {
 	// the job again. It is part of the action's binding, so a decision to
 	// re-run a run never authorizes a republish, nor the reverse.
 	Step string `json:"step,omitempty"`
+	// Rerun, when set, is a person's explicit request for a new execution
+	// of the job: it runs the job again even when the retried execution
+	// sealed a result, which is then superseded and never published. A
+	// retry that sets neither Step nor Rerun is unspecified, and the job's
+	// machine runs it again only when the execution sealed nothing. Rerun is
+	// part of the binding like Step; omitted when false, so an unspecified
+	// retry binds as it always has.
+	Rerun bool `json:"rerun,omitempty"`
 }
 
 // RetryStepPublish is the only step a dagu.retry_run may name: the TXE job's
 // publish step, retried for a sealed result whose publication was lost.
 const RetryStepPublish = txepkg.PublishStepName
+
+// The intents of a dagu.retry_run: what the person or reviewer asked for.
+const (
+	// RetryIntentUnspecified re-runs an execution that sealed nothing, and
+	// is not carried out for one that sealed a result.
+	RetryIntentUnspecified = ""
+	// RetryIntentRepublish publishes what the execution sealed.
+	RetryIntentRepublish = "republish"
+	// RetryIntentRerun runs the job again, whatever the execution sealed.
+	RetryIntentRerun = "rerun"
+)
+
+// Intent is the retry's intent.
+func (p RetryRunParams) Intent() string {
+	switch {
+	case p.Step == RetryStepPublish:
+		return RetryIntentRepublish
+	case p.Rerun:
+		return RetryIntentRerun
+	}
+	return RetryIntentUnspecified
+}
 
 // UncertainEffectParams are the parameters of txe.uncertain_effect.
 // Attempt is the attempt whose outcome is unresolved: each escalation of an
@@ -108,9 +138,20 @@ func EscalationProposalID(actionID string, attempt, jobVersion int) (string, err
 }
 
 // RetryProposalID is the ID of the proposal to retry the execution
-// executionRef of runID at jobVersion.
+// executionRef of runID at jobVersion, with no intent named.
 func RetryProposalID(runID, executionRef string, jobVersion int) (string, error) {
-	return DerivedID(PrefixProposal, "retry", runID, executionRef, jobVersion)
+	return RetryIntentProposalID(runID, executionRef, jobVersion, RetryIntentUnspecified)
+}
+
+// RetryIntentProposalID is the ID of the proposal to retry the execution
+// executionRef of runID at jobVersion with the given intent. Each intent has
+// its own proposal, so a decision about one never lands on another's. The
+// unspecified intent keeps the derivation it always had.
+func RetryIntentProposalID(runID, executionRef string, jobVersion int, intent string) (string, error) {
+	if intent == RetryIntentUnspecified {
+		return DerivedID(PrefixProposal, "retry", runID, executionRef, jobVersion)
+	}
+	return DerivedID(PrefixProposal, "retry", runID, executionRef, jobVersion, intent)
 }
 
 // ExecutionRef is the portable reference of one execution of a run: the
@@ -201,6 +242,9 @@ func (tx *JobTx) checkReservedProposal(p *Proposal) error {
 		}
 		if rp.Step != "" && rp.Step != RetryStepPublish {
 			return refuse(CodeInvalid, "dagu.retry_run retries the whole run or only its %q step, not %q", RetryStepPublish, rp.Step)
+		}
+		if rp.Step != "" && rp.Rerun {
+			return refuse(CodeInvalid, "dagu.retry_run either republishes the sealed result or runs the job again, not both")
 		}
 		if err := tx.checkRunBinding(rp, true); err != nil {
 			return err
@@ -737,6 +781,85 @@ func (s *Store) EndMovedOnRetries(ctx context.Context, jobID string) ([]Affected
 	return out, err
 }
 
+// checkRetryIntent refuses a retry of the execution params names when any
+// other retry proposal of that execution at the job's version, whoever made
+// it, has another intent and is still open, snoozed or decided and not yet
+// settled. A decided retry whose action was settled without anything
+// running (failed or not applied, with no execution admitted) is settled:
+// the job's machine refused it, as it refuses an unspecified retry of a
+// sealed execution, and the person may then ask for the other intent. Proposal
+// id is the request's own, which may be answered again under its own rules.
+func (tx *JobTx) checkRetryIntent(params RetryRunParams, id string) error {
+	j := tx.Job
+	for _, p := range sortedProposals(j.Proposals) {
+		if p.ProposalID == id || p.Action.Name != ActionRetryRun || p.JobVersion != j.Version {
+			continue
+		}
+		switch p.State {
+		case ProposalOpen, ProposalSnoozed:
+		case ProposalDecided:
+			settled, err := tx.retrySettledWithoutEffect(p.ProposalID)
+			if err != nil {
+				return err
+			}
+			if settled {
+				continue
+			}
+		case ProposalExecuted, ProposalRejected, ProposalSuperseded, ProposalClosed:
+			continue
+		}
+		var other RetryRunParams
+		if err := decodeParams(p.Action.Params, &other); err != nil {
+			return err
+		}
+		if other.RunID != params.RunID || other.AttemptID != params.AttemptID || other.QueuedAt != params.QueuedAt || other.Intent() == params.Intent() {
+			continue
+		}
+		return &Error{Code: CodeRetryIntentConflict, Current: p, Message: fmt.Sprintf(
+			"execution %s of run %s already has a %s retry (proposal %s, %s); answer or reject it before asking for a %s retry",
+			ExecutionRef(params.AttemptID, params.QueuedAt), params.RunID, intentName(other.Intent()), p.ProposalID, p.State, intentName(params.Intent()))}
+	}
+	return nil
+}
+
+// retrySettledWithoutEffect reports whether the decided retry proposal's
+// action was settled with nothing run: its every attempt is failed or not
+// applied, and none recorded an execution its request admitted unless run
+// history shows that execution abandoned before dispatch. A retry with no
+// action yet, one in flight, or one whose admitted execution may have run
+// (dispatched, still being prepared, or not readable) is not.
+func (tx *JobTx) retrySettledWithoutEffect(proposalID string) (bool, error) {
+	found := false
+	for _, a := range tx.Job.Actions {
+		if a.ProposalID != proposalID {
+			continue
+		}
+		found = true
+		if a.State != ActionFailed && a.State != ActionNotApplied {
+			return false, nil
+		}
+		admitted, err := admittedExecutionOf(a.Outcome)
+		if err != nil {
+			return false, err
+		}
+		if admitted == "" {
+			continue
+		}
+		execution, _, err := tx.admittedRetry(a, admitted)
+		if err != nil || !execution.Abandoned {
+			return false, nil
+		}
+	}
+	return found, nil
+}
+
+func intentName(intent string) string {
+	if intent == RetryIntentUnspecified {
+		return "unspecified"
+	}
+	return intent
+}
+
 func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Proposal, *Decision, error) {
 	j := tx.Job
 	if tx.actor.Kind != ActorHuman {
@@ -751,11 +874,6 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	if !j.Lifecycle.AcceptsEffects() {
 		return nil, nil, &Error{Code: CodeLifecycle, Message: "job is " + string(j.Lifecycle), Current: j}
 	}
-	if params.Step != "" {
-		// A republish is proposed by the reviewer, which can see the seal
-		// on the machine; a person's own retry re-runs the run.
-		return nil, nil, refuse(CodeInvalid, "a person's retry re-runs the whole run; it names no step")
-	}
 	if _, err := tx.EndMovedOnRetries(); err != nil {
 		return nil, nil, err
 	}
@@ -763,12 +881,24 @@ func (tx *JobTx) ProposeRetry(params RetryRunParams, idempotencyKey string) (*Pr
 	if err != nil {
 		return nil, nil, err
 	}
-	id, err := RetryProposalID(params.RunID, ExecutionRef(params.AttemptID, params.QueuedAt), j.Version)
+	intent := params.Intent()
+	ref := ExecutionRef(params.AttemptID, params.QueuedAt)
+	id, err := RetryIntentProposalID(params.RunID, ref, j.Version, intent)
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := tx.checkRetryIntent(params, id); err != nil {
+		return nil, nil, err
+	}
+	question := "Retry run " + params.RunID + "?"
+	switch intent {
+	case RetryIntentRepublish:
+		question = "Republish the sealed result of execution " + ref + " of run " + params.RunID + " (the job is not run again)?"
+	case RetryIntentRerun:
+		question = "Run the job again for run " + params.RunID + ", as a new execution after " + ref + "?"
+	}
 	p := Proposal{ProposalID: id, Action: ActionSpec{Name: ActionRetryRun, Params: raw},
-		AllowedVerdicts: []Verdict{VerdictRetry, VerdictReject}, WaitingOn: "person", Question: "Retry run " + params.RunID + "?"}
+		AllowedVerdicts: []Verdict{VerdictRetry, VerdictReject}, WaitingOn: "person", Question: question}
 	if err := tx.checkReservedProposal(&p); err != nil {
 		return nil, nil, err
 	}
