@@ -78,3 +78,13 @@ func TestNamedReturn(t *testing.T) {
 func removeTree(dir string) {
 	_ = os.RemoveAll(dir) // want:env-path-delete
 }
+
+func TestBooleanSpelling(t *testing.T) {
+	_ = exec.Command("go", "clean", "-modcache=true").Run() // want:go-clean-cache
+	_ = exec.Command("go", "clean", "--cache=1").Run() // want:go-clean-cache
+	_ = exec.Command("go", "clean", "-fuzzcache=T").Run() // want:go-clean-cache
+	boolArgs := []string{"clean", "-modcache=TRUE"} // want:go-clean-cache
+	_ = exec.Command("go", boolArgs...).Run() // want:go-clean-cache
+	_ = exec.Command("sh", "-c", "go clean -testcache -modcache=true").Run() // want:go-clean-cache
+	_ = exec.Command("sh", "-c", "go clean -tags x -cache").Run() // want:go-clean-cache
+}

@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -348,9 +349,16 @@ func sortFindings(fs []Finding) {
 	})
 }
 
-// goCleanRe matches `go clean` with a flag that empties a whole Go cache,
-// in text whose quotes, commas and brackets have been turned into spaces.
-var goCleanRe = regexp.MustCompile(`(^|[^\w.-])go\s+clean(\s+-{1,2}[\w=.-]+)*\s+-{1,2}(modcache|cache|fuzzcache)\b`)
+// goCleanCmdRe finds `go clean` in text whose quotes, commas and brackets
+// have been turned into spaces.
+var goCleanCmdRe = regexp.MustCompile(`(^|[^\w.-])go\s+clean\b`)
+
+// cmdEndRe ends a command's arguments: a shell separator or redirection.
+var cmdEndRe = regexp.MustCompile(`[;&|<>\n]`)
+
+// quotedFlagValueRe is a flag value quoted on its own, -modcache="false", so
+// that it stays one word with its flag.
+var quotedFlagValueRe = regexp.MustCompile(`=(?:"([^"\s]*)"|'([^'\s]*)')`)
 
 // argvPunct turns an argv written as a list ("go", "clean") into words.
 var argvPunct = strings.NewReplacer(`"`, " ", `'`, " ", ",", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ", "`", " ")
@@ -363,8 +371,80 @@ func normArgv(text string) string {
 	return argvPunct.Replace(goVarRe.ReplaceAllString(text, " go "))
 }
 
+// goCleanIn reports text that runs go clean with a flag that empties a whole
+// Go cache.
 func goCleanIn(text string) bool {
-	return goCleanRe.MatchString(normArgv(text))
+	norm := normArgv(quotedFlagValueRe.ReplaceAllString(text, "=$1$2"))
+	for _, loc := range goCleanCmdRe.FindAllStringIndex(norm, -1) {
+		args := norm[loc[1]:]
+		if end := cmdEndRe.FindStringIndex(args); end != nil {
+			args = args[:end[0]]
+		}
+		if cleanFlagsCache(strings.Fields(args)) {
+			return true
+		}
+	}
+	return false
+}
+
+// goValueFlags are go clean's flags (its own and the build flags) that take
+// the next argument as their value when written without =.
+var goValueFlags = map[string]bool{
+	"C": true, "p": true, "o": true, "asmflags": true, "buildmode": true, "compiler": true,
+	"covermode": true, "coverpkg": true, "gccgoflags": true, "gcflags": true,
+	"installsuffix": true, "ldflags": true, "mod": true, "modfile": true, "overlay": true,
+	"pgo": true, "pkgdir": true, "tags": true, "toolexec": true, "exec": true,
+	"debug-actiongraph": true, "debug-runtime-trace": true, "debug-trace": true,
+}
+
+// cleanFlagsCache reads go clean's arguments as Go's flag package does: flags
+// end at the first argument that is not one, or at --, and a flag in
+// goValueFlags written without = takes the next argument. A word holding an
+// unexpanded variable ($EXTRA) may be any number of flags, so the scan reads
+// past it.
+func cleanFlagsCache(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--":
+			return false
+		case strings.Contains(a, "$"):
+			continue
+		case !strings.HasPrefix(a, "-") || a == "-":
+			return false
+		case cleansCache(a):
+			return true
+		}
+		name := strings.TrimLeft(a, "-")
+		if !strings.Contains(name, "=") && goValueFlags[name] {
+			i++
+		}
+	}
+	return false
+}
+
+// cleansCache reports a go clean argument that turns on -modcache, -cache or
+// -fuzzcache, with one dash or two: the bare flag, or the flag given a value
+// Go's flag package reads as true (-modcache=true, =1, =T). A value it reads
+// as false (-modcache=false, =0, =F) turns the flag off. Any other value is
+// reported too: go refuses it, but the lint cannot tell it from a variable
+// that expands to true.
+func cleansCache(arg string) bool {
+	name, ok := strings.CutPrefix(arg, "-")
+	if !ok {
+		return false
+	}
+	name, val, hasVal := strings.Cut(strings.TrimPrefix(name, "-"), "=")
+	switch name {
+	case "modcache", "cache", "fuzzcache":
+	default:
+		return false
+	}
+	if !hasVal {
+		return true
+	}
+	on, err := strconv.ParseBool(val)
+	return on || err != nil
 }
 
 const goCleanMsg = "go clean with -modcache, -cache or -fuzzcache removes whatever GOMODCACHE/GOCACHE names when it runs; remove the directory your code created instead"

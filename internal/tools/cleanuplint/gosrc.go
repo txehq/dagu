@@ -28,8 +28,9 @@ import (
 //     a parameter is tainted when any call in the package passes it a
 //     tainted argument.
 //
-// It reports `go clean -modcache|-cache|-fuzzcache` in any argv or string,
-// and os.RemoveAll, or an argv running rm -r, given a tainted path.
+// It reports `go clean -modcache|-cache|-fuzzcache`, bare or set true, in any
+// argv or string, and os.RemoveAll, or an argv running rm -r, given a tainted
+// path.
 
 var envSources = map[string]map[string]bool{
 	"os": {
@@ -503,7 +504,7 @@ func collectLits(n ast.Node, env litEnv) {
 
 // cleanArgv reports literals that make a go clean of a whole cache.
 func cleanArgv(lits []string) bool {
-	return slices.Contains(lits, "clean") && slices.ContainsFunc(lits, func(s string) bool { return goCacheFlags[s] })
+	return slices.Contains(lits, "clean") && slices.ContainsFunc(lits, cleansCache)
 }
 
 // argvBuilder reports a call that only assembles a slice: append, or
@@ -561,11 +562,6 @@ func execCall(gf *goFile, call *ast.CallExpr, lits []string) bool {
 		}
 	}
 	return slices.Contains(lits, "-c")
-}
-
-var goCacheFlags = map[string]bool{
-	"-modcache": true, "--modcache": true, "-cache": true, "--cache": true,
-	"-fuzzcache": true, "--fuzzcache": true,
 }
 
 var rmRecursiveFlag = func(s string) bool { return rmRecRe.MatchString(s) }

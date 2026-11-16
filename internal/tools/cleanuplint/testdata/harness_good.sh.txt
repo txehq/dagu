@@ -23,3 +23,9 @@ legacy=`mktemp -d "$HOME/x.XXXXXX"`
 rm -rf "$legacy"
 testargs=(test -count=1 ./...)
 go "${testargs[@]}"
+go clean -modcache=false
+go clean -cache=0 -fuzzcache=f -testcache
+go clean -modcache="false"
+go clean -testcache; echo -cache
+echo "go clean with -modcache empties the shared cache"
+go clean -n ./...
