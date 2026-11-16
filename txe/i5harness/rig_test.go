@@ -20,8 +20,13 @@ import (
 
 func rig(t *testing.T, args ...string) (string, int) {
 	t.Helper()
+	return rigEnv(t, nil, args...)
+}
+
+func rigEnv(t *testing.T, env []string, args ...string) (string, int) {
+	t.Helper()
 	cmd := exec.Command("bash", append([]string{"rig.sh"}, args...)...)
-	cmd.Env = append(os.Environ(), "I5_PYTHON="+python(t))
+	cmd.Env = append(append(os.Environ(), "I5_PYTHON="+python(t)), env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		var exit *exec.ExitError
@@ -241,7 +246,7 @@ func TestFixtureRunWaitsForItsGoMarker(t *testing.T) {
 // The runbook calls ./rig.sh and the tools directly, so each must keep its
 // executable bit in the repository.
 func TestEntryPointsAreExecutable(t *testing.T) {
-	for _, f := range []string{"rig.sh", "relay.py", "preflight.py", "procs.py", "pin.py", "check_seal.py", "actions.py", "fixture-run.sh"} {
+	for _, f := range []string{"rig.sh", "relay.py", "preflight.py", "procs.py", "pin.py", "check_seal.py", "check_proof.py", "actions.py", "fixture-run.sh"} {
 		info, err := os.Stat(f)
 		require.NoError(t, err)
 		assert.NotZero(t, info.Mode().Perm()&0o111, "%s is not executable", f)

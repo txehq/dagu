@@ -37,6 +37,7 @@ RELAY_FRONT=127.0.0.1:$PORT_FRONT_RELAY
 API=http://127.0.0.1:$PORT_FRONT/api/v1        # the harness's own observation path
 API_RELAY=http://127.0.0.1:$PORT_FRONT_RELAY/api/v1  # the machine's path, through the relay
 WORKER_ID=rig-i5-worker
+POLL=${I5_POLL_LIMIT:-200}  # proof's polls, 3 s apart (tests shorten it)
 
 die() { echo "rig: $*" >&2; exit 1; }
 say() { echo "$(date -u +%FT%TZ) $*" | tee -a "$RIG/logs/rig.log"; }
@@ -358,23 +359,41 @@ cmd_proof() {
   local out="$RIG/evidence/proof"; mkdir -p "$out"
   local prp action=3
   prp=$(json 'd["proposal"]' < "$RIG/evidence/decision/authority.json")
-  for _ in $(seq 1 200); do # up to 10 min for the decided action to settle
+  for _ in $(seq 1 "$POLL"); do # up to 10 min for the decided action to settle
     get "/txe/jobs/$JOB/actions" > "$out/actions.json" || { sleep 3; continue; }
     action=0; "$PY" -I "$HERE/actions.py" "$out/actions.json" "$prp" > "$out/action.json" || action=$?
     [ "$action" -eq 3 ] || break
     sleep 3
   done
-  get "/dag-runs/$JOB/$RUN" > "$out/run-final.json"
-  get "/dag-runs/$JOB/$RUN/attempts" > "$out/attempts.json" || :
-  get "/txe/jobs/$JOB/runs/$RUN/artifacts" > "$out/artifacts.json"
-  get "/txe/jobs/$JOB/events" > "$out/events.json"
-  cp "$RIG/control/counter" "$out/counter"
-  local broken=""
+  local broken="" published=3 admitted=""
   case $action in
-    0) ;;
+    0) admitted=$(json 'd["admitted_execution"]' < "$out/action.json") ;;
     3) broken="the action for $prp did not settle in 10 min" ;;
     *) broken="the action for $prp did not succeed: $(cat "$out/action.json")" ;;
   esac
+  # A succeeded action means the retry was dispatched; the publication is
+  # proved by the admitted execution itself (check_proof.py).
+  for _ in $(seq 1 "$POLL"); do
+    get "/dag-runs/$JOB/$RUN" > "$out/run-final.json" || { sleep 3; continue; }
+    get "/txe/jobs/$JOB/runs/$RUN/artifacts" > "$out/artifacts.json" || :
+    cp "$RIG/control/counter" "$out/counter"
+    [ -n "$admitted" ] || break
+    published=0
+    "$PY" -I "$HERE/check_proof.py" --run "$out/run-final.json" --artifacts "$out/artifacts.json" \
+      --seals "$RIG/evidence/loss/seals.json" --admitted "$admitted" \
+      --counter-at-loss "$RIG/evidence/loss/counter-after-loss" --counter-now "$out/counter" > "$out/publication.json" || published=$?
+    [ "$published" -eq 3 ] || break
+    sleep 3
+  done
+  get "/dag-runs/$JOB/$RUN/attempts" > "$out/attempts.json" || :
+  get "/txe/jobs/$JOB/events" > "$out/events.json" || :
+  if [ -n "$admitted" ]; then
+    case $published in
+      0) ;;
+      3) broken="${broken:+$broken; }the admitted execution $admitted did not finish in 10 min" ;;
+      *) broken="${broken:+$broken; }the publication does not hold: $(cat "$out/publication.json")" ;;
+    esac
+  fi
   "$PY" -I "$HERE/check_seal.py" "$RIG/evidence/loss/seals.json" "$(cat "$RIG/control/run-dir")" > "$out/seal-bytes-after.txt" \
     || broken="${broken:+$broken; }the sealed bytes changed"
   procs check --pidfile "$RIG/control/worker.pid" > "$out/worker-same-process.json" \

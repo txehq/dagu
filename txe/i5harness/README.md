@@ -44,6 +44,7 @@ TXE-3401 root ruling (msg_f64163e22ee5) fixed:
 | `procs.py` | starts each process as its own group leader; stops it only if its pid, group, executable and kernel start time still match |
 | `pin.py` | copies the installed W/C read-only, builds H and R from `git archive` plus picks, reports A's changed files against the reviewer's dependency closure, writes the manifest |
 | `actions.py` | the state of the action a decided proposal created: `succeeded` with an admitted execution, still in flight, or settled otherwise |
+| `check_proof.py` | P8 on the run itself: a succeeded action only says the retry was dispatched. Checks that the admitted execution finished `succeeded` as a `retryOf` the sealed one, publish ran and run did not, the artifacts record `produced_in` = the sealed execution with exactly the sealed digests, and the counter did not move |
 | `check_seal.py` | one begun execution, one seal, `attempts/` empty, and every sealed file still hashing to its seal |
 | `fixture-job.yaml.tmpl`, `fixture-run.sh` | the harmless fixture: it counts itself, waits for the harness's go marker, then writes one result unique to its run |
 
