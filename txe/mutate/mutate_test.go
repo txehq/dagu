@@ -89,6 +89,8 @@ if args[:1] == ["inspect"]:
     if os.path.exists(LOG + ".slowclean"):
         time.sleep(30)
     r = reg()
+    if "{{.State.Running}}" in args and os.path.exists(LOG + ".slowstate"):
+        time.sleep(30)
     if os.path.exists(LOG + ".daemondown"):
         print("Cannot connect to the Docker daemon", file=sys.stderr)
         sys.exit(1)
@@ -112,7 +114,7 @@ if args[:2] == ["rm", "-f"]:
     sys.exit(0)
 if not args or args[0] != "run":
     sys.exit(0)
-VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt", "--pids-limit",
+VALUED = {"--log-driver", "--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt", "--pids-limit",
           "--tmpfs", "--user", "--workdir", "--entrypoint", "--mount", "--env", "--cidfile", "--label"}
 i, mounts, env, workdir, name, cidfile, owner = 1, {}, {}, "/", "", "", ""
 while i < len(args) and args[i].startswith("--"):
@@ -376,6 +378,7 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 		joined := strings.Join(argv, " ")
 		assert.Contains(t, joined, "--network none")
 		assert.Contains(t, joined, "--pull never")
+		assert.Contains(t, joined, "--log-driver none", "docker keeps no unbounded copy of the output")
 		assert.Contains(t, joined, "--memory 8g")
 		assert.Contains(t, joined, "--cpus 4")
 		assert.NotContains(t, joined, "--env HOME=", "HOME is never set")
@@ -1053,6 +1056,7 @@ func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
 	demoSrc, err := os.ReadFile("fixture-demo.py")
 	require.NoError(t, err)
 	assert.Contains(t, string(demoSrc), `for k in sorted(ms.CLEARED_PROXY_ENV) for x in ("--env", f"{k}=")`)
+	assert.Contains(t, string(demoSrc), `"--log-driver", "none"`)
 	assert.Contains(t, string(outer), `>"$fake/caller-env.json"`)
 	assert.Contains(t, string(outer), `fake=/fakehost`)
 	for _, key := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY"} {
@@ -1314,4 +1318,15 @@ func TestImageWithDeclaredVolumeRefused(t *testing.T) {
 	cmd, out := demo(t, f.docker, "sandboxed", filepath.Join(f.root, "evidence"), "sha256:volimage")
 	assert.Equal(t, 2, exitCode(t, cmd.Run()), out.String())
 	assert.Contains(t, out.String(), "declares VOLUME /data")
+}
+
+// The stopped-state check is inside the deadline: a docker slow to answer it stops the run
+// (exit 6) near the deadline, and the container goes through the ownership-checked removal.
+func TestStoppedCheckInsideDeadline(t *testing.T) {
+	f := alarmFixture(t, `open(LOG + ".slowstate", "w").close()`)
+	start := time.Now()
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--deadline", "9")
+	assert.Less(t, time.Since(start), 15*time.Second)
+	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "whether baseline stopped")
 }

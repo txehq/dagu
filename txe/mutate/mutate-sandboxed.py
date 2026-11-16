@@ -604,8 +604,16 @@ class Runner:
                 target = cid
         except OSError:
             pass
-        probe = subprocess.run([self.docker, "inspect", "--format", "{{.State.Running}}", target],
-                               capture_output=True, text=True, env=self.docker_env(), timeout=15)
+        limit = 15.0 if self.hard_end is None else min(15.0, self.hard_end - time.monotonic())
+        if limit <= 0:
+            self.pending[name] = cidfile
+            raise Stopped(f"the whole-run deadline passed before checking that {result.name} stopped")
+        try:
+            probe = subprocess.run([self.docker, "inspect", "--format", "{{.State.Running}}", target],
+                                   capture_output=True, text=True, env=self.docker_env(), timeout=limit)
+        except subprocess.TimeoutExpired as e:
+            self.pending[name] = cidfile
+            raise Stopped(f"docker did not say inside the deadline whether {result.name} stopped") from e
         if probe.returncode == 0:
             if probe.stdout.strip() != "false":
                 self.pending[name] = cidfile  # the finalizer removes it, ownership-checked
@@ -691,7 +699,10 @@ class Runner:
             # one) reaches sandboxed code.
             **CLEARED_PROXY_ENV,
         })
-        argv = [self.docker, "run", "--rm", "--pull", "never", "--name", name, "--cidfile", str(cidfile),
+        # --log-driver none: Docker keeps no second, unbounded copy of the output on its data root;
+        # the attached stream the runner captures (and bounds) is unaffected.
+        argv = [self.docker, "run", "--rm", "--pull", "never", "--log-driver", "none", "--name", name,
+                "--cidfile", str(cidfile),
                 "--label", f"{OWNER_LABEL}={self.work.token}", "--network", self.args.network,
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(self.args.pids),
                 "--memory", self.args.memory, "--cpus", self.args.cpus,

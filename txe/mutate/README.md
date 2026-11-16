@@ -38,7 +38,10 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   anywhere in the runner: the container keeps its image user's default. Every `docker run` has
   `--pull never`, and an image that is not present locally is refused: name it by its id. An
   image that declares a `VOLUME` is refused too: Docker would give every run an anonymous
-  writable host volume outside the sandbox's bounds. A mount
+  writable host volume outside the sandbox's bounds. Every run has `--log-driver none`, so Docker keeps no second,
+  unbounded copy of the output on its data root (the attached stream the runner captures and
+  bounds is unaffected; with no real container run since this change, that is from Docker's
+  documentation, not observed here). A mount
   that would be, contain or lie inside the shared caches, GOPATH, HOME, the Docker socket or the
   live tree is refused before docker runs.
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod

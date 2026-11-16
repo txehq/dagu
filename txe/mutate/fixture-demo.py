@@ -161,7 +161,8 @@ class Demo:
         shutil.copytree(HERE / "testdata", runner_copy / "testdata", symlinks=True)
         name = f"{OUTER_PREFIX}-{self.root.token[:12]}"
         cidfile = root / "outer.cid"  # outside the read-only mount's source
-        argv = [self.args.docker, "run", "--rm", "--pull", "never", "--name", name, "--cidfile", str(cidfile),
+        argv = [self.args.docker, "run", "--rm", "--pull", "never", "--log-driver", "none", "--name", name,
+                "--cidfile", str(cidfile),
                 "--label", f"{ms.OWNER_LABEL}={self.root.token}", "--network", "none", "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges", "--pids-limit", "512", "--memory", "2g", "--cpus", "2",
                 "--mount", f"type=bind,source={runner_copy},target=/runner,readonly", "--workdir", "/",
