@@ -70,6 +70,9 @@ DOCKER_INFRA_EXITS = {125, 126, 127}
 EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_STOPPED = 0, 2, 3, 4, 5, 6
 OWNER_LABEL = "txe.mutate-sandboxed.owner"
 CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
+# docker inspect's answer for a container that does not exist (wording varies by version). Only
+# this establishes absence; any other failure (daemon down, auth) establishes nothing.
+NO_SUCH = re.compile(r"no such (object|container)", re.I)
 
 
 class Refused(Exception):
@@ -440,7 +443,9 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
     probe = subprocess.run([docker, "inspect", "--format", "{{.Name}} {{index .Config.Labels \"" + OWNER_LABEL + "\"}}",
                             target], capture_output=True, text=True, env=env, timeout=call_limit(15, hard_end))
     if probe.returncode != 0:
-        return f"{target}: absent"
+        if NO_SUCH.search(probe.stderr):
+            return f"{target}: absent"
+        return f"{target}: cleanup error: inspect failed: {probe.stderr.strip()[-200:]}"
     if probe.stdout.strip() != f"/{name} {token}":
         return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
     rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env,
@@ -467,11 +472,14 @@ def dir_usage(d: Path, max_entries: int, budget: float) -> tuple[int, int, str |
     def unreadable(err: OSError) -> None:
         problem.append(f"unreadable entry in the run directory: {err}")
 
-    for root, dirs, files in os.walk(d, onerror=unreadable):
+    # fwalk descends through directory descriptors opened without following links, so a container
+    # that swaps a directory for a symlink mid-walk cannot steer the walk onto a host path; each
+    # entry is stat'ed relative to its directory's descriptor, never followed.
+    for _root, dirs, files, dirfd in os.fwalk(d, onerror=unreadable, follow_symlinks=False):
         for name in dirs + files:
             count += 1
             try:
-                total += os.lstat(os.path.join(root, name)).st_blocks * 512
+                total += os.stat(name, dir_fd=dirfd, follow_symlinks=False).st_blocks * 512
             except FileNotFoundError:
                 continue
             except OSError as e:
@@ -553,8 +561,13 @@ class Runner:
             pass
         probe = subprocess.run([self.docker, "inspect", "--format", "{{.State.Running}}", target],
                                capture_output=True, text=True, env=self.docker_env(), timeout=15)
-        if probe.returncode == 0 and probe.stdout.strip() != "false":
-            raise Refused(f"the container of {result.name} ({target}) is still running; the host will not read its files")
+        if probe.returncode == 0:
+            if probe.stdout.strip() != "false":
+                raise Refused(f"the container of {result.name} ({target}) is still running; "
+                              "the host will not read its files")
+        elif not NO_SUCH.search(probe.stderr):
+            raise Refused(f"cannot establish that the container of {result.name} ({target}) has stopped "
+                          f"({probe.stderr.strip()[-200:]}); the host will not read its files")
 
     def discard(self, result: "Result") -> None:
         """A finished run's directory goes once its result is recorded (its log, outside it, stays),

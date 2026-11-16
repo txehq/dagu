@@ -20,6 +20,14 @@ if not os.path.exists("/.dockerenv"):
     print("leaky-docker: refused: only inside the outer container", file=sys.stderr)
     sys.exit(2)
 args = sys.argv[1:]
+if args[:1] == ["inspect"]:
+    # Its runs complete synchronously, so a recorded container is never still running: answer
+    # the runner's stopped-state check, and report no container to any other inspection.
+    if "{{.State.Running}}" in args:
+        print("false")
+        sys.exit(0)
+    print("Error: No such object: " + args[-1], file=sys.stderr)
+    sys.exit(1)
 if args[:1] != ["run"]:
     sys.exit(0)
 VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt",

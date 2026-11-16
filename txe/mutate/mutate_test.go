@@ -86,7 +86,11 @@ if args[:1] == ["inspect"]:
     if os.path.exists(LOG + ".slowclean"):
         time.sleep(30)
     r = reg()
+    if os.path.exists(LOG + ".daemondown"):
+        print("Cannot connect to the Docker daemon", file=sys.stderr)
+        sys.exit(1)
     if args[-1] not in r:
+        print("Error: No such object: " + args[-1], file=sys.stderr)
         sys.exit(1)
     if "{{.State.Running}}" in args:
         print("true")  # a registered container is a running one
@@ -1032,6 +1036,10 @@ func TestOuterNegativeHandsFakeHostEnv(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(leaky), `CALLER_ENV = "/fakehost/caller-env.json"`)
 	assert.Contains(t, string(leaky), "env.update(json.load(f))")
+	// It answers the runner's stopped-state check (its runs finish synchronously), or step 2 would
+	// be refused before the mutant runs.
+	assert.Contains(t, string(leaky), `if "{{.State.Running}}" in args:`)
+	assert.Contains(t, string(leaky), `print("false")`)
 	assert.Contains(t, string(outer), `>"$fake/caller-env.json"`)
 	assert.Contains(t, string(outer), `fake=/fakehost`)
 	for _, key := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY"} {
@@ -1208,4 +1216,13 @@ func TestBaselineMustBeStoppedBeforeCacheRead(t *testing.T) {
 	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "is still running; the host will not read its files")
 	assert.Len(t, dockerRuns(t, f.log), 1, "no mutant ran")
+}
+
+// A failed inspection establishes nothing: when docker cannot answer, the host refuses to read
+// the baseline's files rather than assuming the container is gone.
+func TestStoppedCheckFailsClosed(t *testing.T) {
+	f := alarmFixture(t, `open(LOG + ".daemondown", "w").close()`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "cannot establish that the container of baseline")
 }
