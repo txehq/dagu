@@ -754,6 +754,7 @@ var guardRefused = []string{
 	"(cd x && python3) < tools/mutants.py",
 	`perl -I ./mutants.pl -e 'do "x"'`,
 	"python3 /dev/fd/3 3< /dev/fd/4",
+	"python3 /dev/fd/3 3> /dev/fd/4",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

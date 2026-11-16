@@ -513,15 +513,9 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0) ->
     if kind == "pipe":
         return cmd is not None and piped_mutant(cmd)
     if kind == "file":
-        fd = fd_of_path(value)
-        if fd is None:
-            return mutant_named(value)
-        if cmd is None or fd == "?":
-            return True
-        if fd == "0":
-            return piped_mutant(cmd)
-        nxt = cmd.source(fd)
-        return True if nxt is None else source_runs_mutant(nxt, shell, depth, cmd, hops + 1)
+        # An input redirection from a descriptor path was resolved when it was read; one that is
+        # still a path here (`3> /dev/fd/4`) cannot be judged.
+        return True if fd_of_path(value) is not None else mutant_named(value)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
     return refuses(value, depth + 1) if shell else code_runs_mutant(value)
