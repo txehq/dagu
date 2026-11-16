@@ -4,6 +4,7 @@
 """Check that a run's sealed files still hash to their seal (TXE-7516 harness).
 
   check_seal.py <copy of seals.json> <run dir: outputs/<job>/runs/<run>>
+  check_seal.py --has-seal <seals.json>   exit 0 once a seal is recorded
 
 The run directory holds seals.json, executions/<execution>/<path> and attempts/.
 It prints one line per file and a summary JSON line, and exits 2 when any file is
@@ -17,7 +18,19 @@ import os
 import sys
 
 
+def has_seal(path):
+    """0 when seals.json records at least one seal; `artifacts begin` writes the
+    file earlier, with a begun execution only."""
+    try:
+        seals = json.load(open(path)).get("seals") or []
+    except (OSError, ValueError):
+        return 1
+    return 0 if seals else 1
+
+
 def main(argv):
+    if len(argv) == 2 and argv[0] == "--has-seal":
+        return has_seal(argv[1])
     if len(argv) != 2:
         print((__doc__ or "").strip(), file=sys.stderr)
         return 2

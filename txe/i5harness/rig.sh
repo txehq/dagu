@@ -220,7 +220,12 @@ cmd_up() {
 ids() { . "$RIG/ids.env"; R=txe-reviewer-${MACHINE#mch_}; DD=txe-decide-${MACHINE#mch_}; }
 label() { get "/dag-runs/$1/$2" | json 'd["dagRunDetails"]["statusLabel"]'; }
 is_failed() { [ "$(label "$JOB" "$RUN")" = failed ]; }
-has_seal() { SEALS=$(find "$RIG/machine-home/outputs" -path "*runs/$RUN/seals.json" 2>/dev/null | head -1); [ -n "$SEALS" ]; }
+# `artifacts begin` writes seals.json before the job runs, with a begun execution
+# and no seal; only a seal entry means the result was sealed.
+has_seal() {
+  SEALS=$(find "$RIG/machine-home/outputs" -path "*runs/$RUN/seals.json" 2>/dev/null | head -1)
+  [ -n "$SEALS" ] && "$PY" -I "$HERE/check_seal.py" --has-seal "$SEALS" >/dev/null
+}
 started() { [ -e "$RIG/control/started-$RUN" ]; }
 owner_lost() { grep -q 'Owner coordinator unreachable' "$RIG/logs/worker.log"; }
 
@@ -330,14 +335,20 @@ cmd_decide() {
   "$PY" -I -c 'import json,sys,uuid; p=json.load(open(sys.argv[1])); print(json.dumps({"expected_proposal_revision":p["revision"],"binding_digest":p["binding_digest"],"verdict":sys.argv[2],"idempotency_key":"rig-7516-"+uuid.uuid4().hex}))' "$out/proposal.json" "$v" > "$out/decision-request.json"
   local task; task=$(json 'd["native_task"]["run_id"]' < "$out/proposal.json")
   for _ in $(seq 1 60); do [ "$(label "$DD" "$task")" = waiting ] && break; sleep 2; done
-  local n=0
+  local n=0 last
   while :; do
     n=$((n + 1))
+    last="$out/decision-response-$n.txt"
     curl -s -w '\nHTTP %{http_code}\n' -X POST "$API/txe/jobs/$JOB/proposals/$p/decisions" -H "Authorization: Bearer $(cat "$RIG/person-token")" \
-      -H 'Content-Type: application/json' -d "$(cat "$out/decision-request.json")" > "$out/decision-response-$n.txt"
-    if grep -q follow_up_pending "$out/decision-response-$n.txt" && [ $n -lt 10 ]; then sleep 3; continue; fi
+      -H 'Content-Type: application/json' -d "$(cat "$out/decision-request.json")" > "$last"
+    # The same request is repeated, unchanged, only while the hub says the
+    # decision is recorded and its follow-up pending (J17's decide.sh).
+    if grep -q follow_up_pending "$last" && [ $n -lt 10 ]; then sleep 3; continue; fi
     break
   done
+  if grep -q follow_up_pending "$last" || ! tail -1 "$last" | grep -qE '^HTTP 2[0-9][0-9]$'; then
+    die "decide: the hub did not complete the decision ($(tail -1 "$last")); see $last. The step is not marked."
+  fi
   mark decided
   say "decide: $v on $p under authority $auth"
 }
@@ -355,13 +366,20 @@ cmd_proof() {
   get "/txe/jobs/$JOB/runs/$RUN/artifacts" > "$out/artifacts.json"
   get "/txe/jobs/$JOB/events" > "$out/events.json"
   cp "$RIG/control/counter" "$out/counter"
-  "$PY" -I "$HERE/check_seal.py" "$RIG/evidence/loss/seals.json" "$(cat "$RIG/control/run-dir")" > "$out/seal-bytes-after.txt" || :
-  procs check --pidfile "$RIG/control/worker.pid" > "$out/worker-same-process.json" || :
+  local broken=""
+  "$PY" -I "$HERE/check_seal.py" "$RIG/evidence/loss/seals.json" "$(cat "$RIG/control/run-dir")" > "$out/seal-bytes-after.txt" \
+    || broken="the sealed bytes changed"
+  procs check --pidfile "$RIG/control/worker.pid" > "$out/worker-same-process.json" \
+    || broken="${broken:+$broken; }the worker is not the process that ran the fixture"
+  [ -z "$broken" ] || die "proof: $broken (evidence kept in $out). The step is not marked."
   mark proof
 }
 
 cmd_down() {
-  need init; ids 2>/dev/null || :
+  need init
+  # up can fail before it writes ids.env (at a preflight gate); teardown must
+  # still reach the process stops.
+  if [ -f "$RIG/ids.env" ]; then ids; fi
   local out="$RIG/evidence/teardown"; mkdir -p "$out"
   if [ -n "${JOB:-}" ] && step_done up; then cli txe retire "$JOB" > "$out/retire.txt" 2>&1 || say "down: retire failed (see evidence)"; fi
   for p in worker relay hub; do procs stop --pidfile "$RIG/control/$p.pid" >> "$out/stop.txt" 2>&1 || die "down: $p was not stopped (see $out/stop.txt)"; done

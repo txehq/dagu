@@ -79,7 +79,16 @@ func shortDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "i5h")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		// rig.sh down makes evidence read-only; make it removable again.
+		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+			if err == nil && info.IsDir() {
+				_ = os.Chmod(p, 0o755)
+			}
+			return nil
+		})
+		_ = os.RemoveAll(dir)
+	})
 	return dir
 }
 
