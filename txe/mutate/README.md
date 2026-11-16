@@ -71,6 +71,8 @@ result: every baseline and mutant run executes its tests.
 ## Limits
 
 - Tests that need `.git` in the tree, network access or a host service do not run unchanged.
+- A tree holding a symlink that resolves outside it is refused: a host-side step (the seed's
+  `go mod download` updating `go.sum`, say) could write through it into live files.
 - On Linux the identity is device and inode only: Python's `os.stat` has no birth time there.
 - **The host checks are an alarm, not proof that nothing changed.** They see a watched directory
   replaced, an entry one level inside a shared cache removed or replaced, and a sentinel's content

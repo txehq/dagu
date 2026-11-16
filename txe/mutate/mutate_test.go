@@ -913,3 +913,24 @@ func TestCleanupInsideDeadline(t *testing.T) {
 	assert.Less(t, time.Since(start), 12*time.Second)
 	assert.Contains(t, o.stderr, "cleanup error")
 }
+
+// A symlink in the tree that leads outside it (here an absolute go.sum link back into the live
+// tree) is refused before anything runs on the host or in a container; a link inside is fine.
+func TestOutsideSymlinkRefused(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	outside := filepath.Join(f.root, "elsewhere.sum")
+	require.NoError(t, os.WriteFile(outside, []byte("live\n"), 0o644))
+	require.NoError(t, os.Symlink(outside, filepath.Join(f.tree, "go.sum")))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "go.sum is a symlink to")
+	assert.Empty(t, dockerRuns(t, f.log))
+	raw, err := os.ReadFile(outside)
+	require.NoError(t, err)
+	assert.Equal(t, "live\n", string(raw))
+
+	g := newFixture(t, passingCheck)
+	require.NoError(t, os.Symlink("check.sh", filepath.Join(g.tree, "inside.sh")))
+	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}))
+	assert.Equal(t, 0, o.code, o.stdout+o.stderr)
+}

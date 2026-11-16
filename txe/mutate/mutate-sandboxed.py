@@ -300,10 +300,22 @@ class WorkDir:
 
 
 def copy_tree(src: Path, dst: Path, excludes: tuple[str, ...]) -> None:
+    """Copy the tree, keeping symlinks as links, and refuse any link that leads outside the copy.
+
+    A link that resolves outside the copy (an absolute link into the live tree, say) would let a
+    host-side step such as `go mod download` updating go.sum write through it into live files.
+    Inside the container such a link dangles; on the host it is a hole, so it is refused."""
     def ignore(_d, names):
         return [n for n in names if n in excludes]
 
     shutil.copytree(src, dst, symlinks=True, ignore=ignore)
+    top = real(dst)
+    for d, dirs, files in os.walk(dst):
+        for n in dirs + files:
+            p = Path(d) / n
+            if p.is_symlink() and not within(real(p), top):
+                raise Refused(f"{p.relative_to(dst)} is a symlink to {os.readlink(p)}, outside the tree; "
+                              "a host-side step could write through it")
 
 
 def clone_dir(src: Path, dst: Path) -> None:
