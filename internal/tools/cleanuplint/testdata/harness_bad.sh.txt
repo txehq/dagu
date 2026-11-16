@@ -21,3 +21,7 @@ trap 'rm -rf "$HOME/scratch"' EXIT # want:env-path-delete
 for d in "$HOME"/.cache/*; do rm -rf "$d"; done # want:env-path-delete
 sudo rm -Rf "/home/$USER/.cache" # want:env-path-delete
 "${GO}" clean -cache # want:go-clean-cache
+cache="${GOCACHE:-$(mktemp -d)}"
+rm -rf "$cache" # want:env-path-delete
+scratch="$HOME/.cache/$(mktemp -u XXXXXX)"
+rm -rf "$scratch" # want:env-path-delete

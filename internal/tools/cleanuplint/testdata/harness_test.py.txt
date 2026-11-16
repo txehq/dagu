@@ -21,3 +21,5 @@ under = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
 shutil.rmtree(under)
 tight=os.environ["GOCACHE"]
 shutil.rmtree(tight)  # want:env-path-delete
+fallback = os.environ.get("GOCACHE") or tempfile.mkdtemp()
+shutil.rmtree(fallback)  # want:env-path-delete

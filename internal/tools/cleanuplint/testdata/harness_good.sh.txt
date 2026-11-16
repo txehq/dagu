@@ -19,3 +19,5 @@ find "$HOME/.config" -name x -print
 rm -rf "$HOME/.allowed" # allowed:env-path-delete
 scratch=$(mktemp -d "$HOME/.cache/x.XXXXXX")
 rm -rf "$scratch"
+legacy=`mktemp -d "$HOME/x.XXXXXX"`
+rm -rf "$legacy"

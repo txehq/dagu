@@ -242,15 +242,77 @@ var (
 	psDirDel = regexp.MustCompile(`(?i)\[(System\.)?IO\.Directory\]::Delete\s*\((.*)$`)
 	pyDelRe  = regexp.MustCompile(`\brmtree\s*\((.*)$`)
 
-	// createsTemp matches a value that is a directory or file the script
-	// has just created under a unique name: its identity is known, wherever
-	// its parent came from.
+	// createsTemp starts an expression whose value is a directory or file
+	// just created under a unique name: its identity is known, wherever its
+	// parent came from.
 	createsTemp = regexp.MustCompile(`(?i)\bmktemp\b|\bmkdtemp\s*\(|\bmkstemp\s*\(|\bTemporaryDirectory\s*\(|\bNew-TemporaryFile\b`)
 
 	// targetEnd cuts a delete's arguments where the command ends, including
 	// inside a quoted trap string: trap 'rm -rf "$tmp"; rmdir "$lock"' EXIT.
 	targetEnd = regexp.MustCompile(`;|&&|\|\|?`)
 )
+
+// stripCreated removes each expression in s that creates a fresh temporary
+// path: a $(...) or `...` substitution that runs mktemp, or a call such as
+// tempfile.mkdtemp(...) or New-TemporaryFile. What is left still counts, so
+// ${GOCACHE:-$(mktemp -d)} is still the caller's GOCACHE.
+func stripCreated(s string) string {
+	for {
+		loc := createsTemp.FindStringIndex(s)
+		if loc == nil {
+			return s
+		}
+		start, end := createdSpan(s, loc[0], loc[1])
+		s = s[:start] + " " + s[end:]
+	}
+}
+
+// createdSpan widens a createsTemp match to the expression it belongs to: the
+// enclosing $( ) or backticks for a shell command, or the call's parentheses.
+func createdSpan(s string, mStart, mEnd int) (int, int) {
+	// The enclosing command substitution, if any.
+	depth := 0
+	for i := mStart - 1; i >= 0; i-- {
+		switch s[i] {
+		case ')':
+			depth++
+		case '(':
+			if depth > 0 {
+				depth--
+				continue
+			}
+			if i > 0 && s[i-1] == '$' {
+				return i - 1, closeParen(s, i)
+			}
+		case '`':
+			if end := strings.IndexByte(s[mEnd:], '`'); end >= 0 {
+				return i, mEnd + end + 1
+			}
+		}
+	}
+	// A call: extend over its argument list when the match ends at "(".
+	if mEnd > 0 && s[mEnd-1] == '(' {
+		return mStart, closeParen(s, mEnd-1)
+	}
+	return mStart, mEnd
+}
+
+// closeParen returns the index just past the parenthesis that closes s[open].
+func closeParen(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return len(s)
+}
 
 func cutTarget(s string) string {
 	if loc := targetEnd.FindStringIndex(s); loc != nil {
@@ -382,7 +444,7 @@ func (sc *scriptScan) propagate() {
 			if sc.tainted[a.name] {
 				continue
 			}
-			if !createsTemp.MatchString(a.rhs) && sc.textTainted(a.rhs) {
+			if sc.textTainted(stripCreated(a.rhs)) {
 				sc.tainted[a.name] = true
 				changed = true
 			}
