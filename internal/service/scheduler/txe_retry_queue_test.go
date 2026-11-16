@@ -121,45 +121,131 @@ func distributedDispatcher(f *queueFixture, admitter RunAdmitter) *queueDispatch
 	}
 }
 
-// TXE-7518 characterization, on origin/main 47b89206c: a retry of a
-// registered job's sealed run that the local CLI queued carries no retry
-// request, and queue dispatch admits it because the job is active and on its
-// current version. Nothing binds it to an approved dagu.retry_run action, so
-// the sealed execution would run again.
-func TestQueueDispatch_TxeCLIRetryOfSealedRun_Characterization(t *testing.T) {
+// queuedItem is the one queue item of dag's proc group.
+func queuedItem(t *testing.T, f *queueFixture, dag *ir.DAG) string {
+	t.Helper()
+	items, err := f.queueStore.List(f.ctx, dag.ProcGroup())
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	return items[0].ID()
+}
+
+// assertRetryDropped checks a refused queued retry: not dispatched, its
+// queue item gone, its execution aborted with the registry's reason, the
+// retried execution kept, and the refusal noted on the job.
+func assertRetryDropped(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir.DAGRunStatus, admitted bool, code registry.AdmitCode) {
+	t.Helper()
+	assert.False(t, admitted)
+	items, err := f.queueStore.List(f.ctx, j.dag.ProcGroup())
+	require.NoError(t, err)
+	assert.Empty(t, items)
+	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ir.Aborted, status.Status)
+	assert.Contains(t, status.Error, string(code))
+	retained, err := f.dagRunRepository.ListRetainedExecutions(f.ctx, queued.DAGRun())
+	require.NoError(t, err)
+	require.Len(t, retained, 1, "the retried execution is kept")
+	assert.Equal(t, ir.Succeeded.String(), retained[0].Status)
+	events, err := j.store.ListEvents(f.ctx, j.job.JobID, 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, events)
+	assert.Equal(t, registry.EventRunDropped, events[0].Kind)
+	assert.Equal(t, string(code), events[0].Reason)
+}
+
+// A retry of a registered job's sealed run queued by the local CLI, which
+// carries no retry request (TXE-7518 characterization on 47b89206c: queue
+// dispatch admitted it on lifecycle and version alone), is refused.
+func TestQueueDispatch_TxeRetryWithoutRequestIsRefused(t *testing.T) {
 	j := newTxeQueueJob(t)
 	f := newQueueFixture(t)
 	sealed := finishedRun(t, f, j.dag, "run-sealed", ir.Succeeded)
-
 	queued := cliEnqueueRetry(t, f, j.dag, sealed, nil)
-	assert.Nil(t, queued.RetryRequest, "the CLI cannot carry an approval")
-	items, err := f.queueStore.List(f.ctx, j.dag.ProcGroup())
-	require.NoError(t, err)
-	require.Len(t, items, 1)
 
-	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), items[0].ID(), queued.AttemptID, queued, j.dag)
-	assert.True(t, admitted, "today: only lifecycle and version are checked")
+	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+
+	assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryUnbound)
 }
 
-// TXE-7518 characterization: a queued retry whose recorded request names an
-// action the job does not have is admitted the same way; the request is not
-// read at dispatch.
-func TestQueueDispatch_TxeForgedRetryRequest_Characterization(t *testing.T) {
+// A retry request whose ID is not the one derived for the run's retried
+// execution and action attempt is refused: it was edited after the hub
+// derived it.
+func TestQueueDispatch_TxeTamperedRetryRequestIsRefused(t *testing.T) {
+	j := newTxeQueueJob(t)
+	f := newQueueFixture(t)
+	sealed := finishedRun(t, f, j.dag, "run-sealed", ir.Succeeded)
+	request, err := ir.NewRetryRequest(sealed.DAGRun(), sealed.AttemptID, sealed.QueuedAt, "act_one", "1", "sha256:one")
+	require.NoError(t, err)
+	request.ActionAttempt = "2"
+	queued := cliEnqueueRetry(t, f, j.dag, sealed, request)
+
+	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+
+	assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryMismatch)
+}
+
+// A retry request made for another execution, or another run, is refused:
+// it names no execution this queued retry replaced.
+func TestQueueDispatch_TxeRetryRequestForAnotherExecutionIsRefused(t *testing.T) {
+	for name, retried := range map[string]func(*ir.DAGRunStatus) (ir.DAGRunRef, string, string){
+		"another execution": func(s *ir.DAGRunStatus) (ir.DAGRunRef, string, string) {
+			return s.DAGRun(), s.AttemptID, "2026-01-01T00:00:00Z"
+		},
+		"another run": func(s *ir.DAGRunStatus) (ir.DAGRunRef, string, string) {
+			return ir.NewDAGRunRef(s.Name, "run-other"), s.AttemptID, s.QueuedAt
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			j := newTxeQueueJob(t)
+			f := newQueueFixture(t)
+			sealed := finishedRun(t, f, j.dag, "run-sealed", ir.Succeeded)
+			run, attemptID, queuedAt := retried(sealed)
+			request, err := ir.NewRetryRequest(run, attemptID, queuedAt, "act_one", "1", "sha256:one")
+			require.NoError(t, err)
+			queued := cliEnqueueRetry(t, f, j.dag, sealed, request)
+
+			admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+
+			assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryMismatch)
+		})
+	}
+}
+
+// Pending the TXE-7517 binding: a request derived correctly for the retried
+// execution passes the request check, even for an action the job does not
+// have. The registry binding (approved, executing under a live grant,
+// current attempt, version and binding) is what refuses it; until that step
+// lands, this test pins the gap.
+func TestQueueDispatch_TxeUnknownActionAwaitsBinding(t *testing.T) {
 	j := newTxeQueueJob(t)
 	f := newQueueFixture(t)
 	sealed := finishedRun(t, f, j.dag, "run-sealed", ir.Succeeded)
 	forged, err := ir.NewRetryRequest(sealed.DAGRun(), sealed.AttemptID, sealed.QueuedAt, "act_forged", "1", "sha256:forged")
 	require.NoError(t, err)
-
 	queued := cliEnqueueRetry(t, f, j.dag, sealed, forged)
-	items, err := f.queueStore.List(f.ctx, j.dag.ProcGroup())
-	require.NoError(t, err)
-	require.Len(t, items, 1)
 
-	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), items[0].ID(), queued.AttemptID, queued, j.dag)
-	assert.True(t, admitted, "today: the recorded request is not checked")
+	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+	assert.True(t, admitted)
 	_, has := j.job.Actions["act_forged"]
 	assert.False(t, has)
+}
+
+// A registered job's first run, queued by any other trigger, is not a retry
+// and needs no retry request.
+func TestQueueDispatch_TxeFirstRunNeedsNoRequest(t *testing.T) {
+	j := newTxeQueueJob(t)
+	f := newQueueFixture(t)
+	f.dag = j.dag
+	f.enqueueRunWithTrigger("run-new", ir.TriggerTypeManual)
+	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, ir.NewDAGRunRef(j.dag.Name, "run-new"))
+	require.NoError(t, err)
+	queued, err := attempt.ReadStatus(f.ctx)
+	require.NoError(t, err)
+
+	assert.True(t, distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag))
 }
 
 // The control: a non-TXE DAG's queued retry is outside the registry.

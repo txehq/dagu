@@ -24,6 +24,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/proc"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/runtime/agent"
+	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 	"github.com/spf13/cobra"
 )
 
@@ -256,6 +257,9 @@ func runRetry(ctx *Context, args []string) error {
 	// Step retry is not supported via queue (queue processor does not pass step name).
 	queueConfig := ctx.Config.FindQueueConfig(dag.ProcGroup())
 	if stepName == "" && queueConfig != nil && status.Status != ir.Queued {
+		if err := refuseTxeJobRetry(dag); err != nil {
+			return err
+		}
 		return enqueueRetry(ctx, dag, status, triggerActor)
 	}
 
@@ -516,6 +520,26 @@ func newQueueDispatchNotQueuedError(status *ir.DAGRunStatus) *queue.DAGRunNotQue
 		return &queue.DAGRunNotQueuedError{}
 	}
 	return &queue.DAGRunNotQueuedError{Status: status.Status, HasStatus: true}
+}
+
+// errTxeJobRetry refuses a local retry of a registered TXE job's run.
+var errTxeJobRetry = errors.New("txe: a registered job's run is retried only through its TXE controls")
+
+// refuseTxeJobRetry refuses queueing a retry of a registered TXE job's run
+// from the local CLI, before anything is written. A rerun of a job's sealed
+// execution is a person's approved decision, which the hub binds to the
+// decision's action (TXE-7517) and queue dispatch binds again (TXE-7518).
+// The local CLI cannot carry that approval, and access to the hub's shell or
+// data dir is not one.
+func refuseTxeJobRetry(dag *ir.DAG) error {
+	name := dag.SuspendFlagName()
+	if !registry.IsJobDAG(name) {
+		if !registry.IsJobDAG(dag.Name) {
+			return nil
+		}
+		name = dag.Name
+	}
+	return fmt.Errorf("%w: use \"Run again\" or \"Publish sealed result\" on the job's page (/txe/jobs/%s), where the retry is approved and bound to that decision", errTxeJobRetry, name)
 }
 
 // enqueueRetry enqueues the retry and persists Queued status via queue.EnqueueRetry.

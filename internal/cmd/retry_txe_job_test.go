@@ -87,25 +87,51 @@ func TestRetryCommand_TxeJobLocalRetryRefusedBySelector_Characterization(t *test
 	require.Equal(t, ir.Succeeded, f.latest(t).Status)
 }
 
-// TXE-7518 characterization: with --worker-id and --attempt-id, flags the
-// worker sets for a dispatched task but any shell user can pass, the same
-// command skips that rule. When the job's proc group has a global queue, it
-// re-queues the sealed run as a retry with no retry request, checked by
-// nothing TXE before queue dispatch.
-func TestRetryCommand_TxeJobRetryWithWorkerFlagsIsQueued_Characterization(t *testing.T) {
+// With --worker-id and --attempt-id, flags the worker sets for a dispatched
+// task but any shell user can pass, the command skips the selector rule. When
+// the job's proc group has a global queue it reached the enqueue (TXE-7518
+// characterization on 47b89206c: re-queued with no retry request). It is now
+// refused there, before anything is written, with the TXE controls named.
+func TestRetryCommand_TxeJobRetryWithWorkerFlagsRefusedBeforeEnqueue(t *testing.T) {
 	f := newTxeJobRetryFixture(t, true)
 
-	f.th.RunCommand(t, cmd.Retry(), test.CmdTest{
+	err := f.th.RunCommandWithError(t, cmd.Retry(), test.CmdTest{
 		Args: []string{"retry", "--run-id=" + f.runID, "--worker-id=shell", "--attempt-id=" + f.attempt, f.location},
 	})
+	require.ErrorContains(t, err, "retried only through its TXE controls")
+	require.ErrorContains(t, err, "/txe/jobs/"+f.jobID)
 
 	items, err := f.th.QueueStore.List(f.th.Context, f.jobID)
 	require.NoError(t, err)
+	require.Empty(t, items)
+	latest := f.latest(t)
+	require.Equal(t, ir.Succeeded, latest.Status)
+	require.Equal(t, f.attempt, latest.AttemptID)
+	require.NotEqual(t, ir.TriggerTypeRetry, latest.TriggerType)
+}
+
+// The control: a DAG that is not a registered job still queues its retry.
+func TestRetryCommand_NonTxeRetryWithWorkerFlagsIsQueued(t *testing.T) {
+	const name = "plain-selector-dag"
+	th := test.SetupCommand(t, test.WithConfigMutator(func(cfg *config.Config) {
+		cfg.Queues = config.Queues{Enabled: true, Config: []config.QueueConfig{{Name: name, MaxActiveRuns: 1}}}
+	}))
+	dagFile := th.DAG(t, "name: "+name+"\nworker_selector:\n  pool: a\nsteps:\n  - name: run\n    run: echo plain\n")
+	startedAt := time.Now().Add(-time.Minute)
+	attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, startedAt, "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	logPath := filepath.Join(th.Config.Paths.LogDir, "plain-selector.log")
+	require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
+	writeStatus(t, th.Context, attempt, ir.NewStatusBuilder(dagFile.DAG).Create("run-1", ir.Succeeded, 0, startedAt,
+		ir.WithAttemptID(attempt.ID()), ir.WithLogFilePath(logPath)))
+
+	th.RunCommand(t, cmd.Retry(), test.CmdTest{
+		Args: []string{"retry", "--run-id=run-1", "--worker-id=shell", "--attempt-id=" + attempt.ID(), dagFile.Location},
+	})
+
+	items, err := th.QueueStore.List(th.Context, name)
+	require.NoError(t, err)
 	require.Len(t, items, 1)
-	queued := f.latest(t)
-	require.Equal(t, ir.Queued, queued.Status)
-	require.Equal(t, ir.TriggerTypeRetry, queued.TriggerType)
-	require.Nil(t, queued.RetryRequest)
 }
 
 // TXE-7518 characterization: without a global queue, the same flags take
