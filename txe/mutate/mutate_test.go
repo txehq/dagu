@@ -653,6 +653,19 @@ var guardRefused = []string{
 	`node -e 'require("child_process").execSync("python3 mutants.py")'`,
 	`perl -e 'system("python3 mutants.py")'`,
 	`deno eval 'await import("./mutants.ts")'`,
+	// Review findings on PR 276 (connector and security review).
+	"((python3 mutants.py) )",
+	"echo $(( $(python3 mutants.py) + 1 ))",
+	"python3 < <(cat mutants.py)",
+	"bash < <(cat run-mutations.sh)",
+	"python3 -m runpy tools/mutants.py",
+	"python3 -m pdb mutants.py",
+	"python3 -m cProfile -o prof.out mutants.py",
+	"coverage run mutants.py",
+	"function f { python3 mutants.py; }",
+	"node -r ./mutants.js app.js",
+	"node --require=./mutants.js app.js",
+	"ruby -rmutants app.rb",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -711,6 +724,11 @@ var guardAllowed = []string{
 	`python3 -c 'import subprocess; print(subprocess.run(["git", "status"]).returncode)' mutants.py`,
 	`node -e 'console.log("mutants.js")'`,
 	"true # ; python3 mutants.py",
+	`python3 -c 'print("example: import mutants")'`,
+	"python3 - <<'EOF'\n# import mutants\nprint(1)\nEOF",
+	"echo $((1 + 2)); ((i++))",
+	"python3 -m cProfile -o prof.out tools/report.py mutants.json",
+	"node -r ./setup.js app.js mutants.json",
 	"perl -ne 'print if /mutants.py/' notes.md",
 	"git show origin/main:txe/mutate/guard-hook.py | head",
 	"git log --grep=mutate --oneline",
@@ -873,9 +891,12 @@ start = time.monotonic()
 for _ in range(4000):
     s = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 40)))
     g.refuses(s)
-deep = "$(" * 3000 + "python3 mutants.py" + ")" * 3000
-g.refuses(deep)
 g.refuses("bash -c " + "'bash -c " * 200 + "x")
+# Nesting too deep to read fails closed, whatever it holds.
+for deep in ["$(" * 3000 + "ls" + ")" * 3000, "(" * 3000 + "ls" + ")" * 3000, "uv run " * 3000 + "ls",
+             "find . -exec " * 3000 + "ls", "echo " + "<(" * 3000 + "ls" + ")" * 3000]:
+    assert g.refuses(deep) is True, deep[:20]
+assert g.refuses("$(" * 5 + "ls" + ")" * 5) is False
 for noise in ["echo '", 'echo "', "cat <<EOF", "x=$(", "# "]:
     assert g.refuses("python3 mutants.py; " + noise) is True, noise
 print("ok", round(time.monotonic() - start, 1) < 60)

@@ -8,8 +8,9 @@ loud: a shell command that runs a mutation script or a mutation tool any other w
 
 It reads the hook input (Claude Code and Codex share the shape) on stdin, and for a refused
 command exits 2 with the reason on stderr, which both harnesses feed back to the agent. It prints
-nothing and exits 0 for anything else, including input it cannot parse: it only ever adds a
-refusal.
+nothing and exits 0 for anything else, including hook input that is not JSON or carries no shell
+command. A command it cannot judge fails closed: nesting deeper than MAX_DEPTH levels, or an
+internal error, is refused.
 
 The command is read the way a shell reads it (quotes, escapes, pipelines, lists, subshells,
 command and process substitution, redirections and here-documents), and only what a shell would
@@ -58,7 +59,14 @@ SHELLS = re.compile(r"^(?:bash|sh|zsh|dash|ksh|mksh|ash|fish)$")
 PYTHONS = re.compile(r"^(?:python[0-9.]*|pypy[0-9.]*)$")
 OTHER_INTERPRETERS = {"node", "nodejs", "deno", "bun", "ruby", "perl", "tsx", "ts-node", "php", "Rscript"}
 KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "coproc"}
-DATA_KEYWORDS = {"for", "select", "case", "function", "fi", "done", "esac", "in", "[[", "]]"}
+# Their words are data: a loop's or case's own commands come after `do`, `;` or `)`, which start a
+# new command here. `function NAME` is skipped instead, so its body is judged.
+DATA_KEYWORDS = {"for", "select", "case", "fi", "done", "esac", "in", "[[", "]]"}
+# Python modules and tools that run a script given as a later argument.
+SCRIPT_RUNNER_MODULES = {"runpy", "pdb", "cProfile", "profile", "trace", "coverage", "debugpy", "pyinstrument",
+                         "memray", "scalene", "viztracer", "line_profiler", "kernprof", "py_spy"}
+SCRIPT_RUNNER_TOOLS = {"coverage", "pdb", "pyinstrument", "memray", "scalene", "viztracer", "kernprof", "py-spy"}
+PRELOAD_OPTS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
 # Wrapper commands run their arguments as a command. Value: options that take a separate value,
 # and how many positional words come before the command (timeout's duration, chrt's priority).
 WRAPPERS = {
@@ -103,6 +111,7 @@ CODE_RUNS = re.compile(r"runpy|\bexec(?:file)?\s*\(|subprocess|\bos\s*\.\s*(?:sy
                        r"|\b(?:execSync|execFile\w*|spawnSync|fork)\b|\brequire\s*\(|\bimport\s*\(|\bsystem\s*\("
                        r"|\bload\s*\(|\bdo\s*\(?\s*['\"]|`|%x|\bpty\s*\.\s*spawn")
 CODE_IMPORTS_MUTANT = re.compile(r"(?:^|[\s;:])(?:import|from)\s+(?:[\w.]*\.)?(?:mutants?|mutations?|mutmut)\b")
+CODE_STRING_OR_COMMENT = re.compile(r"#[^\n]*|//[^\n]*|'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\"")
 CODE_TOKEN = re.compile(r"[^\s'\"(),\[\]{};=+<>]+")
 
 REASON = ("Refused: this runs a mutation test outside the sandboxed runner. A mutant breaks a guard on "
@@ -130,6 +139,7 @@ class Cmd:
         self.words: list[Word] = []
         self.stdin_file: "str | None" = None
         self.stdin_text: "str | None" = None  # a here-document's body or a here-string's word
+        self.stdin_procsub: "list[Cmd] | None" = None  # `< <(cmd)`: stdin is that command's output
         self.piped_from: "Cmd | None" = None
 
 
@@ -145,17 +155,26 @@ class Parser:
         self.s, self.i, self.depth = src, 0, depth
         self.cmds = []  # every simple command found, nested ones included
         self.heredocs = []  # (cmd, delimiter, strip_tabs, quoted) waiting for the next newline
+        self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
 
     def parse(self) -> list:
         self.seq(None)
         return self.cmds
 
+    def deeper(self) -> bool:
+        """Whether one more level of nesting may be read; records it when not."""
+        if self.depth < MAX_DEPTH:
+            return True
+        self.too_deep = True
+        return False
+
     def sub(self, src: str) -> list:
         """Commands in shell code found inside this one (backticks, here-document substitutions)."""
-        if self.depth >= MAX_DEPTH:
+        if not self.deeper():
             return []
         p = Parser(src, self.depth + 1)
         found = p.parse()
+        self.too_deep = self.too_deep or p.too_deep
         self.cmds.extend(found)
         return found
 
@@ -167,7 +186,7 @@ class Parser:
 
         def finish():
             nonlocal cur
-            if cur.words or cur.stdin_file is not None or cur.stdin_text is not None:
+            if cur.words or cur.stdin_file is not None or cur.stdin_text is not None or cur.stdin_procsub is not None:
                 self.cmds.append(cur)
             done, cur = cur, Cmd()
             return done
@@ -200,10 +219,10 @@ class Parser:
                 cur.piped_from = prev
             elif c == "(" and not cur.words:
                 if s.startswith("((", self.i):
-                    self.skip_balanced("((")
+                    self.arithmetic("((")
                 else:
                     self.i += 1
-                    if self.depth < MAX_DEPTH:
+                    if self.deeper():
                         self.depth += 1
                         self.seq(")")
                         self.depth -= 1
@@ -235,6 +254,8 @@ class Parser:
             self.heredocs.append((cur, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
         elif op == "<<<":
             cur.stdin_text = target.text
+        elif op == "<" and target.procsub is not None:
+            cur.stdin_procsub = target.procsub
         elif op == "<":
             cur.stdin_file = target.text
 
@@ -255,24 +276,33 @@ class Parser:
                 p = Parser(body, self.depth)
                 p.dquote(None)
                 self.cmds.extend(p.cmds)
+                self.too_deep = self.too_deep or p.too_deep
         self.heredocs = []
 
-    def skip_balanced(self, opener: str):
-        depth, self.i = 1, self.i + len(opener)
-        while self.i < len(self.s) and depth:
-            if self.s.startswith("((", self.i) or self.s[self.i] == "(":
+    def arithmetic(self, opener: str):
+        """Read `((...))` or `$((...))` to its closing brackets. Bash reads `((cmd) )` as a nested
+        subshell, not arithmetic, so the text inside is also read as commands: real arithmetic
+        yields only harmless words."""
+        s, start = self.s, self.i + len(opener)
+        depth, j = 2, start
+        while j < len(s) and depth:
+            if s[j] == "(":
                 depth += 1
-            elif self.s[self.i] == ")":
+            elif s[j] == ")":
                 depth -= 1
-            self.i += 1
-        if depth and self.s.startswith(")", self.i):
-            self.i += 1
+            j += 1
+        self.i = j
+        inner = s[start:j]
+        for _ in range(2):
+            inner = inner.rstrip(" \t\n")
+            inner = inner[:-1] if inner.endswith(")") else inner
+        self.sub(inner)
 
     def word(self) -> Word:
         s, w = self.s, Word()
         if s.startswith(("<(", ">("), self.i):
             self.i += 2
-            if self.depth < MAX_DEPTH:
+            if self.deeper():
                 self.depth += 1
                 w.procsub = self.seq(")")
                 self.depth -= 1
@@ -311,11 +341,11 @@ class Parser:
         arithmetic expansion, or a plain $; return the text it adds to the word."""
         s = self.s
         if s.startswith("$((", self.i):
-            self.skip_balanced("$((")
+            self.arithmetic("$((")
             return ""
         if s.startswith("$(", self.i):
             self.i += 2
-            if self.depth < MAX_DEPTH:
+            if self.deeper():
                 self.depth += 1
                 self.seq(")")
                 self.depth -= 1
@@ -380,8 +410,8 @@ def code_runs_mutant(code: str) -> bool:
     """Whether code for a non-shell interpreter runs a mutant: it imports one, or it names a
     mutant script or a mutation tool and calls something that runs a file or a process. Code that
     only mentions the names (prints them, edits text that contains them) is data."""
-    if CODE_IMPORTS_MUTANT.search(code):
-        return True
+    if CODE_IMPORTS_MUTANT.search(CODE_STRING_OR_COMMENT.sub(" ", code)):
+        return True  # an import statement, not import text inside a string or a comment
     if not CODE_RUNS.search(code):
         return False
     return any(mutant_named(t, need_ext=True) or TOOLS.match(base(t)) for t in CODE_TOKEN.findall(code))
@@ -395,6 +425,8 @@ def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
         return True
     if cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words):
         return True
+    if cmd.stdin_procsub is not None and any(names_mutant_script(c.words) for c in cmd.stdin_procsub):
+        return True  # python3 < <(cat mutants.py)
     if cmd.stdin_text is None:
         return False
     return refuses(cmd.stdin_text, depth + 1) if shell else code_runs_mutant(cmd.stdin_text)
@@ -404,6 +436,7 @@ class Judge:
     def __init__(self, depth: int):
         self.depth = depth
         self.vars = {}
+        self.nest = 0
 
     def runs_mutation(self, cmd: Cmd) -> bool:
         words = list(cmd.words)
@@ -416,11 +449,23 @@ class Judge:
         return self.program(words, cmd)
 
     def program(self, words: list, cmd) -> bool:
+        """Runners and find -exec recurse here; past MAX_DEPTH levels the command is refused, so
+        a deep chain cannot exhaust the stack and fail open."""
+        self.nest += 1
+        try:
+            return True if self.nest > MAX_DEPTH else self._program(words, cmd)
+        finally:
+            self.nest -= 1
+
+    def _program(self, words: list, cmd) -> bool:
         i = 0
         while i < len(words):
             t = words[i].text
             if ASSIGN.match(t) or t in KEYWORDS:
                 i += 1
+                continue
+            if t == "function":  # function NAME [()] { body }: the body is judged as commands
+                i += 2
                 continue
             if t in DATA_KEYWORDS:
                 return False
@@ -482,6 +527,8 @@ class Judge:
             return self.runner(prog, args, cmd)
         if prog == "find":
             return self.find_exec(args)
+        if prog in SCRIPT_RUNNER_TOOLS:  # coverage run x.py, pdb x.py, py-spy record -- python3 x.py
+            return names_mutant_script(args)
         if VARIABLE.match(w0.text):  # an unknown program in a variable: judge it as an interpreter
             ops = [a for a in args if not a.text.startswith("-")]
             return bool(ops) and mutant_named(ops[0].text, need_ext=True)
@@ -525,8 +572,13 @@ class Judge:
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
                     return code_runs_mutant(code)
                 if ch == "m":
+                    attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return bool(TOOLS.match(mod) or mutant_named(mod))
+                    if TOOLS.match(mod) or mutant_named(mod):
+                        return True
+                    # python3 -m runpy|pdb|cProfile|coverage ... runs a script named later.
+                    rest = args[j + (1 if attached else 2):]
+                    return mod.split(".")[0] in SCRIPT_RUNNER_MODULES and names_mutant_script(rest)
                 if ch in "WXQ":
                     j += 0 if t[k + 1:] else 1
                     break
@@ -547,6 +599,13 @@ class Judge:
             return code_at(1)
         while j < len(args):
             t = args[j].text
+            opt, eq, val = t.partition("=")
+            if opt in PRELOAD_OPTS and t.startswith("--") and eq and mutant_named(val):
+                return True  # --require=./mutants.js
+            if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
+                return True  # node -r ./mutants.js, ruby -r ./mutants.rb: a preloaded module runs
+            if prog in ("ruby", "perl") and re.match(r"^-[rM].", t) and mutant_named(t[2:].split("=")[0]):
+                return True  # ruby -rmutants, perl -Mmutants
             if t in ("-e", "--eval", "-p", "--print", "-E", "-r", "--require", "--import", "--loader",
                      "--experimental-loader", "-C", "--conditions", "-I", "-M") and prog not in ("perl", "ruby"):
                 if t in ("-e", "--eval", "-p", "--print", "-E"):
@@ -614,12 +673,13 @@ class Judge:
 
 def refuses(command: str, depth: int = 0) -> bool:
     if depth > MAX_DEPTH:
-        return False
+        return True  # shell code nested this deep is not read: refused rather than let through
     judge = Judge(depth)
-    for cmd in Parser(command, depth).parse():
-        if judge.runs_mutation(cmd):
-            return True
-    return False
+    parser = Parser(command, depth)
+    cmds = parser.parse()
+    if parser.too_deep:
+        return True
+    return any(judge.runs_mutation(cmd) for cmd in cmds)
 
 
 def command_of(data: dict):
@@ -646,7 +706,15 @@ def main() -> int:
     if not isinstance(data, dict):
         return 0
     command = command_of(data)
-    if command is not None and refuses(command):
+    if command is None:
+        return 0
+    try:
+        refused = refuses(command)
+    except Exception as e:  # noqa: BLE001 - fail closed: a command the guard cannot judge is refused
+        print(f"Refused: the mutant-run guard (TXE-7549) could not read this command ({type(e).__name__}). "
+              "Ask your coordinator; do not rephrase or rename anything to get past this check.", file=sys.stderr)
+        return 2
+    if refused:
         print(REASON, file=sys.stderr)
         return 2
     return 0
