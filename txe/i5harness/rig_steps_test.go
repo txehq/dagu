@@ -310,6 +310,14 @@ func TestCheckProof(t *testing.T) {
 	assert.Equal(t, 2, code, out)
 	assert.Contains(t, out, "not sealed")
 
+	for _, status := range []string{"upload_failed", "mismatch", "pending_upload"} {
+		_, unverified := published("succeeded", "failed", sealedSha(t, runDir))
+		unverified.(map[string]any)["artifacts"].([]any)[0].(map[string]any)["status"] = status
+		out, code = check(run, unverified, "1\n", "1\n")
+		assert.Equal(t, 2, code, out)
+		assert.Contains(t, out, "the hub's copy is '"+status+"'", status)
+	}
+
 	queued, _ := published("queued", "failed", sealedSha(t, runDir))
 	_, code = check(queued, art, "1\n", "1\n")
 	assert.Equal(t, 3, code, "a queued admitted execution is pending, not failed")

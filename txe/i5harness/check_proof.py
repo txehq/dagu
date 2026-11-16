@@ -14,7 +14,7 @@ checks the run itself:
   - it is a retry of the sealed execution (retryRequest.retryOf);
   - its publish step succeeded and its run step was not executed again;
   - the hub's artifacts record that execution, produced_in = the sealed one,
-    and every sealed file with the sealed sha256;
+    and every sealed file with the sealed sha256 and a hub copy that is verified;
   - the fixture's counter did not move after the loss.
 Exit 0 when all hold, 3 while the execution is still queued or running, 2 when
 any check fails. One JSON line reports every check. It only reads.
@@ -66,9 +66,15 @@ def main(argv):
     if produced != seal["execution"]:
         errs.append(f"produced_in is {produced!r}, not the sealed {seal['execution']!r}")
     published = {x.get("path"): x.get("sha256") for x in art.get("artifacts") or []}
+    # The hub keeps the recorded sha256 when its copy is missing or differs
+    # (status mismatch, upload_failed, pending_upload); only "verified" says the
+    # bytes the hub holds are the sealed ones.
+    status_of = {x.get("path"): x.get("status") for x in art.get("artifacts") or []}
     for f in seal.get("files") or []:
         if published.get(f["path"]) != f["sha256"]:
             errs.append(f"{f['path']}: published {published.get(f['path'])!r}, sealed {f['sha256']!r}")
+        elif status_of.get(f["path"]) != "verified":
+            errs.append(f"{f['path']}: the hub's copy is {status_of.get(f['path'])!r}, not 'verified'")
     extra = sorted(set(published) - {f["path"] for f in seal.get("files") or []})
     if extra:
         errs.append(f"published files that were not sealed: {extra}")
