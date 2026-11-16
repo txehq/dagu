@@ -858,11 +858,13 @@ func buildFromSourceIn(spec sourceSpec, base []string) (*provenanceRecord, error
 			return nil, fmt.Errorf("source record: %s exists; a build never overwrites", p)
 		}
 	}
-	tmp, err := filepath.EvalSymlinks(os.TempDir())
-	if err != nil {
+	// The work directory (clone, private caches) is made inside the spec's
+	// own out_dir, an explicit absolute path: no part of where it lives, or of
+	// what cleanup removes, comes from the environment (not even TMPDIR).
+	if err := os.MkdirAll(spec.OutDir, 0o700); err != nil {
 		return nil, err
 	}
-	workDir, err := createOwnedDir(tmp, "machineauth-source-")
+	workDir, err := createOwnedDir(spec.OutDir, ".machineauth-source-")
 	if err != nil {
 		return nil, err
 	}

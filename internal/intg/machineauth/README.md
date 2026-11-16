@@ -144,7 +144,7 @@ already holds the downloads. `go mod verify` must report every module matching b
 after the build. The first build compiles cold.
 
 The build never sets `HOME`. It names owned `GOPATH`, `GOMODCACHE` and `GOCACHE` directories,
-which it creates exclusively inside one work directory. Before every go command it checks
+which it creates exclusively inside one work directory, itself made inside the spec's `out_dir`, so nothing about where it lives comes from the environment, not even `TMPDIR`. Before every go command it checks
 that each of the three resolves to its own directory; a value that is missing or points
 elsewhere refuses the command. It removes the work directory by the identity recorded at
 creation: the directory and its parent, by device and inode, plus the path. It refuses a
