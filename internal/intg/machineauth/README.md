@@ -99,10 +99,10 @@ DAGU_MACHINEAUTH_EXTRACT=/abs/extract-c.json go test ./internal/intg/machineauth
 #   {"name":"c","layout":"/abs/layout-c","ref":"ghcr.io/…","index":"sha256:…","platform":"linux/amd64",
 #    "manifest":"sha256:<the platform manifest the publication recorded>","path":"/usr/local/bin/dagu","out_dir":"/abs/c"}
 
-# a build from source: the tag's commit, the binary's own build information
+# a build from source, done by the command itself from a fresh, verified clone of the tag
 DAGU_MACHINEAUTH_SOURCE_RECORD=/abs/source-w18.json go test ./internal/intg/machineauth -run MachineAuthSourceRecord -v
-#   {"name":"w18","repo":"/abs/dagu","tag":"txe-v2.18.2-18","commit":"5b011eba…","binary":"/abs/w18/dagu",
-#    "version":"2.18.2-txe.18","goos":"linux","goarch":"amd64","out":"/abs/w18/provenance.json",
+#   {"name":"w18","repo":"/abs/dagu","tag":"txe-v2.18.2-18","commit":"5b011eba…","module":"github.com/dagucloud/dagu/v2",
+#    "package":"./cmd","version":"2.18.2-txe.18","goos":"linux","goarch":"amd64","out_dir":"/abs/w18",
 #    "installed":{"tag":"…","commit":"…","version":"…","read_from":"…"}}   (optional)
 ```
 
@@ -115,13 +115,28 @@ whiteouts. A link at the path, or a non-directory above it, is refused. The extr
 stops at the first link that does not hold, leaves no binary or record behind, and never
 overwrites.
 
-The source record checks the tag's commit with git. It also checks the binary's own build
-information: platform, `-X main.version`, and a git stamp naming that commit with an
-unmodified tree. So the binary must be built from a clean clone of the tag, as the worker
-kit builds it; a `git archive` export or `-buildvcs=false` carries no stamp and is refused.
-Its scope says it is **not** the installed binary of any machine. An installed record (the
-worker kit's `dagu-<version>.json`) corroborates the tag, commit and version only, not the
-bytes.
+The source record is written only by a build the command does itself; it has no field for
+a binary, because a VCS stamp can be borrowed. A module built in an ignored directory of a
+checkout carries the checkout's revision and `vcs.modified=false`. The command:
+
+- clones the tag afresh, with no user or system git configuration;
+- checks that the tag and HEAD are the spec's commit;
+- checks that `git status --porcelain --ignored` is empty before and after the build;
+- builds the package the way the worker kit builds dagu: `go build -ldflags "-X
+  'main.version=<version>'"` for the spec's platform, with cgo off, `-mod=readonly`,
+  `GOENV=off` and no `GOFLAGS`;
+- checks the binary's build information: the module and package, the platform, the
+  version flag, and a git stamp of that commit on a clean tree.
+
+The caller's environment reaches the build only through a fixed list of variables: tools,
+temporary files, the module proxy and the content-checked caches. The list's names are
+recorded and its values are not. The record names the clone's commit and tree, the command,
+the variables the command set, and the Go version. A narrowed build's record must come from
+this builder (`machineauth-controlled-clone-v1`), for the module `narrowedScopes` lists.
+
+The record's scope says it is **not** the installed binary of any machine. An installed record
+(the worker kit's `dagu-<version>.json`) corroborates the tag, commit and version only, not
+the bytes.
 
 **Verify (`TestMachineAuthVerify`, the release gate's command):**
 

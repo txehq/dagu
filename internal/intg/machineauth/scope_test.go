@@ -55,6 +55,8 @@ type narrowedScope struct {
 	Version string
 	// Commit is the source commit the build's provenance record must name.
 	Commit string
+	// Module is the main module the record's controlled build must have built.
+	Module string
 	Scope  buildScope
 	// Reason says why, from the source: shown with every result of the build.
 	Reason string
@@ -69,6 +71,7 @@ var narrowedScopes = []narrowedScope{
 	{
 		Version: "2.18.2-txe.18",
 		Commit:  "5b011eba3a30e224be14a5c81bd15cd9ab90c956",
+		Module:  "github.com/dagucloud/dagu/v2",
 		Scope:   buildScope{Roles: []string{roleWorker}, Routes: []string{routeNative}},
 		Reason: "txe-v2.18.2-18 predates the worker channel (#197, #198 and #213 landed in -19): " +
 			"it runs as a worker over native gRPC under every hub build, never as a hub",

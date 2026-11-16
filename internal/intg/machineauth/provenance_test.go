@@ -5,7 +5,9 @@ package machineauth_test
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"debug/buildinfo"
 	"encoding/hex"
@@ -18,8 +20,11 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -31,13 +36,20 @@ import (
 //     extraction checked link by link (index → the platform's manifest → config
 //     and layers → the file), from an OCI layout on disk. Any link that does not
 //     hash to the digest that names it stops the extraction.
-//   - source: the binary was built from a tag's commit. The record holds what
-//     the binary's own build information says and what git says the tag is; it
-//     is a build of that commit, never the installed binary of another machine.
+//   - source: the binary was built by this package's own command from a fresh
+//     clone of a tag, which it verified (the tag's commit, a clean tree with no
+//     ignored or untracked file) before and after the build. The record names
+//     the inputs the command controlled and what the binary's build information
+//     says. A binary handed to the command is never recorded: a VCS stamp can
+//     be borrowed (a module built in an ignored directory of a checkout carries
+//     the checkout's revision and vcs.modified=false). It is a build of that
+//     commit, never the installed binary of another machine.
 //
 // Both are written by opt-in commands of this package (README.md), never by hand.
 
-const provenanceSchema = 1
+// provenanceSchema 2: source records come only from the controlled build
+// (TXE-7531); a schema-1 source record trusted a binary it was handed.
+const provenanceSchema = 2
 
 type provenanceRecord struct {
 	Schema       int               `json:"schema"`
@@ -70,9 +82,22 @@ type layerRecord struct {
 }
 
 type sourceProvenance struct {
-	Tag    string `json:"tag"`
-	Commit string `json:"commit"`
-	// Revision and Modified are the binary's own VCS stamp.
+	// Builder names the command that built the binary; only the controlled
+	// build writes source records.
+	Builder string `json:"builder"`
+	Tag     string `json:"tag"`
+	Commit  string `json:"commit"`
+	Tree    string `json:"tree"`
+	// Module and Package are the main module and the package that was built,
+	// from the binary's own build information.
+	Module  string `json:"module"`
+	Package string `json:"package"`
+	// Command and Env are the build the command ran: the go arguments, the
+	// variables it set, and the names of the variables it passed through.
+	Command     []string `json:"command"`
+	Env         []string `json:"env"`
+	PassThrough []string `json:"pass_through"`
+	// Revision and Modified are the binary's own VCS stamp, which must agree.
 	Revision  string `json:"vcs_revision"`
 	Modified  string `json:"vcs_modified"`
 	GoVersion string `json:"go_version"`
@@ -453,100 +478,240 @@ func scanLayer(layout string, l ociDescriptor, diffID, target, tmp string) (pres
 	return set, white && !set, nil
 }
 
-// ── source record ────────────────────────────────────────────────────────────
+// ── source record: the controlled build ──────────────────────────────────────
 
-// sourceSpec is DAGU_MACHINEAUTH_SOURCE_RECORD's file.
+// controlledBuilder names the build below in every record it writes.
+const controlledBuilder = "machineauth-controlled-clone-v1"
+
+// sourceSpec is DAGU_MACHINEAUTH_SOURCE_RECORD's file. There is no field for
+// a binary: the command builds it.
 type sourceSpec struct {
 	Name    string `json:"name"`
-	Repo    string `json:"repo"` // a git checkout holding the tag
+	Repo    string `json:"repo"` // a git repository holding the tag; cloned, never built in place
 	Tag     string `json:"tag"`
 	Commit  string `json:"commit"`
-	Binary  string `json:"binary"`
+	Module  string `json:"module"`  // the main module the binary must be built from
+	Package string `json:"package"` // the package to build, relative to the clone ("./cmd" for dagu)
 	Version string `json:"version"`
 	GOOS    string `json:"goos"`
 	GOARCH  string `json:"goarch"`
 	// Installed is another machine's own record of what it runs, when read.
 	Installed *installedRecord `json:"installed,omitempty"`
-	Out       string           `json:"out"` // the record's path; must not exist yet
+	// OutDir gets dagu and provenance.json; it must not hold them yet.
+	OutDir string `json:"out_dir"`
 }
 
-// tagCommit asks git which commit a tag names.
-func tagCommit(repo, tag string) (string, error) {
-	out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", "refs/tags/"+tag+"^{commit}").Output()
+// passThrough are the only variables of the caller's environment the build
+// sees, besides what it sets: where tools, temporary files, caches and the
+// module proxy are, and what Windows needs to start a process. Their values are
+// not recorded (a proxy URL may carry a credential). The caches are
+// content-addressed and the module cache is held to go.sum, so sharing them
+// does not let them choose what is built.
+var passThrough = []string{"PATH", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "PATHEXT", "COMSPEC",
+	"GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY", "GONOSUMDB", "GONOSUMCHECK", "GOPRIVATE", "GOSUMDB"}
+
+// resolvedGoEnv is what the caller's go command resolves for the variables a
+// build with GOENV=off would otherwise lose (the caller's go env file may set
+// the proxy; the caches would move under the build's own HOME).
+var resolvedGoEnv = sync.OnceValue(func() map[string]string {
+	out, err := exec.Command("go", "env", "-json", "GOMODCACHE", "GOCACHE", "GOPROXY", "GOSUMDB").Output()
+	vals := map[string]string{}
+	if err == nil {
+		_ = json.Unmarshal(out, &vals)
+	}
+	return vals
+})
+
+// gitEnv runs git with no user or system configuration: no filters, hooks,
+// templates or rewrites can change what a clone checks out.
+func gitEnv() []string {
+	return append(callerEnv(), "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0", "HOME="+os.TempDir())
+}
+
+func callerEnv() []string {
+	var env []string
+	for _, k := range passThrough {
+		v, ok := os.LookupEnv(k)
+		if !ok {
+			v, ok = resolvedGoEnv()[k]
+			ok = ok && v != ""
+		}
+		if ok {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
+}
+
+func runIn(dir string, env []string, timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir, cmd.Env = dir, env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, truncateText(stderr.String(), 400))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// cleanTree fails unless git sees nothing in the clone beyond its commit:
+// no modified, untracked or ignored file.
+func cleanTree(dir string) error {
+	out, err := runIn(dir, gitEnv(), time.Minute, "git", "status", "--porcelain", "--ignored", "--untracked-files=all")
 	if err != nil {
-		return "", fmt.Errorf("git: tag %s not found in %s: %w", tag, repo, err)
+		return err
 	}
-	return strings.TrimSpace(string(out)), nil
+	if out != "" {
+		return fmt.Errorf("the clone is not its commit alone:\n%s", truncateText(out, 400))
+	}
+	return nil
 }
 
-// recordSourceBuild holds a source build to its tag, its own build
-// information and, when given, the installed record, and writes its record.
-func recordSourceBuild(spec sourceSpec, commitOf func(repo, tag string) (string, error)) (*provenanceRecord, error) {
+// checkBuildInfo holds a binary's own build information to the spec: the main
+// module and package, the platform with cgo off, the version flag, and a git
+// stamp of the commit on an unmodified tree. On its own it cannot tell a
+// borrowed stamp (TestSourceBuildRefusesABorrowedStamp): it is a check of the
+// controlled build's result, never a reason to record a binary it was handed.
+func checkBuildInfo(info *debug.BuildInfo, spec sourceSpec, pkg string) (map[string]string, error) {
+	settings := map[string]string{}
+	for _, st := range info.Settings {
+		settings[st.Key] = st.Value
+	}
+	wantPath := spec.Module
+	if pkg != "." {
+		wantPath += "/" + pkg
+	}
 	switch {
-	case spec.Name == "" || spec.Repo == "" || spec.Tag == "" || spec.Binary == "" || spec.Version == "" || spec.GOOS == "" || spec.GOARCH == "" || spec.Out == "":
-		return nil, errors.New("source record: name, repo, tag, commit, binary, version, goos, goarch and out are all required")
-	case len(spec.Commit) != 40:
+	case info.Main.Path != spec.Module || info.Path != wantPath:
+		return nil, fmt.Errorf("source record: the binary is package %s of module %s, the spec names %s of %s", info.Path, info.Main.Path, wantPath, spec.Module)
+	case settings["GOOS"] != spec.GOOS || settings["GOARCH"] != spec.GOARCH || settings["CGO_ENABLED"] != "0":
+		return nil, fmt.Errorf("source record: the binary was built for %s/%s cgo=%s", settings["GOOS"], settings["GOARCH"], settings["CGO_ENABLED"])
+	case !strings.Contains(settings["-ldflags"], "main.version="+spec.Version):
+		return nil, fmt.Errorf("source record: the binary's -ldflags %q do not set main.version=%s", settings["-ldflags"], spec.Version)
+	case settings["vcs"] != "git" || settings["vcs.revision"] != spec.Commit || settings["vcs.modified"] != "false":
+		return nil, fmt.Errorf("source record: the binary's own stamp (vcs=%q revision=%q modified=%q) does not name the clean clone of %s",
+			settings["vcs"], settings["vcs.revision"], settings["vcs.modified"], spec.Commit)
+	}
+	return settings, nil
+}
+
+// buildFromSource clones the tag into a directory of its own, verifies the
+// clone, builds the package as the worker kit builds dagu (go build with
+// -X main.version) for the spec's platform with cgo off, verifies the clone
+// again and the binary's build information against the inputs, and writes
+// the binary and its record into the spec's directory. It never builds in
+// the caller's checkout and never records a binary it did not build.
+func buildFromSource(spec sourceSpec) (*provenanceRecord, error) {
+	pkg := strings.TrimPrefix(filepath.ToSlash(filepath.Clean(spec.Package)), "./")
+	switch {
+	case spec.Name == "" || spec.Repo == "" || spec.Tag == "" || spec.Module == "" || spec.Package == "" || spec.Version == "" ||
+		spec.GOOS == "" || spec.GOARCH == "" || spec.OutDir == "":
+		return nil, errors.New("source record: name, repo, tag, commit, module, package, version, goos, goarch and out_dir are all required")
+	case !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(spec.Commit):
 		return nil, fmt.Errorf("source record: commit %q is not a full commit id", spec.Commit)
+	case !filepath.IsAbs(spec.OutDir):
+		return nil, errors.New("source record: out_dir must be absolute")
+	case !filepath.IsLocal(filepath.FromSlash(pkg)) && pkg != ".":
+		return nil, fmt.Errorf("source record: package %q must be a path inside the clone", spec.Package)
 	}
-	if _, err := os.Lstat(spec.Out); err == nil {
-		return nil, fmt.Errorf("source record: %s exists; a record is never overwritten", spec.Out)
+	if in := spec.Installed; in != nil && (in.Commit != spec.Commit || in.Tag != spec.Tag || in.Version != spec.Version) {
+		return nil, fmt.Errorf("source record: the installed record names tag %s commit %s version %s, not %s %s %s",
+			in.Tag, in.Commit, in.Version, spec.Tag, spec.Commit, spec.Version)
 	}
-	commit, err := commitOf(spec.Repo, spec.Tag)
+	outBin, outRec := filepath.Join(spec.OutDir, "dagu"), filepath.Join(spec.OutDir, "provenance.json")
+	for _, p := range []string{outBin, outRec} {
+		if _, err := os.Lstat(p); err == nil {
+			return nil, fmt.Errorf("source record: %s exists; a build never overwrites", p)
+		}
+	}
+	work, err := os.MkdirTemp("", "machineauth-source-")
 	if err != nil {
 		return nil, err
 	}
-	if commit != spec.Commit {
-		return nil, fmt.Errorf("source record: tag %s is commit %s, the spec names %s", spec.Tag, commit, spec.Commit)
+	defer func() { _ = os.RemoveAll(work) }()
+	clone := filepath.Join(work, "src")
+	if _, err := runIn(work, gitEnv(), 10*time.Minute, "git", "-c", "advice.detachedHead=false", "clone", "--quiet", "--no-hardlinks",
+		"--branch", spec.Tag, "--", spec.Repo, clone); err != nil {
+		return nil, fmt.Errorf("source record: clone: %w", err)
 	}
-	info, err := buildinfo.ReadFile(spec.Binary)
+	head, err := runIn(clone, gitEnv(), time.Minute, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	tagged, err := runIn(clone, gitEnv(), time.Minute, "git", "rev-parse", "--verify", "refs/tags/"+spec.Tag+"^{commit}")
+	if err != nil {
+		return nil, fmt.Errorf("source record: %s is not a tag of %s: %w", spec.Tag, spec.Repo, err)
+	}
+	if head != spec.Commit || tagged != spec.Commit {
+		return nil, fmt.Errorf("source record: tag %s is commit %s (checked out %s), the spec names %s", spec.Tag, tagged, head, spec.Commit)
+	}
+	tree, err := runIn(clone, gitEnv(), time.Minute, "git", "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return nil, err
+	}
+	if err := cleanTree(clone); err != nil {
+		return nil, fmt.Errorf("source record: before the build: %w", err)
+	}
+	built := filepath.Join(work, "dagu")
+	set := []string{"GOOS=" + spec.GOOS, "GOARCH=" + spec.GOARCH, "CGO_ENABLED=0", "GOTOOLCHAIN=auto", "GOFLAGS=", "GOWORK=off", "GOENV=off",
+		"HOME=" + work}
+	command := []string{"build", "-mod=readonly", "-buildvcs=true", "-ldflags", "-X 'main.version=" + spec.Version + "'", "-o", built, "./" + pkg}
+	if pkg == "." {
+		command[len(command)-1] = "."
+	}
+	if _, err := runIn(clone, append(callerEnv(), set...), 30*time.Minute, "go", command...); err != nil {
+		return nil, fmt.Errorf("source record: build: %w", err)
+	}
+	if err := cleanTree(clone); err != nil {
+		return nil, fmt.Errorf("source record: after the build: %w", err)
+	}
+	info, err := buildinfo.ReadFile(built)
 	if err != nil {
 		return nil, fmt.Errorf("source record: the binary's build information: %w", err)
 	}
-	settings := map[string]string{}
-	for _, s := range info.Settings {
-		settings[s.Key] = s.Value
-	}
-	switch {
-	case settings["GOOS"] != spec.GOOS || settings["GOARCH"] != spec.GOARCH:
-		return nil, fmt.Errorf("source record: the binary was built for %s/%s, the spec names %s/%s", settings["GOOS"], settings["GOARCH"], spec.GOOS, spec.GOARCH)
-	case !strings.Contains(settings["-ldflags"], "main.version="+spec.Version):
-		return nil, fmt.Errorf("source record: the binary's -ldflags %q do not set main.version=%s", settings["-ldflags"], spec.Version)
-	// The binary's own stamp ties it to the commit: the go command records the
-	// checkout's revision and whether its tree was modified (a build from a
-	// git clone of the tag, as the worker kit builds). A binary without that
-	// stamp, from another revision, or from a modified tree has no tie to the
-	// commit and gets no record.
-	case settings["vcs"] != "git" || settings["vcs.revision"] == "":
-		return nil, errors.New("source record: the binary carries no git revision of its own (built with -buildvcs=false, or not from a git checkout); build it from a clone of the tag")
-	case settings["vcs.revision"] != spec.Commit:
-		return nil, fmt.Errorf("source record: the binary says it was built from %s, not %s", settings["vcs.revision"], spec.Commit)
-	case settings["vcs.modified"] != "false":
-		return nil, fmt.Errorf("source record: the binary was built from a modified tree (vcs.modified=%q); build it from a clean clone of the tag", settings["vcs.modified"])
-	}
-	if in := spec.Installed; in != nil {
-		if in.Commit != spec.Commit || in.Tag != spec.Tag || in.Version != spec.Version {
-			return nil, fmt.Errorf("source record: the installed record names tag %s commit %s version %s, not %s %s %s",
-				in.Tag, in.Commit, in.Version, spec.Tag, spec.Commit, spec.Version)
-		}
-	}
-	raw, err := os.ReadFile(spec.Binary)
+	settings, err := checkBuildInfo(info, spec, pkg)
 	if err != nil {
 		return nil, err
 	}
-	scope := fmt.Sprintf("a %s/%s build of tag %s at commit %s; it is NOT the installed binary of any machine (the live worker runs its own build on its own platform)",
-		spec.GOOS, spec.GOARCH, spec.Tag, spec.Commit)
+	raw, err := os.ReadFile(built)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(spec.OutDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(outBin, raw, 0o755); err != nil { //nolint:gosec // the built binary is executed by the matrix
+		return nil, err
+	}
+	var names []string
+	for _, kv := range callerEnv() {
+		names = append(names, strings.SplitN(kv, "=", 2)[0])
+	}
+	scope := fmt.Sprintf("built by %s from a verified clean clone of tag %s at commit %s (tree %s) for %s/%s; it is NOT the installed binary of any machine (the live worker runs its own build on its own platform)",
+		controlledBuilder, spec.Tag, spec.Commit, tree, spec.GOOS, spec.GOARCH)
 	if spec.Installed != nil {
 		scope += "; the installed record read from " + spec.Installed.ReadFrom + " corroborates the tag, commit and version only, not the bytes"
 	}
 	rec := &provenanceRecord{Schema: provenanceSchema, Kind: "source", Name: spec.Name, BinarySHA256: sha256Hex(raw), BinarySize: int64(len(raw)),
-		Source: &sourceProvenance{Tag: spec.Tag, Commit: commit, Revision: settings["vcs.revision"], Modified: settings["vcs.modified"], GoVersion: info.GoVersion, GOOS: settings["GOOS"], GOARCH: settings["GOARCH"],
-			CGO: settings["CGO_ENABLED"], LDFlags: settings["-ldflags"], Installed: spec.Installed},
+		Source: &sourceProvenance{Builder: controlledBuilder, Tag: spec.Tag, Commit: spec.Commit, Tree: tree, Module: info.Main.Path, Package: info.Path,
+			Command: append([]string{"go"}, command...), Env: set, PassThrough: names,
+			Revision: settings["vcs.revision"], Modified: settings["vcs.modified"], GoVersion: info.GoVersion,
+			GOOS: settings["GOOS"], GOARCH: settings["GOARCH"], CGO: settings["CGO_ENABLED"], LDFlags: settings["-ldflags"], Installed: spec.Installed},
 		Scope: scope}
 	out, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(spec.Out, append(out, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(outRec, append(out, '\n'), 0o600); err != nil {
 		return nil, err
 	}
 	return rec, nil
@@ -578,17 +743,19 @@ func TestMachineAuthExtract(t *testing.T) {
 		rec.Name, rec.BinarySHA256, rec.BinarySize, rec.Image.Layer, rec.Image.Manifest, sha256Hex(raw))
 }
 
-// DAGU_MACHINEAUTH_SOURCE_RECORD=<spec.json> records a source build (README.md).
+// DAGU_MACHINEAUTH_SOURCE_RECORD=<spec.json> builds a binary from a tag in a
+// verified clean clone and records it (README.md).
 func TestMachineAuthSourceRecord(t *testing.T) {
 	specPath := os.Getenv("DAGU_MACHINEAUTH_SOURCE_RECORD")
 	if specPath == "" {
-		t.Skip("set DAGU_MACHINEAUTH_SOURCE_RECORD=<spec.json> to record a build from source")
+		t.Skip("set DAGU_MACHINEAUTH_SOURCE_RECORD=<spec.json> to build and record a binary from a tag")
 	}
 	var spec sourceSpec
 	loadSpec(t, specPath, &spec)
-	rec, err := recordSourceBuild(spec, tagCommit)
+	rec, err := buildFromSource(spec)
+	require.NoError(t, err, "the build stopped; nothing it wrote is a build")
+	raw, err := os.ReadFile(filepath.Join(spec.OutDir, "provenance.json"))
 	require.NoError(t, err)
-	raw, err := os.ReadFile(spec.Out)
-	require.NoError(t, err)
-	t.Logf("%s: binary sha256 %s, tag %s commit %s; record sha256 %s; %s", rec.Name, rec.BinarySHA256, rec.Source.Tag, rec.Source.Commit, sha256Hex(raw), rec.Scope)
+	t.Logf("%s: binary sha256 %s (%d bytes), tag %s commit %s tree %s; record sha256 %s; %s",
+		rec.Name, rec.BinarySHA256, rec.BinarySize, rec.Source.Tag, rec.Source.Commit, rec.Source.Tree, sha256Hex(raw), rec.Scope)
 }

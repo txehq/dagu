@@ -28,6 +28,7 @@ func TestNarrowedScopesAreRunnable(t *testing.T) {
 		assert.Equal(t, []string{roleWorker}, n.Scope.Roles, "%s: only worker-only builds have cells", n.Version)
 		assert.Equal(t, []string{routeNative}, n.Scope.Routes, "%s: a worker-only build runs over native gRPC", n.Version)
 		assert.Regexp(t, commit, n.Commit, "%s: a full commit id", n.Version)
+		assert.NotEmpty(t, n.Module, "%s: the module its controlled build must build", n.Version)
 		assert.NotEmpty(t, n.Reason, "%s: the reason is shown with every result", n.Version)
 	}
 }
@@ -205,7 +206,8 @@ func TestVerifyHoldsNarrowedBuildsToTheirSourceCommit(t *testing.T) {
 	wPath, wSum := writeBinary("w18")
 	source := func(commit string) provenanceRecord {
 		return provenanceRecord{Schema: provenanceSchema, Kind: "source", Name: "w18", BinarySHA256: wSum,
-			Source: &sourceProvenance{Tag: "txe-v2.18.2-18", Commit: commit, GOOS: "linux", GOARCH: "amd64"}}
+			Source: &sourceProvenance{Builder: controlledBuilder, Tag: "txe-v2.18.2-18", Commit: commit, Module: narrowedScopes[0].Module,
+				GOOS: "linux", GOARCH: "amd64"}}
 	}
 	n := 0
 	mk := func(wRec provenanceRecord) *manifest {
@@ -225,6 +227,16 @@ func TestVerifyHoldsNarrowedBuildsToTheirSourceCommit(t *testing.T) {
 	}{
 		"another commit":  {mk(source(strings.Repeat("f", 40))), "needs a source record of commit 5b011eba"},
 		"an image record": {mk(imageRecordFor("w18", wSum)), "its record is a image record"},
+		"a record not written by the controlled build": {mk(func() provenanceRecord {
+			r := source(narrowedScopes[0].Commit)
+			r.Source.Builder = ""
+			return r
+		}()), "needs a record of the controlled build"},
+		"a build of another module with the right stamp": {mk(func() provenanceRecord {
+			r := source(narrowedScopes[0].Commit)
+			r.Source.Module = "evil"
+			return r
+		}()), `needs a build of module github.com/dagucloud/dagu/v2; its record names module "evil"`},
 		"another binary": {mk(func() provenanceRecord {
 			r := source(narrowedScopes[0].Commit)
 			r.BinarySHA256 = strings.Repeat("0", 64)
