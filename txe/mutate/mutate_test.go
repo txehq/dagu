@@ -813,6 +813,8 @@ var guardAllowed = []string{
 	"cat mutants.py | python3 < /dev/null",
 	"ruby -e 'puts ARGV[0]' 'import mutants'",
 	"node app.js --title mutants.js",
+	"node --title mutants app.js",
+	"python3 /dev/fd/3 3>>app.py",
 	// Observed false positive 5 (cc1, 17:36Z): a python3 heredoc editing a test file, whose
 	// replacement text has a loop variable named mutate. It edits data and runs nothing.
 	"cd ~/evidence/packet-r1 && ~/.pyenv/versions/vv/bin/python3 -I - <<'PYEOF'\nimport os\np=\"tests/test_r5.py\"; s=open(p).read()\nreps=[(\"old\", '''for mutate, why in ((lambda p: p[\"ports\"].pop(\"worker_health\"), \"missing\"),):\n    bad = dict(good)\n    mutate(bad)\n''')]\nfor a, b in reps:\n    s = s.replace(a, b)\nopen(p + \".tmp\", \"w\").write(s); os.replace(p + \".tmp\", p)\nPYEOF",

@@ -766,14 +766,7 @@ class Judge:
             # (`node --some-flag x mutants.js`): one naming a mutant script is refused.
             if unknown and names_mutant_script(args[j:]):
                 return True
-            # Otherwise positional words are judged up to the first that looks like a script file.
-            for n, w in enumerate(args[j:]):
-                filelike = bool(SCRIPT_EXT.search(base(w.text))) or "/" in w.text or w.procsub is not None
-                if (n == 0 or filelike) and operand_is_mutant(w, cmd, False, self.depth):
-                    return True
-                if filelike:
-                    return False
-            return False
+            return operand_is_mutant(args[j], cmd, False, self.depth)
         return stdin_is_mutant(cmd, False, self.depth)
 
     def perl_ruby(self, prog: str, args: list, cmd) -> bool:
