@@ -513,7 +513,12 @@ class Runner:
                 proc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env(),
                                       timeout=limit)
                 code = proc.returncode
-                del self.pending[name]
+                if code < 0:
+                    # The docker client died by a signal: nothing shows the container finished.
+                    self.remove_pending()
+                    outcome = "ERROR"
+                else:
+                    del self.pending[name]
             except subprocess.TimeoutExpired:
                 self.remove_pending()
                 if limit < self.args.timeout:

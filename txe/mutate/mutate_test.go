@@ -131,6 +131,9 @@ r[cid] = [name, owner]
 save(r)
 if cidfile:
     open(cidfile, "w").write(cid)
+if "selfkill" in image:
+    import signal
+    os.kill(os.getpid(), signal.SIGKILL)  # the client dies; the "container" stays registered
 if "hang" in image:
     time.sleep(120)  # a container whose client is killed stays registered, as a detached one would
 if "noexec" in image:
@@ -939,4 +942,18 @@ func TestOutsideSymlinkRefused(t *testing.T) {
 	require.NoError(t, os.Symlink("check.sh", filepath.Join(g.tree, "inside.sh")))
 	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}))
 	assert.Equal(t, 0, o.code, o.stdout+o.stderr)
+}
+
+// A docker client killed by a signal is a sandbox error, never a kill, and the container it left
+// is removed by its recorded id.
+func TestKilledClientIsErrorAndCleaned(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	foreignContainer(t, f.log)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "selfkill")
+	assert.Equal(t, 4, o.code, o.stdout+o.stderr)
+	assert.Equal(t, "ERROR", o.outcomes()["baseline"])
+	ids := recordedCIDs(t, o.report["workdir"].(string))
+	require.Len(t, ids, 1)
+	assert.Equal(t, ids, removals(t, f.log))
+	assert.Len(t, registry(t, f.log), 1, "only the foreign container is left")
 }
