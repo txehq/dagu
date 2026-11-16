@@ -72,3 +72,9 @@ jobs:
       - run: |
           clean_flags="$clean_flags -x"
           go clean $clean_flags # want:go-clean-cache
+      - run: |
+          if [ -n "$verbose" ]; then clean_flags=-x; fi
+          go clean $clean_flags # want:go-clean-cache
+      - run: |
+          tool=build
+          go $tool -modcache

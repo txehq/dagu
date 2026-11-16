@@ -371,7 +371,7 @@ type scriptScan struct {
 	// envNames are names the environment sets: in a workflow, the keys of
 	// its env: maps. Nil outside a workflow.
 	envNames map[string]bool
-	// argAssigns are assignments from outside the script that expandArgs
+	// argAssigns are assignments from outside the script that expansions
 	// also reads. They define nothing: they only add go clean readings.
 	argAssigns []assignment
 }
@@ -426,7 +426,7 @@ func scanScript(s source, phys []string, envNames map[string]bool, argAssigns []
 		if s.lang == langPython {
 			text = lg.text // Python # inside strings is common; full-line comments were skipped
 		}
-		if goCleanIn(text) || goCleanIn(sc.expandArgs(text)) {
+		if goCleanIn(text) || slices.ContainsFunc(sc.expansions(text), goCleanIn) {
 			out = append(out, Finding{Path: s.rel, Line: lg.line, Rule: ruleGoClean, Msg: goCleanMsg})
 		}
 		if !isHarness(s.rel) {
@@ -440,34 +440,98 @@ func scanScript(s source, phys []string, envNames map[string]bool, argAssigns []
 	return out
 }
 
-// expandArgs replaces each reference to a shell or make variable with the
-// values the file assigns it, so an argument array is read whole:
-// args=(clean -modcache); go "${args[@]}". In a workflow it reads every
-// step's assignments (argAssigns), so a flag exported through $GITHUB_ENV
-// by one step is read in the go clean of a later one.
-func (sc *scriptScan) expandArgs(text string) string {
+// Expansion bounds: rounds of substitution (a value can reference another
+// variable, or its own old value: flags="$flags -x"), and readings in all.
+const (
+	maxExpandRounds = 3
+	maxExpansions   = 256
+)
+
+// expansions returns readings of text with its shell or make variable
+// references replaced by values assigned to them, so an argument array is
+// read whole (args=(clean -modcache); go "${args[@]}"). A variable can hold
+// any of the values assigned to it: the script may assign it on a branch
+// that does not run, or keep a value another step exported through
+// $GITHUB_ENV (argAssigns). So each combination of values is its own
+// reading, as is all of a variable's values joined, and a go clean is
+// reported when any reading clears a cache. It can only report more.
+func (sc *scriptScan) expansions(text string) []string {
 	if sc.l != langShell && sc.l != langMake {
-		return text
+		return nil
 	}
-	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
-		name := argRefRe.FindStringSubmatch(ref)[1]
-		vals := assignedValues(sc.assigns, name)
-		if len(vals) == 0 || refersTo(vals, name) {
-			// A name this script never assigns can come from another
-			// step, and so can the old value an assignment of its own
-			// reads (flags="$flags -x"); otherwise the script's own
-			// assignment is the value it uses.
-			for _, v := range assignedValues(sc.argAssigns, name) {
-				if !slices.Contains(vals, v) {
-					vals = append(vals, v)
+	var out []string
+	cur := []string{text}
+	for range maxExpandRounds {
+		var next []string
+		for _, t := range cur {
+			for _, e := range sc.expandOnce(t) {
+				if len(out)+len(next) >= maxExpansions {
+					break
+				}
+				if !slices.Contains(out, e) && !slices.Contains(next, e) {
+					next = append(next, e)
 				}
 			}
 		}
-		if len(vals) == 0 {
-			return ref
+		if len(next) == 0 {
+			break
 		}
-		return " " + strings.Join(vals, " ") + " "
-	})
+		out = append(out, next...)
+		cur = next
+	}
+	return out
+}
+
+// expandOnce returns text with its references substituted once: one
+// reading per combination of the referenced variables' values, then one
+// with each variable's values joined. It returns nil when no reference has
+// a value.
+func (sc *scriptScan) expandOnce(text string) []string {
+	vals := map[string][]string{}
+	var names []string
+	for _, m := range argRefRe.FindAllStringSubmatch(text, -1) {
+		if _, seen := vals[m[1]]; seen {
+			continue
+		}
+		v := assignedValues(append(slices.Clip(sc.assigns), sc.argAssigns...), m[1])
+		vals[m[1]] = v
+		if len(v) > 0 {
+			names = append(names, m[1])
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	subst := func(pick map[string]string) string {
+		return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
+			if v, ok := pick[argRefRe.FindStringSubmatch(ref)[1]]; ok {
+				return " " + v + " "
+			}
+			return ref
+		})
+	}
+	var out []string
+	pick := map[string]string{}
+	var walk func(i int)
+	walk = func(i int) {
+		if len(out) >= maxExpansions {
+			return
+		}
+		if i == len(names) {
+			out = append(out, subst(pick))
+			return
+		}
+		for _, v := range vals[names[i]] {
+			pick[names[i]] = v
+			walk(i + 1)
+		}
+	}
+	walk(0)
+	joined := map[string]string{}
+	for _, n := range names {
+		joined[n] = strings.Join(vals[n], " ")
+	}
+	return append(out, subst(joined))
 }
 
 // assignedValues returns the distinct values assigns gives name, in order.
@@ -481,18 +545,6 @@ func assignedValues(assigns []assignment, name string) []string {
 		}
 	}
 	return vals
-}
-
-// refersTo reports whether any of vals references the variable name.
-func refersTo(vals []string, name string) bool {
-	for _, v := range vals {
-		for _, m := range argRefRe.FindAllStringSubmatch(v, -1) {
-			if m[1] == name {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // argRefRe is a variable reference: $x, ${x}, ${x[@]}, ${x[*]}, $(x).
