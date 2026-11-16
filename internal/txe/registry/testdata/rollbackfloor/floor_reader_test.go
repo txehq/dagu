@@ -6,8 +6,9 @@
 // never built here.
 //
 // It drives the floor's own paths over every record and reports each one's
-// outcome and the floor's strict parameter fields; it asserts nothing about
-// the outcomes. The current code's test compares them with the declared
+// outcome and the floor's strict parameter fields, and rewrites every record
+// of the stores DAGU_ROLLBACK_FLOOR_REWRITE names (TXE-7559); it asserts
+// nothing about the outcomes. The current code's test compares them with the declared
 // contract.
 package registry
 
@@ -125,6 +126,81 @@ func floorReaderPreserved(f *fixture, j floorReaderJob) string {
 		return fmt.Sprintf("CHANGED: binding %s, written %s (%s)", p.BindingDigest, j.Binding, where)
 	}
 	return "ok (" + where + ", " + string(p.State) + ")"
+}
+
+// floorReaderKeys lists every key under prefix.
+func floorReaderKeys(ctx context.Context, col persis.Collection, prefix string) ([]string, error) {
+	var keys []string
+	cursor := ""
+	for {
+		page, err := col.List(ctx, persis.ListQuery{Prefix: prefix, Cursor: cursor, Limit: 500})
+		if err != nil {
+			return nil, err
+		}
+		for _, rec := range page.Records {
+			keys = append(keys, rec.ID)
+		}
+		if page.NextCursor == "" {
+			return keys, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// floorReaderRoundTrip decodes every record under prefix into the floor's T
+// and compare-and-swaps it back, as the floor's own rewrites of the kind do.
+func floorReaderRoundTrip[T any](f *fixture, prefix string, res map[string]string) {
+	keys, err := floorReaderKeys(f.ctx, f.store.col, prefix)
+	if err != nil {
+		res[prefix] = "ERR list: " + err.Error()
+		return
+	}
+	for _, key := range keys {
+		res[key] = func() string {
+			rec, err := f.store.col.Get(f.ctx, key)
+			if err != nil {
+				return "ERR get: " + err.Error()
+			}
+			var v T
+			if err := json.Unmarshal(rec.Data, &v); err != nil {
+				return "ERR decode: " + err.Error()
+			}
+			data, err := json.Marshal(&v)
+			if err != nil {
+				return "ERR encode: " + err.Error()
+			}
+			if err := f.store.col.CompareAndSwap(f.ctx, key, rec.Data, data); err != nil {
+				return "ERR write: " + err.Error()
+			}
+			return "ok"
+		}()
+	}
+}
+
+// floorReaderRewrite rewrites, with the floor's own code, every record of
+// every rewritten kind in the store under dir (TXE-7559): each job by a job
+// transaction that only marks it changed, each resource event and artifact
+// manifest through the floor's type, and the resource index marker by the
+// floor's RebuildResourceIndex. The current code compares every field before
+// and after; its rewriteCurrent does the same with the current code.
+func floorReaderRewrite(t *testing.T, man floorReaderManifest, dir string) map[string]string {
+	f := &fixture{t: t, ctx: context.Background(), now: man.Now}
+	f.dagsDir = filepath.Join(dir, "dags")
+	f.dags = NewDAGStore(persis.NewDAGRepository(dag.NewStore(f.dagsDir), persis.DAGRepositoryOptions{}))
+	s, err := NewFileStore(filepath.Join(dir, "data"), WithClock(f.clock), WithDAGStore(f.dags))
+	require.NoError(t, err)
+	f.store = s
+	res := map[string]string{}
+	keys, err := floorReaderKeys(f.ctx, s.col, jobsPrefix)
+	require.NoError(t, err)
+	for _, key := range keys {
+		_, err := f.tx(strings.TrimPrefix(key, jobsPrefix), agent, func(tx *JobTx) error { tx.touch(); return nil })
+		res[key] = floorReaderResult(err)
+	}
+	floorReaderRoundTrip[ResourceEvent](f, resourceEventsPrefix, res)
+	floorReaderRoundTrip[ArtifactManifest](f, artifactsPrefix, res)
+	res[resourceIndexReady] = floorReaderResult(s.RebuildResourceIndex(f.ctx))
+	return res
 }
 
 func TestRollbackFloorReader(t *testing.T) {
@@ -260,7 +336,17 @@ func TestRollbackFloorReader(t *testing.T) {
 		res["8_params_and_binding_preserved"] = floorReaderPreserved(f, j)
 	}
 
+	rewrites := map[string]map[string]string{}
+	if dirs := os.Getenv("DAGU_ROLLBACK_FLOOR_REWRITE"); dirs != "" {
+		var byName map[string]string
+		require.NoError(t, json.Unmarshal([]byte(dirs), &byName))
+		for name, dir := range byName {
+			rewrites[name] = floorReaderRewrite(t, man, dir)
+		}
+	}
+
 	rep := map[string]any{
+		"rewrites": rewrites,
 		"fields": map[string][]string{
 			ActionRetryRun:        floorReaderFields(reflect.TypeOf(RetryRunParams{})),
 			ActionUncertainEffect: floorReaderFields(reflect.TypeOf(UncertainEffectParams{})),
