@@ -707,6 +707,20 @@ var guardRefused = []string{
 	"python3 3< mutants.py <&3 3< app.py",
 	"python3 /dev/fd/$N 3< app.py",
 	"bash --rcfile <(cat mutants.sh) -i",
+	// Code given on the command line that runs a mutant named in its arguments.
+	`python3 -c 'exec(open(__import__("sys").argv[1]).read())' mutants.py`,
+	`node -e 'require(process.argv[1])' ./mutants.js`,
+	`ruby -e 'load ARGV[0]' mutants.rb`,
+	`perl -e 'do $ARGV[0]' mutants.pl`,
+	// The guard does not follow data flow: code that can run a process, given a mutant script as
+	// an argument, is refused even when it would not run that argument.
+	`python3 -c 'import subprocess; print(subprocess.run(["git", "status"]).returncode)' mutants.py`,
+	// Preloads and value-taking options.
+	`bun --preload=./mutants.js -e 'console.log(1)'`,
+	"bun --preload ./mutants.js app.js",
+	"node --title harmless mutants.js",
+	// Paths under /proc cannot be judged.
+	"python3 /proc/1/cwd/x.py",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -762,7 +776,6 @@ var guardAllowed = []string{
 	"linear comment --text \"mutmut run; bash run-mutations.sh\"",
 	`python3 -c 'import json; print("mutants.py")'`,
 	`python3 -c 'print(open("tools/mutants.py").read().count("old"))'`,
-	`python3 -c 'import subprocess; print(subprocess.run(["git", "status"]).returncode)' mutants.py`,
 	`node -e 'console.log("mutants.js")'`,
 	"true # ; python3 mutants.py",
 	`python3 -c 'print("example: import mutants")'`,
@@ -787,6 +800,12 @@ var guardAllowed = []string{
 	"bash /dev/stdin < setup.sh",
 	"python3 3< app.py <&3 3< mutants.py",
 	"python3 /home/u/fd/app.py",
+	"cat mutants.py | python3 < /dev/null",
+	"ruby -e 'puts ARGV[0]' 'import mutants'",
+	"node app.js --title mutants.js",
+	// Observed false positive 5 (cc1, 17:36Z): a python3 heredoc editing a test file, whose
+	// replacement text has a loop variable named mutate. It edits data and runs nothing.
+	"cd ~/evidence/packet-r1 && ~/.pyenv/versions/vv/bin/python3 -I - <<'PYEOF'\nimport os\np=\"tests/test_r5.py\"; s=open(p).read()\nreps=[(\"old\", '''for mutate, why in ((lambda p: p[\"ports\"].pop(\"worker_health\"), \"missing\"),):\n    bad = dict(good)\n    mutate(bad)\n''')]\nfor a, b in reps:\n    s = s.replace(a, b)\nopen(p + \".tmp\", \"w\").write(s); os.replace(p + \".tmp\", p)\nPYEOF",
 	"perl -ne 'print if /mutants.py/' notes.md",
 	"git show origin/main:txe/mutate/guard-hook.py | head",
 	"git log --grep=mutate --oneline",

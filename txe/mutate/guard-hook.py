@@ -68,7 +68,9 @@ SCRIPT_RUNNER_MODULES = {"runpy", "pdb", "cProfile", "profile", "trace", "covera
 SCRIPT_RUNNER_TOOLS = {"coverage", "pdb", "pyinstrument", "memray", "scalene", "viztracer", "kernprof", "py-spy"}
 # Shell long options whose value is the next word (bash --rcfile FILE, --init-file FILE).
 SHELL_LONG_VALUE = {"--rcfile", "--init-file"}
-PRELOAD_OPTS = {"-r", "--require", "--import", "--loader", "--experimental-loader"}
+PRELOAD_OPTS = {"-r", "--require", "--import", "--loader", "--experimental-loader", "--preload"}
+NODE_VALUE_OPTS = {"-C", "--conditions", "--title", "--input-type", "--env-file", "--inspect-port",
+                   "--cwd", "--config", "--tsconfig-override", "--define", "--loader-type"}
 # perl and ruby switch clusters: code switches; switches whose value is attached or the next word;
 # switches whose optional value can only be attached (the rest of the cluster).
 PERL_CODE, PERL_VALUE, PERL_ATTACHED = "eE", "IMm", "ixDCV"
@@ -118,8 +120,8 @@ MAX_DEPTH = 24
 # something that runs a file or a process.
 CODE_RUNS = re.compile(r"runpy|\bexec(?:file)?\s*\(|subprocess|\bos\s*\.\s*(?:system|exec\w*|spawn\w*|popen|posix_spawn\w*)"
                        r"|Popen|import_module|__import__|SourceFileLoader|spec_from_file_location|child_process"
-                       r"|\b(?:execSync|execFile\w*|spawnSync|fork)\b|\brequire\s*\(|\bimport\s*\(|\bsystem\s*\("
-                       r"|\bload\s*\(|\bdo\s*\(?\s*['\"]|`|%x|\bpty\s*\.\s*spawn")
+                       r"|\b(?:execSync|execFile\w*|spawnSync|fork)\b|\brequire\b|\bimport\s*\(|\bsystem\b"
+                       r"|\bload\b|\bdo\s*\(?\s*['\"$]|\beval\b|\bexec\b|`|%x|\bpty\s*\.\s*spawn")
 CODE_IMPORTS_MUTANT = re.compile(r"(?:^|[\s;:])(?:import|from)\s+(?:[\w.]*\.)?(?:mutants?|mutations?|mutmut)\b")
 CODE_STRING_OR_COMMENT = re.compile(r"#[^\n]*|//[^\n]*|'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\"")
 CODE_TOKEN = re.compile(r"[^\s'\"(),\[\]{};=+<>]+")
@@ -438,22 +440,23 @@ def names_mutant_script(words) -> bool:
 
 FD_DIR = re.compile(r"^/(?:dev/fd|proc/[^/]+/fd)(?:/|$)")
 FD_PATH = re.compile(r"^/(?:dev/fd|proc/[^/]+/fd)/([0-9]+)$")
-STDIN_PATHS = {"/dev/stdin"}
+STD_PATHS = {"/dev/stdin": "0", "/dev/stdout": "1", "/dev/stderr": "2"}
 
 
 def fd_of_path(text: str):
-    """The descriptor a /dev/fd/N, /proc/<pid|self|thread-self>/fd/N or /dev/stdin path names
-    (after normalising `//`, `.` and `..`); "?" for any other path in a descriptor directory (a
-    variable, `/dev/fd/$N`), which cannot be judged; None for any other path."""
+    """The descriptor a /dev/fd/N, /proc/<pid|self|thread-self>/fd/N or /dev/std{in,out,err} path
+    names (after normalising `//`, `.` and `..`); "?" for any other path in a descriptor directory
+    (a variable, `/dev/fd/$N`) or under /proc (`/proc/self/root/...`, `/proc/1/cwd/...`), which
+    cannot be judged; None for any other path."""
     if not text.startswith("/"):
         return None
     p = os.path.normpath("/" + text.lstrip("/"))
-    if p in STDIN_PATHS:
-        return "0"
+    if p in STD_PATHS:
+        return STD_PATHS[p]
     m = FD_PATH.match(p)
     if m:
         return str(int(m.group(1)))
-    return "?" if FD_DIR.match(p) else None
+    return "?" if FD_DIR.match(p) or p.startswith("/proc/") else None
 
 
 def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) -> bool:
@@ -501,11 +504,20 @@ def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
     """An interpreter with no script reads its program from stdin."""
     if cmd is None:
         return False
-    if cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words):
+    # A redirection of stdin wins over the pipe: a file, a process substitution
+    # (python3 < <(cat mutants.py)), a here-document or here-string, or a duplicated descriptor.
+    if cmd.source("0") is not None:
+        return source_runs_mutant(cmd.source("0"), shell, depth)
+    return cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words)
+
+
+def code_and_args_run_mutant(code: str, rest: list) -> bool:
+    """Code given on the command line, and the arguments after it: the code runs a mutant itself,
+    or it calls something that runs a file or a process and an argument names a mutant script
+    (`python3 -c 'exec(open(sys.argv[1]).read())' mutants.py`)."""
+    if code_runs_mutant(code):
         return True
-    # A file, a process substitution (python3 < <(cat mutants.py)), a here-document or here-string,
-    # or another descriptor duplicated onto stdin (`<&3`).
-    return source_runs_mutant(cmd.source("0"), shell, depth)
+    return bool(CODE_RUNS.search(code)) and names_mutant_script(rest)
 
 
 class Judge:
@@ -666,7 +678,7 @@ class Judge:
                 ch = t[k]
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return code_runs_mutant(code)
+                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):])
                 if ch == "m":
                     attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
@@ -686,8 +698,8 @@ class Judge:
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0
 
-        def code_at(n: int) -> bool:
-            return n < len(args) and code_runs_mutant(args[n].text)
+        def code_at(n: int) -> bool:  # code at args[n], with the arguments after it
+            return n < len(args) and code_and_args_run_mutant(args[n].text, args[n + 1:])
 
         if prog in ("perl", "ruby"):
             return self.perl_ruby(prog, args, cmd)
@@ -700,16 +712,15 @@ class Judge:
             t = args[j].text
             opt, eq, val = t.partition("=")
             if opt in PRELOAD_OPTS and t.startswith("--") and eq and mutant_named(val):
-                return True  # --require=./mutants.js
+                return True  # --require=./mutants.js, bun --preload=./mutants.js
             if t in PRELOAD_OPTS and j + 1 < len(args) and mutant_named(args[j + 1].text):
                 return True  # node -r ./mutants.js: a preloaded module runs
             if opt in ("--eval", "--print") and eq:
-                if code_runs_mutant(val):
+                if code_and_args_run_mutant(val, args[j + 1:]):
                     return True  # node --eval='...'
                 evaluated = True
                 j += 1
-            elif t in ("-e", "--eval", "-p", "--print", "-r", "--require", "--import", "--loader",
-                       "--experimental-loader", "-C", "--conditions"):
+            elif t in ("-e", "--eval", "-p", "--print") or t in PRELOAD_OPTS or t in NODE_VALUE_OPTS:
                 if t in ("-e", "--eval", "-p", "--print"):
                     if code_at(j + 1):
                         return True
@@ -724,16 +735,37 @@ class Judge:
         if evaluated:
             return False
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j], cmd, False, self.depth)
+            # An option this reader does not know may take the next word as its value
+            # (`node --title x mutants.js`), so positional words are judged up to the first one
+            # that looks like a script file.
+            for n, w in enumerate(args[j:]):
+                filelike = bool(SCRIPT_EXT.search(base(w.text))) or "/" in w.text or w.procsub is not None
+                if (n == 0 or filelike) and operand_is_mutant(w, cmd, False, self.depth):
+                    return True
+                if filelike:
+                    return False
+            return False
         return stdin_is_mutant(cmd, False, self.depth)
 
     def perl_ruby(self, prog: str, args: list, cmd) -> bool:
-        """Every argument word is judged as code (-e may be given more than once, attached to any
-        switch cluster): a word is refused only when it both names a mutant and calls something
-        that runs one, so a pattern or a file name alone stays data. The switch clusters
-        (`-lne'code'`) are then read a character at a time, only to skip switch values, catch a
-        mutant preload (`-Mname`, `-r name`, `-d:name`) and find the script operand."""
-        if any(code_runs_mutant(a.text) for a in args):
+        """Every word up to the last code payload is judged as code (-e may be given more than
+        once, attached to any switch cluster, after switches this reader does not model): a word is
+        refused only when it both names a mutant and calls something that runs one, so a pattern
+        or a file name alone stays data. The words after the last payload are the code's
+        arguments: refused when the code runs something and an argument names a mutant script.
+        The switch clusters (`-lne'code'`) are then read a character at a time, only to skip switch
+        values, catch a mutant preload (`-Mname`, `-r name`, `-d:name`) and find the script operand."""
+        code_letters = "eE" if prog == "perl" else "e"
+        last = max((n for n, a in enumerate(args) if a.text.startswith("-") and not a.text.startswith("--")
+                    and any(c in a.text[1:] for c in code_letters)), default=-1)
+        if last >= 0:
+            end = last + (2 if args[last].text[-1] in code_letters else 1)
+            payload, rest = args[:end], args[end:]
+            if any(code_runs_mutant(a.text) for a in payload):
+                return True
+            if names_mutant_script(rest) and any(CODE_RUNS.search(a.text) for a in payload):
+                return True
+        elif any(code_runs_mutant(a.text) for a in args if a.text.startswith("-")):
             return True
         code_sw = PERL_CODE if prog == "perl" else RUBY_CODE
         either, attached_only = (PERL_VALUE, PERL_ATTACHED) if prog == "perl" else (RUBY_VALUE, RUBY_ATTACHED)
