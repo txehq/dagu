@@ -150,10 +150,33 @@ and process substitution, redirections, here-documents) and judges only what wou
   files (`mutant-run-guard`, `guard-hook.py`), are never refused.
 
 The case lists in `mutate_test.go` (`guardRefused`, `guardAllowed`) hold the v3 rollout's
-acceptance cases and every false positive observed since, in their observed shape. Limits: a
-renamed script, a program or file name assembled at run time, a mutation run started from inside
-a script the command calls, or one started by a tool the guard does not know gets past it. The reader
+acceptance cases and every false positive observed since, in their observed shape. The reader
 never fails: input it cannot follow (unbalanced quotes, unknown syntax) is read as words.
+
+### Documented limits (TXE-7658)
+
+The guard reads command text; it does not run a shell. These get past it, by design, and are not
+covered by parser work: the AGENTS.md rule, the sandboxed runner and the runner's host checks are
+the controls for them.
+
+- A renamed script, or a program or file name assembled at run time (`python3 "$f"` inside a
+  loop, `$(printf ./mutants.py)`, a name read from a file).
+- A mutation run started from inside a script the command calls, or by a tool the guard does not
+  know.
+- **Substitutions in go's exec flags.** `-exec "$(printf ./mutants.py)"` leaves no `$` in the word
+  the guard sees, so it is judged as the empty string. A literal `$VAR` or backtick in an
+  `-exec`/`-toolexec`/`-vettool` value is refused.
+- **Go environment state the command does not show.** A go env file reached through HOME,
+  XDG_CONFIG_HOME, GOROOT or GOTOOLCHAIN, or written by an earlier command, can set
+  `GOFLAGS=-exec=...`. Only a visible GOENV assignment and GOFLAGS on the command line are read.
+- **Redirections on compound commands.** `while`/`until … done`, `if … fi` and `case … esac` bodies
+  do not inherit the redirections or pipe written after the closing keyword
+  (`while read l; do python3; done < mutants.py`). `( … )` and `{ …; }` groups do.
+- State set outside the command: an exported variable, an alias or function from the shell's rc
+  files, an `exec 3<` in an earlier call.
+
+A shape gets a parser fix only when an agent would plausibly write it by accident while running a
+mutant, with a fixture in `guardRefused` that shows it.
 
 ## The acceptance demonstration
 
