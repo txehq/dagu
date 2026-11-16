@@ -1,0 +1,17 @@
+package fixture
+
+import (
+	"os"
+	"testing"
+)
+
+func TestDirectives(t *testing.T) {
+	//cleanuplint:allow // want:allow-directive
+	_ = os.RemoveAll(os.Getenv("A")) // want:env-path-delete
+	//cleanuplint:allow too short // want:allow-directive
+	_ = os.RemoveAll(os.Getenv("B")) // want:env-path-delete
+
+	//cleanuplint:allow nothing below this line needs a directive // want:allow-directive
+
+	_ = os.Remove("x")
+}

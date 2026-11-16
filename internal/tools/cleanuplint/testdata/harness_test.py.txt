@@ -1,0 +1,21 @@
+import os
+import shutil
+import subprocess
+import tempfile
+
+subprocess.run(["go", "clean", "-modcache"], check=True)  # want:go-clean-cache
+shutil.rmtree(os.environ["GOCACHE"])  # want:env-path-delete
+cache = os.path.expanduser("~/.cache/x")
+shutil.rmtree(cache)  # want:env-path-delete
+subprocess.run(["rm", "-rf", cache])  # want:env-path-delete
+subprocess.run(  # want:go-clean-cache
+    ["go", "clean",
+     "-cache"],
+)
+tmp = tempfile.mkdtemp()
+shutil.rmtree(tmp)
+with tempfile.TemporaryDirectory() as d:
+    shutil.rmtree(d, ignore_errors=True)
+subprocess.run(["go", "env", "GOMODCACHE"])
+under = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
+shutil.rmtree(under)

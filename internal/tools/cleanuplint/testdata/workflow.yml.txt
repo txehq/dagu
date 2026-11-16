@@ -1,0 +1,9 @@
+jobs:
+  x:
+    steps:
+      - run: rm -rf "${RUNNER_TEMP}/cache" # want:env-path-delete
+      - run: rm -rf ui/node_modules
+      - run: go clean -cache # want:go-clean-cache
+      - run: |
+          scratch="$(mktemp -d)"
+          rm -rf "$scratch"

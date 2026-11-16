@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+go clean -modcache # want:go-clean-cache
+go clean -i -cache # want:go-clean-cache
+"$GO" clean -fuzzcache # want:go-clean-cache
+rm -rf "$HOME/.cache/go-build" # want:env-path-delete
+rm -rf "$(go env GOMODCACHE)" # want:env-path-delete
+cache="$(go env GOCACHE)"
+rm -r "${cache}" # want:env-path-delete
+rm -rf ~/.cache # want:env-path-delete
+rm -rf "$TMPDIR/build" # want:env-path-delete
+rm -rf "$CACHE_ROOT" # want:env-path-delete
+dir="${WORK_DIR:-/tmp/work}"
+rm -rf "$dir" # want:env-path-delete
+STATE="${STATE:-/tmp/state}"
+rm -fr "$STATE" # want:env-path-delete
+rm --recursive --force "$GOPATH/pkg/mod" # want:env-path-delete
+find "$GOPATH/pkg" -delete # want:env-path-delete
+find "$HOME/x" -type d -exec rm -rf {} + # want:env-path-delete
+trap 'rm -rf "$HOME/scratch"' EXIT # want:env-path-delete
+for d in "$HOME"/.cache/*; do rm -rf "$d"; done # want:env-path-delete
+sudo rm -Rf "/home/$USER/.cache" # want:env-path-delete
+"${GO}" clean -cache # want:go-clean-cache

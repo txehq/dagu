@@ -26,6 +26,12 @@ on:
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
       - ".github/opencode/**"
+      # The cleanup lint reads every script and workflow (TXE-7550).
+      - ".github/**"
+      - "**/*.sh"
+      - "**/*.bash"
+      - "**/*.py"
+      - "**/*.ps1"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -55,6 +61,12 @@ on:
       - ".github/actions/setup-go-cache/**"
       - ".github/workflows/ci.yaml"
       - ".github/opencode/**"
+      # The cleanup lint reads every script and workflow (TXE-7550).
+      - ".github/**"
+      - "**/*.sh"
+      - "**/*.bash"
+      - "**/*.py"
+      - "**/*.ps1"
   workflow_dispatch:
 
 permissions:
@@ -151,6 +163,29 @@ jobs:
           echo "go=${go_changed}" >> "${GITHUB_OUTPUT}"
           echo "e2e=${e2e_changed}" >> "${GITHUB_OUTPUT}"
           echo "windows_installer=${windows_installer_changed}" >> "${GITHUB_OUTPUT}"
+
+  # Test and harness code never runs go clean -modcache/-cache/-fuzzcache and
+  # never deletes a tree whose path comes from the environment (TXE-7550,
+  # after a test cleanup deleted a machine's shared module cache). It reads
+  # source text only, so it runs on every change, with no path gate.
+  cleanuplint:
+    name: Cleanup lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Run cleanuplint
+        run: go run ./internal/tools/cleanuplint -v
 
   # Lint Go code
   golint:

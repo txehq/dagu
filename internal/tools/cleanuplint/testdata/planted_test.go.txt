@@ -1,0 +1,10 @@
+package planted
+
+import (
+	"os/exec"
+	"testing"
+)
+
+func TestPlanted(t *testing.T) {
+	_ = exec.Command("go", "clean", "-modcache").Run()
+}

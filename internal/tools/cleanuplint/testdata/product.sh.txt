@@ -1,0 +1,4 @@
+#!/bin/sh
+# An installer: env-path-delete is out of scope, go clean of a cache is not.
+rm -rf "$HOME/.dagu/old"
+go clean -modcache # want:go-clean-cache

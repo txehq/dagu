@@ -174,6 +174,7 @@ cmd_up() {
   # The fail-loud gate: owner calls must reach the relay, or the cut proves nothing.
   pf hub-log --log "$RIG/logs/hub.log" --relay-coord "$RELAY_COORD" --bind "[::1]"
   pf registry --dir "$RIG/hub/data/service-registry/coordinator" --relay-coord "$RELAY_COORD"
+  # cleanuplint:allow removes only the example DAG files start-all seeded into this rig's own hub, one level deep
   find "$RIG/hub/dags" -maxdepth 1 -name 'example-0*' -delete
 
   umask 077
