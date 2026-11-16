@@ -17,12 +17,6 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/txe/runcontrol"
 )
 
-// registryBindsQueuedRetries is whether this tree has TXE-7517's
-// registry.CheckRetryRun wired into registry.AdmitQueuedRetry. Until it
-// merges, every queued retry of a registered job is refused, so the tests
-// that need the binding to accept, or to give its own reason, wait for it.
-const registryBindsQueuedRetries = false
-
 // testClock is a registry clock a test moves forward.
 type testClock struct {
 	mu  sync.Mutex
@@ -60,6 +54,13 @@ func newRegistryJobWithRuns(t *testing.T, f *queueFixture) (txeQueueJob, *testCl
 
 func approveRerun(t *testing.T, f *queueFixture, j txeQueueJob, runID string) approvedRerun {
 	t.Helper()
+	return approveRetry(t, f, j, runID, func(*registry.RetryRunParams) {})
+}
+
+// approveRetry is approveRerun for the params form sets: a republish
+// (Step) or an explicit rerun (Rerun).
+func approveRetry(t *testing.T, f *queueFixture, j txeQueueJob, runID string, form func(*registry.RetryRunParams)) approvedRerun {
+	t.Helper()
 	person := registry.Actor{Kind: registry.ActorHuman, ID: "owner"}
 	reviewer := registry.Actor{Kind: registry.ActorReviewer, ID: "reviewer"}
 	failed := finishedRun(t, f, j.dag, runID, ir.Failed)
@@ -67,10 +68,12 @@ func approveRerun(t *testing.T, f *queueFixture, j txeQueueJob, runID string) ap
 	var decision *registry.Decision
 	_, err := j.store.WithJobTx(f.ctx, j.job.JobID, person, func(tx *registry.JobTx) error {
 		var err error
-		proposal, decision, err = tx.ProposeRetry(registry.RetryRunParams{
+		params := registry.RetryRunParams{
 			RunID: runID, AttemptID: failed.AttemptID, QueuedAt: failed.QueuedAt,
 			RunSpecSHA256: j.job.DAGSpecSHA256, PackageDigest: j.job.PackageDigest,
-		}, "key-"+runID)
+		}
+		form(&params)
+		proposal, decision, err = tx.ProposeRetry(params, "key-"+runID)
 		return err
 	})
 	require.NoError(t, err)
@@ -97,16 +100,14 @@ func approveRerun(t *testing.T, f *queueFixture, j txeQueueJob, runID string) ap
 	return approvedRerun{actionID: actionID, grant: grant, failed: failed, request: request}
 }
 
-// A rerun a person approved, queued by the hub with its retry request while
-// the grant is live, is dispatched.
-func TestQueueDispatch_TxeApprovedRerunIsAdmitted(t *testing.T) {
+// A retry a person approved with no intent named (the legacy form, unchanged
+// by TXE-7515's explicit forms), queued by the hub with its retry request
+// while the grant is live, is dispatched.
+func TestQueueDispatch_TxeApprovedRetryIsAdmitted(t *testing.T) {
 	f := newQueueFixture(t)
 	j, _ := newRegistryJobWithRuns(t, f)
 	approved := approveRerun(t, f, j, "run-failed")
 	queued := cliEnqueueRetry(t, f, j.dag, approved.failed, approved.request)
-	if !registryBindsQueuedRetries {
-		t.Skip("TXE-7517: registry.CheckRetryRun is not wired yet")
-	}
 
 	assert.True(t, distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag))
 }
@@ -130,11 +131,40 @@ func TestQueueDispatch_TxeExpiredGrantIsRefusedAndReconciled(t *testing.T) {
 	job, err := j.store.GetJob(f.ctx, j.job.JobID)
 	require.NoError(t, err)
 	assert.Equal(t, registry.ActionUncertain, job.Actions[approved.actionID].State)
-	if registryBindsQueuedRetries {
-		attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
-		require.NoError(t, err)
-		status, err := attempt.ReadStatus(f.ctx)
-		require.NoError(t, err)
-		assert.Contains(t, status.Error, "grant")
+	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
+	require.NoError(t, err)
+	status, err := attempt.ReadStatus(f.ctx)
+	require.NoError(t, err)
+	assert.Contains(t, status.Error, "live grant")
+}
+
+// A person's approval of a republish or of an explicit rerun, with its
+// grant live and its retry request intact, is still refused when it reaches
+// the queue: a queued retry names no step, so it would carry out neither
+// form. It is refused, not applied, never coerced into a whole-run retry.
+func TestQueueDispatch_TxeExplicitFormsAreRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		form   func(*registry.RetryRunParams)
+		reason string
+	}{
+		"republish":      {func(p *registry.RetryRunParams) { p.Step = registry.RetryStepPublish }, "approved as a republish"},
+		"explicit rerun": {func(p *registry.RetryRunParams) { p.Rerun = true }, "approved as a rerun of the job"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newQueueFixture(t)
+			j, _ := newRegistryJobWithRuns(t, f)
+			approved := approveRetry(t, f, j, "run-failed", tc.form)
+			queued := cliEnqueueRetry(t, f, j.dag, approved.failed, approved.request)
+
+			admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+
+			assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
+			attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
+			require.NoError(t, err)
+			status, err := attempt.ReadStatus(f.ctx)
+			require.NoError(t, err)
+			assert.Contains(t, status.Error, "not applied")
+			assert.Contains(t, status.Error, tc.reason)
+		})
 	}
 }
