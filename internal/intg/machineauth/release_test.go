@@ -6,10 +6,12 @@
 package machineauth_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -46,8 +48,11 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 	}
 	m, resultsDir := loadMatrixSpec(t, spec)
 	require.NoError(t, checkBinaries(m), "a build's binary is not the one the manifest names")
+	if approved := os.Getenv("DAGU_MACHINEAUTH_MANIFEST_SHA256"); approved != "" {
+		require.Equal(t, approved, m.sha256, "the manifest given is not the approved one")
+	}
 
-	res := &results{Schema: resultsSchema, At: time.Now().UTC(), Long: m.Long}
+	res := &results{Schema: resultsSchema, At: time.Now().UTC(), Long: m.Long, ManifestSHA256: m.sha256}
 	record := func(c cellResult) {
 		res.Cells = append(res.Cells, c)
 		mark := "PASS"
@@ -56,21 +61,55 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 		}
 		t.Logf("%-28s hub=%-8s worker=%-8s %s %s", c.Name, c.HubBuild, c.WorkerBuild, mark, truncate(c.Detail, 160))
 	}
+	// Before any cell: every build's own account of itself (its version, and
+	// whether its worker can take the channel) is held to its scope, and every
+	// provenance record to its build. A build that does not hold stops the run.
 	builds := map[string]build{}
+	scopes := map[string]buildScope{}
+	var workerOnly []build
 	for _, mb := range m.Builds {
-		builds[mb.Name] = build{name: mb.Name, path: mb.Path, sha256: mb.SHA256}
+		b := build{name: mb.Name, path: mb.Path, sha256: mb.SHA256}
+		builds[mb.Name] = b
+		s, n, err := resolveScope(mb)
+		require.NoError(t, err)
+		scopes[mb.Name] = s
+		c := probeCapability(t, mb.Path)
+		version := mb.Version
+		if spec == "source" {
+			version = c.VersionOutput // the harness's own build names no version in advance
+		}
+		require.NoError(t, checkCapability(mb.Name, version, s, c), "the build's own account does not hold")
+		if mb.Provenance != nil {
+			var problems []string
+			verifyProvenance(mb, func(f string, a ...any) { problems = append(problems, fmt.Sprintf(f, a...)) })
+			require.Empty(t, problems, "the build's provenance does not hold")
+		}
+		rb := resultBuild{Name: mb.Name, Path: mb.Path, SHA256: mb.SHA256, Version: version, Scope: s, Excluded: excludedCells(s),
+			Capability: c, Provenance: mb.Provenance}
+		if n != nil {
+			rb.ScopeReason = n.Reason
+		}
+		res.Builds = append(res.Builds, rb)
+		if !s.hub() {
+			workerOnly = append(workerOnly, b)
+		}
 	}
 	for _, mb := range m.Builds {
+		if !scopes[mb.Name].hub() {
+			continue
+		}
 		b := builds[mb.Name]
-		run := newMatrixRun(t, b, resultsDir, record)
-		res.Builds = append(res.Builds, resultBuild{Name: b.name, Path: b.path, SHA256: b.sha256, Version: run.version})
+		run := newMatrixRun(t, b, res.versionOf(b.name), resultsDir, record, workerOnly)
 		run.cells()
-		// The pairs run while A's credential is still good at the issuer: the
-		// long cells end with the provider refusing it.
+		// The pairs and the worker-only builds run while A's credential is still
+		// good at the issuer: the long cells end with the provider refusing it.
 		for _, other := range m.Builds {
 			if other.Name != b.name {
 				run.pair(builds[other.Name])
 			}
+		}
+		for _, w := range workerOnly {
+			run.workerOnly(w, m.Long)
 		}
 		run.longCells(m.Long)
 		run.close()
@@ -91,13 +130,20 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 			failed = append(failed, fmt.Sprintf("%s (hub %s, worker %s): %s", c.Name, c.HubBuild, c.WorkerBuild, c.Detail))
 		}
 	}
+	for _, line := range scopeSummary(res) {
+		t.Log(line)
+	}
 	require.Empty(t, failed, "cells failed")
-	if res.Partial {
+	switch {
+	case res.Partial:
 		t.Logf("PARTIAL: some cells were not run (see the table); this result is a smoke of %d build(s), not a release proof", len(res.Builds))
-	} else if problems := verifyResults(m, res, true); len(problems) > 0 {
-		t.Fatalf("the run passed its cells but the verifier does not hold it as a proof:\n  %s", strings.Join(problems, "\n  "))
-	} else {
-		t.Logf("FULL: %d build(s), %d cells, a release proof the verifier holds", len(res.Builds), len(res.Cells))
+	case spec == "source":
+		t.Logf("SOURCE: every cell passed on the harness's own build of the current source; a smoke with no manifest or provenance, never a release proof")
+	default:
+		if problems := verifyResults(m, res, true); len(problems) > 0 {
+			t.Fatalf("the run passed its cells but the verifier does not hold it as a proof:\n  %s", strings.Join(problems, "\n  "))
+		}
+		t.Logf("FULL for the manifest's scope: %d build(s), %d cells, a release proof the verifier holds", len(res.Builds), len(res.Cells))
 	}
 }
 
@@ -138,21 +184,53 @@ func loadMatrixSpec(t *testing.T, spec string) (*manifest, string) {
 	return &manifest{Builds: []manifestBuild{{Name: "source", Path: path, SHA256: sum}}, Long: os.Getenv("DAGU_MACHINEAUTH_LONG") == "1"}, dir
 }
 
+func (r *results) versionOf(name string) string {
+	for _, b := range r.Builds {
+		if b.Name == name {
+			return b.Version
+		}
+	}
+	return ""
+}
+
+// probeCapability asks a binary for its version and whether its worker takes
+// --worker.hub-url, with an environment of its own and a bound.
+func probeCapability(t *testing.T, path string) capability {
+	t.Helper()
+	home := t.TempDir()
+	run := func(args ...string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, path, args...)
+		cmd.Env = []string{"PATH=" + rigPath, "HOME=" + home, "DAGU_HOME=" + filepath.Join(home, "dagu")}
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s %s: %s", path, strings.Join(args, " "), truncate(string(out), 300))
+		return string(out)
+	}
+	return capability{
+		VersionOutput: strings.TrimSpace(run("version")),
+		HubURLFlag:    strings.Contains(run("worker", "--help"), "--worker.hub-url"),
+	}
+}
+
 // matrixRun is one build's run: its own rig, hub and store.
 type matrixRun struct {
-	t          *testing.T
-	b          build
-	r          *rig
-	version    string
-	record     func(cellResult)
-	resultsDir string
+	t       *testing.T
+	b       build
+	r       *rig
+	version string
+	// wantVersion is what the binary said of itself (dagu version) before
+	// the run; the hub must say the same on /health.
+	wantVersion string
+	record      func(cellResult)
+	resultsDir  string
 	// ok is false once setup failed; later cells are then not run.
 	ok bool
 }
 
-func newMatrixRun(t *testing.T, b build, resultsDir string, record func(cellResult)) *matrixRun {
+func newMatrixRun(t *testing.T, b build, version, resultsDir string, record func(cellResult), workerOnly []build) *matrixRun {
 	t.Helper()
-	run := &matrixRun{t: t, b: b, r: newRig(t), record: record, resultsDir: resultsDir, ok: true}
+	run := &matrixRun{t: t, b: b, r: newRig(t, workerOnly...), wantVersion: version, record: record, resultsDir: resultsDir, ok: true}
 	run.cell("setup", run.setup)
 	return run
 }
@@ -167,12 +245,12 @@ func (run *matrixRun) cell(name string, body func() string) {
 	run.cellAs(name, run.b, body)
 }
 
-func (run *matrixRun) cellAs(name string, worker build, body func() string) {
+func (run *matrixRun) cellAs(name string, worker build, body func() string) string {
 	c := cellResult{Name: name, HubBuild: run.b.name, WorkerBuild: worker.name}
 	if !run.ok {
 		c.Status, c.Detail = statusNotRun, "setup failed"
 		run.record(c)
-		return
+		return c.Status
 	}
 	run.r.markLog()
 	var detail string
@@ -187,12 +265,17 @@ func (run *matrixRun) cellAs(name string, worker build, body func() string) {
 	c.Reasons = run.r.refusalsSinceMark()
 	c.Status, c.Detail = cellStatus(passed, ran, detail)
 	if c.Status == statusFail {
-		run.keepLogs(name)
+		logName := name
+		if worker.name != run.b.name {
+			logName = name + "-" + worker.name
+		}
+		run.keepLogs(logName)
 		if name == "setup" {
 			run.ok = false
 		}
 	}
 	run.record(c)
+	return c.Status
 }
 
 // keepLogs copies the rig's process logs beside the results when a cell
@@ -225,6 +308,19 @@ func (run *matrixRun) notRun(name, why string) {
 	run.record(cellResult{Name: name, HubBuild: run.b.name, WorkerBuild: run.b.name, Status: statusNotRun, Detail: why})
 }
 
+// subject is a machine, the worker build that runs for it, and the machine's
+// pinned and holding jobs: A with the hub's own build, or a worker-only
+// build's own machine.
+type subject struct {
+	m         *machineHome
+	b         build
+	pin, hold string
+}
+
+func (run *matrixRun) a() subject {
+	return subject{m: run.r.A(), b: run.b, pin: "pin-a", hold: "hold-a"}
+}
+
 // cells runs every short cell of one build.
 func (run *matrixRun) cells() {
 	run.cell("pos-native", func() string { return run.pinnedRun("a-native", run.b, "native") })
@@ -235,11 +331,11 @@ func (run *matrixRun) cells() {
 	for _, class := range refusalClasses {
 		run.cell("neg-"+class.Name, func() string { return run.probeClass(class) })
 	}
-	run.cell("neg-worker-start", run.workerRefusesToStart)
-	run.cell("neg-worker-nocred", run.workerWithoutCredential)
-	run.cell("cancel", run.cancelFromHub)
-	run.cell("revoke-owner", run.revokeOwner)
-	run.cell("reenrol", run.reenrol)
+	run.cell("neg-worker-start", func() string { return run.workerRefusesToStart(run.a(), run.r.B()) })
+	run.cell("neg-worker-nocred", func() string { return run.workerWithoutCredential(run.a()) })
+	run.cell("cancel", func() string { return run.cancelFromHub(run.a()) })
+	run.cell("revoke-owner", func() string { return run.revokeOwner(run.a()) })
+	run.cell("reenrol", func() string { return run.reenrol(run.a()) })
 }
 
 // longCells runs the slow cells, or records them as not run.
@@ -250,8 +346,68 @@ func (run *matrixRun) longCells(long bool) {
 		}
 		return
 	}
-	run.cell("stale", run.staleAttempt)
-	run.cell("revoke-issuer", run.revokeAtIssuer) // last: it refuses A's client at the issuer for good
+	run.cell("stale", func() string { return run.staleAttempt(run.a()) })
+	run.cell("revoke-issuer", func() string { return run.revokeAtIssuer(run.a()) }) // last: it refuses A's client at the issuer for good
+}
+
+// workerOnly runs a worker-only build's cells under this hub, on the build's
+// own machine (owner B), enrolled through the build's own CLI. Its issuer
+// revocation refuses only that machine's client.
+func (run *matrixRun) workerOnly(w build, long bool) {
+	s := subject{m: run.r.machines["w-"+w.name], b: w, pin: "pin-w-" + w.name, hold: "hold-w-" + w.name}
+	ok := true
+	cell := func(name string, body func() string) {
+		if !ok {
+			run.record(cellResult{Name: name, HubBuild: run.b.name, WorkerBuild: w.name, Status: statusNotRun, Detail: "w-setup failed"})
+			return
+		}
+		if run.cellAs(name, w, body) == statusFail && name == "w-setup" {
+			ok = false
+		}
+	}
+	cell("w-setup", func() string { return run.workerSetup(s) })
+	cell("pos-native", func() string { return run.pinnedRunOn(s, "w-native", "native") })
+	cell("neg-worker-start", func() string { return run.workerRefusesToStart(s, run.r.A()) })
+	cell("neg-worker-nocred", func() string { return run.workerWithoutCredential(s) })
+	cell("cancel", func() string { return run.cancelFromHub(s) })
+	cell("revoke-owner", func() string { return run.revokeOwner(s) })
+	cell("reenrol", func() string { return run.reenrol(s) })
+	if !long {
+		for _, name := range workerOnlyLongCells {
+			run.record(cellResult{Name: name, HubBuild: run.b.name, WorkerBuild: w.name, Status: statusNotRun,
+				Detail: "long cells are off (manifest long=false / DAGU_MACHINEAUTH_LONG unset): a smoke, not a release proof"})
+		}
+		return
+	}
+	cell("stale", func() string { return run.staleAttempt(s) })
+	cell("revoke-issuer", func() string { return run.revokeAtIssuer(s) })
+}
+
+// workerSetup enrols a worker-only build's machine through that build's own
+// CLI: the person (bob, already bound by setup) signs the CLI in, records the
+// machine, enrols the worker and reviewer classes through the issuer and
+// approves them; enrol check loads the credential as the worker does.
+func (run *matrixRun) workerSetup(s subject) string {
+	r := run.r
+	t := r.t
+	m := s.m
+	require.NoError(t, os.WriteFile(filepath.Join(m.txe(), "machine.json"),
+		[]byte(fmt.Sprintf(`{"schema":1,"machine_id":%q,"owner_id":%q,"display_name":"rig-%s"}`+"\n", m.id, m.owner, m.name)), 0o600))
+	r.cliSignIn(m, m.person, "txe", "login", "--hub", r.hubURL(), "--json")
+	who := lastJSON(t, r.cli(m, "txe", "whoami", "--json"))
+	hubIdentity, _ := who["hub_identity"].(map[string]any)
+	require.Equal(t, "bound", hubIdentity["state"], "whoami through %s's CLI (%v)", s.b.name, who["hub_identity_error"])
+	created := lastJSON(t, r.cli(m, "txe", "machine", "create", "--display-name", "rig-"+m.name, "--json"))
+	require.Equal(t, m.id, created["machine_id"])
+	require.Equal(t, m.owner, created["owner_id"])
+	run.enrol(m, "worker")
+	run.enrol(m, "reviewer")
+	check := lastJSON(t, r.cli(m, "txe", "enrol", "check", "--json"))
+	require.Equal(t, m.id, check["machine_id"], "enrol check through %s's CLI", s.b.name)
+	r.writeDAG(s.pin, m, `echo "pinned to `+m.name+`"`, "sleep 2", "echo done")
+	r.writeDAG(s.hold, m, "echo hold-start", `mkdir -p "$DAG_RUN_ARTIFACTS_DIR" && echo late > "$DAG_RUN_ARTIFACTS_DIR/late.txt"`,
+		"for i in $(seq 1 300); do echo tick $i; sleep 1; done", "echo hold-end")
+	return fmt.Sprintf("machine %s (owner B) enrolled through %s's CLI (worker and reviewer) under hub %s", m.name, s.b.name, run.b.name)
 }
 
 // pair runs the pair cell: this hub with a worker of another build.
@@ -266,6 +422,7 @@ func (run *matrixRun) setup() string {
 	t := r.t
 	r.startHub(run.b)
 	run.version = r.hubVersion()
+	require.Equal(t, run.wantVersion, run.version, "the hub's /health version is not what the binary said of itself")
 	require.True(t, r.hubSaysEnforce(), "the hub did not log that it authenticates its callers in enforce mode:\n%s", r.logTail(r.hub, 20))
 	r.adminLogin()
 	me := r.apiOK(http.MethodGet, "/auth/me", r.tokens["admin"], nil)
@@ -341,17 +498,24 @@ func (run *matrixRun) enrol(m *machineHome, class string) int {
 // pinnedRun starts a worker of build b for machine A over route and runs A's
 // pinned job on it.
 func (run *matrixRun) pinnedRun(name string, b build, route string) string {
+	s := run.a()
+	s.b = b
+	return run.pinnedRunOn(s, name, route)
+}
+
+// pinnedRunOn starts subject's worker over route and runs its pinned job on it.
+func (run *matrixRun) pinnedRunOn(sub subject, name, route string) string {
 	r := run.r
 	t := r.t
-	before := r.issuer.refreshes(r.workerClient(r.A()))
-	w := r.startWorker(name, b, r.A(), route, workerOptions{})
+	before := r.issuer.refreshes(r.workerClient(sub.m))
+	w := r.startWorker(name, sub.b, sub.m, route, workerOptions{})
 	defer r.stop(w, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id, 30*time.Second), "worker %s not healthy:\n%s", name, r.logTail(w, 15))
-	id := r.enqueue("pin-a")
-	s := r.waitRun("pin-a", id, 120*time.Second)
-	require.Equal(t, "succeeded", s.status, "pin-a %s: %+v\n%s", id, s, r.logTail(w, 15))
-	require.Equal(t, r.A().id, s.worker, "pin-a ran on another worker")
-	renewed := r.issuer.refreshes(r.workerClient(r.A())) - before
+	require.True(t, r.workerHealthy(sub.m.id, 30*time.Second), "worker %s not healthy:\n%s", name, r.logTail(w, 15))
+	id := r.enqueue(sub.pin)
+	s := r.waitRun(sub.pin, id, 120*time.Second)
+	require.Equal(t, "succeeded", s.status, "%s %s: %+v\n%s", sub.pin, id, s, r.logTail(w, 15))
+	require.Equal(t, sub.m.id, s.worker, "%s ran on another worker", sub.pin)
+	renewed := r.issuer.refreshes(r.workerClient(sub.m)) - before
 	require.Positive(t, renewed, "the worker renewed its access token at the issuer")
 	return fmt.Sprintf("run %s succeeded on %s over %s; %d issuer renewal(s)", id, s.worker, route, renewed)
 }
@@ -460,17 +624,17 @@ func (run *matrixRun) probeClass(class refusalClass) string {
 
 // workerRefusesToStart: the binary itself refuses a reviewer credential,
 // another machine's worker id and another machine's label.
-func (run *matrixRun) workerRefusesToStart() string {
+func (run *matrixRun) workerRefusesToStart(sub subject, other *machineHome) string {
 	r := run.r
 	t := r.t
 	cases := map[string]workerOptions{
-		"a-reviewer-cred": {credential: r.A().credential("reviewer")},
-		"a-as-b":          {id: r.B().id},
-		"a-label-b":       {label: r.B().id},
+		"a-reviewer-cred": {credential: sub.m.credential("reviewer")},
+		"a-as-b":          {id: other.id},
+		"a-label-b":       {label: other.id},
 	}
 	var notes []string
 	for name, o := range cases {
-		w := r.startWorker(name, run.b, r.A(), "native", o)
+		w := r.startWorker(name, sub.b, sub.m, "native", o)
 		select {
 		case <-w.done:
 			require.Error(t, w.err, "worker %s exited 0; it must refuse", name)
@@ -487,66 +651,66 @@ func (run *matrixRun) workerRefusesToStart() string {
 
 // workerWithoutCredential: a worker that presents nothing is refused on every
 // call and never handed a task.
-func (run *matrixRun) workerWithoutCredential() string {
+func (run *matrixRun) workerWithoutCredential(sub subject) string {
 	r := run.r
 	t := r.t
-	w := r.startWorker("a-nocred", run.b, r.A(), "native", workerOptions{noCred: true})
+	w := r.startWorker("a-nocred", sub.b, sub.m, "native", workerOptions{noCred: true})
 	defer r.stop(w, 10*time.Second)
-	id := r.enqueue("pin-a")
+	id := r.enqueue(sub.pin)
 	time.Sleep(12 * time.Second)
 	require.False(t, r.exited(w), "the credential-less worker should keep trying, not exit")
-	s := r.run("pin-a", id)
-	require.Equal(t, "queued", s.status, "pin-a was handed to a credential-less worker: %+v", s)
+	s := r.run(sub.pin, id)
+	require.Equal(t, "queued", s.status, "%s was handed to a credential-less worker: %+v", sub.pin, s)
 	counts := r.refusalsSinceMark()
 	require.Positive(t, counts["no_credential"], "the hub logged no refusal: %v", counts)
 	// Leave the queue clean for the next cell: the run is cancelled.
 	r.stop(w, 10*time.Second)
-	wa := r.startWorker("a-after-nocred", run.b, r.A(), "native", workerOptions{})
+	wa := r.startWorker("a-after-nocred", sub.b, sub.m, "native", workerOptions{})
 	defer r.stop(wa, 10*time.Second)
-	final := r.waitRun("pin-a", id, 120*time.Second)
+	final := r.waitRun(sub.pin, id, 120*time.Second)
 	require.Equal(t, "succeeded", final.status, "the queued run should go to the enrolled worker afterwards: %+v", final)
 	return fmt.Sprintf("refused no_credential ×%d; the run stayed queued until an enrolled worker took it", counts["no_credential"])
 }
 
 // ── cancel, revocation, re-enrolment ─────────────────────────────────────────
 
-func (run *matrixRun) cancelFromHub() string {
+func (run *matrixRun) cancelFromHub(sub subject) string {
 	r := run.r
 	t := r.t
-	w := r.startWorker("a-cancel", run.b, r.A(), "native", workerOptions{})
+	w := r.startWorker("a-cancel", sub.b, sub.m, "native", workerOptions{})
 	defer r.stop(w, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id, 30*time.Second))
-	id := r.enqueue("hold-a")
-	require.True(t, r.waitRunning("hold-a", id, 60*time.Second), "hold-a did not start")
+	require.True(t, r.workerHealthy(sub.m.id, 30*time.Second))
+	id := r.enqueue(sub.hold)
+	require.True(t, r.waitRunning(sub.hold, id, 60*time.Second), "%s did not start", sub.hold)
 	time.Sleep(3 * time.Second)
 	t0 := time.Now()
-	code, raw := r.api(http.MethodPost, "/dag-runs/hold-a/"+id+"/stop", r.tokens["admin"], map[string]any{})
+	code, raw := r.api(http.MethodPost, "/dag-runs/"+sub.hold+"/"+id+"/stop", r.tokens["admin"], map[string]any{})
 	require.Equal(t, http.StatusOK, code, "stop: %s", truncate(string(raw), 200))
-	s := r.waitRun("hold-a", id, 90*time.Second)
-	require.Equal(t, "aborted", s.status, "hold-a after stop: %+v", s)
+	s := r.waitRun(sub.hold, id, 90*time.Second)
+	require.Equal(t, "aborted", s.status, "%s after stop: %+v", sub.hold, s)
 	return fmt.Sprintf("aborted on %s %s after the stop", s.worker, time.Since(t0).Round(time.Second))
 }
 
 // revokeOwner: the owner revokes A's worker enrolment while a step runs. The
 // hub refuses the next call, the worker stops the step within its bound, and
 // every late write is refused.
-func (run *matrixRun) revokeOwner() string {
+func (run *matrixRun) revokeOwner(sub subject) string {
 	r := run.r
 	t := r.t
-	w := r.startWorker("a-revoke", run.b, r.A(), "native", workerOptions{})
+	w := r.startWorker("a-revoke", sub.b, sub.m, "native", workerOptions{})
 	defer r.stop(w, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id, 30*time.Second))
-	id := r.enqueue("hold-a")
-	require.True(t, r.waitRunning("hold-a", id, 60*time.Second), "hold-a did not start")
+	require.True(t, r.workerHealthy(sub.m.id, 30*time.Second))
+	id := r.enqueue(sub.hold)
+	require.True(t, r.waitRunning(sub.hold, id, 60*time.Second), "%s did not start", sub.hold)
 	time.Sleep(3 * time.Second)
 	r.markLog()
 	t0 := time.Now()
-	revoked := r.apiOK(http.MethodPost, "/txe/machines/"+r.A().id+"/enrolments/worker/revoke", r.tokens[r.A().person],
+	revoked := r.apiOK(http.MethodPost, "/txe/machines/"+sub.m.id+"/enrolments/worker/revoke", r.tokens[sub.m.person],
 		map[string]any{"reason": "machineauth matrix: the owner revokes the worker while a step runs"})
 	require.Equal(t, "revoked", revoked["state"])
-	s := r.waitRun("hold-a", id, 150*time.Second)
+	s := r.waitRun(sub.hold, id, 150*time.Second)
 	ended := time.Since(t0).Round(time.Second)
-	require.True(t, terminal(s.status), "hold-a still %s %s after the revocation", s.status, ended)
+	require.True(t, terminal(s.status), "%s still %s %s after the revocation", sub.hold, s.status, ended)
 	require.NotEqual(t, "succeeded", s.status, "the revoked worker's run succeeded")
 	counts := r.refusalsSinceMark()
 	require.Positive(t, counts["not_enrolled"], "no not_enrolled refusal logged: %v", counts)
@@ -569,12 +733,12 @@ func (run *matrixRun) revokeOwner() string {
 // reenrol: enrolling the revoked machine again is a new generation of the
 // machine's worker enrolment (the hub lists one standing record per class),
 // and the worker runs again with the credential the new enrolment wrote.
-func (run *matrixRun) reenrol() string {
+func (run *matrixRun) reenrol(sub subject) string {
 	r := run.r
 	t := r.t
-	gen := run.enrol(r.A(), "worker")
+	gen := run.enrol(sub.m, "worker")
 	require.GreaterOrEqual(t, gen, 2, "the re-enrolment is a new generation")
-	list := r.apiOK(http.MethodGet, "/txe/machines/"+r.A().id+"/enrolments", r.tokens[r.A().person], nil)
+	list := r.apiOK(http.MethodGet, "/txe/machines/"+sub.m.id+"/enrolments", r.tokens[sub.m.person], nil)
 	items, _ := list["enrolments"].([]any)
 	active := 0
 	for _, item := range items {
@@ -586,29 +750,29 @@ func (run *matrixRun) reenrol() string {
 		}
 	}
 	require.Equal(t, 1, active, "one active worker enrolment")
-	return fmt.Sprintf("generation %d active; %s", gen, run.pinnedRun("a-reenrolled", run.b, "native"))
+	return fmt.Sprintf("generation %d active; %s", gen, run.pinnedRunOn(sub, "a-reenrolled", "native"))
 }
 
 // ── long cells ───────────────────────────────────────────────────────────────
 
 // staleAttempt: a frozen worker's attempt expires at the production lease
 // threshold; its late status and streams are refused as stale.
-func (run *matrixRun) staleAttempt() string {
+func (run *matrixRun) staleAttempt(sub subject) string {
 	r := run.r
 	t := r.t
-	old := r.startWorker("a-old", run.b, r.A(), "native", workerOptions{id: r.A().id + "@old", maxRuns: 1})
+	old := r.startWorker("a-old", sub.b, sub.m, "native", workerOptions{id: sub.m.id + "@old", maxRuns: 1})
 	defer r.stop(old, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id+"@old", 30*time.Second))
-	id := r.enqueue("hold-a")
-	require.True(t, r.waitRunning("hold-a", id, 60*time.Second), "hold-a did not start")
+	require.True(t, r.workerHealthy(sub.m.id+"@old", 30*time.Second))
+	id := r.enqueue(sub.hold)
+	require.True(t, r.waitRunning(sub.hold, id, 60*time.Second), "%s did not start", sub.hold)
 	time.Sleep(3 * time.Second)
 	r.freeze(old)
 	frozenAt := time.Now()
-	fresh := r.startWorker("a-new", run.b, r.A(), "native", workerOptions{id: r.A().id + "@new", maxRuns: 1})
+	fresh := r.startWorker("a-new", sub.b, sub.m, "native", workerOptions{id: sub.m.id + "@new", maxRuns: 1})
 	defer r.stop(fresh, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id+"@new", 30*time.Second))
+	require.True(t, r.workerHealthy(sub.m.id+"@new", 30*time.Second))
 	r.markLog()
-	s := r.waitRun("hold-a", id, 400*time.Second)
+	s := r.waitRun(sub.hold, id, 400*time.Second)
 	expiredAfter := time.Since(frozenAt).Round(time.Second)
 	require.True(t, terminal(s.status), "the frozen attempt did not expire in 400 s: %+v", s)
 	require.Contains(t, s.errText, "lease expired", "the run's error names the expired lease: %q", s.errText)
@@ -653,10 +817,10 @@ func (run *matrixRun) staleAttempt() string {
 	var seen []string
 	for range 12 {
 		time.Sleep(5 * time.Second)
-		now := r.run("hold-a", id)
+		now := r.run(sub.hold, id)
 		seen = append(seen, fmt.Sprintf("%s/%s/%s", now.status, now.worker, now.attempt))
 	}
-	after := r.run("hold-a", id)
+	after := r.run(sub.hold, id)
 	repaired := r.hubLinesSinceMark("Repaired stale distributed run failure from fresh heartbeat", id)
 	require.Empty(t, repaired, "the hub took the thawed worker's heartbeat as fresh and repaired the failure; the thaw came inside the repair window (%s); seen: %v", confirmation, seen)
 	// Every late write is refused for the expired attempt by name: the
@@ -676,7 +840,7 @@ func (run *matrixRun) staleAttempt() string {
 		require.Equal(t, s.finished, after.finished, "the expired attempt's end moved: %+v; seen: %v", after, seen)
 		require.Equal(t, s.errText, after.errText, "the expired attempt's error changed: %+v", after)
 	} else {
-		require.Equal(t, r.A().id+"@new", after.worker, "a new attempt %s ran on %s, not on the machine's healthy worker; seen: %v", after.attempt, after.worker, seen)
+		require.Equal(t, sub.m.id+"@new", after.worker, "a new attempt %s ran on %s, not on the machine's healthy worker; seen: %v", after.attempt, after.worker, seen)
 	}
 	outcome := "the expired attempt stayed " + s.status + " with its end and error unchanged"
 	if after.attempt != s.attempt {
@@ -699,15 +863,15 @@ const defaultZombieDetectionInterval = 45 * time.Second
 
 // revokeAtIssuer: the provider refuses the worker's refresh; the worker ends
 // and presents nothing more. Run last: A's client stays refused.
-func (run *matrixRun) revokeAtIssuer() string {
+func (run *matrixRun) revokeAtIssuer(sub subject) string {
 	r := run.r
 	t := r.t
-	w := r.startWorker("a-issuer", run.b, r.A(), "native", workerOptions{})
+	w := r.startWorker("a-issuer", sub.b, sub.m, "native", workerOptions{})
 	defer r.stop(w, 10*time.Second)
-	require.True(t, r.workerHealthy(r.A().id, 30*time.Second))
-	control := r.waitRun("pin-a", r.enqueue("pin-a"), 120*time.Second)
+	require.True(t, r.workerHealthy(sub.m.id, 30*time.Second))
+	control := r.waitRun(sub.pin, r.enqueue(sub.pin), 120*time.Second)
 	require.Equal(t, "succeeded", control.status, "control run before the revocation")
-	dropped := r.issuer.revokeClient(r.workerClient(r.A()))
+	dropped := r.issuer.revokeClient(r.workerClient(sub.m))
 	t0 := time.Now()
 	deadline := t0.Add(330 * time.Second)
 	noticed := false
@@ -726,14 +890,14 @@ func (run *matrixRun) revokeAtIssuer() string {
 	// not advance; or it is no longer listed), and a run for its machine is
 	// not taken.
 	r.markLog()
-	heardBefore, listedBefore := r.workerLastHeartbeat(r.A().id)
-	id := r.enqueue("pin-a")
+	heardBefore, listedBefore := r.workerLastHeartbeat(sub.m.id)
+	id := r.enqueue(sub.pin)
 	time.Sleep(45 * time.Second)
-	s := r.run("pin-a", id)
+	s := r.run(sub.pin, id)
 	require.Equal(t, "queued", s.status, "a run was handed to a worker whose credential the provider refused: %+v", s)
 	counts := r.refusalsSinceMark()
 	require.Empty(t, counts, "the worker presented a token after the provider refused it: %v", counts)
-	heardAfter, listedAfter := r.workerLastHeartbeat(r.A().id)
+	heardAfter, listedAfter := r.workerLastHeartbeat(sub.m.id)
 	if listedBefore && listedAfter {
 		require.Equal(t, heardBefore, heardAfter, "the hub heard the worker again after the provider's refusal")
 	}
