@@ -225,7 +225,8 @@ func TestTxeGenericRetryCarriesOutARerunOnlyFromTheJobStep(t *testing.T) {
 	action, _, _ := g.decideAndGrantMode(t, &rerun)
 	var params registry.RetryRunParams
 	require.NoError(t, json.Unmarshal(action.Spec.Params, &params))
-	require.True(t, params.Rerun, "the person's rerun was not recorded as one")
+	require.Equal(t, registry.RetryStepRun, params.Step, "the person's rerun was not recorded as one")
+	require.NotContains(t, string(action.Spec.Params), `"rerun"`)
 	attempt := strconv.Itoa(action.Attempt)
 
 	err := g.retry(w.reviewerA, g.conditional(action.ActionID, attempt, action.BindingDigest))

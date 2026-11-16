@@ -1570,7 +1570,7 @@ func TestRetryIntentAgainstTheSeal(t *testing.T) {
 	intents := map[string]map[string]string{
 		"unspecified": {},
 		"republish":   {review.RetryRunStepParam: review.RetryStepPublish},
-		"rerun":       {review.RetryRunRerunParam: "true"},
+		"rerun":       {review.RetryRunStepParam: review.RetryStepRun},
 	}
 	grid := map[string]map[string]want{
 		"unspecified": {
@@ -1616,8 +1616,9 @@ func TestRetryIntentAgainstTheSeal(t *testing.T) {
 				} else {
 					assert.Equal(t, review.ActionSucceeded, out.Action.State, out.Action.Detail)
 					assert.Equal(t, []string{w.step}, f.runs.steps)
-					// Only an explicit rerun is sent as a rerun of the job's
-					// step: the service then runs the job step again.
+					// Only an explicit rerun, decided as step "run", is sent
+					// as a rerun of the job's step (never as that step
+					// alone): the service then runs the job step again.
 					assert.Equal(t, []bool{intent == "rerun"}, f.runs.reruns)
 				}
 				assert.Contains(t, out.Action.Detail, w.detail)
@@ -1626,12 +1627,15 @@ func TestRetryIntentAgainstTheSeal(t *testing.T) {
 	}
 }
 
-// A decision that names both a rerun and the publish step, or a rerun value
-// other than "true", is not carried out: its intent is not one.
-func TestRetryWithAnUnclearIntentIsNotDispatched(t *testing.T) {
+// TXE-7629: a decision naming the legacy rerun key, which no registry
+// writes, is not carried out in any form, alone or with a step: it fails
+// closed rather than run as a retry that names no intent.
+func TestRetryWithTheLegacyRerunKeyIsNotDispatched(t *testing.T) {
 	for name, extra := range map[string]map[string]string{
-		"rerun and publish": {review.RetryRunRerunParam: "true", review.RetryRunStepParam: review.RetryStepPublish},
-		"rerun not true":    {review.RetryRunRerunParam: "yes"},
+		"rerun true":         {review.RetryRunRerunParam: "true"},
+		"rerun false":        {review.RetryRunRerunParam: "false"},
+		"rerun and publish":  {review.RetryRunRerunParam: "true", review.RetryRunStepParam: review.RetryStepPublish},
+		"rerun and job step": {review.RetryRunRerunParam: "true", review.RetryRunStepParam: review.RetryStepRun},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newRetryFixture(t)
@@ -1640,7 +1644,8 @@ func TestRetryWithAnUnclearIntentIsNotDispatched(t *testing.T) {
 			out, err := f.executor("executor").Execute(context.Background(), jobID, proposal.ID, decided.ID)
 			require.NoError(t, err)
 			assert.Equal(t, review.ActionFailed, out.Action.State)
-			assert.Contains(t, out.Action.Detail, "never both")
+			assert.Contains(t, out.Action.Detail, "not dispatched")
+			assert.Contains(t, out.Action.Detail, "which no registry writes")
 			assert.Empty(t, f.runs.requested)
 		})
 	}

@@ -7,6 +7,8 @@ package registry
 // not know makes that reader refuse the whole record, and with it every path
 // that decodes it: TXE-7553 found the explicit rerun's `rerun: true` locking
 // jobs on -17 and -19 that way, and nothing had caught it before merge.
+// TXE-7629 (R2) now stores the rerun as `step: "run"`, a field every floor
+// knows, so no path is documented to fail.
 //
 // One source of truth, declared here:
 //
@@ -103,10 +105,11 @@ var strictParamFields = map[string]map[string]fieldCompat{
 		"queued_at":       floorField,
 		"run_spec_sha256": floorField,
 		"package_digest":  floorField,
-		"step":            floorField,
-		// Known incompatibility, pending TXE-7553's R1/R2 decision: -17 and
-		// -19 refuse every record carrying `rerun: true`.
-		"rerun": {Breaks: "TXE-7553"},
+		// A person's rerun is `step: "run"` since TXE-7629: the floors know
+		// the field, so they read the record. Their own code carries out
+		// only a republish by step, so they refuse to run a rerun (the
+		// binding and the reviewer's step switch), and refuse nothing else.
+		"step": floorField,
 	},
 	ActionUncertainEffect: {
 		"action_id": floorField,
@@ -125,20 +128,11 @@ type knownFloorFailure struct {
 	Field string
 }
 
-// knownFloorFailures are the documented refusals, the same on every floor:
-// exactly the nine TXE-7553's proof (rollback-proof, 147/156) found on -17
-// and -19. The escalated scenario, which that proof did not write, adds none.
-var knownFloorFailures = []knownFloorFailure{
-	{Record: "rerun/decided", Op: "4_end_moved_on_retries", Field: "rerun"},
-	{Record: "rerun/decided", Op: "5_authorize_pending_decision", Field: "rerun"},
-	{Record: "rerun/decided", Op: "6_later_person_retry_same_job", Field: "rerun"},
-	{Record: "rerun/executing", Op: "5_settle_executing_action", Field: "rerun"},
-	{Record: "rerun/uncertain", Op: "5_settle_uncertain_action", Field: "rerun"},
-	{Record: "rerun/not_applied", Op: "4_end_moved_on_retries", Field: "rerun"},
-	{Record: "rerun/not_applied", Op: "6_later_person_retry_same_job", Field: "rerun"},
-	{Record: "rerun/abandoned", Op: "4_end_moved_on_retries", Field: "rerun"},
-	{Record: "rerun/abandoned", Op: "6_later_person_retry_same_job", Field: "rerun"},
-}
+// knownFloorFailures are the documented refusals, the same on every floor.
+// TXE-7553's proof (rollback-proof, 147/156) found nine on -17 and -19, all
+// for the `rerun` field; TXE-7629 removed that field and with it every one.
+// The CI job fails if a floor refuses any path now.
+var knownFloorFailures = []knownFloorFailure{}
 
 // floorRefusal is how a floor reader reports a record it refuses for an
 // unknown strictly decoded field: decodeParams' own error.
@@ -156,7 +150,7 @@ var rollbackFloorIntents = []struct {
 }{
 	{Name: "unspecified", Set: func(*RetryRunParams) {}},
 	{Name: "republish", Set: func(p *RetryRunParams) { p.Step = RetryStepPublish }},
-	{Name: "rerun", Set: func(p *RetryRunParams) { p.Rerun = true }},
+	{Name: "rerun", Set: func(p *RetryRunParams) { p.Step = RetryStepRun }},
 }
 
 // rollbackFloorScenarios are the lifecycle states a retry is persisted in:

@@ -338,8 +338,15 @@ files.
   A person asks the hub for one of two things (TXE-7515): a republish of an
   execution's sealed result (`republish-requests`, stored as
   `step: publish`), or an explicit rerun (`retry-requests` with
-  `mode: rerun`, stored as `rerun: true`), which runs the job again even
-  when a result was sealed; that result is superseded and never published.
+  `mode: rerun`, stored as `step: run`, TXE-7629), which runs the job again
+  even when a result was sealed; that result is superseded and never
+  published. Only a person asks for a rerun: the registry refuses a
+  reviewer's proposal of `step: run`. The rerun is a step rather than a
+  field of its own so that the rollback floors (-17, -19), which decode
+  retry parameters strictly and know `step`, read its records; their own
+  code does not carry it out (their binding and executor accept only
+  `step: publish`). A decision naming the legacy `rerun` key is not
+  dispatched, and the hub refuses it in every form.
   A retry that names neither is unspecified: the job's machine runs it
   again only for an execution known to have sealed nothing. A sealed,
   changed or unreadable seal, or no seal reader, leaves it not dispatched,
@@ -355,10 +362,9 @@ files.
   grant, for this run's execution, the job's current version and binding,
   and in the one form that decision approved: a republish as
   `stepName: publish` with `acceptFailedPrerequisites`; an explicit rerun
-  (`rerun: true`) as `stepName: run` with `includeDownstream`, so the job
+  (`step: run`) as `stepName: run` with `includeDownstream`, so the job
   runs again even when its step had succeeded; a retry naming neither with
-  no step. A rerun sent with no step, as a machine that ignores `rerun`
-  sends it, is refused: Dagu would keep a job step that succeeded and only
+  no step. A rerun sent with no step is refused: Dagu would keep a job step that succeeded and only
   publish the old seal again. A request with no `retryRequest` is 409
   `txe_decision_required`, naming the job's TXE page, where a person
   chooses "Run again" or "Publish sealed result". One that does not carry

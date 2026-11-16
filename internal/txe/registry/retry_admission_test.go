@@ -42,8 +42,9 @@ func putRetryForm(t *testing.T, f *fixture, jobID, actionID, raw string) {
 func TestAdmitQueuedRetryRefusesFormsAQueueDoesNotCarry(t *testing.T) {
 	for name, tc := range map[string]struct{ params, reason string }{
 		"republish":      {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"publish"}`, "approved as a republish"},
-		"explicit rerun": {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","rerun":true}`, "approved as a rerun of the job"},
-		"another step":   {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"run"}`, `retries step "run"`},
+		"explicit rerun": {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"run"}`, "approved as a rerun of the job"},
+		"another step":   {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","step":"check"}`, `retries step "check"`},
+		"legacy rerun":   {`{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","rerun":true}`, `names "rerun"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
@@ -61,8 +62,8 @@ func TestAdmitQueuedRetryRefusesFormsAQueueDoesNotCarry(t *testing.T) {
 	}
 }
 
-// The legacy form, a person's retry that names no intent (no step, no
-// rerun), is the form a queued retry carries: it passes the form check and
+// The legacy form, a person's retry that names no intent (no step), is
+// the form a queued retry carries: it passes the form check and
 // is judged on the rest of the binding, so the explicit forms do not
 // redefine an unspecified action. (This injected action is no person's
 // decision, so the binding refuses it there; the scheduler's
@@ -70,7 +71,6 @@ func TestAdmitQueuedRetryRefusesFormsAQueueDoesNotCarry(t *testing.T) {
 func TestAdmitQueuedRetryLegacyUnspecifiedPassesTheFormCheck(t *testing.T) {
 	for name, params := range map[string]string{
 		"no intent fields": `{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","run_spec_sha256":"sha256:s","package_digest":"sha256:p"}`,
-		"rerun false":      `{"run_id":"run-1","attempt_id":"a1","queued_at":"q1","rerun":false}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)

@@ -125,14 +125,18 @@ const (
 	// republish: only the job's publish step runs, for the result the failed
 	// execution sealed, and the job does not run again. The reviewer sets it
 	// when that seal is on this machine, and a person may ask for it; the
-	// agent never does.
+	// agent never does. Set to RetryStepRun, it is a person's explicit
+	// request to run the job again as a new execution, even when the
+	// retried execution sealed a result (TXE-7515); only a person asks for
+	// it. A retry with no step is unspecified, and runs the job again only
+	// for an execution that sealed nothing.
 	RetryRunStepParam = "step"
 	RetryStepPublish  = registry.RetryStepPublish
-	// RetryRunRerunParam, "true", is a person's explicit request to run the
-	// job again as a new execution, even when the retried execution sealed
-	// a result (TXE-7515). A retry with neither it nor RetryRunStepParam is
-	// unspecified, and runs the job again only for an execution that sealed
-	// nothing.
+	RetryStepRun      = registry.RetryStepRun
+	// RetryRunRerunParam is the key an unreleased build stored a person's
+	// rerun under before it became step RetryStepRun (TXE-7629). The
+	// registry no longer writes it, and a decision naming it is refused as
+	// not dispatched; it is kept only to refuse it.
 	RetryRunRerunParam = "rerun"
 	// CapabilityRepublishSealed is what the service's installation lists
 	// when it runs a retry of only the publish step for a sealed result.

@@ -1059,3 +1059,38 @@ func TestReplayRetryRefusesUnmarkedExecution(t *testing.T) {
 		t.Fatalf("replay found=%v err=%v, want idempotency_mismatch", found, err)
 	}
 }
+
+// TXE-7629: a person's rerun is stored as step "run" with no rerun key, so
+// the rollback floors, which decode retry params strictly, read it; its
+// replay is found by that step, and the key never replays as another intent.
+func TestRetryRequestRerunStoresTheJobStep(t *testing.T) {
+	f := newFixture(t)
+	req := f.retryRequest("run-0085", "key-rerun-step-1")
+	req.Intent = registry.RetryIntentRerun
+	res, err := f.svc.RequestRetry(f.ctx, f.jobID, req, f.human)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := string(res.Proposal.Action.Params)
+	if !strings.Contains(raw, `"step":"run"`) || strings.Contains(raw, `"rerun"`) {
+		t.Fatalf("stored params = %s, want step run and no rerun key", raw)
+	}
+	var stored registry.RetryRunParams
+	if err := json.Unmarshal(res.Proposal.Action.Params, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Step != registry.RetryStepRun || stored.Intent() != registry.RetryIntentRerun {
+		t.Fatalf("stored step %q intent %q, want %q and %q", stored.Step, stored.Intent(), registry.RetryStepRun, registry.RetryIntentRerun)
+	}
+	replay, found, err := f.svc.ReplayRetry(f.ctx, f.jobID, req, f.human)
+	if err != nil || !found || !replay.AlreadyRecorded || replay.Decision.DecisionID != res.Decision.DecisionID {
+		t.Fatalf("replay found=%v err=%v", found, err)
+	}
+	for _, intent := range []string{registry.RetryIntentUnspecified, registry.RetryIntentRepublish} {
+		changed := req
+		changed.Intent = intent
+		if _, found, err := f.svc.ReplayRetry(f.ctx, f.jobID, changed, f.human); !found || registry.ErrorCode(err) != CodeIdempotencyMismatch {
+			t.Errorf("intent %q: replay found=%v err=%v, want idempotency_mismatch", intent, found, err)
+		}
+	}
+}
