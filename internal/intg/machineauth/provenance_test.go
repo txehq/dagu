@@ -689,6 +689,14 @@ func bindOwned(path, parent string, pinfo os.FileInfo) (*ownedDir, error) {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return nil, fmt.Errorf("owned dir: %s is not a real directory", path)
 	}
+	// Pin the identity now. On Windows a FileInfo from Lstat loads its volume
+	// and file index lazily, by path, on the first SameFile; left unloaded, a
+	// record compared after the directory was replaced would read the
+	// replacement's identity and match it. Comparing each with itself loads
+	// and caches it (on Unix device and inode are already in the FileInfo).
+	if !os.SameFile(info, info) || !os.SameFile(pinfo, pinfo) {
+		return nil, fmt.Errorf("owned dir: cannot read the identity of %s or its parent", path)
+	}
 	return &ownedDir{path: path, info: info, parent: parent, parentInfo: pinfo}, nil
 }
 
