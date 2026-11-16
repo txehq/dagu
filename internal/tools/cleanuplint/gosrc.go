@@ -405,7 +405,19 @@ func (p *goPkg) isSource(gf *goFile, call *ast.CallExpr) bool {
 	}
 	lits := argvLiterals(call, p.env)
 	for i := 0; i+1 < len(lits); i++ {
-		if lits[i] == "go" && lits[i+1] == "env" {
+		if lits[i] != "go" {
+			continue
+		}
+		// go's leading -C dir (or -C=dir) changes directory first; the
+		// env it then prints is still the environment's.
+		j := i + 1
+		if c := strings.TrimLeft(lits[j], "-"); lits[j] != c && (c == "C" || strings.HasPrefix(c, "C=")) {
+			j++
+			if c == "C" {
+				j++
+			}
+		}
+		if j < len(lits) && lits[j] == "env" {
 			return true
 		}
 	}

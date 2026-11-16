@@ -350,8 +350,10 @@ func sortFindings(fs []Finding) {
 }
 
 // goCleanCmdRe finds `go clean` in text whose quotes, commas and brackets
-// have been turned into spaces.
-var goCleanCmdRe = regexp.MustCompile(`(^|[^\w.-])go\s+clean\b`)
+// have been turned into spaces, including after go's leading -C dir flag
+// (go -C dir clean, go -C=dir clean), which changes directory first and
+// leaves the cache flags meaning what they always do.
+var goCleanCmdRe = regexp.MustCompile(`(^|[^\w.-])go(?:\s+-{1,2}C(?:\s*=\s*\S*|\s+\S+))?\s+clean\b`)
 
 // cmdEndRe ends a command's arguments: a shell separator or redirection.
 var cmdEndRe = regexp.MustCompile(`[;&|<>\n]`)
@@ -361,14 +363,23 @@ var cmdEndRe = regexp.MustCompile(`[;&|<>\n]`)
 var quotedFlagValueRe = regexp.MustCompile(`=(?:"([^"\s]*)"|'([^'\s]*)')`)
 
 // argvPunct turns an argv written as a list ("go", "clean") into words.
-var argvPunct = strings.NewReplacer(`"`, " ", `'`, " ", ",", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ", "`", " ")
+var argvPunct = strings.NewReplacer(`"`, " ", `'`, " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ", "`", " ")
+
+// listCommaRe is a comma that separates list elements: one with space or a
+// line's edge beside it once quotes are spaces ("go", "clean"). A comma
+// inside a word is part of the argument, as in -tags integration,e2e.
+var listCommaRe = regexp.MustCompile(`(^|\s),|,(\s|$)`)
 
 // goVarRe is a go binary held in a variable: $GO, ${GO}, $(GO), $(GO_BIN).
 var goVarRe = regexp.MustCompile(`\$[({]?GO[A-Z0-9_]*[)}]?`)
 
 // normArgv turns text into words for the go clean and go env patterns.
 func normArgv(text string) string {
-	return argvPunct.Replace(goVarRe.ReplaceAllString(text, " go "))
+	t := argvPunct.Replace(goVarRe.ReplaceAllString(text, " go "))
+	for listCommaRe.MatchString(t) {
+		t = listCommaRe.ReplaceAllString(t, "$1 $2")
+	}
+	return t
 }
 
 // goCleanIn reports text that runs go clean with a flag that empties a whole

@@ -39,3 +39,8 @@ go clean $EXTRA_FLAGS -cache # want:go-clean-cache
 go clean -modcache="$want" # want:go-clean-cache
 go clean -tags '' -modcache # want:go-clean-cache
 go clean -tags "" -cache # want:go-clean-cache
+go -C . clean -modcache # want:go-clean-cache
+go -C="$dir" clean -cache=true # want:go-clean-cache
+subcache=$(go -C ./sub env GOMODCACHE)
+rm -rf "$subcache" # want:env-path-delete
+go clean -tags integration,e2e -modcache # want:go-clean-cache

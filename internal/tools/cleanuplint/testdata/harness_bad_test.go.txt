@@ -89,3 +89,11 @@ func TestBooleanSpelling(t *testing.T) {
 	_ = exec.Command("sh", "-c", "go clean -tags x -cache").Run() // want:go-clean-cache
 	_ = exec.Command("sh", "-c", "go clean $FLAGS -modcache=$ON").Run() // want:go-clean-cache
 }
+
+func TestDirFlagEnv(t *testing.T) {
+	out, _ := exec.Command("go", "-C", ".", "env", "GOMODCACHE").Output()
+	_ = os.RemoveAll(strings.TrimSpace(string(out))) // want:env-path-delete
+	out2, _ := exec.Command("go", "-C=.", "env", "GOCACHE").Output()
+	_ = os.RemoveAll(strings.TrimSpace(string(out2))) // want:env-path-delete
+	_ = exec.Command("go", "clean", "-tags", "a,b", "-modcache").Run() // want:go-clean-cache
+}
