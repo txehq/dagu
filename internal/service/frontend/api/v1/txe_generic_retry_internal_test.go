@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"testing"
@@ -77,10 +78,18 @@ func (g *genericRetry) conditional(actionID, attempt, binding string) *apigen.Re
 // dagu.retry_run executing its first attempt under a live grant.
 func (g *genericRetry) decideAndGrant(t *testing.T) (*registry.Action, *registry.Claim, *registry.Grant) {
 	t.Helper()
+	return g.decideAndGrantMode(t, nil)
+}
+
+// decideAndGrantMode is decideAndGrant for a person's request with mode
+// (nil: a retry naming no intent).
+func (g *genericRetry) decideAndGrantMode(t *testing.T, mode *apigen.TxeRetryRequestMode) (*registry.Action, *registry.Claim, *registry.Grant) {
+	t.Helper()
 	w := g.w
 	ctx := context.Background()
 	_, err := w.api.RequestTxeRunRetry(w.personA, apigen.RequestTxeRunRetryRequestObject{JobId: w.jobA, RunId: g.run,
-		Body: &apigen.RequestTxeRunRetryJSONRequestBody{AttemptId: &g.attemptID, QueuedAt: &g.queuedAt, ExpectedJobVersion: 1, IdempotencyKey: "retry-key-1"}})
+		Body: &apigen.RequestTxeRunRetryJSONRequestBody{AttemptId: &g.attemptID, QueuedAt: &g.queuedAt, ExpectedJobVersion: 1,
+			IdempotencyKey: "retry-key-1", Mode: mode}})
 	require.NoError(t, err)
 	job, err := w.reg.GetJob(ctx, w.jobA)
 	require.NoError(t, err)
@@ -202,6 +211,45 @@ func TestTxeGenericRetryCarriesOutOnlyTheBoundDecision(t *testing.T) {
 	require.Equal(t, txeRepublishUnsupported, detailOf(err), "%v", err)
 	require.Equal(t, txeRetryUnbound, refusalReason(err), "%v", err)
 	require.Len(t, g.recorder.dispatched, 1, "a replayed request was dispatched")
+}
+
+// A person's explicit rerun (TXE-7515 mode rerun) is carried out only from
+// the job's step with everything after it, so the job runs again even when
+// its step had succeeded. Sent with no step, as an older machine that
+// ignores rerun sends it, it is refused before anything is dispatched: Dagu
+// would keep that step and only publish the old seal (TXE-7517).
+func TestTxeGenericRetryCarriesOutARerunOnlyFromTheJobStep(t *testing.T) {
+	g := newGenericRetry(t)
+	w := g.w
+	rerun := apigen.TxeRetryRequestModeRerun
+	action, _, _ := g.decideAndGrantMode(t, &rerun)
+	var params registry.RetryRunParams
+	require.NoError(t, json.Unmarshal(action.Spec.Params, &params))
+	require.True(t, params.Rerun, "the person's rerun was not recorded as one")
+	attempt := strconv.Itoa(action.Attempt)
+
+	err := g.retry(w.reviewerA, g.conditional(action.ActionID, attempt, action.BindingDigest))
+	require.Equal(t, http.StatusBadRequest, statusOf(err), "%v", err)
+	require.Equal(t, txeRepublishUnsupported, detailOf(err), "an older reviewer reads it as nothing started")
+	require.Equal(t, txeRetryUnbound, refusalReason(err))
+	assert.Contains(t, err.Error(), `stepName "run", includeDownstream`)
+	require.Empty(t, g.recorder.dispatched, "a rerun sent with no step was dispatched")
+
+	step, downstream := "run", true
+	alone := g.conditional(action.ActionID, attempt, action.BindingDigest)
+	alone.StepName = &step
+	require.Equal(t, txeRetryUnbound, refusalReason(g.retry(w.reviewerA, alone)), "the job step without what follows it")
+	require.Empty(t, g.recorder.dispatched)
+
+	fromJobStep := g.conditional(action.ActionID, attempt, action.BindingDigest)
+	fromJobStep.StepName, fromJobStep.IncludeDownstream = &step, &downstream
+	require.NoError(t, g.retry(w.reviewerA, fromJobStep))
+	require.Len(t, g.recorder.dispatched, 1)
+	task := g.recorder.dispatched[0]
+	assert.Equal(t, "run", task.Step)
+	assert.True(t, task.IncludeDownstream)
+	assert.False(t, task.AcceptFailedPrerequisites)
+	assert.True(t, task.RequireLatestIsPrevious)
 }
 
 func republishBody(b *apigen.RetryDAGRunJSONRequestBody) *apigen.RetryDAGRunJSONRequestBody {

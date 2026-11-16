@@ -45,28 +45,16 @@ type RetryActionRequest struct {
 	BindingDigest string
 }
 
-// retryRunBinding is the part of a dagu.retry_run's params a retry is bound
-// to. Rerun is read here as well as wherever RetryRunParams carries it, so
-// that the binding holds a rerun decision to its form whatever build
-// recorded it.
-type retryRunBinding struct {
-	RunID     string `json:"run_id"`
-	AttemptID string `json:"attempt_id"`
-	QueuedAt  string `json:"queued_at"`
-	Step      string `json:"step"`
-	Rerun     bool   `json:"rerun"`
-}
-
-// approvedForm is the one form a decision with these params is carried out
-// in: a republish only as the publish step alone; an explicit rerun only
-// from the job's step, so the job runs again even when its step had
+// approvedRetryForm is the one form a decision with params p is carried
+// out in: a republish only as the publish step alone; an explicit rerun
+// only from the job's step, so the job runs again even when its step had
 // succeeded (a retry with no step would keep that step and publish the old
 // seal); a retry that names neither only as a retry of the whole run.
-func (p retryRunBinding) approvedForm() RetryForm {
-	switch {
-	case p.Step == RetryStepPublish:
+func approvedRetryForm(p RetryRunParams) RetryForm {
+	switch p.Intent() {
+	case RetryIntentRepublish:
 		return RetryFormPublish
-	case p.Rerun:
+	case RetryIntentRerun:
 		return RetryFormFromJobStep
 	}
 	return RetryFormWholeRun
@@ -79,7 +67,7 @@ func (p retryRunBinding) approvedForm() RetryForm {
 // applies (TXE-7517):
 //
 //   - action is a dagu.retry_run, carried out in the one form its params
-//     approve (approvedForm), never another;
+//     approve (approvedRetryForm), never another;
 //   - request names its current attempt and binding digest;
 //   - it was approved for this run and this execution;
 //   - it is a person's approved decision: an approved action whose
@@ -101,7 +89,7 @@ func CheckRetryRun(job *Job, action *Action, runID string, expected RetriedExecu
 	}
 	// Not decoded strictly: a field added to the params later is part of
 	// the binding the digest is recomputed over, not a reason to refuse.
-	var params retryRunBinding
+	var params RetryRunParams
 	if err := json.Unmarshal(action.Spec.Params, &params); err != nil {
 		return stale("action %s has unreadable params", action.ActionID)
 	}
@@ -110,7 +98,7 @@ func CheckRetryRun(job *Job, action *Action, runID string, expected RetriedExecu
 	default:
 		return stale("retry form %q is not one a decision is carried out in", form)
 	}
-	approved := params.approvedForm()
+	approved := approvedRetryForm(params)
 	switch {
 	case params.Step != "" && params.Step != RetryStepPublish:
 		return stale("action %s retries step %q; only %q is a step a decision retries", action.ActionID, params.Step, RetryStepPublish)
