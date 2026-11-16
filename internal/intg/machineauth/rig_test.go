@@ -141,40 +141,58 @@ func portBlock() (lo, hi int, err error) {
 		if spec == "" {
 			return
 		}
-		if _, err := fmt.Sscanf(spec, "%d-%d", &ports.lo, &ports.hi); err != nil || ports.lo < 1024 || ports.hi > 65535 || ports.lo > ports.hi {
-			ports.err = fmt.Errorf("DAGU_MACHINEAUTH_PORTS=%q is not <lo>-<hi> within 1024-65535", spec)
-			return
-		}
-		ports.next = ports.lo
+		lo, hi, err := parsePortBlock(spec)
+		ports.mu.Lock()
+		defer ports.mu.Unlock()
+		ports.lo, ports.hi, ports.next, ports.err = lo, hi, lo, err
 	})
+	ports.mu.Lock()
+	defer ports.mu.Unlock()
 	return ports.lo, ports.hi, ports.err
 }
 
+// parsePortBlock reads <lo>-<hi>, a non-empty range of unprivileged ports.
+func parsePortBlock(spec string) (lo, hi int, err error) {
+	var rest string
+	if n, _ := fmt.Sscanf(spec+" end", "%d-%d %s", &lo, &hi, &rest); n != 3 || rest != "end" || lo < 1024 || hi > 65535 || lo > hi {
+		return 0, 0, fmt.Errorf("DAGU_MACHINEAUTH_PORTS=%q is not <lo>-<hi> within 1024-65535", spec)
+	}
+	return lo, hi, nil
+}
+
 // listenLoopback listens on a loopback port: the next free one of the block,
-// or an ephemeral one.
+// or an ephemeral one when no block is set.
 func listenLoopback(t *testing.T) net.Listener {
 	t.Helper()
-	lo, _, err := portBlock()
+	ln, err := allocLoopback()
 	require.NoError(t, err)
+	return ln
+}
+
+// allocLoopback is listenLoopback's allocator. With a block set it never
+// listens outside it: when every port of the block is held it fails, with no
+// fallback to an ephemeral port.
+func allocLoopback() (net.Listener, error) {
+	lo, hi, err := portBlock()
+	if err != nil {
+		return nil, err
+	}
 	if lo == 0 {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		return ln
+		return net.Listen("tcp", "127.0.0.1:0")
 	}
 	ports.mu.Lock()
 	defer ports.mu.Unlock()
-	for range ports.hi - ports.lo + 1 {
+	for range hi - lo + 1 {
 		port := ports.next
 		ports.next++
-		if ports.next > ports.hi {
-			ports.next = ports.lo
+		if ports.next > hi {
+			ports.next = lo
 		}
 		if ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
-			return ln
+			return ln, nil
 		}
 	}
-	t.Fatalf("DAGU_MACHINEAUTH_PORTS: every port of the block %d-%d is in use", ports.lo, ports.hi)
-	return nil
+	return nil, fmt.Errorf("DAGU_MACHINEAUTH_PORTS: every port of the block %d-%d is in use; the rig does not listen outside its block", lo, hi)
 }
 
 func freePort(t *testing.T) int {

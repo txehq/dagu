@@ -22,48 +22,104 @@ func TestPortBlockWrapsAndSkipsHeldPorts(t *testing.T) {
 	if lo != 0 {
 		t.Skip("DAGU_MACHINEAUTH_PORTS is set for this process; the walk is tested on a block of its own")
 	}
-	// A block of three ports this test owns: found free now, then released.
-	var block [3]int
-	for {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		base := ln.Addr().(*net.TCPAddr).Port
-		_ = ln.Close()
-		if base+2 > 65535 || base < 1024 {
-			continue
-		}
-		ok := true
-		for i := range block {
-			l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(base+i)))
-			if err != nil {
-				ok = false
-				break
-			}
-			_ = l.Close()
-			block[i] = base + i
-		}
-		if ok {
-			break
-		}
-	}
-	ports.mu.Lock()
-	savedLo, savedHi, savedNext := ports.lo, ports.hi, ports.next
-	ports.lo, ports.hi, ports.next = block[0], block[2], block[0]
-	ports.mu.Unlock()
-	t.Cleanup(func() {
-		ports.mu.Lock()
-		ports.lo, ports.hi, ports.next = savedLo, savedHi, savedNext
-		ports.mu.Unlock()
-	})
-	held := listenLoopback(t) // block[0], kept open
+	base := ownedBase(t)
+	useBlock(t, base, base+2)
+	held := listenLoopback(t) // base, kept open
 	defer func() { _ = held.Close() }()
-	assert.Equal(t, block[0], held.Addr().(*net.TCPAddr).Port)
+	assert.Equal(t, base, held.Addr().(*net.TCPAddr).Port)
 	var got []int
 	for range 4 {
 		ln := listenLoopback(t)
 		got = append(got, ln.Addr().(*net.TCPAddr).Port)
 		_ = ln.Close()
 	}
-	// block[0] is held: the walk goes 1, 2, then round past the held 0 to 1, 2.
-	assert.Equal(t, []int{block[1], block[2], block[1], block[2]}, got)
+	// base is held: the walk goes base+1, base+2, then round past the held base.
+	assert.Equal(t, []int{base + 1, base + 2, base + 1, base + 2}, got)
+}
+
+// With a block set, the allocator fails closed when every port of it is held:
+// an error, and no listener outside the block.
+func TestPortBlockExhaustedFailsClosed(t *testing.T) {
+	lo, _, err := portBlock()
+	require.NoError(t, err)
+	if lo != 0 {
+		t.Skip("DAGU_MACHINEAUTH_PORTS is set for this process; the walk is tested on a block of its own")
+	}
+	base := ownedBase(t)
+	useBlock(t, base, base+1)
+	a := listenLoopback(t)
+	defer func() { _ = a.Close() }()
+	b := listenLoopback(t)
+	defer func() { _ = b.Close() }()
+	for _, ln := range []net.Listener{a, b} {
+		port := ln.Addr().(*net.TCPAddr).Port
+		assert.True(t, port == base || port == base+1, "port %d outside the block", port)
+	}
+	ln, err := allocLoopback()
+	if ln != nil {
+		_ = ln.Close()
+	}
+	require.Error(t, err, "an exhausted block must not hand out a port")
+	assert.Nil(t, ln, "no listener outside the block")
+	assert.Contains(t, err.Error(), "does not listen outside its block")
+	// Released, a port of the block is handed out again.
+	_ = b.Close()
+	again, err := allocLoopback()
+	require.NoError(t, err)
+	defer func() { _ = again.Close() }()
+	assert.Equal(t, base+1, again.Addr().(*net.TCPAddr).Port)
+}
+
+func TestParsePortBlock(t *testing.T) {
+	t.Parallel()
+	lo, hi, err := parsePortBlock("29260-29319")
+	require.NoError(t, err)
+	assert.Equal(t, [2]int{29260, 29319}, [2]int{lo, hi})
+	for _, bad := range []string{"", "29260", "29319-29260", "80-90", "29260-70000", "29260-29319x", "a-b", "29260 - 29319"} {
+		_, _, err := parsePortBlock(bad)
+		assert.Error(t, err, "%q", bad)
+	}
+}
+
+// ownedBase finds three consecutive loopback ports free now and returns the
+// first: a block a test can point the allocator at.
+func ownedBase(t *testing.T) int {
+	t.Helper()
+	for range 100 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		base := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		if base < 1024 || base+2 > 65535 {
+			continue
+		}
+		ok := true
+		for i := range 3 {
+			l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(base+i)))
+			if err != nil {
+				ok = false
+				break
+			}
+			_ = l.Close()
+		}
+		if ok {
+			return base
+		}
+	}
+	t.Fatal("no three consecutive free loopback ports")
+	return 0
+}
+
+// useBlock points the allocator at [lo, hi] for this test.
+func useBlock(t *testing.T, lo, hi int) {
+	t.Helper()
+	ports.mu.Lock()
+	savedLo, savedHi, savedNext := ports.lo, ports.hi, ports.next
+	ports.lo, ports.hi, ports.next = lo, hi, lo
+	ports.mu.Unlock()
+	t.Cleanup(func() {
+		ports.mu.Lock()
+		ports.lo, ports.hi, ports.next = savedLo, savedHi, savedNext
+		ports.mu.Unlock()
+	})
 }
