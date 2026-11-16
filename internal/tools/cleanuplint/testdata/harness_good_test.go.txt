@@ -1,0 +1,35 @@
+package fixture
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// Cleanups of what the test created, and commands that only read.
+func TestCreated(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(filepath.Join(dir, "sub"))
+	tmp, _ := os.MkdirTemp("", "x-")
+	defer os.RemoveAll(tmp)
+	under, _ := os.MkdirTemp(os.Getenv("TMPDIR"), "x-")
+	_ = os.RemoveAll(under)
+	home, _ := os.UserHomeDir()
+	own, _ := os.MkdirTemp(home, "dagu-")
+	t.Cleanup(func() { _ = os.RemoveAll(own) })
+	_ = exec.Command("go", "clean", "-testcache").Run()
+	_ = exec.Command("go", "env", "GOMODCACHE").Run()
+	_ = exec.Command("go", "build", "-modcacherw", "./...").Run()
+	_ = os.Remove(os.Getenv("LOCK"))
+	_ = exec.Command("rm", "-f", home).Run()
+	_ = exec.Command("rm", "-rf", dir).Run()
+	testArgs := []string{"clean", "-testcache"}
+	_ = exec.Command("go", testArgs...).Run()
+	note := "it's; rm -rf ~" // data under test, never run
+	_ = note
+	//cleanuplint:allow the fixture shows a directive that carries a written reason
+	_ = os.RemoveAll(os.Getenv("ALLOWED")) // allowed:env-path-delete
+	_ = os.RemoveAll(os.Getenv("ALLOWED_SAME_LINE")) //cleanuplint:allow the directive may also sit on the same line // allowed:env-path-delete
+}

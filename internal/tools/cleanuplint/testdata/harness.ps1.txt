@@ -1,0 +1,9 @@
+go clean -modcache # want:go-clean-cache
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\go-build" # want:env-path-delete
+$cache = go env GOCACHE
+Remove-Item -Recurse -Force $cache # want:env-path-delete
+Remove-Item -Recurse -Force (Join-Path $HOME ".cache") # want:env-path-delete
+Remove-Item -Recurse -Force .\build
+Remove-Item -Force "$env:TEMP\x.txt"
+$tight=$env:GOCACHE
+Remove-Item -Recurse -Force $tight # want:env-path-delete

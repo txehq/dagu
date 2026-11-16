@@ -186,9 +186,16 @@ test-coverage:
 	@${GOTESTSUM_BIN} ${GOTESTSUM_ARGS} -- ${GO_TEST_FLAGS} -coverpkg=./... -coverprofile="coverage.out" -covermode=atomic ${TEST_TARGET}
 	@go tool cover -html=coverage.out -o coverage.html
 
-# lint runs the linter.
+# lint runs the linters.
 .PHONY: lint
-lint: golangci-lint
+lint: golangci-lint cleanuplint
+
+# cleanuplint fails on go clean of a whole Go cache, or a recursive delete of a
+# path from the environment, in test and harness code (TXE-7550).
+.PHONY: cleanuplint
+cleanuplint:
+	@printf '%b\n' "${COLOR_GREEN}Running cleanuplint...${COLOR_RESET}"
+	@go run ./internal/tools/cleanuplint
 
 # api generates the server code from the OpenAPI specification.
 .PHONY: api

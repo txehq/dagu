@@ -430,6 +430,7 @@ EOF
 }
 
 prepare_stack() {
+  # cleanuplint:allow the stack owns STATE_DIR: ui/test-results/e2e-stack, or a directory DAGU_E2E_STATE_DIR dedicates to it
   rm -rf "$STATE_DIR"
   mkdir -p \
     "$PID_DIR" \

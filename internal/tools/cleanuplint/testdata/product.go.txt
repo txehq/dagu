@@ -1,0 +1,13 @@
+package server
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+)
+
+// Product code: env-path-delete is out of scope, go clean of a cache is not.
+func cleanup(runID string) {
+	_ = os.RemoveAll(filepath.Join(os.TempDir(), "dagu", runID))
+	_ = exec.Command("go", "clean", "-modcache").Run() // want:go-clean-cache
+}

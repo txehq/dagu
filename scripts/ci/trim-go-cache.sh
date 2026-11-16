@@ -27,6 +27,7 @@ fi
 
 before="$(du -sm "${cache}" | cut -f1)"
 # Entries sit in subdirectories; the files at the top hold the cache's state.
+# cleanuplint:allow CI only: it trims the cache setup-go-cache restored for this job, and refuses without that job's start mark
 find "${cache}" -mindepth 2 -type f ! -newer "${epoch}" -delete
 after="$(du -sm "${cache}" | cut -f1)"
 echo "Go build cache trimmed from ${before} MB to ${after} MB"

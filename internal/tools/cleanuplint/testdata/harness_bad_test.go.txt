@@ -1,0 +1,80 @@
+package fixture
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	gobuild "go/build"
+)
+
+var sharedCache = os.Getenv("GOMODCACHE")
+
+var modcacheArgs = []string{"clean", "-modcache"} // want:go-clean-cache
+
+type rig struct{ cache string }
+
+func runIn(env []string, name string, args ...string) {}
+
+func TestPlanted(t *testing.T) {
+	_ = exec.Command("go", "clean", "-modcache").Run() // want:go-clean-cache
+	_ = exec.Command("go", "clean", "-cache").Run() // want:go-clean-cache
+	_ = exec.Command("go", "clean", "-fuzzcache").Run() // want:go-clean-cache
+	_ = exec.Command("sh", "-c", "go clean -i -modcache").Run() // want:go-clean-cache
+	runIn(nil, "go", "clean", "-modcache") // want:go-clean-cache
+	argv := append([]string{"clean"}, "-cache") // want:go-clean-cache
+	_ = argv
+	cleanArgs := []string{"clean"}
+	cleanArgs = append(cleanArgs, "-modcache")
+	_ = exec.Command("go", cleanArgs...).Run() // want:go-clean-cache
+	flag := "-fuzzcache"
+	cmd := exec.Command("go", "clean", flag) // want:go-clean-cache
+	_ = cmd.Run()
+	_ = exec.Command("go", modcacheArgs...).Run() // want:go-clean-cache
+	base := os.Getenv("XDG_CACHE_HOME")
+	goBuild := filepath.Join(base, "go-build")
+	_ = os.RemoveAll(goBuild) // want:env-path-delete
+	_ = os.RemoveAll(os.Getenv("GOCACHE")) // want:env-path-delete
+	home, _ := os.UserHomeDir()
+	_ = os.RemoveAll(filepath.Join(home, ".cache")) // want:env-path-delete
+	_ = os.RemoveAll(sharedCache) // want:env-path-delete
+	out, _ := exec.Command("go", "env", "GOMODCACHE").Output()
+	_ = os.RemoveAll(strings.TrimSpace(string(out))) // want:env-path-delete
+	envArgs := []string{"env", "GOCACHE"}
+	viaVar, _ := exec.Command("go", envArgs...).Output()
+	_ = os.RemoveAll(strings.TrimSpace(string(viaVar))) // want:env-path-delete
+	_ = os.RemoveAll(cacheDir()) // want:env-path-delete
+	removeTree(os.TempDir())
+	_ = os.RemoveAll(gobuild.Default.GOPATH) // want:env-path-delete
+	_ = exec.Command("rm", "-rf", home).Run() // want:env-path-delete
+	_ = exec.Command("sh", "-c", "rm -rf $HOME/.cache/go-build").Run() // want:env-path-delete
+	_ = exec.Command("sh", "-c", "rm -rf "+home).Run() // want:env-path-delete
+	for _, kv := range os.Environ() {
+		if v, ok := strings.CutPrefix(kv, "TMPDIR="); ok {
+			_ = os.RemoveAll(v) // want:env-path-delete
+		}
+	}
+	var d rig
+	d.cache = os.Getenv("CACHE")
+	_ = os.RemoveAll(d.cache) // want:env-path-delete
+	t.Cleanup(func() {
+		_ = os.RemoveAll(home) // want:env-path-delete
+	})
+}
+
+func cacheDir() string { return filepath.Join(os.Getenv("HOME"), ".cache") }
+
+func namedCacheDir() (dir string) {
+	dir = os.Getenv("GOCACHE")
+	return
+}
+
+func TestNamedReturn(t *testing.T) {
+	_ = os.RemoveAll(namedCacheDir()) // want:env-path-delete
+}
+
+func removeTree(dir string) {
+	_ = os.RemoveAll(dir) // want:env-path-delete
+}

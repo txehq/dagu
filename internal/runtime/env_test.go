@@ -516,12 +516,14 @@ func TestNewEnvForStep_WorkingDirectory(t *testing.T) {
 	subDir := filepath.Join(tempDir, "subdir")
 	require.NoError(t, os.Mkdir(subDir, 0755))
 
-	// Create testdir in home for tilde tests
+	// Create a directory of this run's own in home for the tilde tests: a
+	// fixed name there could be another run's or the user's (TXE-7550).
 	homeDir, err := os.UserHomeDir()
 	require.NoError(t, err)
-	homeTempDir := filepath.Join(homeDir, "dagu_test_workdir")
-	require.NoError(t, os.MkdirAll(homeTempDir, 0755))
+	homeTempDir, err := os.MkdirTemp(homeDir, "dagu_test_workdir-")
+	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(homeTempDir) })
+	homeTempName := filepath.Base(homeTempDir)
 
 	tests := []struct {
 		name        string
@@ -560,7 +562,7 @@ func TestNewEnvForStep_WorkingDirectory(t *testing.T) {
 			name: "StepWithHomeDirectoryNotation",
 			step: ir.Step{
 				Name: "test-step",
-				Dir:  "~/dagu_test_workdir",
+				Dir:  "~/" + homeTempName,
 			},
 			dagWorkDir:  tempDir,
 			expectedDir: homeTempDir,
@@ -590,9 +592,9 @@ func TestNewEnvForStep_WorkingDirectory(t *testing.T) {
 				Name: "test-step",
 				Dir: func() string {
 					if goruntime.GOOS == "windows" {
-						return "$USERPROFILE\\dagu_test_workdir"
+						return "$USERPROFILE\\" + homeTempName
 					}
-					return "$HOME/dagu_test_workdir"
+					return "$HOME/" + homeTempName
 				}(),
 			},
 			dagWorkDir:  tempDir,
@@ -622,7 +624,7 @@ func TestNewEnvForStep_WorkingDirectory(t *testing.T) {
 				Name: "test-step",
 				Dir:  "", // Empty - should inherit DAG WorkingDir
 			},
-			dagWorkDir:  "~/dagu_test_workdir",
+			dagWorkDir:  "~/" + homeTempName,
 			expectedDir: homeTempDir,
 		},
 		{
@@ -633,9 +635,9 @@ func TestNewEnvForStep_WorkingDirectory(t *testing.T) {
 			},
 			dagWorkDir: func() string {
 				if goruntime.GOOS == "windows" {
-					return "$USERPROFILE\\dagu_test_workdir"
+					return "$USERPROFILE\\" + homeTempName
 				}
-				return "$HOME/dagu_test_workdir"
+				return "$HOME/" + homeTempName
 			}(),
 			expectedDir: homeTempDir,
 		},

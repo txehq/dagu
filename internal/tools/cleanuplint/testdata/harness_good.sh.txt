@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"; rmdir "$HOME/.lock"' EXIT
+work=$(mktemp -d "${TMPDIR:-/tmp}/x.XXXXXX")
+rm -rf "$work"
+out="$tmp/out"; rm -rf "$out"
+rm -rf ./build node_modules .cache
+rm -f "$HOME/.lock"
+go clean -testcache
+go env GOMODCACHE
+go build -modcacherw ./...
+# rm -rf "$HOME" in a comment is not run
+TMPDIR=$(mktemp -d)
+rm -rf "$TMPDIR"
+find "$tmp" -name '*.log' -delete
+find "$HOME/.config" -name x -print
+# cleanuplint:allow the fixture shows a directive that carries a written reason
+rm -rf "$HOME/.allowed" # allowed:env-path-delete
+scratch=$(mktemp -d "$HOME/.cache/x.XXXXXX")
+rm -rf "$scratch"
+legacy=`mktemp -d "$HOME/x.XXXXXX"`
+rm -rf "$legacy"
+testargs=(test -count=1 ./...)
+go "${testargs[@]}"

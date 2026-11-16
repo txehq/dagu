@@ -1,0 +1,10 @@
+GO ?= go
+CACHE ?= $(HOME)/.cache/x
+BIN := .local/bin
+
+clean:
+	$(GO) clean -modcache # want:go-clean-cache
+	rm -rf $(CACHE) # want:env-path-delete
+	rm -rf $(shell go env GOCACHE) # want:env-path-delete
+	rm -rf $$HOME/.x # want:env-path-delete
+	rm -rf $(BIN) node_modules
