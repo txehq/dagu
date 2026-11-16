@@ -69,3 +69,6 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_ENV"
       - run: rm -rf "$multi_dir" # want:env-path-delete
+      - run: |
+          clean_flags="$clean_flags -x"
+          go clean $clean_flags # want:go-clean-cache

@@ -452,10 +452,16 @@ func (sc *scriptScan) expandArgs(text string) string {
 	return argRefRe.ReplaceAllStringFunc(text, func(ref string) string {
 		name := argRefRe.FindStringSubmatch(ref)[1]
 		vals := assignedValues(sc.assigns, name)
-		if len(vals) == 0 {
-			// Only a name this script never assigns can come from another
-			// step: a step's own assignment is the value it uses.
-			vals = assignedValues(sc.argAssigns, name)
+		if len(vals) == 0 || refersTo(vals, name) {
+			// A name this script never assigns can come from another
+			// step, and so can the old value an assignment of its own
+			// reads (flags="$flags -x"); otherwise the script's own
+			// assignment is the value it uses.
+			for _, v := range assignedValues(sc.argAssigns, name) {
+				if !slices.Contains(vals, v) {
+					vals = append(vals, v)
+				}
+			}
 		}
 		if len(vals) == 0 {
 			return ref
@@ -475,6 +481,18 @@ func assignedValues(assigns []assignment, name string) []string {
 		}
 	}
 	return vals
+}
+
+// refersTo reports whether any of vals references the variable name.
+func refersTo(vals []string, name string) bool {
+	for _, v := range vals {
+		for _, m := range argRefRe.FindAllStringSubmatch(v, -1) {
+			if m[1] == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // argRefRe is a variable reference: $x, ${x}, ${x[@]}, ${x[*]}, $(x).
