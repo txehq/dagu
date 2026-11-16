@@ -214,10 +214,12 @@ var (
 	shellAssignRe = regexp.MustCompile(`(?:^|[\s;&|(])(?:(?:export|local|readonly|declare|typeset)\s+(?:-\w+\s+)*)?([A-Za-z_]\w*)=`)
 	shellForRe    = regexp.MustCompile(`\bfor\s+([A-Za-z_]\w*)\s+in\s+([^;]*)`)
 	makeAssignRe  = regexp.MustCompile(`^(?:override\s+|export\s+)?([A-Za-z_][\w.-]*)\s*(\?=|::=|:=|\+=|!=|=)\s*(.*)$`)
-	psAssignRe    = regexp.MustCompile(`(?:^|[\s;(])\$([A-Za-z_]\w*)\s*=[^=]\s*(.*)$`)
-	pyAssignRe    = regexp.MustCompile(`^\s*([A-Za-z_][\w, ]*?)\s*(?::[^=]+)?=[^=](.*)$`)
-	pyForRe       = regexp.MustCompile(`^\s*(?:async\s+)?for\s+([A-Za-z_][\w, ]*?)\s+in\s+(.*):`)
-	pyWithRe      = regexp.MustCompile(`\bas\s+([A-Za-z_]\w*)`)
+	// The value's first character is part of the capture: x=os.environ[...]
+	// with no space after = must keep its "o".
+	psAssignRe = regexp.MustCompile(`(?:^|[\s;(])\$([A-Za-z_]\w*)\s*=([^=].*)$`)
+	pyAssignRe = regexp.MustCompile(`^\s*([A-Za-z_][\w, ]*?)\s*(?::[^=]+)?=([^=].*)$`)
+	pyForRe    = regexp.MustCompile(`^\s*(?:async\s+)?for\s+([A-Za-z_][\w, ]*?)\s+in\s+(.*):`)
+	pyWithRe   = regexp.MustCompile(`\bas\s+([A-Za-z_]\w*)`)
 
 	shellRefRe = regexp.MustCompile(`\$\{?([A-Za-z_]\w*)`)
 	makeRefRe  = regexp.MustCompile(`\$[({]([A-Za-z_][\w.-]*)[)}]`)

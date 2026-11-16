@@ -19,3 +19,5 @@ with tempfile.TemporaryDirectory() as d:
 subprocess.run(["go", "env", "GOMODCACHE"])
 under = tempfile.mkdtemp(dir=os.environ.get("TMPDIR"))
 shutil.rmtree(under)
+tight=os.environ["GOCACHE"]
+shutil.rmtree(tight)  # want:env-path-delete
