@@ -341,7 +341,10 @@ def go_env(names: list[str], env: dict[str, str], deadline_at: float | None = No
     if limit <= 0:
         raise Stopped("the whole-run deadline passed before go env")
     try:
-        out = subprocess.run(["go", "env", "-json", *names], capture_output=True, text=True, env=env, timeout=limit)
+        # From a neutral directory and with no workspace, so the caller's own go.mod or go.work
+        # cannot select (and try to download) a toolchain for a tree that is not the one tested.
+        out = subprocess.run(["go", "env", "-json", *names], capture_output=True, text=True,
+                             env={**env, "GOWORK": "off"}, cwd=os.path.abspath(os.sep), timeout=limit)
     except subprocess.TimeoutExpired as e:
         raise Stopped(f"go env took longer than {limit:.0f}s") from e
     if out.returncode != 0:

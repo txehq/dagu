@@ -546,7 +546,7 @@ func TestSeedReadsSharedCacheAsFileProxy(t *testing.T) {
 import json, os, sys
 LOG = ` + fmt.Sprintf("%q", goLog) + `
 with open(LOG, "a") as f:
-    f.write(json.dumps({"args": sys.argv[1:], "env": {k: os.environ.get(k) for k in
+    f.write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd(), "env": {k: os.environ.get(k) for k in
         ("HOME", "GOPROXY", "GOMODCACHE", "GOPATH", "GOCACHE", "GOFLAGS", "GOWORK", "GOENV",
          "MUTATE_TEST_CANARY")}}) + "\n")
 if sys.argv[1:3] == ["env", "-json"]:
@@ -577,6 +577,10 @@ elif sys.argv[1:3] == ["mod", "download"]:
 		require.NoError(t, json.Unmarshal([]byte(line), &rec))
 		if fmt.Sprint(rec["args"]) == "[mod download]" {
 			download = rec["env"].(map[string]any)
+		}
+		if fmt.Sprint(rec["args"])[:9] == "[env -jso" {
+			assert.Equal(t, "/", rec["cwd"], "go env runs outside any caller module")
+			assert.Equal(t, "off", rec["env"].(map[string]any)["GOWORK"])
 		}
 	}
 	require.NotNil(t, download, "the seed ran go mod download")

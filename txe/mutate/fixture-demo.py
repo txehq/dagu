@@ -2,7 +2,7 @@
 """The TXE-7549 acceptance demonstration. Each step needs its own go-ahead; run one per call.
 
   fixture-demo.py sandboxed <evidence-dir> <image-id> [--deadline 300]
-    Step 1. testdata/fixture's mutant runs `go clean -modcache` with the environment it is given,
+    Step 1. testdata/fixture's mutant runs Go's module-cache clean with the environment it is given,
     through the runner's real sandbox on this machine, against sentinel-only fake caches inside
     the demo's own directory (--no-seed: the real module cache is not read). Expected: runner
     exit 0, the mutant SURVIVED, the fake caches and sentinels unchanged.
