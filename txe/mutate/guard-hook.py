@@ -770,7 +770,6 @@ class Judge:
         elif prog == "deno" and args and args[0].text == "eval":
             return code_at(1)
         evaluated = False  # -e code runs instead of a script; preloads after it still load
-        unknown = False  # an option this reader does not know was seen
         while j < len(args):
             t = args[j].text
             opt, eq, val = t.partition("=")
@@ -790,7 +789,6 @@ class Judge:
                     evaluated = True
                 j += 2
             elif t.startswith("-") and t != "-":
-                unknown = unknown or "=" not in t  # it may take the next word as its value
                 j += 1
             elif evaluated:
                 j += 1  # an argument of the -e code: keep looking for options after it
@@ -799,14 +797,11 @@ class Judge:
         if evaluated:
             return False
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            # After an option this reader does not know, any positional word may be the script
-            # (`node --some-flag x mutants.js`): one naming a mutant script is refused.
-            if unknown and names_mutant_script(args[j:]):
-                return True
             first = args[j]
             if first.procsub is None and not SCRIPT_EXT.search(base(first.text)) and "/" not in first.text:
                 # Not a script file: a subcommand that runs one (node inspect, tsx watch, deno test,
-                # bun test x.ts), so a later word naming a mutant script is refused.
+                # bun test x.ts), or the value of an option this reader does not know
+                # (`node --some-flag x mutants.js`), so a later word naming a mutant script is refused.
                 if names_mutant_script(args[j + 1:]):
                     return True
             return operand_is_mutant(first, cmd, False, self.depth)

@@ -752,6 +752,8 @@ var guardRefused = []string{
 	"{ python3; } < mutants.py",
 	"cat mutants.py | (python3 -)",
 	"(cd x && python3) < tools/mutants.py",
+	`perl -I ./mutants.pl -e 'do "x"'`,
+	"python3 /dev/fd/3 3< /dev/fd/4",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -841,6 +843,7 @@ var guardAllowed = []string{
 	"GOFLAGS=-count=1 go test ./txe/mutate/...",
 	"(python3 app.py) < mutants.py",
 	"{ cat; } < mutants.py",
+	"node --inspect ./app.js fixtures/mutants.js",
 	// Observed false positive 5 (cc1, 17:36Z): a python3 heredoc editing a test file, whose
 	// replacement text has a loop variable named mutate. It edits data and runs nothing.
 	"cd ~/evidence/packet-r1 && ~/.pyenv/versions/vv/bin/python3 -I - <<'PYEOF'\nimport os\np=\"tests/test_r5.py\"; s=open(p).read()\nreps=[(\"old\", '''for mutate, why in ((lambda p: p[\"ports\"].pop(\"worker_health\"), \"missing\"),):\n    bad = dict(good)\n    mutate(bad)\n''')]\nfor a, b in reps:\n    s = s.replace(a, b)\nopen(p + \".tmp\", \"w\").write(s); os.replace(p + \".tmp\", p)\nPYEOF",
