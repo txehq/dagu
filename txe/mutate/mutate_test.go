@@ -1226,6 +1226,10 @@ func TestBaselineMustBeStoppedBeforeCacheRead(t *testing.T) {
 	assert.Equal(t, 2, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "is still running; the host will not read its files")
 	assert.Len(t, dockerRuns(t, f.log), 1, "no mutant ran")
+	rm := removals(t, f.log)
+	require.Len(t, rm, 1, "the still-running container is removed")
+	assert.Contains(t, o.stderr, rm[0]+": removed")
+	assert.Empty(t, registry(t, f.log))
 }
 
 // A failed inspection establishes nothing: when docker cannot answer, the host refuses to read

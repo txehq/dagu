@@ -566,9 +566,11 @@ class Runner:
                                capture_output=True, text=True, env=self.docker_env(), timeout=15)
         if probe.returncode == 0:
             if probe.stdout.strip() != "false":
+                self.pending[name] = cidfile  # the finalizer removes it, ownership-checked
                 raise Refused(f"the container of {result.name} ({target}) is still running; "
                               "the host will not read its files")
         elif not NO_SUCH.search(probe.stderr):
+            self.pending[name] = cidfile
             raise Refused(f"cannot establish that the container of {result.name} ({target}) has stopped "
                           f"({probe.stderr.strip()[-200:]}); the host will not read its files")
 
@@ -1005,6 +1007,7 @@ def main(argv: list[str]) -> int:
                       "after checking their owner label", file=sys.stderr)
                 if code == EXIT_OK:
                     code = EXIT_FINDINGS
+                args.keep = True  # never delete a directory a container may still have mounted
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
                 print(f"mutate-sandboxed: container {line}", file=sys.stderr)
