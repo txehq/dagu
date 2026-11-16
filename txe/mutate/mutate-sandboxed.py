@@ -6,29 +6,31 @@ the session's real environment and the code under test deleted the Mac's shared 
 (postmortem TXE-7547, txehq/txe docs/postmortems/2026-11-16-shared-gomodcache-deletion.md). This
 runner owns the boundary, so no single test has to:
 
-- Every mutant runs in a fresh copy of the tree, inside a container. The container gets exactly
-  two mounts, both inside a work directory this run created: the mutant's own directory
-  (read-write) and the module proxy seeded from the shared cache (read-only). It gets no network,
-  no Docker socket, no capabilities, and no variable from the caller's environment. HOME, GOPATH,
-  GOMODCACHE, GOCACHE, TMPDIR and XDG_CACHE_HOME all point inside the mutant's directory.
+- Every mutant runs in a fresh copy of the tree, inside a container (`--pull never`, so an image
+  is never fetched). The container gets exactly two mounts, both inside a work directory this run
+  created: the mutant's own directory (read-write) and the module proxy seeded from the shared
+  cache (read-only). It gets no network, no Docker socket, no capabilities, bounded memory, CPU
+  and processes, and no variable from the caller's environment. GOPATH, GOMODCACHE, GOCACHE,
+  TMPDIR, XDG_CACHE_HOME and XDG_CONFIG_HOME point inside the mutant's directory. HOME is never
+  set, here or anywhere in this runner: the container keeps its image user's default.
 - The seed is filled on the host, before any mutant runs, by `go mod download` from the unmutated
   tree with an owned GOMODCACHE and `GOPROXY=file://<shared GOMODCACHE>/cache/download,<caller
-  proxy>`. Go only reads a file proxy, and `go mod download` runs no project code.
-- The identity (device, inode and, where the OS has one, birth time) of the shared GOMODCACHE,
-  its cache/download, GOCACHE, GOPATH and HOME is read before the run and after every sandboxed
-  command. Any change stops the run at once with exit 3. So does a change to any live-tree file a
-  mutant names.
+  proxy>`. Go only reads a file proxy, and `go mod download` runs no project code. `--no-seed`
+  skips it: then nothing reads the shared module cache and the container has GOPROXY=off.
+- After every sandboxed command the runner checks the host: the identity (device, inode and,
+  where the OS has one, birth time) of the shared GOMODCACHE, its cache/download, GOCACHE, GOPATH,
+  HOME and the live tree; that no entry directly inside the shared GOMODCACHE, its cache/download
+  or GOCACHE disappeared or was replaced; the content of a fixture sentinel file where one exists;
+  and the content of every live-tree file a mutant names. Any change stops the run at once with
+  exit 3. These checks are the alarm, not the boundary: a deletion deeper inside a cache leaves
+  them unchanged. The container's mounts are the boundary.
 - A killed mutant is run again in a new sandbox. A kill that does not repeat is a finding (exit 5),
   never a flake. The unmutated tree must pass before the first mutant and after the last.
 - The work directory is removed only when its identity and its ownership token still match what
   this run recorded when it created it. It is never chosen from an environment variable later.
 
-`--unsafe-host-run-for-fixture` turns the sandbox off, to prove the identity check fires. It is
-refused unless both shared caches are given explicitly and each holds the fixture sentinel file,
-so it cannot be pointed at a real cache.
-
 Usage:
-  mutate-sandboxed.py --mutants mutants.json [--tree DIR] [--image REF] -- go test ./pkg/...
+  mutate-sandboxed.py --mutants mutants.json [--tree DIR] --image IMAGE -- go test ./pkg/...
 
 mutants.json is a list of {"name", "file", "old", "new"} objects, with an optional "count"
 (default 1): `old` must occur exactly `count` times in `file` (relative to the tree), and every
@@ -53,7 +55,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-DEFAULT_IMAGE = "golang:1.27.3-bookworm"
 SENTINEL = ".mutate-sandboxed-fixture-sentinel"
 OWNER_FILE = ".mutate-sandboxed-owned"
 DEFAULT_EXCLUDES = (".git", "node_modules", ".local")
@@ -100,22 +101,52 @@ class Watch:
 
     dirs: dict[str, Path]
     files: dict[str, Path] = field(default_factory=dict)
+    # Directories whose existing entries must neither disappear nor be replaced. New entries are
+    # fine: other sessions fill the shared caches while a run is in progress.
+    children: dict[str, Path] = field(default_factory=dict)
 
     def snapshot(self) -> dict:
-        snap = {name: identity(p) for name, p in self.dirs.items()}
+        snap: dict = {name: identity(p) for name, p in self.dirs.items()}
         for name, p in self.files.items():
             snap[name] = {"identity": identity(p), "sha256": file_digest(p)}
+        for name, p in self.children.items():
+            snap[f"entries of {name}"] = entries(p)
         return snap
 
     def verify(self, before: dict, when: str) -> None:
         after = self.snapshot()
-        changed = sorted(k for k in before if before[k] != after.get(k))
+        changed = []
+        for k in sorted(before):
+            if k.startswith("entries of "):
+                lost = {e: v for e, v in before[k].items() if after.get(k, {}).get(e) != v}
+                if lost:
+                    changed.append(k)
+                    before = {**before, k: lost}
+                    after = {**after, k: {e: after.get(k, {}).get(e) for e in lost}}
+            elif before[k] != after.get(k):
+                changed.append(k)
         if changed:
             lines = [f"  {k}: {self.describe(k)}\n    before {before[k]}\n    after  {after.get(k)}" for k in changed]
             raise SharedStateChanged(f"after {when}:\n" + "\n".join(lines))
 
     def describe(self, key: str) -> str:
-        return str(self.dirs.get(key) or self.files.get(key))
+        return str(self.dirs.get(key) or self.files.get(key) or self.children.get(key[len("entries of "):]))
+
+
+def entries(d: Path) -> dict:
+    """The identity of each entry directly inside d (empty when d is absent or unreadable)."""
+    out = {}
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                out[e.name] = [st.st_dev, st.st_ino]
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        pass
+    return out
 
 
 # ---------------------------------------------------------------- paths and mounts
@@ -286,13 +317,14 @@ def file_url(p: Path) -> str:
 # ---------------------------------------------------------------- the sandbox
 
 
+# HOME is deliberately absent: the container keeps its image user's default home.
 SANDBOX_ENV_DIRS = {
-    "HOME": "home",
     "GOPATH": "gopath",
     "GOMODCACHE": "gomodcache",
     "GOCACHE": "gocache",
     "TMPDIR": "tmp",
     "XDG_CACHE_HOME": "xdg-cache",
+    "XDG_CONFIG_HOME": "xdg-config",
 }
 
 
@@ -346,8 +378,9 @@ class Runner:
             "GOENV": "off",
             "MUTATE_SANDBOXED": "1",
         })
-        argv = [self.docker, "run", "--rm", "--name", name, "--network", self.args.network,
-                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "4096",
+        argv = [self.docker, "run", "--rm", "--pull", "never", "--name", name, "--network", self.args.network,
+                "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(self.args.pids),
+                "--memory", self.args.memory, "--cpus", self.args.cpus,
                 "--read-only", "--tmpfs", "/tmp:rw,size=256m", "--user", f"{os.getuid()}:{os.getgid()}",
                 "--workdir", "/work/src", "--entrypoint", ""]
         for src, dst, ro in mounts:
@@ -356,41 +389,23 @@ class Runner:
             argv += ["--env", f"{k}={env[k]}"]
         return argv + [self.args.image, *self.args.command]
 
-    def host_argv_env(self, d: Path) -> tuple[list[str], dict[str, str]]:
-        """--unsafe-host-run-for-fixture: the caller's environment, aimed at the fake caches."""
-        env = dict(os.environ)
-        env.update({
-            "GOMODCACHE": str(self.args.shared_modcache),
-            "GOCACHE": str(self.args.shared_gocache),
-            # Were GOMODCACHE ever ignored, the default GOPATH/pkg/mod is still not the real one.
-            "GOPATH": str(self.work.path / "unsafe-gopath"),
-            "GOPROXY": "off",
-            "GOTOOLCHAIN": "local",
-            "GOENV": "off",
-        })
-        return list(self.args.command), env
-
     def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
         before = self.watch.snapshot()
         live = {m.file: file_digest(self.args.tree / m.file) for m in ([mutant] if mutant else [])}
         d = self.prepare(label, pristine, mutant)
         name = f"mutate-sandboxed-{os.getpid()}-{self.seq}-{secrets.token_hex(3)}"
-        if self.args.unsafe_host_run_for_fixture:
-            argv, env, cwd = *self.host_argv_env(d), d / "src"
-        else:
-            argv, env, cwd = self.docker_argv(d, name), self.docker_env(), None
+        argv = self.docker_argv(d, name)
         log_path = d / "output.log"
         start = time.monotonic()
         code, outcome = None, None
         with open(log_path, "wb") as log:
             try:
-                proc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=cwd,
+                proc = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env(),
                                       timeout=self.args.timeout)
                 code = proc.returncode
             except subprocess.TimeoutExpired:
                 outcome = "TIMEOUT"
-                if not self.args.unsafe_host_run_for_fixture:
-                    subprocess.run([self.docker, "kill", name], capture_output=True, env=self.docker_env())
+                subprocess.run([self.docker, "kill", name], capture_output=True, env=self.docker_env())
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
@@ -400,14 +415,15 @@ class Runner:
         if outcome is None:
             if code == 0:
                 outcome = "PASSED" if mutant is None else "SURVIVED"
-            elif not self.args.unsafe_host_run_for_fixture and code in DOCKER_INFRA_EXITS:
+            elif code in DOCKER_INFRA_EXITS:
                 outcome = "ERROR"
             else:
                 outcome = "FAILED" if mutant is None else "KILLED"
         return Result(label, outcome, code, round(secs, 2), str(log_path))
 
     def docker_env(self) -> dict[str, str]:
-        """What the docker client itself needs from the caller; none of it reaches the container."""
+        """What the docker client itself needs from the caller, unchanged; none of it reaches the
+        container (docker run passes only --env values)."""
         keep = ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "USER", "LANG")
         return {k: os.environ[k] for k in keep if k in os.environ}
 
@@ -415,6 +431,7 @@ class Runner:
 def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, caller_proxy: str) -> None:
     """Fill an owned module cache from the unmutated tree. Reads the shared cache only as a file proxy."""
     seed = work.path / "seed"
+    seed.mkdir()  # go mod download creates nothing for a module with no dependencies
     env = dict(os.environ)
     env.update({
         "GOMODCACHE": str(seed / "gomodcache"),
@@ -437,9 +454,13 @@ def parse(argv: list[str]):
     p = argparse.ArgumentParser(description="Run mutation tests in a sandbox that cannot reach shared host state.")
     p.add_argument("--mutants", type=Path, required=True)
     p.add_argument("--tree", type=Path, default=Path.cwd())
-    p.add_argument("--image", default=DEFAULT_IMAGE)
+    p.add_argument("--image", required=True,
+                   help="an image present locally, best named by its immutable id (sha256:...); never pulled")
     p.add_argument("--network", default="none", help="docker network for the sandbox (default none)")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per sandboxed run")
+    p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
+    p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
+    p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
     p.add_argument("--workdir-root", type=Path, default=Path(tempfile.gettempdir()))
     p.add_argument("--exclude", action="append", default=list(DEFAULT_EXCLUDES),
                    help="top-level or nested names not copied into the sandbox tree")
@@ -452,8 +473,6 @@ def parse(argv: list[str]):
     p.add_argument("--keep", action="store_true", help="keep the work directory")
     p.add_argument("--report", type=Path, help="also write the JSON report here")
     p.add_argument("--docker", default="docker")
-    p.add_argument("--unsafe-host-run-for-fixture", action="store_true",
-                   help="turn the sandbox OFF; only with explicit sentinel-marked fake caches")
     p.add_argument("command", nargs=argparse.REMAINDER)
     args = p.parse_args(argv)
     if args.command[:1] == ["--"]:
@@ -466,22 +485,6 @@ def parse(argv: list[str]):
 
 def resolve_shared(args) -> tuple[Path, Path, Path, str]:
     """The shared GOMODCACHE, GOCACHE and GOPATH, and the caller's GOPROXY."""
-    if args.unsafe_host_run_for_fixture:
-        if not (args.shared_modcache and args.shared_gocache):
-            raise Refused("--unsafe-host-run-for-fixture needs --shared-modcache and --shared-gocache")
-        for p in (args.shared_modcache, args.shared_gocache):
-            if not (p / SENTINEL).is_file():
-                raise Refused(f"{p} holds no {SENTINEL}: the sandbox is only turned off for a fake cache")
-        try:
-            facts = go_env(["GOMODCACHE", "GOCACHE"], {k: v for k, v in os.environ.items()
-                                                      if k not in ("GOMODCACHE", "GOCACHE")})
-        except (Refused, OSError):
-            facts = {}
-        for key, fake in (("GOMODCACHE", args.shared_modcache), ("GOCACHE", args.shared_gocache)):
-            if facts.get(key) and (within(real(facts[key]), real(fake)) or within(real(fake), real(facts[key]))):
-                raise Refused(f"{fake} overlaps the real {key} {facts[key]}")
-        gopath = real(args.shared_modcache).parent
-        return real(args.shared_modcache), real(args.shared_gocache), gopath, ""
     facts = go_env(["GOMODCACHE", "GOCACHE", "GOPATH", "GOPROXY"], dict(os.environ))
     modcache = real(args.shared_modcache or facts["GOMODCACHE"])
     gocache = real(args.shared_gocache or facts["GOCACHE"])
@@ -496,7 +499,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
     if base.outcome != "PASSED":
         print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
         return EXIT_BASELINE
-    if args.warm_gocache and not args.unsafe_host_run_for_fixture:
+    if args.warm_gocache:
         clone_dir(Path(base.log).parent / "sandbox" / "gocache", runner.work.path / "warm-gocache")
 
     findings = []
@@ -546,28 +549,29 @@ def main(argv: list[str]) -> int:
     forbidden = {"shared GOMODCACHE": modcache, "shared GOCACHE": gocache, "GOPATH": gopath, "HOME": home,
                  "live tree": args.tree, "docker socket": Path("/var/run/docker.sock")}
     watch = Watch({"GOMODCACHE": modcache, "GOMODCACHE/cache/download": modcache / "cache" / "download",
-                   "GOCACHE": gocache, "GOPATH": gopath, "HOME": home, "live tree": args.tree})
+                   "GOCACHE": gocache, "GOPATH": gopath, "HOME": home, "live tree": args.tree},
+                  children={"GOMODCACHE": modcache, "GOMODCACHE/cache/download": modcache / "cache" / "download",
+                            "GOCACHE": gocache})
     for name, root in (("GOMODCACHE", modcache), ("GOCACHE", gocache)):
         if (root / SENTINEL).exists():
             watch.files[f"{name}/{SENTINEL}"] = root / SENTINEL
-    report: dict = {"tree": str(args.tree), "image": args.image, "sandbox": not args.unsafe_host_run_for_fixture,
+    report: dict = {"tree": str(args.tree), "image": args.image, "seeded": not args.no_seed,
                     "watched": {k: str(v) for k, v in watch.dirs.items()}, "results": []}
     initial = watch.snapshot()
     report["identity_before"] = initial
     work = None
     code = EXIT_OK
     try:
-        if not args.unsafe_host_run_for_fixture:
-            check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
-            if subprocess.run([args.docker, "version"], capture_output=True).returncode != 0:
-                raise Refused(f"{args.docker} cannot reach a daemon")
+        check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
+        if subprocess.run([args.docker, "image", "inspect", args.image], capture_output=True).returncode != 0:
+            raise Refused(f"image {args.image} is not present locally (or {args.docker} cannot reach a daemon); "
+                          "this runner never pulls")
         work = WorkDir(args.workdir_root)
         report["workdir"] = str(work.path)
-        if not args.unsafe_host_run_for_fixture:
-            check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
+        check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
         pristine = work.path / "pristine"
         copy_tree(args.tree, pristine, tuple(args.exclude))
-        if not args.no_seed and not args.unsafe_host_run_for_fixture:
+        if not args.no_seed:
             seed_modules(args, work, pristine, modcache, caller_proxy)
             watch.verify(initial, "seeding the module proxy")
         code = run_all(args, mutants, Runner(args, watch, forbidden, work, args.docker), pristine, report)

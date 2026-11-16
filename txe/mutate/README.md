@@ -6,7 +6,7 @@ session's real environment, and the code under test deleted the Mac's shared Go 
 Mutation tests run only through this runner, never through a per-ticket script.
 
 ```sh
-mutate-sandboxed --mutants mutants.json --tree . -- go test ./internal/intg/machineauth/...
+mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id> -- go test ./internal/intg/machineauth/...
 # ~/.coding_global/bin/mutate-sandboxed runs main's copy of txe/mutate/mutate-sandboxed.py
 ```
 
@@ -21,8 +21,11 @@ mutate-sandboxed --mutants mutants.json --tree . -- go test ./internal/intg/mach
 - **A container per run.** It has two mounts, both inside the work directory this run created:
   the run's own directory (read-write, at `/work`) and the seeded module proxy (read-only, at
   `/goproxy`). It has no network (`--network none` unless `--network` says otherwise), no Docker
-  socket, no capabilities, a read-only root and no variable from the caller's environment. HOME,
-  GOPATH, GOMODCACHE, GOCACHE, TMPDIR and XDG_CACHE_HOME point under `/work/sandbox`. A mount
+  socket, no capabilities, a read-only root, `--memory`/`--cpus`/`--pids` limits (8g, 4, 4096 by
+  default) and no variable from the caller's environment. GOPATH, GOMODCACHE, GOCACHE, TMPDIR,
+  XDG_CACHE_HOME and XDG_CONFIG_HOME point under `/work/sandbox`. HOME is never set, here or
+  anywhere in the runner: the container keeps its image user's default. Every `docker run` has
+  `--pull never`, and an image that is not present locally is refused: name it by its id. A mount
   that would be, contain or lie inside the shared caches, GOPATH, HOME, the Docker socket or the
   live tree is refused before docker runs.
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod
@@ -30,10 +33,13 @@ mutate-sandboxed --mutants mutants.json --tree . -- go test ./internal/intg/mach
   `GOPROXY=file://<shared GOMODCACHE>/cache/download,<your GOPROXY>`. Go never writes to a file
   proxy, and `go mod download` runs no project code. HOME is not overridden. `--no-seed` skips
   this for a tree with no module dependencies.
-- **Identity checks.** The device, inode and (on macOS) birth time of the shared GOMODCACHE, its
-  `cache/download`, GOCACHE, GOPATH, HOME and the live tree are read before the run and after
-  every sandboxed command. Any change stops the run at once with exit 3 and a banner; the work
-  directory is kept as evidence and that run gets no verdict.
+- **Host checks after every run.** The identity (device, inode and, on macOS, birth time) of the
+  shared GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the live tree; that no entry
+  directly inside the shared GOMODCACHE, its `cache/download` or GOCACHE disappeared or was
+  replaced (new entries are fine: other sessions fill the caches); the content of a fixture
+  sentinel file where one exists; and the content of each live-tree file a mutant names. Any
+  change stops the run at once with exit 3 and a banner; the work directory is kept as evidence
+  and that run gets no verdict.
 - **Kills must repeat.** The unmutated tree must pass first (exit 4 otherwise) and again at the
   end. Each killed mutant runs again in a new sandbox; a kill that does not repeat is reported as
   `UNREPEATED-KILL`, a finding (exit 5), never a flake. docker's own failures (exit 125 to 127)
@@ -51,9 +57,15 @@ sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives eac
 
 - Tests that need `.git` in the tree, network access or a host service do not run unchanged.
 - On Linux the identity is device and inode only: Python's `os.stat` has no birth time there.
-- The identity check sees a watched directory replaced or deleted, not a file deleted inside it.
-  The container boundary is what keeps those files out of reach; the check is the alarm if the
-  boundary is ever bypassed.
+- **The host checks are an alarm, not proof that nothing changed.** They see a watched directory
+  replaced, an entry one level inside a shared cache removed or replaced, and a sentinel's content
+  changed. They do not see a deletion deeper inside a cache (one module's files, one build-cache
+  object), a change to files outside the watched paths, or a change made and undone between two
+  checks. Device and inode alone would miss an in-place deletion that keeps the root directory,
+  which is why the entry and sentinel checks exist. The container's mounts are the boundary; the
+  checks are how you learn the boundary failed.
+- The guard hook (below) is a heuristic over command text, not complete enforcement: a script
+  with an ordinary name, or a command built at run time, gets past it.
 
 ## The forgotten-wrapper check
 
@@ -65,11 +77,19 @@ script gets past it; it catches the habit that caused the incident, and the rule
 
 ## The acceptance demonstration
 
-`fixture-demo.sh <evidence-dir>` runs `testdata/fixture` (a module with no dependencies, whose
-one mutant runs `go clean -modcache`) twice against sentinel-only fake caches it creates: once
-sandboxed (exit 0, the mutant survives, the fake caches unchanged) and once with
-`--unsafe-host-run-for-fixture` (exit 3 on the identity check). That flag is refused unless both
-caches are given explicitly and each holds `.mutate-sandboxed-fixture-sentinel`.
+`fixture-demo.sh` runs `testdata/fixture` (a module with no dependencies, whose one mutant runs
+`go clean -modcache` with its environment), one step per call, each against sentinel-only fake
+caches. Neither step reads the real module cache.
 
-Tests: `go test ./txe/mutate/`. They start no container and download nothing: a fake docker
-plays the container on a temporary directory.
+- `fixture-demo.sh sandboxed <evidence> <image-id>`: through the real sandbox. Expected: exit 0,
+  the mutant SURVIVED, the fake caches and sentinels unchanged.
+- `fixture-demo.sh outer-negative <evidence> <image-id>`: the alarm, with the boundary removed,
+  proven inside an outer container with no network, no capabilities, no Docker socket, no
+  credentials and no mount but a read-only copy of this directory. There `negative-in-outer.sh`
+  plays the host with fake caches and gives the runner `testdata/leaky-docker.py`, which runs the
+  mutant with the caller's environment. Expected: the runner inside exits 3. A boundary-off run
+  never happens on a real host: there is no flag for it.
+
+Tests: `go test ./txe/mutate/`. They start no container, download nothing and run no
+destructive mutant: a fake docker plays the container on a temporary directory, and the alarm
+tests change sentinel-only fake caches from that fake docker, at paths the test names.

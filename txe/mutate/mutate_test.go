@@ -3,9 +3,12 @@
 
 // Package mutate_test tests txe/mutate/mutate-sandboxed.py and its guard hook (TXE-7549).
 //
-// These tests start no container and download nothing. A fake docker records the argv the runner
-// builds and then plays the container on the host, with the run's own directory standing in for
-// /work. Every cache a test touches is a sentinel-only fake under t.TempDir(), never the real one.
+// These tests start no container, download nothing and run no destructive mutant. A fake docker
+// records the argv the runner builds and then plays the container on the host, with the run's own
+// directory standing in for /work. Every cache a test touches is a sentinel-only fake under
+// t.TempDir(), never the real one. The alarm tests change those fakes from the fake docker itself
+// (a test double that stands for a broken boundary), at paths the test names, never from a mutant
+// or from an environment variable.
 package mutate_test
 
 import (
@@ -44,18 +47,26 @@ func script(t *testing.T, name string) string {
 
 // fakeDocker writes a docker stand-in that appends each argv to log as a JSON line and, for
 // `run`, executes the command on the host with only the --env values, /work and /goproxy mapped
-// to their mount sources. An image named "infra-125" exits 125 as the daemon would.
-func fakeDocker(t *testing.T, dir, log string) string {
+// to their mount sources. An image named "infra-125" exits 125 as the daemon would, and
+// `image inspect missing` fails. sideEffect, when set, is Python run on every `run` before the
+// command: the tests' stand-in for a boundary that leaked.
+func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 	t.Helper()
+	effect := "pass"
+	if len(sideEffect) > 0 {
+		effect = sideEffect[0]
+	}
 	src := `#!/usr/bin/env python3
 import json, os, subprocess, sys
 LOG = ` + fmt.Sprintf("%q", log) + `
 args = sys.argv[1:]
 with open(LOG, "a") as f:
     f.write(json.dumps(args) + "\n")
+if args[:3] == ["image", "inspect", "missing"]:
+    sys.exit(1)
 if not args or args[0] != "run":
     sys.exit(0)
-VALUED = {"--name", "--network", "--cap-drop", "--security-opt", "--pids-limit", "--tmpfs", "--user",
+VALUED = {"--pull", "--memory", "--cpus", "--name", "--network", "--cap-drop", "--security-opt", "--pids-limit", "--tmpfs", "--user",
           "--workdir", "--entrypoint", "--mount", "--env"}
 i, mounts, env, workdir = 1, {}, {}, "/"
 while i < len(args) and args[i].startswith("--"):
@@ -76,6 +87,7 @@ while i < len(args) and args[i].startswith("--"):
 image, cmd = args[i], args[i + 1:]
 if image == "infra-125":
     sys.exit(125)
+` + effect + `
 def host(p):
     for target, source in sorted(mounts.items(), key=lambda kv: -len(kv[0])):
         if p == target or p.startswith(target + "/"):
@@ -138,7 +150,7 @@ func (f fixture) run(t *testing.T, mutants string, extra ...string) outcome {
 	_ = os.Remove(report)
 	args := append([]string{"-I", script(t, "mutate-sandboxed.py"), "--mutants", mutants, "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
-		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60"}, extra...)
+		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"}, extra...)
 	args = append(args, "--", "sh", "check.sh")
 	cmd := exec.Command(python(t), args...)
 	cmd.Env = append(os.Environ(), "MUTATE_TEST_CANARY=host-only-value")
@@ -182,16 +194,18 @@ func dockerRuns(t *testing.T, log string) [][]string {
 	return runs
 }
 
-// The check passes unless BREAK is in it; the cleanup mutant deletes whatever GOMODCACHE names,
-// as `go clean -modcache` does, and the check still passes.
+// The check passes. The env mutant writes a marker into whatever GOMODCACHE names, where the
+// incident's mutant ran `go clean -modcache`; it deletes nothing, and the check still passes.
 const passingCheck = "#!/bin/sh\n: CLEANUP\n: GUARD\nexit 0\n"
 
-var cleanupMutant = map[string]any{"name": "cleanup reaches the env cache", "file": "check.sh",
-	"old": ": CLEANUP", "new": `rm -rf "$GOMODCACHE"`}
+const marker = "mutant-was-here"
 
-// A mutant that deletes the cache its environment names reaches only the sandbox: the fake shared
-// cache and its sentinel are untouched, the mutant survives (the deletion is not a kill), and the
-// container got nothing from the caller's environment and no host path but its own directory.
+var cleanupMutant = map[string]any{"name": "cleanup reaches the env cache", "file": "check.sh",
+	"old": ": CLEANUP", "new": `touch "$GOMODCACHE/` + marker + `"`}
+
+// A mutant that writes to the cache its environment names reaches only the sandbox: the fake
+// shared cache and its sentinel are untouched, the mutant survives, and the container got nothing
+// from the caller's environment, no HOME, and no host path but its own directory.
 func TestSandboxKeepsSharedCache(t *testing.T) {
 	f := newFixture(t, passingCheck)
 	before, err := os.ReadFile(filepath.Join(f.modcache, sentinel))
@@ -205,6 +219,7 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 	after, err := os.ReadFile(filepath.Join(f.modcache, sentinel))
 	require.NoError(t, err)
 	assert.Equal(t, before, after)
+	assert.NoFileExists(t, filepath.Join(f.modcache, marker))
 	assert.Equal(t, o.report["identity_before"], o.report["identity_after"])
 
 	live, err := os.ReadFile(filepath.Join(f.tree, "check.sh"))
@@ -221,6 +236,10 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 	for _, argv := range runs {
 		joined := strings.Join(argv, " ")
 		assert.Contains(t, joined, "--network none")
+		assert.Contains(t, joined, "--pull never")
+		assert.Contains(t, joined, "--memory 8g")
+		assert.Contains(t, joined, "--cpus 4")
+		assert.NotContains(t, joined, "--env HOME=", "HOME is never set")
 		assert.Contains(t, joined, "--cap-drop ALL")
 		assert.Contains(t, joined, "--read-only")
 		assert.NotContains(t, joined, "docker.sock")
@@ -240,39 +259,63 @@ func TestSandboxKeepsSharedCache(t *testing.T) {
 				}
 			}
 		}
-		for _, name := range []string{"HOME", "GOPATH", "GOMODCACHE", "GOCACHE", "TMPDIR", "XDG_CACHE_HOME"} {
+		for _, name := range []string{"GOPATH", "GOMODCACHE", "GOCACHE", "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"} {
 			assert.Contains(t, joined, "--env "+name+"=/work/sandbox/")
 		}
 	}
 }
 
-// With the sandbox turned off, the same mutant deletes the fake shared cache and the runner fails
-// loudly on the identity check (exit 3), keeping its work directory as evidence.
-func TestHostRunFailsIdentityCheck(t *testing.T) {
+// alarmFixture is a fixture whose fake docker runs sideEffect (Python, with modcache, gocache and
+// sentinel bound) on every run: the stand-in for a boundary that leaked.
+func alarmFixture(t *testing.T, sideEffect string) fixture {
+	t.Helper()
 	f := newFixture(t, passingCheck)
-	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--unsafe-host-run-for-fixture")
-	require.Equal(t, 3, o.code, o.stdout+o.stderr)
-	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
-	assert.Contains(t, o.stderr, "after cleanup reaches the env cache")
-	assert.Contains(t, o.stderr, "GOMODCACHE")
-	assert.NoFileExists(t, filepath.Join(f.modcache, sentinel), "the fake cache was the target")
-	assert.NotContains(t, o.outcomes(), "cleanup reaches the env cache", "a run that touched host state has no verdict")
-	assert.DirExists(t, o.report["workdir"].(string))
-	runs, _ := os.ReadFile(f.log)
-	assert.NotContains(t, string(runs), `"run"`, "the host run starts no container")
+	require.NoError(t, os.MkdirAll(filepath.Join(f.modcache, "cache", "download", "example.com"), 0o755))
+	bind := fmt.Sprintf("modcache, gocache, sentinel = %q, %q, %q\n", f.modcache, f.gocache, sentinel)
+	f.docker = fakeDocker(t, f.root, f.log, bind+sideEffect)
+	return f
 }
 
-// The sandbox is only turned off for caches that carry the fixture sentinel.
-func TestHostRunRefusedWithoutSentinel(t *testing.T) {
+// The alarm fires, with exit 3, a banner, the work directory kept and no verdict, when the fake
+// shared cache's sentinel content changes, when an entry inside it is replaced, and when the
+// cache directory itself is replaced. The changes come from the fake docker, never a mutant.
+func TestAlarmOnSharedChange(t *testing.T) {
+	cases := map[string]struct{ effect, want string }{
+		"sentinel content": {`open(os.path.join(modcache, sentinel), "w").write("changed\n")`,
+			"GOMODCACHE/" + sentinel},
+		"entry replaced": {`os.rename(os.path.join(modcache, "cache", "download", "example.com"), os.path.join(modcache, "moved"))`,
+			"entries of GOMODCACHE/cache/download"},
+		"cache replaced": {`os.rename(gocache, gocache + ".old"); os.mkdir(gocache)`, "GOCACHE"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			// The side effect fires on the baseline's run, so the alarm names the baseline.
+			f := alarmFixture(t, c.effect)
+			o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+			require.Equal(t, 3, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+			assert.Contains(t, o.stderr, "after baseline")
+			assert.Contains(t, o.stderr, c.want)
+			assert.Empty(t, o.outcomes(), "a run that touched host state has no verdict")
+			assert.DirExists(t, o.report["workdir"].(string))
+		})
+	}
+}
+
+// Entries added to a shared cache during a run (another session filling it) are not an alarm.
+func TestNewSharedEntriesAreFine(t *testing.T) {
+	f := alarmFixture(t, `open(os.path.join(modcache, "cache", "download", "new-%d" % os.getpid()), "w").write("x")`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	assert.Equal(t, 0, o.code, o.stdout+o.stderr)
+}
+
+// The runner never pulls: an image that is not present locally is refused before anything runs.
+func TestMissingImageRefused(t *testing.T) {
 	f := newFixture(t, passingCheck)
-	require.NoError(t, os.Remove(filepath.Join(f.gocache, sentinel)))
-	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--unsafe-host-run-for-fixture")
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "missing")
 	assert.Equal(t, 2, o.code)
-	assert.Contains(t, o.stderr, "holds no "+sentinel)
-	assert.FileExists(t, filepath.Join(f.modcache, sentinel))
-	entries, err := os.ReadDir(f.workRoot)
-	require.NoError(t, err)
-	assert.Empty(t, entries, "nothing ran")
+	assert.Contains(t, o.stderr, "never pulls")
+	assert.Empty(t, dockerRuns(t, f.log))
 }
 
 // A kill must repeat in a new sandbox; one that does not is a finding (exit 5), not a flake.
@@ -449,7 +492,7 @@ elif sys.argv[1:3] == ["mod", "download"]:
 	report := filepath.Join(f.root, "report.json")
 	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
 		f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--workdir-root", f.workRoot,
-		"--docker", f.docker, "--report", report, "--", "sh", "check.sh")
+		"--docker", f.docker, "--report", report, "--image", "fixture-image", "--", "sh", "check.sh")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
