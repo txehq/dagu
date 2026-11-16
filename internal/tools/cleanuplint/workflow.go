@@ -128,14 +128,41 @@ func workflowEnvNames(phys []string) map[string]bool {
 	return names
 }
 
+// githubEnvNameRe is a name written as name=value: in a step that writes
+// $GITHUB_ENV, any such text may be what it exports (echo "x=$v" >>
+// "$GITHUB_ENV", a heredoc, printf), and it cannot tell which.
+var githubEnvNameRe = regexp.MustCompile(`(?:^|[^\w$-])([A-Za-z_]\w*)=`)
+
+// githubEnvNames returns every name a run: block that writes $GITHUB_ENV
+// may export to the steps after it: each name=value text in that block.
+// It over-collects, which can only report more: a name the reading step
+// assigns itself is still defined there.
+func githubEnvNames(segs [][]string) map[string]bool {
+	names := map[string]bool{}
+	for _, seg := range segs {
+		text := strings.Join(seg, "\n")
+		if !strings.Contains(text, "GITHUB_ENV") {
+			continue
+		}
+		for _, m := range githubEnvNameRe.FindAllStringSubmatch(text, -1) {
+			names[m[1]] = true
+		}
+	}
+	return names
+}
+
 // lintWorkflow lints a workflow or action file one run: block at a time. A
 // step may run under shell: pwsh, so each block is read as PowerShell as
 // well as shell.
 func lintWorkflow(s source) ([]Finding, []directiveAt) {
 	phys := lines(s.data)
 	envNames := workflowEnvNames(phys)
+	segs := workflowSegments(phys)
+	for n := range githubEnvNames(segs[:len(segs)-1]) {
+		envNames[n] = true
+	}
 	var out []Finding
-	for _, seg := range workflowSegments(phys) {
+	for _, seg := range segs {
 		out = mergeFindings(out, scanScript(s, seg, envNames))
 		ps := s
 		ps.lang = langPowerShell

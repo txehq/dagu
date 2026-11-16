@@ -28,7 +28,8 @@
 //
 // A workflow's run: blocks are each read as their own script (TXE-7563): a
 // variable one step assigns is not defined in another step, and any name an
-// env: map in the file sets is a source unless the step assigns it itself.
+// env: map in the file sets, or a step writing $GITHUB_ENV may export, is a
+// source unless the step assigns it itself.
 //
 // A finding that is right as written is kept with a directive on its line or
 // the line above, and the directive must say why:

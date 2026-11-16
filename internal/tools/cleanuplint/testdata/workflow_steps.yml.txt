@@ -43,3 +43,12 @@ jobs:
       - run: go clean -tags "a b" -modcache=false
       - run: sh -c "go clean -fuzzcache" # want:go-clean-cache
       - run: go clean -tags "a b" ./pkg -modcache
+  github-env:
+    steps:
+      - run: |
+          cache_dir="$HOME/.cache/shared"
+          echo "cache_dir=$cache_dir" >> "$GITHUB_ENV"
+      - run: rm -rf "$cache_dir" # want:env-path-delete
+      - run: |
+          cache_dir="$(mktemp -d)"
+          rm -rf "$cache_dir"
