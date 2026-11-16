@@ -143,40 +143,29 @@ class Word:
 
 
 class Cmd:
-    """A simple command: its words, what it reads on stdin, and the command piped into it."""
+    """A simple command: its words, what each of its descriptors is redirected to, and the
+    command piped into it."""
 
     def __init__(self):
         self.words: list[Word] = []
-        self.stdin_file: "str | None" = None
-        self.stdin_text: "str | None" = None  # a here-document's body or a here-string's word
-        self.stdin_procsub: "list[Cmd] | None" = None  # `< <(cmd)`: stdin is that command's output
+        # Descriptor ("0" is stdin, "3", "{name}") -> ("file", path) | ("procsub", cmds) |
+        # ("text", here-document or here-string) | ("dup", other descriptor, resolved when judged,
+        # after every here-document body has been read).
+        self.fds: dict = {}
         self.piped_from: "Cmd | None" = None
-        self.fds: dict = {}  # other input descriptors: "3" -> ("file", path) | ("procsub", cmds) | ("text", s)
 
-    def source(self, key: str):
-        """What input descriptor `key` reads, as (kind, value), or None."""
-        if key != "0":
-            return self.fds.get(key)
-        if self.stdin_text is not None:
-            return ("text", self.stdin_text)
-        if self.stdin_procsub is not None:
-            return ("procsub", self.stdin_procsub)
-        return ("file", self.stdin_file) if self.stdin_file is not None else None
+    def source(self, key: str, hops: int = 0):
+        """What descriptor `key` reads, as (kind, value), or None when the command does not set it.
+        A duplication that cannot be resolved is ("unknown", key)."""
+        src = self.fds.get(key)
+        if src is None or src[0] != "dup":
+            return src
+        if hops > 16 or src[1] not in self.fds:
+            return ("unknown", src[1])
+        return self.source(src[1], hops + 1)
 
     def set_source(self, key: str, src):
-        if key != "0":
-            if src is not None:
-                self.fds[key] = src
-            return
-        self.stdin_file = self.stdin_text = self.stdin_procsub = None
-        if src is not None:
-            kind, value = src
-            if kind == "text":
-                self.stdin_text = value
-            elif kind == "procsub":
-                self.stdin_procsub = value
-            else:
-                self.stdin_file = value
+        self.fds[key] = src
 
 
 REDIRECT = re.compile(r"(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)")
@@ -222,7 +211,7 @@ class Parser:
 
         def finish():
             nonlocal cur
-            if cur.words or cur.source("0") is not None or cur.fds:
+            if cur.words or cur.fds:
                 self.cmds.append(cur)
             done, cur = cur, Cmd()
             return done
@@ -282,21 +271,29 @@ class Parser:
         op = op.lstrip("0123456789")
         if op.startswith("{"):
             fd, op = op[:op.index("}") + 1], op[op.index("}") + 1:]
-        # The descriptor this redirection sets: "0" for stdin (no number, or any spelling of 0).
-        key = "0" if fd == "" or (fd.isdigit() and int(fd) == 0) else (str(int(fd)) if fd.isdigit() else fd)
+        # The descriptor this redirection sets, as a number ("00" is stdin), a {name}, or the
+        # operator's default: 0 for input, 1 for output.
+        key = str(int(fd)) if fd.isdigit() else (fd or ("0" if op.startswith("<") else "1"))
         while self.i < len(self.s) and self.s[self.i] in " \t":
             self.i += 1
         start = self.i
         target = self.word()
+        src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
             self.heredocs.append((cur, key, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
         elif op == "<<<":
             cur.set_source(key, ("text", target.text))
-        elif op in ("<", "<>"):
-            cur.set_source(key, ("procsub", target.procsub) if target.procsub is not None else ("file", target.text))
-        elif op == "<&" and target.text.isdigit():
-            cur.set_source(key, cur.source(str(int(target.text))))  # `<&3`: stdin is whatever fd 3 holds
+        elif op in ("<&", ">&") and re.fullmatch(r"[0-9]+-?", target.text):
+            # `<&3` or `<&3-` (move): this descriptor reads what fd 3 holds, resolved when judged.
+            cur.set_source(key, ("dup", str(int(target.text.rstrip("-")))))
+        elif op in ("<&", ">&") and target.text == "-":
+            cur.fds.pop(key, None)  # closed
+        elif op in ("&>", "&>>") or (op == ">&" and not fd):
+            cur.set_source("1", src)
+            cur.set_source("2", src)
+        else:  # <, <>, >, >>, >| and a descriptor-less <& target: the file it opens
+            cur.set_source(key, src)
 
     def read_heredocs(self):
         s = self.s
@@ -438,25 +435,45 @@ def names_mutant_script(words) -> bool:
     return any(mutant_named(w.text, need_ext=True) for w in words)
 
 
-FD_PATH = re.compile(r"^/(?:dev|proc/self)/fd/([0-9]+)$")
+FD_PATH = re.compile(r"^/(?:dev/fd|proc/[^/]+/fd)/([0-9]+)$")
+STDIN_PATHS = {"/dev/stdin"}
+
+
+def fd_of_path(text: str):
+    """The descriptor a /dev/fd/N, /proc/<pid|self|thread-self>/fd/N or /dev/stdin path names
+    (after normalising `//`, `.` and `..`), or None for any other path."""
+    if not text.startswith("/"):
+        return None
+    p = os.path.normpath("/" + text.lstrip("/"))
+    if p in STDIN_PATHS:
+        return "0"
+    m = FD_PATH.match(p)
+    return str(int(m.group(1))) if m else None
 
 
 def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) -> bool:
-    """The script an interpreter runs: a file, the output of a process substitution, or an input
-    descriptor of the command (`python3 /dev/fd/3 3< mutants.py`)."""
+    """The script an interpreter runs: a file, the output of a process substitution, or a
+    descriptor of the command (`python3 /dev/fd/3 3< mutants.py`). A descriptor path the command
+    does not set (opened by an earlier `exec 3<`, say) cannot be judged and is refused."""
     if w.procsub is not None:
         return any(names_mutant_script(c.words) for c in w.procsub)
-    m = FD_PATH.match(w.text)
-    if m and cmd is not None:
-        return source_runs_mutant(cmd.source(str(int(m.group(1)))), shell, depth)
+    fd = fd_of_path(w.text)
+    if fd == "0":
+        return stdin_is_mutant(cmd, shell, depth)
+    if fd is not None:
+        src = cmd.source(fd) if cmd is not None else None
+        return True if src is None else source_runs_mutant(src, shell, depth)
     return mutant_named(w.text)
 
 
 def source_runs_mutant(src, shell: bool, depth: int) -> bool:
-    """Whether an input source, read as a program, runs a mutant."""
+    """Whether an input source, read as a program, runs a mutant. A duplicated descriptor whose
+    source is not set in this command is refused."""
     if src is None:
         return False
     kind, value = src
+    if kind == "unknown":
+        return True
     if kind == "file":
         return mutant_named(value)
     if kind == "procsub":
@@ -600,7 +617,13 @@ class Judge:
             if t == "--":
                 j += 1
                 break
-            if t in ("-o", "+o", "-O", "+O") or t in SHELL_LONG_VALUE:
+            if t in SHELL_LONG_VALUE or t.split("=")[0] in SHELL_LONG_VALUE:
+                # --rcfile FILE / --rcfile=FILE: an interactive shell runs FILE first
+                value = t.split("=", 1)[1] if "=" in t else (args[j + 1].text if j + 1 < len(args) else "")
+                if mutant_named(value):
+                    return True
+                j += 1 if "=" in t else 2
+            elif t in ("-o", "+o", "-O", "+O"):
                 j += 2
             elif len(t) > 1 and t[0] in "-+":
                 code = code or (not t.startswith("--") and "c" in t[1:])

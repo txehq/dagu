@@ -693,6 +693,17 @@ var guardRefused = []string{
 	`ruby --some-new-option value -e 'system("python3 mutants.py")'`,
 	"bash --rcfile /dev/null run-mutations.sh",
 	"bash --init-file ~/.bashrc -- tools/mutants.sh",
+	"bash --rcfile=tools/mutants.sh -i",
+	// Descriptors are resolved when judged, after here-document bodies are read; a descriptor
+	// path the command does not set fails closed.
+	"python3 3<<'EOF' <&3\nimport runpy; runpy.run_path('mutants.py')\nEOF",
+	"bash 3<<'EOF' <&3-\npython3 mutants.py\nEOF",
+	"python3 //dev/fd/3 3< mutants.py",
+	"python3 /proc/self/../self/fd/3 3< mutants.py",
+	"python3 /proc/thread-self/fd/3 3< mutants.py",
+	"python3 /dev/fd/3 3>>mutants.py",
+	"exec 3< mutants.py; python3 /dev/fd/3",
+	"python3 <&3",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -768,6 +779,9 @@ var guardAllowed = []string{
 	`ruby -Kue 'puts File.read("mutants.rb")'`,
 	"python3 /dev/fd/3 3< app.py 4< mutants.py",
 	"python3 - 3< mutants.py",
+	"python3 app.py <&3",
+	"python3 /dev/fd/3 3< app.py",
+	"bash /dev/stdin < setup.sh",
 	"perl -ne 'print if /mutants.py/' notes.md",
 	"git show origin/main:txe/mutate/guard-hook.py | head",
 	"git log --grep=mutate --oneline",
