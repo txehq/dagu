@@ -9,19 +9,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// snapshotDir returns every file under dir with a hash of its bytes, and
-// every directory, so a test can tell the tree was left as it was.
+// snapshotDir returns every entry under dir with its mode, modification
+// time and, for a file, a hash of its bytes. A directory's modification
+// time changes when an entry is made in it or removed from it, so a file
+// written and removed again shows too: an unchanged snapshot means nothing
+// was written.
 func snapshotDir(t *testing.T, dir string) map[string]string {
 	t.Helper()
 	snapshot := map[string]string{}
@@ -30,16 +36,20 @@ func snapshotDir(t *testing.T, dir string) map[string]string {
 			return err
 		}
 		rel, _ := filepath.Rel(dir, path)
-		if entry.IsDir() {
-			snapshot[rel] = "dir"
-			return nil
-		}
-		raw, err := os.ReadFile(path)
+		info, err := os.Lstat(path)
 		if err != nil {
 			return err
 		}
-		sum := sha256.Sum256(raw)
-		snapshot[rel] = hex.EncodeToString(sum[:])
+		state := fmt.Sprintf("%v %d", info.Mode(), info.ModTime().UnixNano())
+		if info.Mode().IsRegular() {
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			sum := sha256.Sum256(raw)
+			state += " " + hex.EncodeToString(sum[:])
+		}
+		snapshot[rel] = state
 		return nil
 	}))
 	return snapshot
@@ -55,6 +65,14 @@ func oldProfile(t *testing.T, browserDir, name, prefs string) string {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "Default", "Preferences"), []byte(prefs), 0o600))
 	}
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "Default", "Cookies"), []byte("a person's logins"), 0o600))
+	// Modification times a later write would move.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, filepath.WalkDir(dir, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, past, past)
+	}))
 	return dir
 }
 
@@ -79,9 +97,8 @@ func TestAcquireProfileCreatesAnOwnedProfile(t *testing.T) {
 }
 
 // A named profile made before Dagu marked its profiles is refused, with
-// the way to claim it, and left exactly as it was: no mark, no file
-// written, its logins kept.
-func TestAcquireProfileRefusesAnUnclaimedProfileAndLeavesItAsItWas(t *testing.T) {
+// the way to claim it, and nothing is written in it.
+func TestAcquireProfileRefusesAnUnclaimedProfileAndWritesNothing(t *testing.T) {
 	t.Parallel()
 	browserDir := t.TempDir()
 	dir := oldProfile(t, browserDir, "old", `{"profile":{"name":"old"}}`)
@@ -91,14 +108,13 @@ func TestAcquireProfileRefusesAnUnclaimedProfileAndLeavesItAsItWas(t *testing.T)
 	require.True(t, errors.As(err, &unclaimed), "%v", err)
 	assert.ErrorContains(t, err, `dagu browser profile claim old`)
 	assert.ErrorContains(t, err, "logins and cookies")
-	assert.Equal(t, before, snapshotDir(t, dir), "the profile is left as it was")
-	assert.False(t, devtoolsgate.ProfileClaimed(dir))
+	assert.Equal(t, before, snapshotDir(t, dir), "nothing is written in the profile")
 }
 
 // A claim keeps a copy of the profile's preferences and the value Dagu's
-// browsers change, and marks the profile; a step may then use it. Its undo
-// puts the value back and keeps what the browser wrote since; a step
-// refuses the profile again.
+// browsers change, changes no preference, and marks the profile; a step
+// may then use it. Its undo puts the value back, keeps what the browser
+// wrote since and the copy, and removes the mark and the record.
 func TestClaimProfileAndItsUndo(t *testing.T) {
 	t.Parallel()
 	browserDir := t.TempDir()
@@ -111,10 +127,20 @@ func TestClaimProfileAndItsUndo(t *testing.T) {
 	assert.True(t, report.Claimed)
 	assert.True(t, report.Changed)
 	assert.JSONEq(t, "0", string(report.PreviousValue))
-	assert.Equal(t, prefs+claimBackupSuffix, report.Backup)
+	require.True(t, strings.HasPrefix(report.Backup, filepath.Join(dir, "Default", claimBackupPrefix)), report.Backup)
 	backup, err := os.ReadFile(report.Backup)
 	require.NoError(t, err)
 	assert.Equal(t, original, string(backup), "the copy is the preferences as they were")
+	current, err := os.ReadFile(prefs)
+	require.NoError(t, err)
+	assert.Equal(t, original, string(current), "the claim changes no preference")
+	for _, written := range []string{report.Backup, filepath.Join(dir, claimRecordName)} {
+		info, err := os.Lstat(written)
+		require.NoError(t, err)
+		if runtime.GOOS != "windows" {
+			assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), written)
+		}
+	}
 	assert.Equal(t, "dagu browser profile unclaim old", report.Undo)
 	assert.Contains(t, report.Change, "incognito.mode_availability = 1")
 	assert.True(t, devtoolsgate.ProfileClaimed(dir))
@@ -122,6 +148,7 @@ func TestClaimProfileAndItsUndo(t *testing.T) {
 	again, err := ClaimProfile(browserDir, "old")
 	require.NoError(t, err)
 	assert.False(t, again.Changed, "a second claim changes nothing")
+	assert.Equal(t, report.Backup, again.Backup)
 
 	lease, err := acquireProfile(context.Background(), browserDir, "old", "rec", false)
 	require.NoError(t, err)
@@ -133,7 +160,9 @@ func TestClaimProfileAndItsUndo(t *testing.T) {
 	undone, err := UnclaimProfile(browserDir, "old")
 	require.NoError(t, err)
 	assert.True(t, undone.Changed)
-	assert.Equal(t, prefs+claimBackupSuffix, undone.Backup, "the copy stays")
+	assert.Equal(t, report.Backup, undone.Backup, "the copy stays")
+	_, err = os.Lstat(report.Backup)
+	assert.NoError(t, err)
 	restored := readJSON(t, prefs)
 	assert.Equal(t, map[string]any{"mode_availability": float64(0), "other": "kept"}, restored["incognito"])
 	assert.Equal(t, true, restored["later"], "what the browser wrote since is kept")
@@ -163,10 +192,9 @@ func TestClaimProfileWithoutPreferences(t *testing.T) {
 	assert.Equal(t, map[string]any{"kept": float64(1)}, readJSON(t, prefs))
 }
 
-// A claim is refused, and leaves the profile as it was, for a name that is
-// not a profile's, one that does not exist, one in use, and one that is
-// not exactly where its name says.
-func TestClaimProfileRefusals(t *testing.T) {
+// Every refused claim writes nothing in the profile: the checks all come
+// before the first write.
+func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	t.Parallel()
 	browserDir := t.TempDir()
 	_, err := ClaimProfile(browserDir, "../elsewhere")
@@ -174,40 +202,122 @@ func TestClaimProfileRefusals(t *testing.T) {
 	_, err = ClaimProfile(browserDir, "missing")
 	assert.ErrorContains(t, err, "no browser profile")
 
-	dir := oldProfile(t, browserDir, "busy", `{"a":1}`)
-	before := snapshotDir(t, dir)
-	lease, err := acquireProfileLockOnly(t, browserDir, "busy")
-	require.NoError(t, err)
-	_, err = ClaimProfile(browserDir, "busy")
-	var held *profileHeldError
-	assert.True(t, errors.As(err, &held), "%v", err)
-	assert.Equal(t, before, snapshotDir(t, dir))
-	lease()
-
-	if runtime.GOOS != "windows" {
-		elsewhere := t.TempDir()
-		require.NoError(t, os.Symlink(elsewhere, filepath.Join(browserDir, profilesDirName, "linked")))
-		_, err = ClaimProfile(browserDir, "linked")
-		assert.ErrorContains(t, err, "not a directory of its own")
-		assert.False(t, devtoolsgate.ProfileClaimed(elsewhere))
-
-		shared := oldProfile(t, browserDir, "shared", `{"a":1}`)
-		require.NoError(t, os.Chmod(shared, 0o777))
-		before := snapshotDir(t, shared)
-		_, err = ClaimProfile(browserDir, "shared")
-		assert.ErrorContains(t, err, "others may write")
-		assert.Equal(t, before, snapshotDir(t, shared), "a refused claim leaves no copy and no record")
+	refuse := func(t *testing.T, name, want string, setup func(dir string)) {
+		t.Helper()
+		dir := oldProfile(t, browserDir, name, `{"a":1}`)
+		setup(dir)
+		before := snapshotDir(t, dir)
+		_, err := ClaimProfile(browserDir, name)
+		assert.ErrorContains(t, err, want)
+		assert.Equal(t, before, snapshotDir(t, dir), "%s: nothing is written", name)
+		assert.False(t, devtoolsgate.ProfileClaimed(dir))
 	}
+	refuse(t, "busy", "in use by a running browser step", func(dir string) {
+		held, err := holdExistingProfile(browserDir, "busy")
+		require.NoError(t, err)
+		t.Cleanup(held.release)
+	})
+	refuse(t, "stale-record", "a claim record is already there", func(dir string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, claimRecordName), []byte(`{}`), 0o600))
+	})
+	refuse(t, "odd-mark", "not a regular file", func(dir string) {
+		require.NoError(t, os.Mkdir(filepath.Join(dir, ".dagu-devtools-gate-profile"), 0o700))
+	})
+	if runtime.GOOS == "windows" {
+		return
+	}
+	refuse(t, "shared", "others may write", func(dir string) {
+		require.NoError(t, os.Chmod(dir, 0o777))
+	})
+	elsewhere := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(elsewhere, "Preferences"), []byte(`{"theirs":1}`), 0o600))
+	refuse(t, "linked-prefs", "not a regular file", func(dir string) {
+		require.NoError(t, os.Remove(filepath.Join(dir, "Default", "Preferences")))
+		require.NoError(t, os.Symlink(filepath.Join(elsewhere, "Preferences"), filepath.Join(dir, "Default", "Preferences")))
+	})
+	refuse(t, "linked-default", "not a directory", func(dir string) {
+		require.NoError(t, os.RemoveAll(filepath.Join(dir, "Default")))
+		require.NoError(t, os.Symlink(elsewhere, filepath.Join(dir, "Default")))
+	})
+	host, err := os.Hostname()
+	require.NoError(t, err)
+	refuse(t, "running", "open in a running browser", func(dir string) {
+		require.NoError(t, os.Symlink(fmt.Sprintf("%s-%d", host, os.Getpid()), filepath.Join(dir, "SingletonLock")))
+	})
+	assert.Equal(t, map[string]any{"theirs": float64(1)}, readJSON(t, filepath.Join(elsewhere, "Preferences")), "a link's target is never written")
+
+	linkedTarget := t.TempDir()
+	require.NoError(t, os.Symlink(linkedTarget, filepath.Join(browserDir, profilesDirName, "linked")))
+	before := snapshotDir(t, linkedTarget)
+	_, err = ClaimProfile(browserDir, "linked")
+	assert.ErrorContains(t, err, "not a directory of its own")
+	assert.Equal(t, before, snapshotDir(t, linkedTarget))
 }
 
-// acquireProfileLockOnly holds the named profile's lease as a running step
-// would, without creating or checking the profile, and returns its release.
-func acquireProfileLockOnly(t *testing.T, browserDir, name string) (func(), error) {
-	t.Helper()
-	dir, unlock, err := holdExistingProfile(browserDir, name)
-	if err != nil {
-		return nil, err
-	}
-	_ = dir
-	return unlock, nil
+// A claim whose mark fails removes what it wrote, having changed no
+// preference; what it cannot remove it keeps, and names.
+func TestClaimProfileThatFailsLeavesItsEvidence(t *testing.T) {
+	t.Parallel()
+	failMark := defaultClaimOps
+	failMark.mark = func(*os.Root) error { return errors.New("the mark failed") }
+
+	browserDir := t.TempDir()
+	original := `{"incognito":{"mode_availability":0}}`
+	dir := oldProfile(t, browserDir, "undone", original)
+	before := snapshotDir(t, dir)
+	_, err := claimProfileWith(browserDir, "undone", failMark)
+	assert.ErrorContains(t, err, "the mark failed")
+	// The snapshot sees writes that were undone: the refusals above write
+	// nothing, where this claim wrote and removed.
+	assert.NotEqual(t, before, snapshotDir(t, dir), "a write removed again still shows")
+	entries, err := os.ReadDir(filepath.Join(dir, "Default"))
+	require.NoError(t, err)
+	assert.Len(t, entries, 2, "only Preferences and Cookies are left")
+	_, err = os.Lstat(filepath.Join(dir, claimRecordName))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	raw, err := os.ReadFile(filepath.Join(dir, "Default", "Preferences"))
+	require.NoError(t, err)
+	assert.Equal(t, original, string(raw), "no preference changed")
+
+	failBoth := failMark
+	failBoth.remove = func(*os.Root, string) error { return errors.New("the removal failed") }
+	dir = oldProfile(t, browserDir, "kept", original)
+	_, err = claimProfileWith(browserDir, "kept", failBoth)
+	assert.ErrorContains(t, err, "the mark failed")
+	assert.ErrorContains(t, err, "could not be removed and are kept")
+	assert.ErrorContains(t, err, claimRecordName)
+	_, err = os.Lstat(filepath.Join(dir, claimRecordName))
+	assert.NoError(t, err, "the record it could not remove is kept")
+	raw, err = os.ReadFile(filepath.Join(dir, "Default", "Preferences"))
+	require.NoError(t, err)
+	assert.Equal(t, original, string(raw))
+	assert.False(t, devtoolsgate.ProfileClaimed(dir))
+}
+
+// An undo that put the preference back but could not remove the mark keeps
+// the record and the copy, and says so.
+func TestUnclaimProfileThatFailsKeepsTheRecord(t *testing.T) {
+	t.Parallel()
+	browserDir := t.TempDir()
+	dir := oldProfile(t, browserDir, "half", `{"incognito":{"mode_availability":0}}`)
+	report, err := ClaimProfile(browserDir, "half")
+	require.NoError(t, err)
+	prefs := filepath.Join(dir, "Default", "Preferences")
+	require.NoError(t, os.WriteFile(prefs, []byte(`{"incognito":{"mode_availability":1}}`), 0o600))
+
+	failRelease := defaultClaimOps
+	failRelease.release = func(*os.Root) error { return errors.New("the release failed") }
+	_, err = unclaimProfileWith(browserDir, "half", failRelease)
+	assert.ErrorContains(t, err, "the claim record and the copy of its preferences are kept")
+	assert.Equal(t, map[string]any{"mode_availability": float64(0)}, readJSON(t, prefs)["incognito"])
+	assert.True(t, devtoolsgate.ProfileClaimed(dir))
+	_, err = os.Lstat(filepath.Join(dir, claimRecordName))
+	assert.NoError(t, err)
+	_, err = os.Lstat(report.Backup)
+	assert.NoError(t, err)
+
+	// The undo can be run again, and completes.
+	_, err = UnclaimProfile(browserDir, "half")
+	require.NoError(t, err)
+	assert.False(t, devtoolsgate.ProfileClaimed(dir))
 }

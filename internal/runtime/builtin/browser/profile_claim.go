@@ -8,8 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
@@ -18,24 +22,40 @@ import (
 
 // A named profile made before Dagu marked the profiles its browsers may
 // change is refused by a step (profileUnclaimedError) and left as it is. A
-// person who wants Dagu's browsers to use it claims it explicitly:
-// ClaimProfile checks the profile is the one meant and that nothing holds
-// it, keeps a copy of its preferences and the one value Dagu's browsers
-// change there, and marks it. UnclaimProfile undoes that: it removes the
-// mark and puts the value back as it was, keeping every preference the
-// browser wrote since.
+// person who wants Dagu's browsers to use it claims it explicitly, and can
+// undo that.
+//
+//   - Everything is checked before anything is written: the name, that the
+//     profile is <browserDir>/profiles/<name> itself and no link, that it is
+//     this user's alone, that no step, session or browser holds it (under
+//     its lease), and that each file the claim reads or writes is a regular
+//     file or absent. A refused claim writes nothing in the profile.
+//   - The profile is opened once (an *os.Root) and every later step works on
+//     that open directory: a directory swapped in after the checks cannot
+//     receive the writes, and no step follows a symbolic link.
+//   - A claim writes only new files, created exclusively with mode 0600: a
+//     copy of the preferences, a record of the one value Dagu's browsers
+//     change, and the gate's mark. It changes no preference itself.
+//   - Its undo puts that value back, keeping every preference the browser
+//     wrote since, then removes the mark and the record. The copy stays.
+//   - Evidence is never lost: a claim that fails after writing removes what
+//     it wrote only while no preference has changed, and keeps whatever it
+//     cannot remove, naming it. An undo that changed the preferences but
+//     could not remove the mark keeps the record and the copy.
 
 const (
 	// claimRecordName holds, inside a claimed profile, what the claim
-	// found: whether the profile had preferences and the value of the one
-	// preference Dagu's browsers change.
+	// found: whether the profile had preferences, the value of the one
+	// preference Dagu's browsers change, and the copy it kept.
 	claimRecordName = ".dagu-profile-claim.json"
-	// claimBackupSuffix names the copy of the profile's preferences a claim
-	// keeps, beside them.
-	claimBackupSuffix = ".dagu-before-claim"
+	// claimBackupPrefix names the copies of the profile's preferences a
+	// claim keeps, beside them, with the claim's time after it.
+	claimBackupPrefix = "Preferences.dagu-before-claim-"
 	// claimedProfile is the profile within the directory Dagu's browsers
 	// use, and so the one whose preferences they change.
 	claimedProfile = "Default"
+	// claimPreferences is the preferences file within the directory.
+	claimPreferences = claimedProfile + "/Preferences"
 )
 
 // ProfileClaimReport says what a claim, or its undoing, did.
@@ -60,171 +80,365 @@ type ProfileClaimReport struct {
 type claimRecord struct {
 	HadPreferences bool            `json:"hadPreferences"`
 	PreviousValue  json.RawMessage `json:"previousIncognitoModeAvailability"`
+	Backup         string          `json:"backup,omitempty"`
 }
 
 const claimChange = `Dagu's browsers set incognito.mode_availability = 1 in Default/Preferences each time they start, so the browser opens no window off the record; nothing else in the profile is changed`
 
+// claimOps are the steps a claim takes that a test makes fail.
+type claimOps struct {
+	mark    func(root *os.Root) error
+	release func(root *os.Root) error
+	remove  func(root *os.Root, name string) error
+	now     func() time.Time
+}
+
+var defaultClaimOps = claimOps{
+	mark:    devtoolsgate.ClaimExistingProfileRoot,
+	release: devtoolsgate.ReleaseProfileClaimRoot,
+	remove:  func(root *os.Root, name string) error { return root.Remove(name) },
+	now:     time.Now,
+}
+
 // ClaimProfile claims the named profile under browserDir for Dagu's
-// browsers. It refuses a profile that does not exist, is not exactly
-// <browserDir>/profiles/<name> on disk, is not this user's alone, or that a
-// step, a session or a browser holds.
+// browsers.
 func ClaimProfile(browserDir, name string) (ProfileClaimReport, error) {
-	report := ProfileClaimReport{Name: name, Change: claimChange, Undo: "dagu browser profile unclaim " + name}
-	dir, unlock, err := holdExistingProfile(browserDir, name)
+	return claimProfileWith(browserDir, name, defaultClaimOps)
+}
+
+// UnclaimProfile undoes ClaimProfile.
+func UnclaimProfile(browserDir, name string) (ProfileClaimReport, error) {
+	return unclaimProfileWith(browserDir, name, defaultClaimOps)
+}
+
+func claimProfileWith(browserDir, name string, ops claimOps) (ProfileClaimReport, error) {
+	report := ProfileClaimReport{Name: name, Change: claimChange, Undo: "dagu browser profile unclaim " + name, PreviousValue: json.RawMessage("null")}
+	held, err := holdExistingProfile(browserDir, name)
 	if err != nil {
 		return report, err
 	}
-	defer unlock()
-	report.Dir = dir
-	prefs := filepath.Join(dir, claimedProfile, "Preferences")
-	if devtoolsgate.ProfileClaimed(dir) {
+	defer held.release()
+	root := held.root
+	report.Dir = held.dir
+	claimed, err := devtoolsgate.ProfileClaimedRoot(root)
+	if err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	if claimed {
 		report.Claimed = true
-		if record, err := readClaimRecord(dir); err == nil {
+		if record, err := readClaimRecord(root); err == nil {
 			report.PreviousValue = record.PreviousValue
-		}
-		if _, err := os.Lstat(prefs + claimBackupSuffix); err == nil {
-			report.Backup = prefs + claimBackupSuffix
+			report.Backup = backupPath(held.dir, record.Backup)
 		}
 		return report, nil
 	}
 
-	record := claimRecord{PreviousValue: json.RawMessage("null")}
-	created := []string{}
-	rollback := func() {
-		for _, path := range created {
-			_ = os.Remove(path)
-		}
-	}
-	switch info, err := os.Lstat(prefs); {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
+	// Every check before the first write.
+	if _, err := regularOrAbsent(root, claimRecordName); err != nil {
 		return report, fmt.Errorf("browser profile %q: %w", name, err)
-	case !info.Mode().IsRegular():
-		return report, fmt.Errorf("browser profile %q: its preferences are not a regular file", name)
-	default:
-		raw, err := os.ReadFile(prefs) //nolint:gosec // the named profile's own preferences, checked above
-		if err != nil {
-			return report, fmt.Errorf("browser profile %q: %w", name, err)
+	} else if err := absent(root, claimRecordName); err != nil {
+		return report, fmt.Errorf("browser profile %q: a claim record is already there (%w); it is evidence of an earlier claim, so look at it before claiming again", name, err)
+	}
+	if err := dirOrAbsent(root, claimedProfile); err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	present, err := regularOrAbsent(root, claimPreferences)
+	if err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	record := claimRecord{PreviousValue: json.RawMessage("null")}
+	var prefs []byte
+	if present {
+		if prefs, err = readNoFollow(root, claimPreferences); err != nil {
+			return report, fmt.Errorf("browser profile %q: read its preferences: %w", name, err)
 		}
-		value, err := incognitoValue(raw)
-		if err != nil {
+		if record.PreviousValue, err = incognitoValue(prefs); err != nil {
 			return report, fmt.Errorf("browser profile %q: its preferences: %w", name, err)
 		}
-		record.HadPreferences, record.PreviousValue = true, value
-		backup := prefs + claimBackupSuffix
-		if err := writeNew(backup, raw); err != nil {
-			return report, fmt.Errorf("browser profile %q: keep a copy of its preferences: %w", name, err)
+		record.HadPreferences = true
+		record.Backup = path.Join(claimedProfile, claimBackupPrefix+ops.now().UTC().Format("20060102T150405.000000000Z"))
+		if err := absent(root, record.Backup); err != nil {
+			return report, fmt.Errorf("browser profile %q: %w", name, err)
 		}
-		created = append(created, backup)
-		report.Backup = backup
 	}
 	encoded, err := json.Marshal(record)
 	if err != nil {
-		rollback()
 		return report, err
 	}
-	recordPath := filepath.Join(dir, claimRecordName)
-	if err := writeNew(recordPath, encoded); err != nil {
-		rollback()
-		return report, fmt.Errorf("browser profile %q: record the claim: %w", name, err)
+
+	// The writes: new files only, then the mark. No preference changes,
+	// so what was written may go again if the mark fails.
+	var written []string
+	undo := func(cause error) error {
+		var kept []string
+		for _, file := range written {
+			if err := ops.remove(root, file); err != nil {
+				kept = append(kept, filepath.Join(held.dir, filepath.FromSlash(file)))
+			}
+		}
+		if len(kept) > 0 {
+			return fmt.Errorf("%w; the claim also left %s, which could not be removed and are kept as they are", cause, strings.Join(kept, ", "))
+		}
+		return cause
 	}
-	created = append(created, recordPath)
-	if err := devtoolsgate.ClaimExistingProfile(dir); err != nil {
-		rollback()
-		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	if present {
+		if err := writeNewFile(root, record.Backup, prefs); err != nil {
+			return report, fmt.Errorf("browser profile %q: keep a copy of its preferences: %w", name, err)
+		}
+		written = append(written, record.Backup)
+	}
+	if err := writeNewFile(root, claimRecordName, encoded); err != nil {
+		return report, undo(fmt.Errorf("browser profile %q: record the claim: %w", name, err))
+	}
+	written = append(written, claimRecordName)
+	if err := ops.mark(root); err != nil {
+		return report, undo(fmt.Errorf("browser profile %q: %w", name, err))
 	}
 	report.Claimed, report.Changed, report.PreviousValue = true, true, record.PreviousValue
+	report.Backup = backupPath(held.dir, record.Backup)
 	return report, nil
 }
 
-// UnclaimProfile undoes ClaimProfile: Dagu's browsers no longer use the
-// named profile, and the preference they change is put back as it was
-// before the claim, every other preference staying as the browser left it.
-// The copy the claim kept stays, and the report names it.
-func UnclaimProfile(browserDir, name string) (ProfileClaimReport, error) {
-	report := ProfileClaimReport{Name: name, Change: claimChange}
-	dir, unlock, err := holdExistingProfile(browserDir, name)
+func unclaimProfileWith(browserDir, name string, ops claimOps) (ProfileClaimReport, error) {
+	report := ProfileClaimReport{Name: name, Change: claimChange, PreviousValue: json.RawMessage("null")}
+	held, err := holdExistingProfile(browserDir, name)
 	if err != nil {
 		return report, err
 	}
-	defer unlock()
-	report.Dir = dir
-	if !devtoolsgate.ProfileClaimed(dir) {
-		return report, nil
-	}
-	prefs := filepath.Join(dir, claimedProfile, "Preferences")
-	if _, err := os.Lstat(prefs + claimBackupSuffix); err == nil {
-		report.Backup = prefs + claimBackupSuffix
-	}
-	record, err := readClaimRecord(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		// A profile Dagu created claimed: it had nothing to put back.
-		record = claimRecord{PreviousValue: json.RawMessage("null")}
-	} else if err != nil {
-		return report, fmt.Errorf("browser profile %q: read its claim: %w", name, err)
-	}
-	if err := restoreIncognitoValue(prefs, record.PreviousValue); err != nil {
-		return report, fmt.Errorf("browser profile %q: put its preference back: %w", name, err)
-	}
-	if err := devtoolsgate.ReleaseProfileClaim(dir); err != nil {
+	defer held.release()
+	root := held.root
+	report.Dir = held.dir
+	claimed, err := devtoolsgate.ProfileClaimedRoot(root)
+	if err != nil {
 		return report, fmt.Errorf("browser profile %q: %w", name, err)
 	}
-	_ = os.Remove(filepath.Join(dir, claimRecordName))
-	report.Changed, report.PreviousValue = true, record.PreviousValue
+	if !claimed {
+		return report, nil
+	}
+
+	// Every check before the first write.
+	recordPresent, err := regularOrAbsent(root, claimRecordName)
+	if err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	record := claimRecord{PreviousValue: json.RawMessage("null")}
+	if recordPresent {
+		if record, err = readClaimRecord(root); err != nil {
+			return report, fmt.Errorf("browser profile %q: read its claim: %w", name, err)
+		}
+	}
+	report.PreviousValue, report.Backup = record.PreviousValue, backupPath(held.dir, record.Backup)
+	if err := dirOrAbsent(root, claimedProfile); err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	present, err := regularOrAbsent(root, claimPreferences)
+	if err != nil {
+		return report, fmt.Errorf("browser profile %q: %w", name, err)
+	}
+	var restored []byte
+	if present {
+		prefs, err := readNoFollow(root, claimPreferences)
+		if err != nil {
+			return report, fmt.Errorf("browser profile %q: read its preferences: %w", name, err)
+		}
+		if restored, err = withIncognitoValue(prefs, record.PreviousValue); err != nil {
+			return report, fmt.Errorf("browser profile %q: its preferences: %w", name, err)
+		}
+	}
+
+	// The writes: the preference first, then the mark, then the record.
+	if present {
+		if err := replaceFile(root, claimPreferences, restored); err != nil {
+			return report, fmt.Errorf("browser profile %q: put its preference back: %w", name, err)
+		}
+	}
+	if err := ops.release(root); err != nil {
+		// The preference is back but the mark stays, so the next browser
+		// sets it again; the record and the copy stay with it.
+		return report, fmt.Errorf("browser profile %q: its preference was put back, but its mark could not be removed (%w); the claim record and the copy of its preferences are kept", name, err)
+	}
+	if recordPresent {
+		if err := ops.remove(root, claimRecordName); err != nil {
+			return report, fmt.Errorf("browser profile %q: unclaimed, but its claim record %s could not be removed: %w", name, filepath.Join(held.dir, claimRecordName), err)
+		}
+	}
+	report.Changed = true
 	return report, nil
 }
 
+// heldProfile is a named profile open for a claim, with its lease.
+type heldProfile struct {
+	dir     string
+	root    *os.Root
+	release func()
+}
+
 // holdExistingProfile checks the named profile exists exactly where it is
-// named, takes its lease so no step or session starts on it meanwhile, and
-// refuses it when a step, a session or a browser holds it.
-func holdExistingProfile(browserDir, name string) (string, func(), error) {
+// named and is this user's alone, opens it, takes its lease so no step or
+// session starts on it meanwhile, and refuses it when a step, a session or
+// a browser holds it. Nothing is written in the profile.
+func holdExistingProfile(browserDir, name string) (*heldProfile, error) {
 	if !agentstep.FileNamePattern.MatchString(name) {
-		return "", nil, fmt.Errorf("browser profile %q: not a profile name", name)
+		return nil, fmt.Errorf("browser profile %q: not a profile name", name)
 	}
 	profilesDir := filepath.Join(browserDir, profilesDirName)
 	dir := filepath.Join(profilesDir, name)
 	info, err := os.Lstat(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", nil, fmt.Errorf("no browser profile %q in %s", name, profilesDir)
+		return nil, fmt.Errorf("no browser profile %q in %s", name, profilesDir)
 	}
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", nil, fmt.Errorf("browser profile %q is not a directory of its own: %s", name, dir)
+		return nil, fmt.Errorf("browser profile %q is not a directory of its own: %s", name, dir)
 	}
 	canonicalDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	canonicalProfiles, err := filepath.EvalSymlinks(profilesDir)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if canonicalDir != filepath.Join(canonicalProfiles, name) {
-		return "", nil, fmt.Errorf("browser profile %q resolves to %s, outside %s", name, canonicalDir, canonicalProfiles)
+		return nil, fmt.Errorf("browser profile %q resolves to %s, outside %s", name, canonicalDir, canonicalProfiles)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	// The directory opened is the one checked: the same file, still no link.
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, info) {
+		_ = root.Close()
+		return nil, fmt.Errorf("browser profile %q changed while it was opened", name)
+	}
+	if err := devtoolsgate.CheckProfileRoot(root); err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("browser profile %q: %w", name, err)
 	}
 	lockDir := dir + profileLockSuffix
 	if err := os.MkdirAll(lockDir, profileDirMode); err != nil {
-		return "", nil, fmt.Errorf("lock browser profile %q: %w", name, err)
+		_ = root.Close()
+		return nil, fmt.Errorf("lock browser profile %q: %w", name, err)
 	}
 	lock := dirlock.New(lockDir, nil)
 	if err := lock.TryLock(); err != nil {
+		_ = root.Close()
 		if errors.Is(err, dirlock.ErrLockConflict) {
-			return "", nil, &profileHeldError{message: fmt.Sprintf("browser profile %q is in use by a running browser step", name)}
+			return nil, &profileHeldError{message: fmt.Sprintf("browser profile %q is in use by a running browser step", name)}
 		}
-		return "", nil, fmt.Errorf("lock browser profile %q: %w", name, err)
+		return nil, fmt.Errorf("lock browser profile %q: %w", name, err)
 	}
-	unlock := func() { _ = lock.Unlock() }
+	release := func() {
+		_ = lock.Unlock()
+		_ = root.Close()
+	}
 	if heldErr := profileHolder(browserDir, name, ""); heldErr != nil {
-		unlock()
-		return "", nil, heldErr
+		release()
+		return nil, heldErr
 	}
-	if devtoolsgate.ProfileInUse(dir) {
-		unlock()
-		return "", nil, &profileHeldError{message: fmt.Sprintf("browser profile %q is open in a running browser", name)}
+	if devtoolsgate.ProfileInUseRoot(root) {
+		release()
+		return nil, &profileHeldError{message: fmt.Sprintf("browser profile %q is open in a running browser", name)}
 	}
-	return dir, unlock, nil
+	return &heldProfile{dir: dir, root: root, release: release}, nil
+}
+
+func backupPath(dir, backup string) string {
+	if backup == "" {
+		return ""
+	}
+	return filepath.Join(dir, filepath.FromSlash(backup))
+}
+
+// regularOrAbsent reports whether name is a regular file in root, and
+// refuses anything else that is there: a link, a directory, a device.
+func regularOrAbsent(root *os.Root, name string) (bool, error) {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s is not a regular file", name)
+	}
+	return true, nil
+}
+
+// dirOrAbsent refuses name in root unless it is a directory or absent.
+func dirOrAbsent(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is not a directory", name)
+	}
+	return nil
+}
+
+// absent refuses name in root when anything is there.
+func absent(root *os.Root, name string) error {
+	if _, err := root.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("%s is already there", name)
+		}
+		return err
+	}
+	return nil
+}
+
+// readNoFollow reads the regular file name in root without following a
+// link.
+func readNoFollow(root *os.Root, name string) ([]byte, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|openNoFollow, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", name)
+	}
+	return io.ReadAll(file)
+}
+
+// writeNewFile writes data to a new file name in root, mode 0600, refusing
+// anything already there, a link included.
+func writeNewFile(root *os.Root, name string, data []byte) error {
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(data)
+	if err := errors.Join(writeErr, file.Close()); err != nil {
+		_ = root.Remove(name)
+		return err
+	}
+	return nil
+}
+
+// replaceFile replaces the regular file name in root with data in one
+// rename, mode 0600.
+func replaceFile(root *os.Root, name string, data []byte) error {
+	temp := name + ".dagu-unclaim"
+	if err := writeNewFile(root, temp, data); err != nil {
+		return err
+	}
+	if err := root.Rename(temp, name); err != nil {
+		_ = root.Remove(temp)
+		return err
+	}
+	return nil
 }
 
 // incognitoValue returns incognito.mode_availability in the preferences
@@ -246,34 +460,20 @@ func incognitoValue(raw []byte) (json.RawMessage, error) {
 	return json.RawMessage("null"), nil
 }
 
-// restoreIncognitoValue puts incognito.mode_availability in the
-// preferences at path back to previous, removing it when previous is null,
-// and keeps every other preference as it is.
-func restoreIncognitoValue(path string, previous json.RawMessage) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("the preferences are not a regular file")
-	}
-	raw, err := os.ReadFile(path) //nolint:gosec // the named profile's own preferences, checked above
-	if err != nil {
-		return err
-	}
+// withIncognitoValue returns the preferences raw with
+// incognito.mode_availability set to previous, or removed when previous is
+// null, every other preference kept as it is.
+func withIncognitoValue(raw []byte, previous json.RawMessage) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var prefs map[string]any
 	if err := decoder.Decode(&prefs); err != nil || prefs == nil {
-		return errors.New("the preferences are not a JSON object")
+		return nil, errors.New("not a JSON object")
 	}
 	incognito, _ := prefs["incognito"].(map[string]any)
 	if string(previous) == "null" || len(previous) == 0 {
 		delete(incognito, "mode_availability")
-		if len(incognito) == 0 {
+		if incognito != nil && len(incognito) == 0 {
 			delete(prefs, "incognito")
 		}
 	} else {
@@ -283,50 +483,21 @@ func restoreIncognitoValue(path string, previous json.RawMessage) error {
 		}
 		incognito["mode_availability"] = previous
 	}
-	encoded, err := json.Marshal(prefs)
-	if err != nil {
-		return err
-	}
-	temp, err := os.CreateTemp(filepath.Dir(path), "Preferences.unclaim-*")
-	if err != nil {
-		return err
-	}
-	_, writeErr := temp.Write(encoded)
-	closeErr := temp.Close()
-	if err := errors.Join(writeErr, closeErr, os.Chmod(temp.Name(), 0o600)); err != nil {
-		_ = os.Remove(temp.Name())
-		return err
-	}
-	if err := os.Rename(temp.Name(), path); err != nil {
-		_ = os.Remove(temp.Name())
-		return err
-	}
-	return nil
+	return json.Marshal(prefs)
 }
 
-// readClaimRecord reads what a claim recorded in dir.
-func readClaimRecord(dir string) (claimRecord, error) {
+// readClaimRecord reads what a claim recorded in root.
+func readClaimRecord(root *os.Root) (claimRecord, error) {
 	var record claimRecord
-	raw, err := os.ReadFile(filepath.Join(dir, claimRecordName)) //nolint:gosec // the claimed profile's own record
+	raw, err := readNoFollow(root, claimRecordName)
 	if err != nil {
 		return record, err
 	}
 	if err := json.Unmarshal(raw, &record); err != nil {
 		return record, err
 	}
+	if len(record.PreviousValue) == 0 {
+		record.PreviousValue = json.RawMessage("null")
+	}
 	return record, nil
-}
-
-// writeNew writes data to a new file at path, refusing one that exists.
-func writeNew(path string, data []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // a new file in the checked profile
-	if err != nil {
-		return err
-	}
-	_, writeErr := file.Write(data)
-	if err := errors.Join(writeErr, file.Close()); err != nil {
-		_ = os.Remove(path)
-		return err
-	}
-	return nil
 }

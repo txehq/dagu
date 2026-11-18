@@ -19,11 +19,24 @@ func checkProfileOwner(string, os.FileInfo) error {
 	return nil
 }
 
+// openNoFollow is 0 on Windows, where an os.Root open does not follow a
+// link out of the directory, and Lstat checks come first.
+const openNoFollow = 0
+
 // profileInUse reports whether a running browser holds the profile: Chrome
 // keeps its lockfile open, shared with nobody, while it runs.
 func profileInUse(userDataDir string) bool {
-	path := filepath.Join(userDataDir, "lockfile")
-	file, err := os.OpenFile(path, os.O_RDWR, 0) //nolint:gosec // the profile's own lock file, opened only to see whether it is held
+	file, err := os.OpenFile(filepath.Join(userDataDir, "lockfile"), os.O_RDWR, 0) //nolint:gosec // the profile's own lock file, opened only to see whether it is held
+	return lockFileHeld(file, err)
+}
+
+// profileInUseRoot is profileInUse for the profile directory open as root.
+func profileInUseRoot(root *os.Root) bool {
+	file, err := root.OpenFile("lockfile", os.O_RDWR, 0)
+	return lockFileHeld(file, err)
+}
+
+func lockFileHeld(file *os.File, err error) bool {
 	if errors.Is(err, os.ErrNotExist) {
 		return false
 	}
