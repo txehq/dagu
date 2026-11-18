@@ -1,0 +1,191 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package devtoolsgate
+
+import (
+	"encoding/json"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// The fake browser starts these workers as Chrome starts a service worker,
+// and applies a worker's commands across its sessions in the worst order
+// the browser may (fakeWorker). TXE-6223.
+
+// createWorker has the page targetID start a service worker and returns its
+// id.
+func createWorker(t *testing.T, c *cdpConn, targetID string) string {
+	t.Helper()
+	var created struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(c.mustCall("", "Fake.createWorker", map[string]any{"targetId": targetID}), &created))
+	return created.TargetID
+}
+
+// workerSession waits for c's session on worker, attached under the
+// session under ("" for the root).
+func workerSession(t *testing.T, c *cdpConn, worker, under string) attached {
+	t.Helper()
+	return decodeAttached(t, c.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return m.SessionID == under && decodeAttached(t, m).TargetInfo.TargetID == worker
+	}))
+}
+
+// waitQueued waits until the worker holds at least n commands sent on
+// session.
+func waitQueued(t *testing.T, tg *testGate, c *cdpConn, session string, n int) {
+	t.Helper()
+	eventually(t, 5*time.Second, func() bool { return tg.state(c).Queued[session] >= n }, "the commands reaching the worker")
+}
+
+// pumpUntilRunning lets the worker apply what reached it until it runs, and
+// returns the fake browser's log.
+func pumpUntilRunning(t *testing.T, tg *testGate, c *cdpConn, worker string) []string {
+	t.Helper()
+	var log []string
+	eventually(t, 5*time.Second, func() bool {
+		c.mustCall("", "Fake.pump", nil)
+		log = tg.state(c).Log
+		return slices.Contains(log, "run "+worker)
+	}, "the worker's start")
+	return log
+}
+
+// before reports whether first is in log ahead of then.
+func before(log []string, first, then string) bool {
+	i, j := slices.Index(log, first), slices.Index(log, then)
+	return i >= 0 && j >= 0 && i < j
+}
+
+// A worker two clients wait for runs only once the setup each sent on its
+// own session before resuming it took effect. A resume on any session of
+// the worker lets it run, the other client's or the gate's own, and the
+// browser keeps no order between sessions: on main the worker ran first
+// and the setup came after (the write gate missed the socket the worker's
+// first statement opened).
+func TestMuxWorkerRunsAfterEveryWaitingClientsSetup(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	watcher, other := tg.dial(""), tg.dial("")
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	other.mustCall("", "Target.setAutoAttach", autoAttach(true))
+
+	worker := createWorker(t, other, "T1")
+	watched := workerSession(t, watcher, worker, "")
+	resumed := workerSession(t, other, worker, "")
+	require.True(t, watched.WaitingForDebugger)
+
+	watcher.send(watched.SessionID, "Network.enable", map[string]any{})
+	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	other.send(resumed.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	waitQueued(t, tg, other, watched.SessionID, 2)
+	waitQueued(t, tg, other, resumed.SessionID, 1)
+
+	log := pumpUntilRunning(t, tg, other, worker)
+	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker),
+		"the worker ran before the watcher's setup took effect: %v", log)
+}
+
+// A client auto-attached on the page that starts a worker makes the gate
+// hold the worker's script fetch too, and then no session of the worker is
+// answered until that hold is released. Waiting for an answer before
+// releasing it waited for ever (spec079's TestSessionRehearsesEveryWrite);
+// releasing it with a resume let the worker run before the other client's
+// setup. The gate lets go of its page-level session instead, which releases
+// the fetch and leaves the worker held at the root until every waiting
+// client's setup took effect.
+func TestMuxWorkerHeldBeforeItsScriptFetchStarts(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	pageClient, watcher := tg.dial(""), tg.dial("")
+	pageClient.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	page := decodeAttached(t, pageClient.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.TargetID == "T1"
+	}))
+	pageClient.mustCall(page.SessionID, "Target.setAutoAttach", autoAttach(true))
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+
+	worker := createWorker(t, watcher, "T1")
+	atRoot := workerSession(t, pageClient, worker, "")
+	underPage := workerSession(t, pageClient, worker, page.SessionID)
+	watched := workerSession(t, watcher, worker, "")
+	assert.True(t, underPage.WaitingForDebugger, "the page's client sees the worker held under the page")
+
+	watcher.send(watched.SessionID, "Network.enable", map[string]any{})
+	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	pageClient.send(atRoot.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	pageClient.send(underPage.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	waitQueued(t, tg, watcher, watched.SessionID, 2)
+
+	log := pumpUntilRunning(t, tg, watcher, worker)
+	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker),
+		"the worker ran before the watcher's setup took effect: %v", log)
+	assert.True(t, slices.ContainsFunc(log, func(line string) bool {
+		return strings.HasPrefix(line, "fetch of "+worker+" released by the detach of ")
+	}), "the gate let go of its page-level session: %v", log)
+	assert.False(t, slices.ContainsFunc(log, func(line string) bool {
+		return strings.HasPrefix(line, "fetch of "+worker+" released by the resume on ")
+	}), "no resume released the fetch: %v", log)
+}
+
+// A client that attached itself to a held worker holds nothing, and its
+// resume does not let the worker run before the client the gate holds it
+// for set it up. The resume is answered, as the browser answers one.
+func TestMuxExplicitSessionDoesNotResumeAHeldWorker(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	watcher, other := tg.dial(""), tg.dial("")
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	worker := createWorker(t, other, "T1")
+	watched := workerSession(t, watcher, worker, "")
+
+	var explicit struct {
+		SessionID string `json:"sessionId"`
+	}
+	require.NoError(t, json.Unmarshal(other.mustCall("", "Target.attachToTarget", map[string]any{"targetId": worker, "flatten": true}), &explicit))
+	other.mustCall(explicit.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+	other.mustCall("", "Fake.pump", nil)
+	state := tg.state(other)
+	assert.NotContains(t, state.Log, "run "+worker, "the explicit session's resume ran the worker")
+	assert.Contains(t, state.Paused, worker)
+
+	watcher.send(watched.SessionID, "Network.enable", map[string]any{})
+	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	log := pumpUntilRunning(t, tg, other, worker)
+	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker), "%v", log)
+}
+
+// A waiting client that goes away after resuming a worker, before the
+// browser answered the barrier behind its resume, leaves nothing to wait
+// for: its session and the setup on it are gone, and the barrier is never
+// answered.
+func TestMuxWorkerReleasedWhenAResumingClientLeaves(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	watcher, leaver := tg.dial(""), tg.dial("")
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	leaver.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	worker := createWorker(t, watcher, "T1")
+	watched := workerSession(t, watcher, worker, "")
+	leaving := workerSession(t, leaver, worker, "")
+
+	leaver.send(leaving.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	waitQueued(t, tg, watcher, leaving.SessionID, 1)
+	leaver.close()
+	eventually(t, 5*time.Second, func() bool {
+		_, queued := tg.state(watcher).Queued[leaving.SessionID]
+		return !queued
+	}, "the leaving client's session detached")
+
+	watcher.send(watched.SessionID, "Network.enable", map[string]any{})
+	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	log := pumpUntilRunning(t, tg, watcher, worker)
+	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker), "%v", log)
+}

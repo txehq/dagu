@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 )
 
@@ -34,10 +35,47 @@ import (
 //     before any target can run, for what must be in place for every
 //     request of every target, such as the proxy's credential
 //     (proxyauth.go). Its events reach no client, and no client can
-//     address it.
+//     address it;
+//   - a service or shared worker runs only after the setup every waiting
+//     client sent on its session before resuming it took effect. See
+//     "Worker holds" below.
 //
 // Commands the gate sends for itself run on the gate's own sessions, never on
-// a client's.
+// a client's, except the barrier a worker hold sends on a waiting client's
+// session, whose reply the gate keeps.
+//
+// # Worker holds
+//
+// The browser applies one session's commands in order, and keeps no order
+// between two sessions. A client sets a worker up on its private session
+// (the write gate enables Network there, to see the sockets the worker's
+// first statement opens) and then resumes it; the resume that lets the
+// worker run comes from another session. Measured with Chrome (TXE-6223):
+//
+//   - a resume on any session of a held worker, a client's private one
+//     included, lets it run, and so does the gate's resume on its own
+//     session: either can reach the worker before another session's setup;
+//   - the gate holds a worker started by a page twice when a client asked
+//     for auto-attach on that page: at the root, a hold in the worker that
+//     answers commands once its script is loaded, and under the page, a
+//     hold on the fetch of its script, during which no session of the
+//     worker is answered. Only the page-level session's resume or detach
+//     releases the fetch; its resume also lets the worker run, its detach
+//     does not, and the root hold then keeps the worker waiting.
+//
+// So for a service or shared worker (rootWorker) the gate never forwards a
+// resume while it holds the worker. A waiting client's resume is answered
+// once a barrier the gate sends behind it on the client's own session is
+// answered: that reply proves the client's earlier commands there were
+// applied. The page-level hold is let go by detaching the gate's
+// page-level session once its waiting clients resumed, and the gate resumes
+// the root hold, on its own session, only once every waiting client's
+// barrier was answered. No step waits for a time to pass.
+//
+// One case stays as over a port: a client that asked for auto-attach on a
+// session it attached itself has the browser hold that session's children
+// for it, and its resume there is the browser's to release; the gate
+// forwards it as it is.
 
 // outQueue is how many messages may wait for the pipe before a writer blocks.
 // The queue to the browser is unbounded: a client's command is never held
@@ -85,9 +123,12 @@ type target struct {
 	id   string
 	typ  string
 	info json.RawMessage
-	// parent is the target this one was attached under, "" at the root.
-	parent string
-	// gateSession is the gate's own session on the target.
+	// parent is the target this one was attached under, "" at the root, and
+	// parentSession the gate session it was attached under.
+	parent        string
+	parentSession string
+	// gateSession is the gate's own session on the target, "" once the gate
+	// let go of it to release a worker's page-level hold (released).
 	gateSession string
 	// paused is set while Chrome holds the target for the gate's
 	// waitForDebuggerOnStart.
@@ -106,7 +147,25 @@ type target struct {
 	// so a replay racing a live attach makes one session, not two.
 	private          map[*client]string
 	privateAttaching map[*client]struct{}
+	// settling holds, for a worker (rootWorker), the waiting clients that
+	// resumed it and whose barrier the browser has not answered yet.
+	settling map[*client]struct{}
+	// released is set once the gate detached its page-level session of a
+	// worker to let go of the hold on the worker's script fetch.
+	released bool
 }
+
+// rootWorker reports whether a target of type typ is a worker the browser
+// attaches at the root as well as under the page that started it, whose
+// holds the gate releases as "Worker holds" describes.
+func rootWorker(typ string) bool {
+	return typ == "service_worker" || typ == "shared_worker"
+}
+
+// workerBarrier is the command the gate sends on a waiting client's session
+// behind the client's resume of a worker. It changes nothing; the browser
+// answers it only after the client's earlier commands on that session.
+const workerBarrier = "Runtime.getIsolateId"
 
 // attachRequest is a Target.attachToTarget the gate issued and whose reply
 // is still to come: a private session for a client, or a client's explicit
@@ -131,13 +190,20 @@ type mux struct {
 	clients map[*client]struct{}
 
 	// targets the gate's auto-attach holds, by target id and by the gate's
-	// session id.
+	// session id. A target the browser attached the gate to more than once,
+	// at the root and under a page, has a record per attach in byID;
+	// targets holds the one its children are attached under, the root
+	// record for a worker.
 	targets      map[string]*target
+	byID         map[string][]*target
 	gateSessions map[string]*target
 	// privateSessions maps a client's private session id to its target.
 	privateSessions map[string]*target
-	// explicitSessions maps a session a client attached itself to the client.
+	// explicitSessions maps a session a client attached itself to the client,
+	// and explicitTargets such a session made by Target.attachToTarget to
+	// its target.
 	explicitSessions map[string]*client
+	explicitTargets  map[string]string
 	// attaching holds, per target, the attaches in flight in request order;
 	// stashed holds Target.attachedToTarget events that arrived for those
 	// attaches before the replies that name their requesters.
@@ -186,9 +252,11 @@ func newMux(p *pipe) *mux {
 		pending:          make(map[uint64]*pendingCommand),
 		clients:          make(map[*client]struct{}),
 		targets:          make(map[string]*target),
+		byID:             make(map[string][]*target),
 		gateSessions:     make(map[string]*target),
 		privateSessions:  make(map[string]*target),
 		explicitSessions: make(map[string]*client),
+		explicitTargets:  make(map[string]string),
 		attaching:        make(map[string][]*attachRequest),
 		stashed:          make(map[string][]message),
 		discoverers:      make(map[*client]targetFilter),
@@ -513,13 +581,20 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		typ:              info.Type,
 		info:             rawInfo,
 		parent:           parent,
+		parentSession:    parentSession,
 		gateSession:      session,
 		paused:           waiting,
 		waiting:          make(map[*client]struct{}),
 		private:          make(map[*client]string),
 		privateAttaching: make(map[*client]struct{}),
+		settling:         make(map[*client]struct{}),
 	}
-	m.targets[t.id] = t
+	// A worker's children are attached under its root record; a page-level
+	// record of it never takes the root's place.
+	if current, known := m.targets[t.id]; !known || !rootWorker(t.typ) || (parent == "" && current.parent != "") {
+		m.targets[t.id] = t
+	}
+	m.byID[t.id] = append(m.byID[t.id], t)
 	m.gateSessions[session] = t
 	for c := range m.clients {
 		sub, ok := c.autoAttach[parent]
@@ -557,7 +632,7 @@ func (m *mux) attachPrivateLocked(c *client, t *target, wait bool) {
 			// detached; a session nobody wants is let go of again.
 			sub, wanted := c.autoAttach[t.parent]
 			parent, parentKnown := m.targets[t.parent]
-			stillThere := m.targets[t.id] == t && (t.parent == "" || parentKnown)
+			stillThere := m.liveLocked(t) && (t.parent == "" || parentKnown)
 			if cdpErr != nil || session == "" || !m.clientAlive(c) || !wanted || !sub.filter.matches(t.typ) || !stillThere {
 				if session != "" {
 					m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
@@ -644,13 +719,93 @@ func (m *mux) dropStashedLocked(targetID, session string) message {
 }
 
 // maybeResumeLocked lets a held target run once every client that asked to
-// wait for it has resumed it and no private attach is in flight.
+// wait for it has resumed it and no private attach is in flight. A worker's
+// holds are released together (releaseWorkerLocked).
 func (m *mux) maybeResumeLocked(t *target) {
+	if rootWorker(t.typ) {
+		m.releaseWorkerLocked(t.id)
+		return
+	}
 	if !t.paused || len(t.waiting) > 0 || t.attaching > 0 {
 		return
 	}
 	t.paused = false
 	m.gateCommand(t.gateSession, "Runtime.runIfWaitingForDebugger", map[string]any{}, nil)
+}
+
+// liveLocked reports whether t is still a record the gate keeps.
+func (m *mux) liveLocked(t *target) bool {
+	return slices.Contains(m.byID[t.id], t)
+}
+
+// allTargetsLocked returns every target record, a worker's page-level ones
+// included.
+func (m *mux) allTargetsLocked() []*target {
+	var all []*target
+	for _, records := range m.byID {
+		all = append(all, records...)
+	}
+	return all
+}
+
+// workerHeldLocked reports whether the gate holds the worker targetID: one
+// of its records is still paused.
+func (m *mux) workerHeldLocked(targetID string) bool {
+	for _, r := range m.byID[targetID] {
+		if rootWorker(r.typ) && r.paused {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseWorkerLocked releases what it can of the holds on the worker
+// targetID ("Worker holds"). A page-level hold, on the worker's script
+// fetch, is let go by detaching the gate's session once that record's
+// waiting clients resumed and its private attaches are done, and only once
+// the root hold exists to keep the worker from running. The root hold is
+// resumed once no record has a client still waiting, an attach in flight
+// or a barrier unanswered. Until the browser attached the gate to the
+// worker at the root, nothing is released: the page-level resume would let
+// the worker run.
+func (m *mux) releaseWorkerLocked(targetID string) {
+	records := m.byID[targetID]
+	var root *target
+	settled := true
+	for _, r := range records {
+		if r.parent == "" {
+			root = r
+		}
+		if len(r.waiting) > 0 || r.attaching > 0 || len(r.settling) > 0 {
+			settled = false
+		}
+	}
+	if root == nil {
+		return
+	}
+	for _, r := range records {
+		if r == root || !r.paused || r.released || r.gateSession == "" || len(r.waiting) > 0 || r.attaching > 0 {
+			continue
+		}
+		r.released = true
+		m.gateCommand(r.parentSession, "Target.detachFromTarget", map[string]any{"sessionId": r.gateSession}, nil)
+	}
+	if root.paused && !settled {
+		return
+	}
+	for _, r := range records {
+		if r != root && r.released {
+			r.paused = false
+		}
+	}
+	if !root.paused {
+		return
+	}
+	root.paused = false
+	for _, r := range records {
+		r.paused = false
+	}
+	m.gateCommand(root.gateSession, "Runtime.runIfWaitingForDebugger", map[string]any{}, nil)
 }
 
 // onDetachedLocked handles a Target.detachedFromTarget event for a gate
@@ -672,6 +827,14 @@ func (m *mux) onDetachedLocked(msg message) {
 		return
 	}
 	if t, ok := m.gateSessions[params.SessionID]; ok {
+		if t.released {
+			// The gate let go of this session itself, to release the
+			// worker's page-level hold; the record stays for the clients
+			// that see the worker under that page.
+			delete(m.gateSessions, params.SessionID)
+			t.gateSession = ""
+			return
+		}
 		m.forgetTargetLocked(t)
 		return
 	}
@@ -685,6 +848,7 @@ func (m *mux) onDetachedLocked(msg message) {
 	}
 	if c, ok := m.explicitSessions[params.SessionID]; ok {
 		delete(m.explicitSessions, params.SessionID)
+		delete(m.explicitTargets, params.SessionID)
 		c.deliverEvent(msg.SessionID, "Target.detachedFromTarget", map[string]any{"sessionId": params.SessionID, "targetId": params.TargetID})
 	}
 }
@@ -692,20 +856,68 @@ func (m *mux) onDetachedLocked(msg message) {
 // forgetTargetLocked drops a target the browser detached the gate from,
 // telling every client holding a private session on it.
 func (m *mux) forgetTargetLocked(t *target) {
-	for c := range t.private {
-		m.forgetPrivateLocked(c, t, true)
+	if !m.liveLocked(t) {
+		return
 	}
+	// The waits go first: a client that waited on a target that is gone is
+	// no reason to keep the worker's other records held, and the worker's
+	// release is weighed once, below.
 	for c := range t.waiting {
 		delete(t.waiting, c)
 	}
-	// A subscription to the children of a target that is gone has nothing
-	// left to attach; the children's own detach events follow from the
-	// browser.
-	for c := range m.clients {
-		delete(c.autoAttach, t.id)
+	for c := range t.settling {
+		delete(t.settling, c)
 	}
-	delete(m.gateSessions, t.gateSession)
-	delete(m.targets, t.id)
+	for c := range t.private {
+		m.forgetPrivateLocked(c, t, true)
+	}
+	if t.gateSession != "" {
+		delete(m.gateSessions, t.gateSession)
+	}
+	records := m.byID[t.id][:0]
+	for _, r := range m.byID[t.id] {
+		if r != t {
+			records = append(records, r)
+		}
+	}
+	if len(records) == 0 {
+		delete(m.byID, t.id)
+	} else {
+		m.byID[t.id] = records
+	}
+	if m.targets[t.id] == t {
+		delete(m.targets, t.id)
+		for _, r := range records {
+			if _, kept := m.targets[t.id]; !kept || r.parent == "" {
+				m.targets[t.id] = r
+			}
+		}
+	}
+	if len(records) == 0 {
+		// A subscription to the children of a target that is gone has
+		// nothing left to attach; the children's own detach events follow
+		// from the browser.
+		for c := range m.clients {
+			delete(c.autoAttach, t.id)
+		}
+	}
+	// A worker record the gate let go of the session of hears of its end
+	// from nobody: it ends with the worker's root record, which the browser
+	// detaches when the worker ends, and with the page it was seen under,
+	// whose own end detaches its children's sessions over a port. The
+	// clients' sessions on the worker then go too.
+	for _, r := range m.allTargetsLocked() {
+		if r.released && ((len(records) == 0 && r.parent == t.id) || (rootWorker(t.typ) && t.parent == "" && r.id == t.id)) {
+			for c, session := range r.private {
+				m.forgetPrivateLocked(c, r, true)
+				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+			}
+			m.forgetTargetLocked(r)
+		}
+	}
+	if rootWorker(t.typ) {
+		m.releaseWorkerLocked(t.id)
+	}
 }
 
 // forgetPrivateLocked drops c's private session on t, telling c when
@@ -717,6 +929,12 @@ func (m *mux) forgetPrivateLocked(c *client, t *target, notify bool) {
 	}
 	delete(t.private, c)
 	delete(m.privateSessions, session)
+	if _, settling := t.settling[c]; settling {
+		// The session the barrier went to is gone, and the setup on it with
+		// it: nothing of this client is left to wait for.
+		delete(t.settling, c)
+		m.releaseWorkerLocked(t.id)
+	}
 	if notify {
 		outer := ""
 		if parent, ok := m.targets[t.parent]; ok {
@@ -868,7 +1086,7 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 	sub := autoAttachSub{wait: params.WaitForDebuggerOnStart, filter: parseTargetFilter(msg.Params)}
 	c.autoAttach[scope] = sub
 	replay := func() {
-		for _, t := range m.targets {
+		for _, t := range m.allTargetsLocked() {
 			if t.parent == scope && sub.filter.matches(t.typ) {
 				m.attachPrivateLocked(c, t, sub.wait)
 			}
@@ -901,7 +1119,7 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 // the private sessions it brought, as the browser does over a port.
 func (m *mux) unsubscribeAutoAttachLocked(c *client, scope string) {
 	delete(c.autoAttach, scope)
-	for _, t := range m.targets {
+	for _, t := range m.allTargetsLocked() {
 		if t.parent == scope {
 			m.dropPrivateLocked(c, t)
 		}
@@ -999,6 +1217,7 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 				return
 			}
 			m.explicitSessions[session] = c
+			m.explicitTargets[session] = params.TargetID
 			if event.Method != "" {
 				c.deliverEvent(sessionID, event.Method, event.Params)
 			}
@@ -1016,6 +1235,7 @@ func (m *mux) detachFromTargetLocked(c *client, msg message, sessionID string) {
 	}
 	if owner, ok := m.explicitSessions[params.SessionID]; ok && owner == c {
 		delete(m.explicitSessions, params.SessionID)
+		delete(m.explicitTargets, params.SessionID)
 		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, func(_ json.RawMessage, cdpErr *cdpError) {
 			if cdpErr != nil {
 				c.deliverError(msg.ID, sessionID, cdpErr.Message)
@@ -1034,17 +1254,56 @@ func (m *mux) detachFromTargetLocked(c *client, msg message, sessionID string) {
 }
 
 // runIfWaitingLocked passes a client's Runtime.runIfWaitingForDebugger on to
-// its private session and counts it toward resuming the held target.
+// its private session and counts it toward resuming the held target. A
+// worker the gate holds is not resumed by the client's session at all
+// (resumeWorkerLocked).
 func (m *mux) runIfWaitingLocked(c *client, msg message, sessionID string) {
+	t, private := m.privateSessions[sessionID]
+	private = private && t.private[c] == sessionID
+	if private && rootWorker(t.typ) && m.workerHeldLocked(t.id) {
+		m.resumeWorkerLocked(c, t, msg, sessionID)
+		return
+	}
+	if targetID, explicit := m.explicitTargets[sessionID]; explicit && m.workerHeldLocked(targetID) {
+		// A session the client attached itself holds nothing for the gate
+		// to wait for, and its resume would let the worker run before the
+		// clients it is held for set it up.
+		c.deliverResult(msg.ID, sessionID, map[string]any{})
+		return
+	}
 	m.forwardLocked(c, msg, sessionID)
-	t, ok := m.privateSessions[sessionID]
-	if !ok || t.private[c] != sessionID {
+	if !private {
 		return
 	}
 	if _, waiting := t.waiting[c]; waiting {
 		delete(t.waiting, c)
 		m.maybeResumeLocked(t)
 	}
+}
+
+// resumeWorkerLocked takes a client's resume of a worker the gate holds. The
+// browser does not see it: a resume on any session would let the worker
+// run. A client the gate waits for has the barrier sent behind its earlier
+// commands on its session; its resume is answered, and counts toward the
+// worker's release, once the browser answered the barrier, which proves
+// those commands were applied. Any other resume is answered at once.
+func (m *mux) resumeWorkerLocked(c *client, t *target, msg message, sessionID string) {
+	if _, waiting := t.waiting[c]; !waiting {
+		c.deliverResult(msg.ID, sessionID, map[string]any{})
+		return
+	}
+	delete(t.waiting, c)
+	t.settling[c] = struct{}{}
+	m.gateCommand(sessionID, workerBarrier, map[string]any{}, func(json.RawMessage, *cdpError) {
+		// An error answers in order too: it is as much proof.
+		if _, still := t.settling[c]; !still {
+			return
+		}
+		delete(t.settling, c)
+		c.deliverResult(msg.ID, sessionID, map[string]any{})
+		m.releaseWorkerLocked(t.id)
+	})
+	m.releaseWorkerLocked(t.id)
 }
 
 // ---- client lifecycle ----
@@ -1083,10 +1342,11 @@ func (m *mux) removeClient(c *client) {
 	for session, owner := range m.explicitSessions {
 		if owner == c {
 			delete(m.explicitSessions, session)
+			delete(m.explicitTargets, session)
 			m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
 		}
 	}
-	for _, t := range m.targets {
+	for _, t := range m.allTargetsLocked() {
 		m.dropPrivateLocked(c, t)
 	}
 	if c.root != "" {
@@ -1114,5 +1374,6 @@ func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error 
 	}
 	c.root = session
 	m.explicitSessions[session] = c
+	m.explicitTargets[session] = targetID
 	return nil
 }
