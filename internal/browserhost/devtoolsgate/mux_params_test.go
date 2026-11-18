@@ -15,115 +15,113 @@ import (
 )
 
 // auditedTargetParams is the audit of every Target command the gate passes
-// on (TXE-7856): each param the DevTools protocol defines for it, and
-// whether the gate passes it. A param that changes the browser's
-// networking, proxying or isolation is refused. A method added to
-// forwardedTargetMethods without a row here, or a policy that differs from
-// its row, fails TestMuxForwardedTargetMethodsHaveAuditedParamPolicies.
-var auditedTargetParams = map[string]struct {
-	passed, refused []string
-}{
-	"Target.activateTarget": {passed: []string{"targetId"}},
-	"Target.closeTarget":    {passed: []string{"targetId"}},
-	"Target.createBrowserContext": {
-		passed:  []string{"disposeOnDetach"},
-		refused: []string{"proxyServer", "proxyBypassList", "originsWithUniversalNetworkAccess"},
-	},
-	"Target.createTarget": {passed: []string{
+// on (TXE-7856): the params the DevTools protocol defines for it, all of
+// which the gate passes, since none changes the browser's networking,
+// proxying or isolation. A method added to forwardedTargetMethods without a
+// row here, or a policy that differs from its row, fails
+// TestMuxForwardedTargetMethodsHaveAuditedParamPolicies.
+var auditedTargetParams = map[string][]string{
+	"Target.activateTarget": {"targetId"},
+	"Target.closeTarget":    {"targetId"},
+	"Target.createTarget": {
 		"url", "left", "top", "width", "height", "windowState", "browserContextId",
 		"enableBeginFrameControl", "newWindow", "background", "forTab", "hidden", "focus",
-	}},
-	"Target.disposeBrowserContext": {passed: []string{"browserContextId"}},
-	"Target.getBrowserContexts":    {},
-	"Target.getTargetInfo":         {passed: []string{"targetId"}},
-	"Target.getTargets":            {passed: []string{"filter"}},
+	},
+	"Target.getBrowserContexts": nil,
+	"Target.getTargetInfo":      {"targetId"},
+	"Target.getTargets":         {"filter"},
 }
 
+// refusedTargetMethods are the Target commands the audit refused whole: a
+// new browser context is set apart from the browser's own, whatever its
+// params, and disposing of one has nothing left to act on.
+var refusedTargetMethods = []string{"Target.createBrowserContext", "Target.disposeBrowserContext"}
+
 // An allowlist entry is a method and its param policy. Every forwarded
-// method has a policy that matches its audit row, passes none of the params
-// the audit refuses, and refuses a param it does not name, so a param the
-// browser adds later is refused until someone reads it.
+// method has a policy that matches its audit row and refuses a param it does
+// not name, so a param the browser adds later is refused until someone reads
+// it; the methods the audit refused are not forwarded.
 func TestMuxForwardedTargetMethodsHaveAuditedParamPolicies(t *testing.T) {
 	t.Parallel()
 	assert.ElementsMatch(t, slices.Collect(maps.Keys(auditedTargetParams)), slices.Collect(maps.Keys(forwardedTargetMethods)),
 		"every forwarded Target method needs an audit row in auditedTargetParams, and every row a policy")
 	for method, policy := range forwardedTargetMethods {
-		audit := auditedTargetParams[method]
-		assert.ElementsMatch(t, audit.passed, policy.passed, "%s passes exactly its audited params", method)
-		for _, name := range audit.refused {
-			assert.NotContains(t, policy.passed, name, "%s refuses %s", method, name)
-			_, err := policy.check(method, json.RawMessage(`{"`+name+`":"x"}`))
-			assert.ErrorContains(t, err, "the gate does not pass on "+method+` with the param "`+name+`"`)
-		}
+		assert.ElementsMatch(t, auditedTargetParams[method], policy.passed, "%s passes exactly its audited params", method)
 		_, err := policy.check(method, json.RawMessage(`{"someFutureParam":true}`))
 		assert.ErrorContains(t, err, "the gate does not pass on "+method+` with the param "someFutureParam"`)
 	}
-	for _, name := range []string{"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"} {
-		assert.Contains(t, clientAutoAttachParams.passed, name)
+	for _, method := range refusedTargetMethods {
+		assert.NotContains(t, forwardedTargetMethods, method)
 	}
-	assert.Len(t, clientAutoAttachParams.passed, 4)
+	assert.ElementsMatch(t, []string{"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"}, clientAutoAttachParams.passed)
 }
 
-// A context that would not use the browser's networking is refused, and the
-// browser never sees the command: a proxy of its own, a list of hosts that
-// skip the proxy, or origins freed of cross-origin isolation, under any
-// spelling the browser would read as one of them, and whatever the value.
-func TestMuxRefusesCreateBrowserContextParamsThatChangeNetworking(t *testing.T) {
+// No client creates a browser context, whatever it asks of it, and the
+// browser never hears of the attempt.
+func TestMuxRefusesNewBrowserContexts(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)
 	c := tg.dial("")
-	for _, params := range []string{
-		`{"proxyServer":"http://127.0.0.1:1"}`,
-		`{"proxyServer":""}`,
-		`{"proxyServer":null}`,
-		`{"proxyBypassList":"<-loopback>"}`,
-		`{"originsWithUniversalNetworkAccess":["https://example.com"]}`,
-		`{"disposeOnDetach":true,"proxyServer":"http://127.0.0.1:1"}`,
-		`{"proxyServer":"http://127.0.0.1:1"}`,
-		`{"disposeOnDetach":true,"proxyServer":"a","proxyServer":"b"}`,
-		`{"ProxyServer":"http://127.0.0.1:1"}`,
+	for _, params := range []any{
+		nil,
+		map[string]any{},
+		map[string]any{"disposeOnDetach": true},
+		map[string]any{"proxyServer": "http://127.0.0.1:1"},
+		map[string]any{"proxyBypassList": "<-loopback>"},
+		map[string]any{"originsWithUniversalNetworkAccess": []string{"https://example.com"}},
 	} {
-		_, err := c.call("", "Target.createBrowserContext", json.RawMessage(params))
-		assert.ErrorContains(t, err, "the gate does not pass on Target.createBrowserContext with the param ", params)
+		_, err := c.call("", "Target.createBrowserContext", params)
+		assert.ErrorContains(t, err, "the gate does not pass on Target.createBrowserContext", "%v", params)
+	}
+	_, err := c.call("", "Target.disposeBrowserContext", map[string]any{"browserContextId": "CTX1"})
+	assert.ErrorContains(t, err, "the gate does not pass on Target.disposeBrowserContext")
+	assert.Empty(t, sentOf(tg.state(c), "Target.createBrowserContext"))
+	assert.Empty(t, sentOf(tg.state(c), "Target.disposeBrowserContext"))
+	c.mustCall("", "Target.getBrowserContexts", map[string]any{})
+}
+
+// A param outside a forwarded method's policy is refused under any spelling
+// the gate reads, and so are params that are not a JSON object; the browser
+// never receives the command.
+func TestMuxRefusesParamsOutsideThePolicy(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	c := tg.dial("")
+	for params, refused := range map[string]string{
+		`{"url":"about:blank","someFutureParam":true}`: "someFutureParam",
+		`{"URL":"about:blank"}`:                        "URL",
+		`{"url":"about:blank","\u0055RL":"x"}`:         "URL",
+		`{"url":"about:blank","a":1,"a":2}`:            "a",
+	} {
+		_, err := c.call("", "Target.createTarget", json.RawMessage(params))
+		assert.ErrorContains(t, err, `the gate does not pass on Target.createTarget with the param "`+refused+`"`, params)
 	}
 	for _, params := range []string{`[]`, `"x"`, `1`} {
-		_, err := c.call("", "Target.createBrowserContext", json.RawMessage(params))
+		_, err := c.call("", "Target.createTarget", json.RawMessage(params))
 		assert.ErrorContains(t, err, "params must be a JSON object", params)
 	}
-	for _, sent := range tg.state(c).TargetParams {
-		assert.False(t, strings.HasPrefix(sent, "Target.createBrowserContext"), "the browser received %s", sent)
-	}
-
-	// A context on the browser's own networking is created as before.
-	var created struct {
-		BrowserContextID string `json:"browserContextId"`
-	}
-	require.NoError(t, json.Unmarshal(c.mustCall("", "Target.createBrowserContext", map[string]any{"disposeOnDetach": true}), &created))
-	assert.Equal(t, "CTX1", created.BrowserContextID)
-	// Params left out reach the browser as before (null).
-	c.mustCall("", "Target.createBrowserContext", nil)
-	assert.Equal(t, []string{
-		`Target.createBrowserContext {"disposeOnDetach":true}`,
-		`Target.createBrowserContext null`,
-	}, sentOf(tg.state(c), "Target.createBrowserContext"))
+	assert.Empty(t, sentOf(tg.state(c), "Target.createTarget"))
 }
 
 // What the browser reads is what the gate checked: a repeated key reaches
-// it once, as the gate read it.
+// it once, as the gate read it, and an escaped key in its plain spelling.
 func TestMuxPassesTargetParamsAsTheGateReadThem(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)
 	c := tg.dial("")
 	c.mustCall("", "Target.createTarget", json.RawMessage(`{"url":"about:blank#first","url":"about:blank"}`))
-	assert.Equal(t, []string{`Target.createTarget {"url":"about:blank"}`}, sentOf(tg.state(c), "Target.createTarget"))
+	c.mustCall("", "Target.createTarget", json.RawMessage(`{"ur\u006c":"about:blank#escaped"}`))
+	assert.Equal(t, []string{
+		`Target.createTarget {"url":"about:blank"}`,
+		`Target.createTarget {"url":"about:blank#escaped"}`,
+	}, sentOf(tg.state(c), "Target.createTarget"))
 }
 
 // Every Target call the gate's real clients make still passes, with its
 // params as they sent them: the write gate (writegate/gate.go,
 // extension.go), Stagehand's Go SDK (cdp_client.go: createTarget with a url,
 // getTargets with {}, closeTarget, attachToTarget) and the browser package
-// (cdp.go: setAutoAttach), and the browser-context calls of chromedp,
-// Playwright and Puppeteer when no proxy is asked for.
+// (cdp.go: setAutoAttach).
 func TestMuxPassesTheTargetCallsRealClientsMake(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)
@@ -138,14 +136,13 @@ func TestMuxPassesTheTargetCallsRealClientsMake(t *testing.T) {
 	require.NoError(t, json.Unmarshal(c.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank", "background": true}), &created))
 	c.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
 	c.mustCall("", "Target.createTarget", map[string]any{
-		"url": "about:blank", "browserContextId": "CTX1", "newWindow": false, "background": false,
+		"url": "about:blank", "newWindow": false, "background": false,
 		"enableBeginFrameControl": false, "forTab": false, "hidden": false,
 	})
+	c.mustCall("", "Target.attachToTarget", map[string]any{"targetId": created.TargetID, "flatten": true})
 	c.mustCall("", "Target.getTargetInfo", map[string]any{"targetId": created.TargetID})
 	c.mustCall("", "Target.activateTarget", map[string]any{"targetId": created.TargetID})
-	c.mustCall("", "Target.createBrowserContext", map[string]any{"disposeOnDetach": false})
 	c.mustCall("", "Target.getBrowserContexts", map[string]any{})
-	c.mustCall("", "Target.disposeBrowserContext", map[string]any{"browserContextId": "CTX1"})
 	c.mustCall("", "Target.closeTarget", map[string]any{"targetId": created.TargetID})
 
 	sent := tg.state(c).TargetParams
@@ -162,7 +159,8 @@ func TestMuxPassesTheTargetCallsRealClientsMake(t *testing.T) {
 }
 
 // A client's auto-attach on a session it attached itself is passed on, so
-// its params are held to a policy too: a param outside it is refused.
+// its params are held to a policy too: a param outside it is refused, and
+// the browser never receives that call.
 func TestMuxClientAutoAttachOnItsOwnSessionRefusesUnknownParams(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)
@@ -171,6 +169,9 @@ func TestMuxClientAutoAttachOnItsOwnSessionRefusesUnknownParams(t *testing.T) {
 		"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true, "someFutureParam": true,
 	})
 	assert.ErrorContains(t, err, `the gate does not pass on Target.setAutoAttach with the param "someFutureParam"`)
+	for _, sent := range sentOf(tg.state(pageClient), "Target.setAutoAttach") {
+		assert.NotContains(t, sent, "someFutureParam")
+	}
 	pageClient.mustCall("", "Target.setAutoAttach", autoAttach(true))
 }
 

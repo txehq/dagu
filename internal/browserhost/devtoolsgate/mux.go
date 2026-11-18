@@ -1150,20 +1150,22 @@ func (p paramPolicy) check(method string, raw json.RawMessage) (json.RawMessage,
 // DevTools protocol (TXE-7856); a method added here comes with its policy,
 // and TestMuxForwardedTargetMethodsHaveAuditedParamPolicies fails until the
 // audit table there lists it.
+//
+// Target.createBrowserContext is not passed on at all, whatever its params:
+// a new browser context is set apart from the browser's own, and what the
+// gate's clients set up for the browser does not reach into it. With no
+// context to create, Target.disposeBrowserContext has nothing to act on and
+// is not passed on either. Every target runs in the browser's own context.
 var forwardedTargetMethods = map[string]paramPolicy{
 	"Target.activateTarget": {passed: []string{"targetId"}},
 	"Target.closeTarget":    {passed: []string{"targetId"}},
-	// The context's other params set its networking or isolation apart
-	// from the browser's, and none is passed on.
-	"Target.createBrowserContext": {passed: []string{"disposeOnDetach"}},
 	"Target.createTarget": {passed: []string{
 		"url", "left", "top", "width", "height", "windowState", "browserContextId",
 		"enableBeginFrameControl", "newWindow", "background", "forTab", "hidden", "focus",
 	}},
-	"Target.disposeBrowserContext": {passed: []string{"browserContextId"}},
-	"Target.getBrowserContexts":    {passed: nil},
-	"Target.getTargetInfo":         {passed: []string{"targetId"}},
-	"Target.getTargets":            {passed: []string{"filter"}},
+	"Target.getBrowserContexts": {passed: nil},
+	"Target.getTargetInfo":      {passed: []string{"targetId"}},
+	"Target.getTargets":         {passed: []string{"filter"}},
 }
 
 // clientAutoAttachParams is the param policy of a client's
