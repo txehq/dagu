@@ -20,7 +20,7 @@ ROOT="$(git -C "$HERE" rev-parse --show-toplevel)" || exit 2
 WF="$ROOT/.github/workflows/codex-review.yml"
 MAIN_REF="${1:-origin/main}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/gate-pin-test.XXXXXX")" || exit 2
-trap 'rm -rf "$TMP"' EXIT
+trap 'RC=$?; set +e; rm -rf "$TMP"; exit "$RC"' EXIT
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL %s: %s\n' "$1" "$2"; }

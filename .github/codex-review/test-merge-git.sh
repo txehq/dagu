@@ -13,7 +13,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/merge-git-test.XXXXXX")" || exit 2
-trap 'rm -rf "$TMP"' EXIT
+trap 'RC=$?; set +e; rm -rf "$TMP"; exit "$RC"' EXIT
 export GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid \
   GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 F="$TMP/fixture"

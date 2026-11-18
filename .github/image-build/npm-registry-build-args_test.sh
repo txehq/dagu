@@ -12,9 +12,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 HELPER="$ROOT/.github/image-build/npm-registry-build-args.sh"
 WORK="$(mktemp -d)"
 server_pid=
+# The trap keeps the test's own status and the cleanup's errors (TXE-7857).
 cleanup() {
-  if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
+  RC=$?
+  set +e
+  if [ -n "$server_pid" ]; then kill "$server_pid"; fi
   rm -rf "${WORK:?}"
+  exit "$RC"
 }
 trap cleanup EXIT
 

@@ -48,7 +48,7 @@ out="$TXE_DAGU_HOME/tunnel/kubeconfig"
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves
 # the tunnel on the credential it already had.
 cand="$(mktemp "$out.XXXXXX")"
-trap 'rm -f "$cand" "$cand.expires"' EXIT
+trap 'RC=$?; set +e; rm -f "$cand" "$cand.expires"; exit "$RC"' EXIT
 
 # The token goes straight from kubectl into the file through python's stdin; it is
 # never in an argument, an environment variable or the terminal.

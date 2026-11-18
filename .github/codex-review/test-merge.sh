@@ -6,7 +6,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/merge-test.XXXXXX")" || exit 2
-trap 'rm -rf "$TMP"' EXIT
+trap 'RC=$?; set +e; rm -rf "$TMP"; exit "$RC"' EXIT
 H=1111111111111111111111111111111111111111
 M=3333333333333333333333333333333333333333  # main's tip
 TREE=4444444444444444444444444444444444444444  # the head's tree

@@ -208,6 +208,8 @@ func lintSources(srcs []source) Result {
 		raw = append(raw, fs...)
 		dirs[s.rel] = ds
 	}
+	trapRaw, trapAllowed := lintTrapSources(srcs)
+	raw = append(raw, trapRaw...)
 	pkgDirs := make([]string, 0, len(goPkgs))
 	for d := range goPkgs {
 		pkgDirs = append(pkgDirs, d)
@@ -221,6 +223,8 @@ func lintSources(srcs []source) Result {
 		}
 	}
 	res.Findings, res.Allowed = applyDirectives(raw, dirs)
+	res.Allowed = append(res.Allowed, trapAllowed...)
+	sortFindings(res.Allowed)
 	return res
 }
 
