@@ -39,7 +39,11 @@ import (
 //     address it;
 //   - a Target command the gate neither handles nor lists in
 //     forwardedTargetMethods is refused, so no client changes which targets
-//     are held, or reaches them, past the gate;
+//     are held, or reaches them, past the gate, and a forwarded one passes
+//     only the params its policy names;
+//   - every target runs in the browser's own context: one the auto-attach
+//     reports in any other is closed while it is held, before it runs, and
+//     no client is attached to it (the context's id is read in start);
 //   - a service or shared worker runs only after the setup every waiting
 //     client sent on its session before resuming it took effect. See
 //     "Worker holds" below.
@@ -105,8 +109,9 @@ type message struct {
 
 // targetInfo is the part of DevTools' TargetInfo the gate reads.
 type targetInfo struct {
-	TargetID string `json:"targetId"`
-	Type     string `json:"type"`
+	TargetID         string `json:"targetId"`
+	Type             string `json:"type"`
+	BrowserContextID string `json:"browserContextId"`
 }
 
 // pendingCommand is a command the gate sent to the browser and the reply it
@@ -128,6 +133,8 @@ type target struct {
 	id   string
 	typ  string
 	info json.RawMessage
+	// context is the browser context the target runs in.
+	context string
 	// parent is the target this one was attached under, "" at the root, and
 	// parentSession the gate session it was attached under.
 	parent        string
@@ -258,6 +265,12 @@ type mux struct {
 	// it holds none. Events on it go to onGateEvent and to no client; a
 	// client addressing it is refused like any session it does not own.
 	browserSession string
+	// ownContext is the id of the browser's own context, read in start;
+	// a target in another is closed (foreignLocked). foreign holds the
+	// targets the gate closed for that, by the gate session the browser
+	// attached them on, until the browser lets go of the session.
+	ownContext string
+	foreign    map[string]string
 	// beforeAttach, when set, runs in start before the gate's auto-attach is
 	// asked for: setup that must be in place before any target can run.
 	// afterAttach, when set, runs once the auto-attach is in place and the
@@ -292,6 +305,7 @@ func newMux(p *pipe) *mux {
 		stashed:          make(map[string][]message),
 		discoverers:      make(map[*client]targetFilter),
 		known:            make(map[string]json.RawMessage),
+		foreign:          make(map[string]string),
 		done:             make(chan struct{}),
 	}
 	go m.writeLoop()
@@ -454,6 +468,9 @@ func (m *mux) start(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := m.readOwnContext(ctx); err != nil {
+		return err
+	}
 	// The browser reports the targets that exist before it answers, so
 	// gateSessions holds them when the call returns.
 	_, err := m.call(ctx, "", "Target.setAutoAttach", map[string]any{
@@ -462,10 +479,58 @@ func (m *mux) start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attach to the browser's targets: %w", err)
 	}
+	m.mu.Lock()
+	if m.ownContext == "" {
+		// A browser that does not name its own context: the targets it had
+		// before any client could reach it are in it, and agree on it.
+		for _, t := range m.allTargetsLocked() {
+			if t.context != "" && m.ownContext != "" && t.context != m.ownContext {
+				m.mu.Unlock()
+				return errors.New("the browser's targets are in more than one context before any client")
+			}
+			if t.context != "" {
+				m.ownContext = t.context
+			}
+		}
+	}
+	own := m.ownContext
+	m.mu.Unlock()
+	if own == "" {
+		return errors.New("the browser named no context of its own")
+	}
 	if m.afterAttach != nil {
 		return m.afterAttach(ctx)
 	}
 	return nil
+}
+
+// readOwnContext reads the id of the browser's own context, the one every
+// target the gate serves runs in. A browser too old to name it leaves it
+// unset, and start takes it from the targets that exist before any client
+// can reach the browser.
+func (m *mux) readOwnContext(ctx context.Context) error {
+	result, err := m.call(ctx, "", "Target.getBrowserContexts", map[string]any{})
+	if err != nil {
+		return fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	var contexts struct {
+		Default string `json:"defaultBrowserContextId"`
+	}
+	if err := json.Unmarshal(result, &contexts); err != nil {
+		return fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	m.mu.Lock()
+	m.ownContext = contexts.Default
+	m.mu.Unlock()
+	return nil
+}
+
+// foreignLocked reports whether a target in the context contextID runs
+// outside the browser's own context. A target that names no context is
+// taken to be in the browser's own: Chrome names one for every target a
+// context holds.
+func (m *mux) foreignLocked(contextID string) bool {
+	return contextID != "" && m.ownContext != "" && contextID != m.ownContext
 }
 
 // handleBrowserMessage dispatches one message from the pipe.
@@ -588,6 +653,11 @@ func (m *mux) onAttachedLocked(msg message) {
 	// A client that asked for auto-attach on a session it attached itself
 	// gets that session's children as its own, as the browser gives them.
 	if owner, ok := m.explicitSessions[msg.SessionID]; ok && msg.SessionID != "" {
+		if m.foreignLocked(info.BrowserContextID) {
+			// Not the client's to see: the gate's root auto-attach closes it.
+			m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, nil)
+			return
+		}
 		m.explicitSessions[params.SessionID] = owner
 		if rootWorker(info.Type) {
 			// The filter the gate gave the client's auto-attach leaves
@@ -606,6 +676,15 @@ func (m *mux) onAttachedLocked(msg message) {
 // the gate session parentSession ("" at the root), and attaches a private
 // session for every subscribed client.
 func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo, rawInfo json.RawMessage, waiting bool) {
+	if m.foreignLocked(info.BrowserContextID) {
+		// A target outside the browser's own context, made past the
+		// commands the gate refuses (a privileged page or worker can open
+		// one). The auto-attach holds it; it is closed before it runs, and
+		// no client is attached to it.
+		m.foreign[session] = info.TargetID
+		m.gateCommand("", "Target.closeTarget", map[string]any{"targetId": info.TargetID}, nil)
+		return
+	}
 	parent := ""
 	if parentSession != "" {
 		pt, ok := m.gateSessions[parentSession]
@@ -618,6 +697,7 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		id:               info.TargetID,
 		typ:              info.Type,
 		info:             rawInfo,
+		context:          info.BrowserContextID,
 		parent:           parent,
 		parentSession:    parentSession,
 		gateSession:      session,
@@ -864,6 +944,10 @@ func (m *mux) onDetachedLocked(msg message) {
 		go m.close()
 		return
 	}
+	if _, ok := m.foreign[params.SessionID]; ok {
+		delete(m.foreign, params.SessionID)
+		return
+	}
 	if t, ok := m.gateSessions[params.SessionID]; ok {
 		if t.released {
 			// The gate let go of this session itself, to release the
@@ -1070,6 +1154,9 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 				return
 			}
 			params, err := policy.check(msg.Method, msg.Params)
+			if err == nil {
+				err = m.checkContextLocked(msg.Method, params)
+			}
 			if err != nil {
 				c.deliverError(msg.ID, sessionID, err.Error())
 				return
@@ -1166,6 +1253,43 @@ var forwardedTargetMethods = map[string]paramPolicy{
 	"Target.getBrowserContexts": {passed: nil},
 	"Target.getTargetInfo":      {passed: []string{"targetId"}},
 	"Target.getTargets":         {passed: []string{"filter"}},
+}
+
+// errForeignContext is the reply to a command that would reach a target, or
+// make one, outside the browser's own context.
+var errForeignContext = errors.New("the gate serves only targets in the browser's own context")
+
+// checkContextLocked refuses a command whose browserContextId names a
+// context other than the browser's own (Target.createTarget's).
+func (m *mux) checkContextLocked(method string, params json.RawMessage) error {
+	var fields struct {
+		BrowserContextID *string `json:"browserContextId"`
+	}
+	if len(params) == 0 || json.Unmarshal(params, &fields) != nil || fields.BrowserContextID == nil {
+		return nil
+	}
+	if *fields.BrowserContextID != m.ownContext {
+		return fmt.Errorf("%s: %w", method, errForeignContext)
+	}
+	return nil
+}
+
+// foreignTargetLocked reports whether the gate closed targetID for running
+// outside the browser's own context, or event, the browser's
+// Target.attachedToTarget for it, places it outside.
+func (m *mux) foreignTargetLocked(targetID string, event message) bool {
+	for _, id := range m.foreign {
+		if id == targetID {
+			return true
+		}
+	}
+	var params struct {
+		TargetInfo targetInfo `json:"targetInfo"`
+	}
+	if event.Method == "" || json.Unmarshal(event.Params, &params) != nil {
+		return false
+	}
+	return m.foreignLocked(params.TargetInfo.BrowserContextID)
 }
 
 // clientAutoAttachParams is the param policy of a client's
@@ -1366,6 +1490,10 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 		c.deliverError(msg.ID, sessionID, errFlattenRequired.Error())
 		return
 	}
+	if m.foreignTargetLocked(params.TargetID, message{}) {
+		c.deliverError(msg.ID, sessionID, "Target.attachToTarget: "+errForeignContext.Error())
+		return
+	}
 	m.attaching[params.TargetID] = append(m.attaching[params.TargetID], &attachRequest{client: c, explicit: true})
 	m.gateCommand(sessionID, "Target.attachToTarget", map[string]any{"targetId": params.TargetID, "flatten": true},
 		func(result json.RawMessage, cdpErr *cdpError) {
@@ -1382,6 +1510,11 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 				return
 			}
 			event := m.dropStashedLocked(params.TargetID, session)
+			if m.foreignTargetLocked(params.TargetID, event) {
+				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+				c.deliverError(msg.ID, sessionID, "Target.attachToTarget: "+errForeignContext.Error())
+				return
+			}
 			if !m.clientAlive(c) {
 				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
 				return
@@ -1547,6 +1680,10 @@ func (m *mux) removeClient(c *client) {
 // endpoint whose commands name no session.
 func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error {
 	m.mu.Lock()
+	if m.foreignTargetLocked(targetID, message{}) {
+		m.mu.Unlock()
+		return fmt.Errorf("Target.attachToTarget: %w", errForeignContext)
+	}
 	m.attaching[targetID] = append(m.attaching[targetID], &attachRequest{client: c, explicit: true})
 	m.mu.Unlock()
 	result, err := m.call(ctx, "", "Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true})
@@ -1554,12 +1691,16 @@ func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error 
 	defer m.mu.Unlock()
 	m.popAttachLocked(targetID)
 	session := sessionOf(result)
-	m.dropStashedLocked(targetID, session)
+	event := m.dropStashedLocked(targetID, session)
 	if err != nil {
 		return err
 	}
 	if session == "" {
 		return errors.New("Target.attachToTarget: no session")
+	}
+	if m.foreignTargetLocked(targetID, event) {
+		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+		return fmt.Errorf("Target.attachToTarget: %w", errForeignContext)
 	}
 	c.root = session
 	m.explicitSessions[session] = c
