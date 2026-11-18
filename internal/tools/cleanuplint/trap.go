@@ -147,9 +147,87 @@ func lintTraps(s source) []Finding {
 	}
 	var out []Finding
 	for _, seg := range segs {
+		if key, script, ok := quotedRun(seg); ok {
+			// The runner runs the decoded scalar; its findings are
+			// reported at the run: key.
+			for _, f := range trapFindings(s.rel, script) {
+				f.Line = key + 1
+				out = mergeFindings(out, []Finding{f})
+			}
+			continue
+		}
 		out = mergeFindings(out, trapFindings(s.rel, strings.Join(seg, "\n")))
 	}
 	return out
+}
+
+// quotedRun decodes a run: block whose value is a YAML quoted scalar,
+// run: "..." or run: '...', which GitHub unquotes before the shell reads it
+// (connector review of PR 292). It returns the key's index and the script.
+// A block scalar (run: |) or a plain value is read as written.
+func quotedRun(seg []string) (int, string, bool) {
+	for i, l := range seg {
+		m := yamlRunKeyRe.FindStringSubmatchIndex(l)
+		if m == nil {
+			continue
+		}
+		v := strings.TrimSpace(l[m[1]:])
+		if v == "" || (v[0] != '"' && v[0] != '\'') {
+			return 0, "", false
+		}
+		// A flow scalar folds its line breaks: each one is a space, and an
+		// empty line is a newline.
+		var b strings.Builder
+		b.WriteString(v)
+		for _, cont := range seg[i+1:] {
+			t := strings.TrimSpace(cont)
+			if t == "" {
+				b.WriteString("\n")
+				continue
+			}
+			b.WriteString(" ")
+			b.WriteString(t)
+		}
+		return i, decodeFlowScalar(b.String()), true
+	}
+	return 0, "", false
+}
+
+// decodeFlowScalar decodes a YAML single- or double-quoted scalar, up to its
+// closing quote: in single quotes a doubled quote is one, and in double
+// quotes a backslash escapes the next character.
+func decodeFlowScalar(v string) string {
+	q := v[0]
+	var b strings.Builder
+	for i := 1; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case q == '\'' && c == '\'':
+			if i+1 < len(v) && v[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+				continue
+			}
+			return b.String()
+		case q == '"' && c == '"':
+			return b.String()
+		case q == '"' && c == '\\' && i+1 < len(v):
+			i++
+			switch v[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 't':
+				b.WriteByte('\t')
+			case ' ':
+				// an escaped line break was folded to a space: it joins
+			default:
+				b.WriteByte(v[i])
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // trapCmd is one trap command found in a script.
