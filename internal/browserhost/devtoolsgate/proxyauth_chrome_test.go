@@ -42,11 +42,20 @@ type testSite struct {
 	privateAuthorizations []string
 	// fromWorker counts the requests the service worker made.
 	fromWorker int
+	// hits counts, by path, every request that reached the site.
+	hits map[string]int
+}
+
+// hitsOf returns how many requests for path reached the site.
+func (s *testSite) hitsOf(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hits[path]
 }
 
 func newTestSite(t *testing.T) *testSite {
 	t.Helper()
-	s := &testSite{}
+	s := &testSite{hits: map[string]int{}}
 	s.server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.server.Close)
 	return s
@@ -63,6 +72,9 @@ func (s *testSite) crossSiteHost() string {
 }
 
 func (s *testSite) serve(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.hits[r.URL.Path]++
+	s.mu.Unlock()
 	switch r.URL.Path {
 	case "/private":
 		s.mu.Lock()

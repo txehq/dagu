@@ -271,6 +271,9 @@ type mux struct {
 	// attached them on, until the browser lets go of the session.
 	ownContext string
 	foreign    map[string]string
+	// hidden are the targets outside the browser's own context that
+	// discovery or the gate reported: no client hears of them.
+	hidden map[string]bool
 	// contextPending is set while start takes the browser's own context
 	// from its first targets: until it knows the context, the gate resumes
 	// no target, and an ambiguous start fails with nothing released.
@@ -310,6 +313,7 @@ func newMux(p *pipe) *mux {
 		discoverers:      make(map[*client]targetFilter),
 		known:            make(map[string]json.RawMessage),
 		foreign:          make(map[string]string),
+		hidden:           make(map[string]bool),
 		done:             make(chan struct{}),
 	}
 	go m.writeLoop()
@@ -522,9 +526,27 @@ func (m *mux) settleOwnContext() error {
 	m.ownContext = own
 	m.contextPending = false
 	for _, t := range m.allTargetsLocked() {
+		if m.foreignLocked(t.context) {
+			// Held since it was attached, and never offered to a client:
+			// none could connect yet.
+			session := t.gateSession
+			m.forgetTargetLocked(t)
+			m.closeForeignLocked(session, t.id)
+		}
+	}
+	for _, t := range m.allTargetsLocked() {
 		m.maybeResumeLocked(t)
 	}
 	return nil
+}
+
+// closeForeignLocked closes targetID, which the browser attached the gate to
+// on session and which runs outside the browser's own context. The gate's
+// auto-attach holds it until then, so it never runs.
+func (m *mux) closeForeignLocked(session, targetID string) {
+	m.foreign[session] = targetID
+	m.hidden[targetID] = true
+	m.gateCommand("", "Target.closeTarget", map[string]any{"targetId": targetID}, nil)
 }
 
 // readOwnContext reads the id of the browser's own context, the one every
@@ -549,11 +571,11 @@ func (m *mux) readOwnContext(ctx context.Context) error {
 }
 
 // foreignLocked reports whether a target in the context contextID runs
-// outside the browser's own context. A target that names no context is
-// taken to be in the browser's own: Chrome names one for every target a
-// context holds.
+// outside the browser's own context, once the gate knows it. A target that
+// names no context is outside too: Chrome names one for every target a
+// context holds, and the gate admits none it cannot place.
 func (m *mux) foreignLocked(contextID string) bool {
-	return contextID != "" && m.ownContext != "" && contextID != m.ownContext
+	return m.ownContext != "" && contextID != m.ownContext
 }
 
 // handleBrowserMessage dispatches one message from the pipe.
@@ -706,8 +728,7 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		// commands the gate refuses (a privileged page or worker can open
 		// one). The auto-attach holds it; it is closed before it runs, and
 		// no client is attached to it.
-		m.foreign[session] = info.TargetID
-		m.gateCommand("", "Target.closeTarget", map[string]any{"targetId": info.TargetID}, nil)
+		m.closeForeignLocked(session, info.TargetID)
 		return
 	}
 	parent := ""
@@ -975,8 +996,12 @@ func (m *mux) onDetachedLocked(msg message) {
 		go m.close()
 		return
 	}
-	if _, ok := m.foreign[params.SessionID]; ok {
+	if targetID, ok := m.foreign[params.SessionID]; ok {
 		delete(m.foreign, params.SessionID)
+		if !m.discoverOn {
+			// No discovery event will name the target again.
+			delete(m.hidden, targetID)
+		}
 		return
 	}
 	if t, ok := m.gateSessions[params.SessionID]; ok {
@@ -1108,8 +1133,23 @@ func (m *mux) onDiscoveryEventLocked(msg message, data []byte) {
 	switch msg.Method {
 	case "Target.targetCreated", "Target.targetInfoChanged":
 		if json.Unmarshal(params.TargetInfo, &info) == nil && info.TargetID != "" {
+			if m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
+				// Outside the browser's own context: no client hears of it.
+				m.hidden[info.TargetID] = true
+				delete(m.known, info.TargetID)
+				return
+			}
 			m.known[info.TargetID] = params.TargetInfo
 		}
+	case "Target.targetDestroyed", "Target.targetCrashed":
+		if m.hidden[params.TargetID] {
+			if msg.Method == "Target.targetDestroyed" {
+				delete(m.hidden, params.TargetID)
+			}
+			return
+		}
+	}
+	switch msg.Method {
 	case "Target.targetDestroyed":
 		if raw, ok := m.known[params.TargetID]; ok {
 			_ = json.Unmarshal(raw, &info)
@@ -1193,8 +1233,70 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 				return
 			}
 			msg.Params = params
+			if filter, ok := targetReplyFilters[msg.Method]; ok {
+				m.forwardFilteredLocked(c, msg, sessionID, filter)
+				return
+			}
 		}
 		m.forwardLocked(c, msg, sessionID)
+	}
+}
+
+// targetReplyFilters rewrite the replies of the forwarded Target commands
+// that describe targets, so no client hears of a target outside the
+// browser's own context.
+var targetReplyFilters = map[string]func(m *mux, result json.RawMessage) (any, error){
+	"Target.getTargets": func(m *mux, result json.RawMessage) (any, error) {
+		var reply struct {
+			TargetInfos []json.RawMessage `json:"targetInfos"`
+		}
+		if err := json.Unmarshal(result, &reply); err != nil {
+			return nil, err
+		}
+		kept := make([]json.RawMessage, 0, len(reply.TargetInfos))
+		for _, raw := range reply.TargetInfos {
+			var info targetInfo
+			if json.Unmarshal(raw, &info) != nil || m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		return map[string]any{"targetInfos": kept}, nil
+	},
+	"Target.getTargetInfo": func(m *mux, result json.RawMessage) (any, error) {
+		var reply struct {
+			TargetInfo targetInfo `json:"targetInfo"`
+		}
+		if err := json.Unmarshal(result, &reply); err != nil {
+			return nil, err
+		}
+		if m.foreignLocked(reply.TargetInfo.BrowserContextID) || m.hidden[reply.TargetInfo.TargetID] {
+			return nil, errForeignContext
+		}
+		return result, nil
+	},
+}
+
+// forwardFilteredLocked passes a command through and answers the client
+// with filter's rewrite of the browser's result.
+func (m *mux) forwardFilteredLocked(c *client, msg message, sessionID string, filter func(m *mux, result json.RawMessage) (any, error)) {
+	_, err := m.sendLocked(sessionID, msg.Method, msg.Params, &pendingCommand{onReply: func(result json.RawMessage, cdpErr *cdpError) {
+		if !m.clientAlive(c) {
+			return
+		}
+		if cdpErr != nil {
+			c.deliverError(msg.ID, sessionID, cdpErr.Message)
+			return
+		}
+		rewritten, err := filter(m, result)
+		if err != nil {
+			c.deliverError(msg.ID, sessionID, msg.Method+": "+err.Error())
+			return
+		}
+		c.deliverResult(msg.ID, sessionID, rewritten)
+	}})
+	if err != nil {
+		c.deliverError(msg.ID, sessionID, err.Error())
 	}
 }
 
@@ -1305,14 +1407,12 @@ func (m *mux) checkContextLocked(method string, params json.RawMessage) error {
 	return nil
 }
 
-// foreignTargetLocked reports whether the gate closed targetID for running
+// foreignTargetLocked reports whether the gate knows targetID to run
 // outside the browser's own context, or event, the browser's
 // Target.attachedToTarget for it, places it outside.
 func (m *mux) foreignTargetLocked(targetID string, event message) bool {
-	for _, id := range m.foreign {
-		if id == targetID {
-			return true
-		}
+	if m.hidden[targetID] {
+		return true
 	}
 	var params struct {
 		TargetInfo targetInfo `json:"targetInfo"`

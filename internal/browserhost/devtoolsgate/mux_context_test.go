@@ -19,10 +19,15 @@ import (
 // worker can, and returns its id.
 func createOffTheRecord(t *testing.T, c *cdpConn) string {
 	t.Helper()
+	return createOffTheRecordWith(t, c, map[string]any{"url": "about:blank#otr"})
+}
+
+func createOffTheRecordWith(t *testing.T, c *cdpConn, params map[string]any) string {
+	t.Helper()
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
-	require.NoError(t, json.Unmarshal(c.mustCall("", "Fake.createOffTheRecord", map[string]any{"url": "about:blank#otr"}), &created))
+	require.NoError(t, json.Unmarshal(c.mustCall("", "Fake.createOffTheRecord", params), &created))
 	return created.TargetID
 }
 
@@ -184,4 +189,83 @@ func TestMuxClientOwnSessionChildOutsideTheBrowsersOwnContext(t *testing.T) {
 		}
 		return true
 	}, "the child's session is detached")
+}
+
+// No client hears of a target outside the browser's own context: not a
+// discovering client, in the same instant as the auto-attach that holds it,
+// not getTargets, not getTargetInfo. A target in the browser's own context
+// is reported as before.
+func TestMuxHidesATargetOutsideTheBrowsersOwnContext(t *testing.T) {
+	t.Parallel()
+	tg := startTestGateWith(t, func(_ *mux, f *fakeBrowser) { f.keepsOffTheRecord = true })
+	c, watcher := tg.dial(""), tg.dial("")
+	c.mustCall("", "Target.setDiscoverTargets", map[string]any{"discover": true})
+	assert.Equal(t, "T1", targetOf(t, c.waitEvent("Target.targetCreated", nil)), "the first page is replayed")
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	assert.Equal(t, "T1", decodeAttached(t, watcher.waitEvent("Target.attachedToTarget", nil)).TargetInfo.TargetID)
+
+	foreign := createOffTheRecord(t, c)
+	c.noEvents(300*time.Millisecond, "Target.targetCreated", "Target.targetInfoChanged", "Target.targetDestroyed")
+	watcher.noEvent("Target.attachedToTarget", 0)
+	var listed struct {
+		TargetInfos []struct {
+			TargetID string `json:"targetId"`
+		} `json:"targetInfos"`
+	}
+	require.NoError(t, json.Unmarshal(c.mustCall("", "Target.getTargets", map[string]any{}), &listed))
+	for _, info := range listed.TargetInfos {
+		assert.NotEqual(t, foreign, info.TargetID)
+	}
+	assert.NotEmpty(t, listed.TargetInfos, "the browser's own targets are listed")
+	_, err := c.call("", "Target.getTargetInfo", map[string]any{"targetId": foreign})
+	assert.ErrorContains(t, err, "the gate serves only targets in the browser's own context")
+	exists, resumed := fakeTargetState(tg.fake, foreign)
+	assert.True(t, exists, "the browser refused to close it")
+	assert.False(t, resumed, "it stays held")
+
+	own := createdTarget(t, c.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"}))
+	assert.Equal(t, own, targetOf(t, c.waitEvent("Target.targetCreated", nil)))
+	assert.Equal(t, own, decodeAttached(t, watcher.waitEvent("Target.attachedToTarget", nil)).TargetInfo.TargetID)
+}
+
+// A target whose info names no context is not placed in the browser's own:
+// it is held, closed and reported to no client, like one in another.
+func TestMuxClosesATargetThatNamesNoContext(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	c, watcher := tg.dial(""), tg.dial("")
+	c.mustCall("", "Target.setDiscoverTargets", map[string]any{"discover": true})
+	assert.Equal(t, "T1", targetOf(t, c.waitEvent("Target.targetCreated", nil)))
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	assert.Equal(t, "T1", decodeAttached(t, watcher.waitEvent("Target.attachedToTarget", nil)).TargetInfo.TargetID)
+
+	unplaced := createOffTheRecordWith(t, c, map[string]any{"url": "about:blank#unplaced", "noContext": true})
+	watcher.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+	c.noEvents(0, "Target.targetCreated", "Target.targetDestroyed")
+	eventually(t, 5*time.Second, func() bool {
+		exists, _ := fakeTargetState(tg.fake, unplaced)
+		return !exists
+	}, "the target that names no context is closed")
+	_, resumed := fakeTargetState(tg.fake, unplaced)
+	assert.False(t, resumed)
+}
+
+func targetOf(t *testing.T, event message) string {
+	t.Helper()
+	var params struct {
+		TargetInfo struct {
+			TargetID string `json:"targetId"`
+		} `json:"targetInfo"`
+	}
+	require.NoError(t, json.Unmarshal(event.Params, &params))
+	return params.TargetInfo.TargetID
+}
+
+func createdTarget(t *testing.T, result json.RawMessage) string {
+	t.Helper()
+	var created struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(result, &created))
+	return created.TargetID
 }
