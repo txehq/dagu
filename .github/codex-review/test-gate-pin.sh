@@ -9,6 +9,8 @@
 #     judged by an older check than main. The fix is a PR that moves the pin to main's commit that
 #     last changed those files; this names it;
 #   - the workflow's base guard accepts a base it should refuse, or refuses one it should accept.
+#   - the workflow's concurrency lets anything but a new head (synchronize) cancel the run in
+#     progress, or adds a job-level group or a queue key (TXE-7843, README.md "Same-head re-checks").
 #
 #   bash .github/codex-review/test-gate-pin.sh [<main ref>]   # default origin/main; needs main's history
 # shellcheck disable=SC2016  # the stand-in gh's body is expanded when it runs
@@ -39,6 +41,31 @@ else bad "permissions" "expected contents: read and pull-requests: read only; go
 if grep -E 'pull_request_target' "$WF" >/dev/null && ! grep -E 'github\.(head_ref|event\.pull_request\.head)' "$WF" >/dev/null; then
     ok "nothing of the PR's head is referenced"
 else bad "head refs" "the gate must not reference the PR's head (head_ref or event.pull_request.head)"; fi
+
+# ── Concurrency (TXE-7843): only a new head cancels the run in progress ──
+# One workflow-level group per PR; cancel-in-progress true for `synchronize` alone, so a same-head
+# re-check (edited, labeled, unlabeled, reopened, ready_for_review) waits as pending instead of
+# cancelling the active run. No job-level concurrency (a second group would cancel on its own), and
+# no `queue:` key: queue `max` refuses a cancel-in-progress expression, and `single` is the default
+# whose pending replacement README.md "Same-head re-checks" measured.
+conc="$(awk '/^concurrency:/{p=1; print; next} p && /^[^ ]/{exit} p' "$WF")"
+want_conc="concurrency:
+  group: codex-review-\${{ github.event.pull_request.number }}
+  cancel-in-progress: \${{ github.event.action == 'synchronize' }}"
+if [ "$conc" = "$want_conc" ]; then ok "one group per PR; only synchronize cancels the run in progress"
+else bad "concurrency" "expected exactly:
+$want_conc
+got:
+$conc"; fi
+if [ "$(grep -c '^concurrency:' "$WF")" = 1 ] && ! grep -qE '^ +concurrency:' "$WF"; then
+    ok "one workflow-level concurrency block and no job-level one"
+else bad "job concurrency" "a job-level concurrency group would cancel same-head runs on its own"; fi
+if ! grep -qE '^ *queue:' "$WF"; then ok "no queue key (GitHub's default: one pending run per group)"
+else bad "queue" "a queue key changes the measured pending semantics; see README.md \"Same-head re-checks\""; fi
+types="$(sed -n 's/^    types: \[\(.*\)\]$/\1/p' "$WF")"
+if [ "$types" = "opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled" ]; then
+    ok "the trigger types are unchanged: synchronize is the only new-head type"
+else bad "trigger types" "the types changed ($types); decide which of them may cancel the run in progress"; fi
 
 # ── The pin ──
 pins="$(grep -cE '^  CODEX_REVIEW_GATE_SHA: ' "$WF")"
