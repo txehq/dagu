@@ -48,7 +48,25 @@ out="$TXE_DAGU_HOME/tunnel/kubeconfig"
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves
 # the tunnel on the credential it already had.
 cand="$(mktemp "$out.XXXXXX")"
-trap 'RC=$?; set +e; rm -f "$cand" "$cand.expires"; exit "$RC"' EXIT
+# The candidate holds a service-account token. Leaving it behind is a defect, not
+# a best-effort cleanup (TXE-7864, the rule of txe's TXE-7858): when its removal
+# fails, or its absence cannot be proved, the script fails, and an earlier
+# failure keeps its own status. Absence is proved, never inferred from rm's
+# status: the parent can be searched and holds no entry by that name. The
+# message names the path only, never the token or the file's contents.
+cand_absent() {
+  [ -d "${1%/*}" ] && [ -x "${1%/*}" ] && [ ! -e "$1" ] && [ ! -L "$1" ]
+}
+cleanup() {
+  local p
+  for p in "$cand" "$cand.expires"; do
+    if ! rm -f -- "$p" || ! cand_absent "$p"; then
+      printf 'txe-dagu: FATAL: %s (a token-bearing tunnel credential candidate) may still be on disk: its removal failed or its absence could not be verified (rm'"'"'s error, if any, is above); remove it\n' "$p" >&2
+      [ "${RC:-0}" -ne 0 ] || RC=1
+    fi
+  done
+}
+trap 'RC=$?; set +e; cleanup; exit "$RC"' EXIT
 
 # The token goes straight from kubectl into the file through python's stdin; it is
 # never in an argument, an environment variable or the terminal.

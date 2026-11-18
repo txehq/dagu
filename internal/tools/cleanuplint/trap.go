@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -156,9 +157,23 @@ func lintTraps(s source) []Finding {
 			}
 			continue
 		}
-		out = mergeFindings(out, trapFindings(s.rel, strings.Join(seg, "\n")))
+		out = mergeFindings(out, trapFindings(s.rel, strings.Join(runValue(seg), "\n")))
 	}
 	return out
+}
+
+// runValue returns a run: block with its key blanked, so that a plain value
+// (run: trap ... EXIT) starts a command where the shell starts one: the
+// script begins after the key, not at the key (TXE-7864). Columns are kept.
+func runValue(seg []string) []string {
+	for i, l := range seg {
+		if m := yamlRunKeyRe.FindStringIndex(l); m != nil {
+			out := slices.Clone(seg)
+			out[i] = strings.Repeat(" ", m[1]) + l[m[1]:]
+			return out
+		}
+	}
+	return seg
 }
 
 // quotedRun decodes a run: block whose value is a YAML quoted scalar,
@@ -299,8 +314,10 @@ func trapFindings(rel, text string) []Finding {
 
 // shellCode returns body with its comments removed and the text inside
 // quotes blanked, so a redirection mentioned in a message or a comment is not
-// read as one (connector review of PR 292). Line breaks are kept.
+// read as one (connector review of PR 292). Line breaks are kept, except a
+// backslash-newline, which the shell removes (TXE-7864).
 func shellCode(body string) string {
+	body = joinContinuations(body)
 	// A quoted redirection target is still a target: 2>"/dev/null".
 	body = quotedTargetRe.ReplaceAllString(body, "$1/dev/null")
 	var out strings.Builder
@@ -393,9 +410,43 @@ func orGuarded(st string) bool {
 	return last == "||"
 }
 
+// joinContinuations removes each backslash-newline outside single quotes and
+// comments, as the shell does when it reads the text: a handler single-quoted
+// when the trap is set keeps those bytes, and the shell joins its lines only
+// when the handler runs (connector review of PR 292, TXE-7864). A comment
+// ends at its newline whatever precedes it, so a backslash there joins
+// nothing, and the next line stays code.
+func joinContinuations(s string) string {
+	if !strings.Contains(s, "\\\n") {
+		return s
+	}
+	var b strings.Builder
+	var z quoter
+	for i := 0; i < len(s); {
+		if z.q == 0 && s[i] == '#' && (i == 0 || strings.IndexByte(" \t\n;&|()", s[i-1]) >= 0) {
+			end := strings.IndexByte(s[i:], '\n')
+			if end < 0 {
+				end = len(s) - i
+			}
+			b.WriteString(s[i : i+end])
+			i += end
+			continue
+		}
+		if z.q != '\'' && s[i] == '\\' && i+1 < len(s) && s[i+1] == '\n' {
+			i += 2
+			continue
+		}
+		next, _ := z.step(s, i)
+		b.WriteString(s[i:min(next, len(s))])
+		i = next
+	}
+	return b.String()
+}
+
 // statements splits a handler at ; and newlines outside quotes, $( ), ${ }
 // and braces, dropping comments and blank statements.
 func statements(body string) []string {
+	body = joinContinuations(body)
 	var out []string
 	var z quoter
 	depth, last := 0, 0
@@ -463,7 +514,7 @@ func findTraps(text string) []trapCmd {
 			i = next
 			continue
 		}
-		if wordStart && strings.HasPrefix(text[i:], "trap") && i+4 < len(text) && (text[i+4] == ' ' || text[i+4] == '\t') {
+		if wordStart && strings.HasPrefix(text[i:], "trap") && i+4 < len(text) && (text[i+4] == ' ' || text[i+4] == '\t') && commandPosition(text, i) {
 			words, end := commandWords(text, i+4)
 			if t, ok := parseTrap(words); ok {
 				t.line = strings.Count(text[:i], "\n") + 1
@@ -476,6 +527,50 @@ func findTraps(text string) []trapCmd {
 	}
 	return out
 }
+
+// commandPosition reports whether the word at i is where the shell reads a
+// command name, not an argument: echo trap false EXIT sets no trap (connector
+// review of PR 292, TXE-7864). It is: the start of the script, or after a
+// newline, ;, &, |, ( or ) (a subshell, or a case pattern), or after a
+// reserved word or command prefix (if, then, !, builtin, command, ...) or an
+// assignment (LC_ALL=C trap ...) that is itself in command position. Blanks
+// and backslash-newlines between are skipped. Where the text is ambiguous it
+// answers yes, so the rule reads a trap it is unsure of rather than miss one.
+func commandPosition(text string, i int) bool {
+	j := i
+	for j > 0 {
+		if text[j-1] == ' ' || text[j-1] == '\t' {
+			j--
+		} else if j >= 2 && text[j-2] == '\\' && text[j-1] == '\n' {
+			j -= 2
+		} else {
+			break
+		}
+	}
+	if j == 0 || strings.IndexByte("\n;&|()", text[j-1]) >= 0 {
+		return true
+	}
+	k := j
+	for k > 0 && strings.IndexByte(" \t\n;&|()", text[k-1]) < 0 {
+		k--
+	}
+	w := text[k:j]
+	if commandPrefixes[w] || assignmentRe.MatchString(w) {
+		return commandPosition(text, k)
+	}
+	return false
+}
+
+// commandPrefixes are the words after which the next word is still a
+// command: reserved words, and builtins that run their argument as one.
+var commandPrefixes = map[string]bool{
+	"if": true, "then": true, "else": true, "elif": true, "do": true,
+	"while": true, "until": true, "!": true, "time": true, "{": true,
+	"builtin": true, "command": true,
+}
+
+// assignmentRe is a variable assignment written before a command.
+var assignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\+?=`)
 
 // commandWords reads the words of one simple command starting at i, up to a
 // newline, ;, &, | or ) outside quotes. A backslash-newline is a space.
@@ -543,7 +638,11 @@ func unquote(w string) (string, bool) {
 			i += end + 1
 		case '"':
 			for i++; i < len(w) && w[i] != '"'; i++ {
-				if w[i] == '\\' && i+1 < len(w) && strings.IndexByte("\"\\$`\n", w[i+1]) >= 0 {
+				if w[i] == '\\' && i+1 < len(w) && w[i+1] == '\n' {
+					i++ // a line continuation: the shell removes both
+					continue
+				}
+				if w[i] == '\\' && i+1 < len(w) && strings.IndexByte("\"\\$`", w[i+1]) >= 0 {
 					i++
 				} else if w[i] == '$' {
 					early = true
@@ -553,7 +652,9 @@ func unquote(w string) (string, bool) {
 		case '\\':
 			if i+1 < len(w) {
 				i++
-				b.WriteByte(w[i])
+				if w[i] != '\n' { // a line continuation: the shell removes both
+					b.WriteByte(w[i])
+				}
 			}
 		case '$':
 			early = true

@@ -172,6 +172,10 @@ func TestTrapShapesAgainstBash(t *testing.T) {
 		{`RC=$?; CLEANUP || echo warned; CLEANUP; exit "$RC"`, false},
 		{`RC=$?; echo removing && CLEANUP; exit "$RC"`, false},
 		{`CLEANUP`, false},
+		// A backslash-newline in a single-quoted handler joins its lines
+		// when the handler runs (TXE-7864).
+		{"RC=$?; \\\n  set +e; \\\n  CLEANUP; \\\n  exit \"$RC\"", true},
+		{"RC=$?; \\\n  CLEANUP; \\\n  exit \"$RC\"", false},
 	}
 	run := func(flags []string, script string) int {
 		args := append(append([]string{"--noprofile", "--norc"}, flags...), "-c", script)
@@ -201,6 +205,22 @@ func TestTrapShapesAgainstBash(t *testing.T) {
 		res := lintSources([]source{{rel: ".github/scripts/x.sh", lang: langShell, data: []byte(src)}})
 		assert.Equal(t, tc.accept, len(res.Findings) == 0, "lint accepts %q: %v", tc.handler, res.Findings)
 	}
+}
+
+// tunnel-credential.sh's trap removes a token-bearing candidate and fails
+// when it cannot prove it gone (TXE-7864). No CI file names the script, so
+// trapReach does not read it; this holds it to the trap rule anyway.
+func TestTunnelCredentialTrapKeepsTheRule(t *testing.T) {
+	t.Parallel()
+	const rel = "txe/worker/tunnel-credential.sh"
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", filepath.FromSlash(rel)))
+	require.NoError(t, err)
+	s := source{rel: rel, lang: langShell, data: data}
+	require.True(t, isShellTrapSource(s))
+	traps := findTraps(string(data))
+	require.Len(t, traps, 1, "the script sets one trap")
+	assert.Equal(t, []string{"EXIT"}, traps[0].signals)
+	assert.Empty(t, lintTraps(s))
 }
 
 // A logical line continued with a backslash is reported where it starts.

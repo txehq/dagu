@@ -100,3 +100,48 @@ trap 'RC=$?; set +e; false >'"'"'/dev/null'"'"' 2>&1; exit "$RC"' EXIT # want:tr
 trap "kill $child_pid; exit 143" TERM
 trap "kill $child_pid 2>/dev/null; exit 143" TERM # want:trap-status
 trap "rm -rf $work" EXIT # want:trap-status
+# The word trap where the shell reads an argument sets no trap (TXE-7864, connector comment 4620462371).
+echo trap false EXIT
+printf '%s\n' done trap 'rm -rf "$work"' EXIT
+echo FOO=1 trap 'rm -rf "$work"' EXIT
+echo then trap 'rm -rf "$work"' EXIT
+echo 'if' trap 'rm -rf "$work"' EXIT
+echo done \
+  trap 'rm -rf "$work"' EXIT
+# ...and where it reads a command, it is still a trap.
+if true; then trap 'rm -rf "$work"' EXIT; fi # want:trap-status
+true && trap 'rm -rf "$work"' EXIT # want:trap-status
+{ trap 'rm -rf "$work"' EXIT; } # want:trap-status
+( trap 'rm -rf "$work"' EXIT ) # want:trap-status
+LC_ALL=C trap 'rm -rf "$work"' EXIT # want:trap-status
+if ! builtin trap 'rm -rf "$work"' EXIT; then :; fi # want:trap-status
+case x in x) trap 'rm -rf "$work"' EXIT ;; esac # want:trap-status
+true \
+  && trap 'rm -rf "$work"' EXIT # want:trap-status
+# A handler's backslash-newline joins its lines when the handler runs (TXE-7864, connector comment 4620462381).
+trap 'RC=$?; \
+  set +e; \
+  rm -rf "$work"; \
+  exit "$RC"' EXIT
+trap "RC=\$?; \
+  set +e; rm -rf \"\$work\"; \
+  exit \"\$RC\"" EXIT
+joined_rc() {
+  local rc=$?; \
+    set +e
+  rm -rf "$work"
+  exit "$rc"
+}
+trap joined_rc EXIT
+# ...and a joined handler that breaks the rule is still reported.
+trap 'RC=$?; \ # want:trap-status
+  rm -rf "$work"; \
+  exit "$RC"' EXIT
+trap 'RC=$?; set +e; \ # want:trap-status
+  rm -rf "$work" 2>/dev/null; \
+  exit "$RC"' EXIT
+trap 'RC=$?; set +e; rm -rf "$work"; \ # want:trap-status
+  exit 0' EXIT
+trap 'RC=$?; set +e # a comment ends at its newline \ # want:trap-status
+  rm -rf "$work" 2>/dev/null
+  exit "$RC"' EXIT
