@@ -32,6 +32,8 @@ on:
       - "**/*.bash"
       - "**/*.py"
       - "**/*.ps1"
+      # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
+      - "**/Dockerfile*"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -67,6 +69,8 @@ on:
       - "**/*.bash"
       - "**/*.py"
       - "**/*.ps1"
+      # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
+      - "**/Dockerfile*"
   workflow_dispatch:
 
 permissions:
@@ -81,7 +85,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  GO_VERSION: "1.27.3"
+  GO_VERSION: "1.27.4"
   NODE_VERSION: "20"
 
 jobs:
@@ -167,7 +171,8 @@ jobs:
   # Test and harness code never runs go clean -modcache/-cache/-fuzzcache and
   # never deletes a tree whose path comes from the environment (TXE-7550,
   # after a test cleanup deleted a machine's shared module cache). It reads
-  # source text only, so it runs on every change, with no path gate.
+  # source text only, so it runs on every change, with no path gate. The same
+  # job checks that every pinned Go version equals go.mod's (TXE-7844).
   cleanuplint:
     name: Cleanup lint
     runs-on: ubuntu-latest
@@ -186,6 +191,10 @@ jobs:
 
       - name: Run cleanuplint
         run: go run ./internal/tools/cleanuplint -v
+
+      # Every Go version a Dockerfile or workflow pins equals go.mod's (TXE-7844).
+      - name: Check Go version pins
+        run: go test -count=1 ./internal/tools/gopin
 
   # Lint Go code
   golint:
