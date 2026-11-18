@@ -148,6 +148,22 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([older_green, rerun_red], attempts={(3, 1): "cancelled"})
         self.assertEqual(evaluate(rerun_red, gh), "alert")
 
+    def test_an_earlier_red_run_whose_rerun_was_cancelled_is_still_red(self):
+        # A failed and alerted; its attempt 2 was cancelled, so the listing shows A as cancelled.
+        green = run(1, "success", "2026-01-01T00:00:00Z")
+        a = run(2, "cancelled", "2026-01-02T00:00:00Z", attempt=2)
+        b = run(3, "success", "2026-01-03T00:00:00Z")
+        gh = FakeGitHub([green, a, b], attempts={(2, 1): "failure"})
+        self.assertEqual(evaluate(b, gh), "clear")
+        # A run cancelled on every attempt is passed over.
+        gh = FakeGitHub([green, a, b], attempts={(2, 1): "cancelled"})
+        self.assertIsNone(evaluate(b, gh))
+        # A single-attempt cancelled run costs no attempts read.
+        c = run(4, "cancelled", "2026-01-02T00:00:00Z")
+        gh = FakeGitHub([green, c, b])
+        self.assertIsNone(evaluate(b, gh))
+        self.assertFalse(any("/attempts/" in x for x in gh.calls))
+
     def test_a_later_run_is_not_history(self):
         # A run created earlier that finishes after a later one is judged by creation order.
         hist = [run(1, "success", "2026-01-01T00:00:00Z"), run(2, "failure", "2026-01-02T00:00:00Z"), run(3, "failure", "2026-01-03T00:00:00Z")]

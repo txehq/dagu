@@ -16,7 +16,8 @@ it lists (`on.workflow_run.workflows`). The rule is stateless; it reads the run'
   * A conclusion of failure, timed_out or startup_failure is red; success is green. Any other
     conclusion (cancelled, skipped, neutral, ...) neither alerts nor clears.
   * The state before the run is its newest earlier attempt that was red or green (a re-run),
-    otherwise the newest earlier counted run of the same workflow on main.
+    otherwise that of the newest earlier counted run of the same workflow on main, judged by
+    its newest red or green attempt (a red run whose re-run was cancelled is still red).
   * Every red run posts, so the first red is never missed: "is red" after green or no counted
     run, "is still red" after red. A previous red is not proof that its post was delivered
     (the notifier may have been installed mid-streak, or that POST failed), and the rule keeps
@@ -85,23 +86,41 @@ def counts(run: dict, repo: str) -> bool:
     return run.get("event") in EVENTS and run.get("head_branch") == BRANCH and head_repo == repo
 
 
-def previous_state(run: dict, history: list[dict], repo: str) -> str | None:
+def previous_state(run: dict, history: list[dict], repo: str, resolve=None) -> str | None:
     """The state of the newest counted run of the history created before `run`.
 
     `history` is any list of the workflow's runs; `run` itself and runs created after it are
     skipped. Order is (created_at, id), so two runs created in the same second still order.
+    The listing shows a run by its latest attempt, so a red run whose re-run was cancelled
+    shows as cancelled: `resolve(h)` gives such a run's newest red or green attempt, and a run
+    is passed over only when none of its attempts was red or green.
     """
     key = (run["created_at"], run["id"])
-    best = None
-    for h in history:
-        if h.get("id") == run["id"] or not counts(h, repo):
-            continue
-        if h.get("status") != "completed" or state_of(h.get("conclusion")) is None:
-            continue
-        hk = (h["created_at"], h["id"])
-        if hk < key and (best is None or hk > (best["created_at"], best["id"])):
-            best = h
-    return None if best is None else state_of(best["conclusion"])
+    earlier = [
+        h
+        for h in history
+        if h.get("id") != run["id"]
+        and counts(h, repo)
+        and h.get("status") == "completed"
+        and (h["created_at"], h["id"]) < key
+    ]
+    for h in sorted(earlier, key=lambda h: (h["created_at"], h["id"]), reverse=True):
+        s = state_of(h.get("conclusion"))
+        if s is None and resolve is not None and int(h.get("run_attempt") or 1) > 1:
+            s = resolve(h)
+        if s is not None:
+            return s
+    return None
+
+
+def attempts_state(run: dict, below: int, repo: str, token: str | None, get) -> str | None:
+    """The newest red or green state among `run`'s attempts below attempt number `below`."""
+    for n in range(below - 1, 0, -1):
+        prev = get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{n}", token)
+        s = state_of(prev.get("conclusion"))
+        if s is not None:
+            return s
+    return None
 
 
 def decide(now: str | None, before: str | None, before_known: bool = True) -> str | None:
@@ -148,11 +167,12 @@ def prior_state(run: dict, repo: str, token: str | None, get=gh_get) -> str | No
     """The state before `run`, read from GitHub. Raises ReadError when it cannot be read."""
     attempt = int(run.get("run_attempt") or 1)
     # A re-run: its newest earlier attempt that was red or green, walking past cancelled ones.
-    for n in range(attempt - 1, 0, -1):
-        prev = get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{n}", token)
-        s = state_of(prev.get("conclusion"))
-        if s is not None:
-            return s
+    s = attempts_state(run, attempt, repo, token, get)
+    if s is not None:
+        return s
+
+    def resolve(h: dict) -> str | None:
+        return attempts_state(h, int(h.get("run_attempt") or 1), repo, token, get)
     branch = urllib.parse.quote(BRANCH)
     history: list[dict] = []
     for page in range(1, MAX_PAGES + 1):
@@ -165,7 +185,7 @@ def prior_state(run: dict, repo: str, token: str | None, get=gh_get) -> str | No
         if not isinstance(runs, list):
             raise ReadError("workflow runs listing has no workflow_runs array")
         history.extend(runs)
-        found = previous_state(run, history, repo)
+        found = previous_state(run, history, repo, resolve)
         if found is not None or len(runs) < 100:
             return found
     # MAX_PAGES full pages with no earlier counted run: unknown, not "none".
