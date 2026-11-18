@@ -271,6 +271,10 @@ type mux struct {
 	// attached them on, until the browser lets go of the session.
 	ownContext string
 	foreign    map[string]string
+	// contextPending is set while start takes the browser's own context
+	// from its first targets: until it knows the context, the gate resumes
+	// no target, and an ambiguous start fails with nothing released.
+	contextPending bool
 	// beforeAttach, when set, runs in start before the gate's auto-attach is
 	// asked for: setup that must be in place before any target can run.
 	// afterAttach, when set, runs once the auto-attach is in place and the
@@ -471,6 +475,9 @@ func (m *mux) start(ctx context.Context) error {
 	if err := m.readOwnContext(ctx); err != nil {
 		return err
 	}
+	m.mu.Lock()
+	m.contextPending = m.ownContext == ""
+	m.mu.Unlock()
 	// The browser reports the targets that exist before it answers, so
 	// gateSessions holds them when the call returns.
 	_, err := m.call(ctx, "", "Target.setAutoAttach", map[string]any{
@@ -479,27 +486,43 @@ func (m *mux) start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attach to the browser's targets: %w", err)
 	}
-	m.mu.Lock()
-	if m.ownContext == "" {
-		// A browser that does not name its own context: the targets it had
-		// before any client could reach it are in it, and agree on it.
-		for _, t := range m.allTargetsLocked() {
-			if t.context != "" && m.ownContext != "" && t.context != m.ownContext {
-				m.mu.Unlock()
-				return errors.New("the browser's targets are in more than one context before any client")
-			}
-			if t.context != "" {
-				m.ownContext = t.context
-			}
-		}
-	}
-	own := m.ownContext
-	m.mu.Unlock()
-	if own == "" {
-		return errors.New("the browser named no context of its own")
+	if err := m.settleOwnContext(); err != nil {
+		return err
 	}
 	if m.afterAttach != nil {
 		return m.afterAttach(ctx)
+	}
+	return nil
+}
+
+// settleOwnContext completes the browser's own context, for a browser that
+// did not name it, from the targets that exist before any client can reach
+// the browser: they must agree on one. Only then are the targets held
+// meanwhile resumed. A browser whose first targets name no context, or
+// several, does not start, and nothing held is let go.
+func (m *mux) settleOwnContext() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.contextPending {
+		return nil
+	}
+	own := ""
+	for _, t := range m.allTargetsLocked() {
+		if t.context == "" {
+			continue
+		}
+		if own != "" && t.context != own {
+			return errors.New("the browser's first targets are in more than one context")
+		}
+		own = t.context
+	}
+	if own == "" {
+		return errors.New("the browser named no context of its own")
+	}
+	m.ownContext = own
+	m.contextPending = false
+	for _, t := range m.allTargetsLocked() {
+		m.maybeResumeLocked(t)
 	}
 	return nil
 }
@@ -655,7 +678,9 @@ func (m *mux) onAttachedLocked(msg message) {
 	if owner, ok := m.explicitSessions[msg.SessionID]; ok && msg.SessionID != "" {
 		if m.foreignLocked(info.BrowserContextID) {
 			// Not the client's to see: the gate's root auto-attach closes it.
-			m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, nil)
+			// The session is let go of on the one it was attached under,
+			// where the browser keeps it.
+			m.gateCommand(msg.SessionID, "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, nil)
 			return
 		}
 		m.explicitSessions[params.SessionID] = owner
@@ -840,6 +865,9 @@ func (m *mux) dropStashedLocked(targetID, session string) message {
 // wait for it has resumed it and no private attach is in flight. A worker's
 // holds are released together (releaseWorkerLocked).
 func (m *mux) maybeResumeLocked(t *target) {
+	if m.contextPending {
+		return
+	}
 	if rootWorker(t.typ) {
 		m.releaseWorkerLocked(t.id)
 		return
@@ -887,6 +915,9 @@ func (m *mux) workerHeldLocked(targetID string) bool {
 // worker at the root, nothing is released: the page-level resume would let
 // the worker run.
 func (m *mux) releaseWorkerLocked(targetID string) {
+	if m.contextPending {
+		return
+	}
 	records := m.byID[targetID]
 	var root *target
 	settled := true

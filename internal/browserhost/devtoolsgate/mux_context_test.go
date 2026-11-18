@@ -105,3 +105,83 @@ func countAttachSessions(state fakeState, targetID string) int {
 	}
 	return n
 }
+
+// startMux starts a mux on a fake browser set up by setup and returns the
+// fake and start's outcome, for a start that may fail.
+func startMux(t *testing.T, setup func(f *fakeBrowser)) (*fakeBrowser, error) {
+	t.Helper()
+	pair := newPipePair(t)
+	fake := newFakeBrowser(pair.browserRead, pair.browserWrite)
+	setup(fake)
+	go func() { _ = fake.serve() }()
+	m := newMux(newPipe(pair.gateRead, pair.gateWrite))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = m.run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		pair.close()
+	})
+	startCtx, cancelStart := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelStart()
+	_, err := readVersion(startCtx, m)
+	require.NoError(t, err)
+	return fake, m.start(startCtx)
+}
+
+// fakeTargetState returns, under the fake's lock, whether the target
+// exists and whether it was resumed.
+func fakeTargetState(f *fakeBrowser, targetID string) (exists, resumed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, exists = f.targets[targetID]
+	return exists, slices.Contains(f.resumed, targetID)
+}
+
+// A target outside the browser's own context that opens as the gate starts
+// is held and closed like any other, never resumed. A browser that does not
+// name its own context and starts with targets in two does not start, and
+// nothing it held is resumed.
+func TestMuxStartResumesNoTargetOutsideTheBrowsersOwnContext(t *testing.T) {
+	t.Parallel()
+	fake, err := startMux(t, func(f *fakeBrowser) { f.offTheRecordAtStart = true })
+	require.NoError(t, err)
+	foreign := "T2"
+	eventually(t, 5*time.Second, func() bool {
+		exists, _ := fakeTargetState(fake, foreign)
+		return !exists
+	}, "the target off the record is closed")
+	_, resumed := fakeTargetState(fake, foreign)
+	assert.False(t, resumed)
+
+	fake, err = startMux(t, func(f *fakeBrowser) { f.offTheRecordAtStart = true; f.unnamedContext = true })
+	assert.ErrorContains(t, err, "more than one context")
+	time.Sleep(200 * time.Millisecond)
+	exists, resumed := fakeTargetState(fake, foreign)
+	assert.True(t, exists)
+	assert.False(t, resumed, "nothing held is let go")
+}
+
+// A child in another context that the browser attaches under a session a
+// client attached itself reaches no client, and its session is let go of
+// on the session it was attached under, where the browser keeps it.
+func TestMuxClientOwnSessionChildOutsideTheBrowsersOwnContext(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	pageClient := tg.dial("T1")
+	pageClient.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	var created struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(pageClient.mustCall("", "Fake.createChild", map[string]any{
+		"targetId": "T1", "type": "iframe", "browserContextId": fakeOffTheRecordContext,
+	}), &created))
+	pageClient.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+	eventually(t, 5*time.Second, func() bool {
+		for _, s := range tg.state(pageClient).Sessions {
+			if s.TargetID == created.TargetID {
+				return false
+			}
+		}
+		return true
+	}, "the child's session is detached")
+}

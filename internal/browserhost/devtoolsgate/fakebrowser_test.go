@@ -97,6 +97,9 @@ type fakeBrowser struct {
 	// keepsOffTheRecord makes Target.closeTarget fail for a page off the
 	// record, so a test can reach it after the gate tried to close it.
 	keepsOffTheRecord bool
+	// offTheRecordAtStart opens a page off the record as the root
+	// auto-attach is asked for.
+	offTheRecordAtStart bool
 	// unnamedContext makes Target.getBrowserContexts name no default
 	// context, as an older browser's does.
 	unnamedContext bool
@@ -175,6 +178,10 @@ type fakeSession struct {
 	nestedWait bool
 	// nestedFilter is the filter of the session's auto-attach.
 	nestedFilter targetFilter
+	// parent is the session a child was auto-attached under, "" for a
+	// session attached at the root. As in Chrome, a child's session is
+	// detached only on its parent.
+	parent string
 }
 
 // fakeChallenge is the authentication challenge a request meets at the
@@ -397,10 +404,21 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.autoAttach.on = boolean("autoAttach")
 		f.autoAttach.wait = boolean("waitForDebuggerOnStart")
 		if f.autoAttach.on {
+			var opening *fakeTarget
+			if f.offTheRecordAtStart {
+				// A page off the record that opens as the auto-attach is
+				// asked for, and is held by it.
+				opening = f.addTargetLocked("page", "about:blank#otr", "otr")
+				opening.context = fakeOffTheRecordContext
+			}
 			for _, t := range f.sortedTargets() {
 				s := f.newSessionLocked(t.id, true)
+				held := t == opening && f.autoAttach.wait
+				if held {
+					t.pausedBy = s.id
+				}
 				f.event("", "Target.attachedToTarget", map[string]any{
-					"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": false,
+					"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": held,
 				})
 			}
 		}
@@ -459,6 +477,9 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"sessionId": s.id})
 	case "Target.detachFromTarget":
 		s, ok := f.sessions[str("sessionId")]
+		if ok && s.parent != "" && s.parent != cmd.SessionID {
+			ok = false
+		}
 		if !ok {
 			f.replyError(cmd.ID, cmd.SessionID, -32602, "No session with given id")
 			return
@@ -590,11 +611,15 @@ func (f *fakeBrowser) handle(data []byte) {
 			typ = "worker"
 		}
 		child := f.addTargetLocked(typ, "child://"+parent.id, "child")
+		if id := str("browserContextId"); id != "" {
+			child.context = id
+		}
 		for _, s := range f.sortedSessions() {
 			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(typ) {
 				continue
 			}
 			cs := f.newSessionLocked(child.id, true)
+			cs.parent = s.id
 			if s.nestedWait {
 				child.pausedBy = cs.id
 			}
