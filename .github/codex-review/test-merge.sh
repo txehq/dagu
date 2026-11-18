@@ -324,10 +324,16 @@ run last-override-removed 1 "changed after main's check (labels or base): was $(
     PR_LABELS="$O" PULL2="$(pj main "$M" '[]')"
 run last-label-added     1 "now $(pj main "$M" '["do-not-merge","review-override"]')" not-merged \
     PR_LABELS="$O" PULL2="$(pj main "$M" '["do-not-merge","review-override"]')"
-# The base: retargeted, or its sha moved, after the check.
+# The base: a retarget after the check refuses. The PR's recorded base sha is not a live view of the
+# base (GitHub does not move it when main moves), so a change in it alone is recorded, not refused:
+# the merge lands on main's current tip either way, and the snapshot printed names the sha read.
 run last-retarget        1 "now $(pj maint/txe-v2.18.2-19 "$M" '[]')" not-merged PULL2="$(pj maint/txe-v2.18.2-19 "$M" '[]')"
-run last-base-moved      1 "now $(pj main 9999999999999999999999999999999999999999 '[]')" not-merged \
+run last-base-sha-moved  0 "PR base sha 9999999999999999999999999999999999999999; checked against main tip $M" merged \
     PULL2="$(pj main 9999999999999999999999999999999999999999 '[]')"
+# The snapshot the merge used is printed: head, base, labels, the judged gate run, main's check commit.
+run last-snapshot        0 "merging on the state read just now: PR #7 head $H, base main (PR base sha $M; checked against main tip $M), labels [\"review-override\"], codex-review run 501 5 1 (id number attempt) completed success, main's check at $M" merged \
+    RUNS="$GATE_ID
+$CI" PR_LABELS="$O"
 # A read that fails is never a pass.
 run last-gate-unread     2 "could not read the codex-review runs on $H before the merge" not-merged \
     FAIL_ON=actions/workflows/codex-review.yml/runs
@@ -387,6 +393,9 @@ PR line
 merge
 merged?
 commit"
+# On a maintenance base the live tip is the guard: the PR's recorded sha moving alone merges (the
+# tip still --base-sha), while the tip moving refuses (maint-moved-late above).
+mrun maint-last-base-sha-moved 0 "checked against $MB tip $BT" merged PULL2="$(pj "$MB" 9999999999999999999999999999999999999999 '[]')"
 mrun maint-last-override-removed 1 "changed after main's check (labels or base)" not-merged \
     PR_LABELS="$O" PULL2="$(pj "$MB" "$M" '[]')"
 mrun maint-last-new-run  1 "a newer run started after the check" not-merged RUNS2="$GATE_MB

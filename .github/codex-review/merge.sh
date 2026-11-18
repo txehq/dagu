@@ -28,7 +28,8 @@
 #      and refuses when a gate run newer than the one judged in 2 exists (a label, an edit or a
 #      re-run starts one; matched by id, run number and attempt), when that run is no longer
 #      completed/success, or when the PR differs from the read before the check (a label added or
-#      removed, review-override included, a retarget, a new base sha); a re-read that fails refuses;
+#      removed, review-override included, a retarget); a re-read that fails refuses; it prints the
+#      snapshot it merges on (head, base, labels, the judged gate run);
 #   6. merges with --match-head-commit, so GitHub refuses the merge if the head moved after 1-5.
 #
 # The merge method (TXE-6221). The default is a squash, as it always was. A squash keeps the tree
@@ -50,6 +51,7 @@
 # None of this bypasses anything: both methods run the same checks 1-5 and merge with
 # --match-head-commit. There is no flag that skips a check.
 #
+# Steps 4-5 REDUCE stale-state exposure; they do not make the merge atomic with what was checked.
 # Residual window, stated rather than hidden. GitHub's merge call binds the head
 # (--match-head-commit) and nothing else: no label, no base, no check run. So a change made after
 # the last reads of 5 is not seen. For the labels and the base that is from the moment GitHub
@@ -61,8 +63,8 @@
 # only as visible as GitHub's API makes it at the moment of the read. A connector review or a
 # check run that changes on the SAME head after the check (4) is not re-read: only the gate's own
 # run is; run this once the connector's state is final.
-# The PR's base sha is the one GitHub records on the PR (it moves on a retarget or a PR event, not
-# on every push to the base), so it is not a live read of main. The live tip of a maintenance base
+# The PR's base sha is the one GitHub records on the PR (it does not follow pushes to the base), so
+# it is recorded, not compared; a retarget is caught by the base name. The live tip of a maintenance base
 # (or of main, for a repair) is read once more just before 5, so its window is 5's two reads longer
 # than the labels': roughly 4-5 s; a move in it is caught only by the readback after the merge.
 # --match-head-commit pins the PR's head, not main: there is no atomic check of main's tip against
@@ -293,9 +295,14 @@ judged="$(jq -s -r "$gate_runs | $gate_id" "$tmp/runs.jsonl")"
 
 # ── The state main's check reads, bracketed (TXE-7847) ──
 # The PR as one line: state, draft, head, base name and sha, and the sorted label names. Read just
-# before the check and again as the last read before the merge; any difference refuses, so a label
-# added or removed (review-override included), a retarget or a base that moved while the check ran
-# or after it is not merged on the earlier read.
+# before the check and again as the last read before the merge; a difference in the state, draft
+# flag, head, base NAME or labels refuses, so a label added or removed (review-override included) or
+# a retarget while the check ran or after it is not merged on the earlier read.
+# The PR's base sha is read, shape-checked and recorded, but not compared: GitHub records it on the
+# PR and does not move it when the base branch moves (PR #282 kept 63309e62e after two merges to main,
+# read 2026-11-19), so it is not a live view of the base. On main, comparing it adds no safety (the
+# merge lands on main's current tip whatever it says) and would refuse only on an unrelated PR event.
+# On a maintenance base the live tip is the guard: it must still be --base-sha just before the merge.
 # Nothing is defaulted in the projection: a missing field stays null and the shape check below
 # refuses it, so two partial answers never compare equal while hiding what changed.
 pull_state='{state, draft, head: .head.sha, base: .base.ref, base_sha: .base.sha, labels: (if (.labels | type) == "array" then [.labels[] | .name] | sort else .labels end)} | tojson'
@@ -337,8 +344,12 @@ final_reread() {
   [ "$last" = "$judged" ] || refuse "the newest codex-review run on $want is now '${last:-missing}' (id, number, attempt), not the judged '$judged' ($lastgate): a newer run started after the check; re-run this once it has finished"
   [ "$lastgate" = "completed success" ] || refuse "the judged codex-review run on $want is now '${lastgate:-missing}', not completed success"
   read_pull_state "$tmp/pull-last.json" "PR #$pr's labels and base before the merge"
-  cmp -s "$tmp/pull-before.json" "$tmp/pull-last.json" \
+  jq -S -c 'del(.base_sha)' "$tmp/pull-before.json" >"$tmp/pull-before.cmp" || unread "PR #$pr's state line before main's check"
+  jq -S -c 'del(.base_sha)' "$tmp/pull-last.json" >"$tmp/pull-last.cmp" || unread "PR #$pr's state line before the merge"
+  cmp -s "$tmp/pull-before.cmp" "$tmp/pull-last.cmp" \
     || refuse "PR #$pr changed after main's check (labels or base): was $(cat "$tmp/pull-before.json"), now $(cat "$tmp/pull-last.json")"
+  # The snapshot this merge is made on, recorded: what was checked, not a guarantee that it held.
+  echo "merge.sh: merging on the state read just now: PR #$pr head $want, base $(jq -r .base "$tmp/pull-last.json") (PR base sha $(jq -r .base_sha "$tmp/pull-last.json"); checked against $bn tip $basetip), labels $(jq -c .labels "$tmp/pull-last.json"), codex-review run $judged (id number attempt) $lastgate, main's check at $maintip"
 }
 
 if [ "$method" = squash ] && [ "$maint" = false ]; then
