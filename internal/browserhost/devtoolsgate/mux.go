@@ -1059,41 +1059,119 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 			c.deliverError(msg.ID, sessionID, err.Error())
 		}
 	default:
-		if (strings.HasPrefix(msg.Method, "Target.") && !forwardedTargetMethods[msg.Method]) || refusedMethods[msg.Method] {
+		if refusedMethods[msg.Method] {
 			c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
 			return
+		}
+		if strings.HasPrefix(msg.Method, "Target.") {
+			policy, ok := forwardedTargetMethods[msg.Method]
+			if !ok {
+				c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
+				return
+			}
+			params, err := policy.check(msg.Method, msg.Params)
+			if err != nil {
+				c.deliverError(msg.ID, sessionID, err.Error())
+				return
+			}
+			msg.Params = params
 		}
 		m.forwardLocked(c, msg, sessionID)
 	}
 }
 
-// forwardedTargetMethods are the Target commands the gate passes on as they
-// are; it handles the others it knows itself. Any other Target command is
-// refused: the domain decides which targets are held, who is attached to
-// them and over which connection, and a command the gate does not mediate
-// could change that under it (TXE-6223's security review: autoAttachRelated
-// turns the gate's own auto-attach off, exposeDevToolsProtocol opens a
-// connection the gate never sees, sendMessageToTarget reaches any session).
-// The clients the gate serves, Stagehand's driver, the write gate and the
-// hub's, use only these and the ones it handles.
 // refusedMethods are the commands outside the Target domain the gate
-// refuses for the same reason: ServiceWorker.inspectWorker opens a DevTools
+// refuses for the same reason as the Target commands it does not mediate
+// (forwardedTargetMethods): ServiceWorker.inspectWorker opens a DevTools
 // window on a worker, an inspector the gate never sees (TXE-6223's Codex
 // review).
 var refusedMethods = map[string]bool{
 	"ServiceWorker.inspectWorker": true,
 }
 
-var forwardedTargetMethods = map[string]bool{
-	"Target.activateTarget":        true,
-	"Target.closeTarget":           true,
-	"Target.createBrowserContext":  true,
-	"Target.createTarget":          true,
-	"Target.disposeBrowserContext": true,
-	"Target.getBrowserContexts":    true,
-	"Target.getTargetInfo":         true,
-	"Target.getTargets":            true,
+// paramPolicy is the part of a Target command's params the gate passes on:
+// the names of the params it accepts. A param it does not name is refused,
+// whatever its value, so a param the browser adds later is refused until it
+// is read and listed here.
+type paramPolicy struct {
+	passed []string
 }
+
+// errParamsNotObject is the reply to a Target command whose params are not
+// a JSON object.
+var errParamsNotObject = errors.New("invalid parameters: params must be a JSON object")
+
+// check returns the params of a client's method as the gate passes them on,
+// or the error the client is answered with. What is passed on is the gate's
+// own encoding of the params it read, not the client's bytes, so the
+// browser reads the same params the gate checked: a repeated key, for one,
+// reaches it once. Params left out, or null, stay left out.
+func (p paramPolicy) check(method string, raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, fmt.Errorf("%s: %w", method, errParamsNotObject)
+	}
+	names := make([]string, 0, len(params))
+	for name := range params {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if !slices.Contains(p.passed, name) {
+			return nil, fmt.Errorf("the gate does not pass on %s with the param %q", method, name)
+		}
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", method, errParamsNotObject)
+	}
+	return encoded, nil
+}
+
+// forwardedTargetMethods are the Target commands the gate passes on, each
+// with the params it passes; it handles the others it knows itself. Any
+// other Target command is refused: the domain decides which targets are
+// held, who is attached to them and over which connection, and a command
+// the gate does not mediate could change that under it (TXE-6223's security
+// review: autoAttachRelated turns the gate's own auto-attach off,
+// exposeDevToolsProtocol opens a connection the gate never sees,
+// sendMessageToTarget reaches any session). The clients the gate serves,
+// Stagehand's driver, the write gate and the hub's, use only these and the
+// ones it handles.
+//
+// An allowlist entry is a method and its param policy, never a method
+// alone: a forwarded method can take a param that changes the browser's
+// networking, proxying or isolation, and such a param is left out of the
+// policy and refused. Every param of each method below was read against the
+// DevTools protocol (TXE-7856); a method added here comes with its policy,
+// and TestMuxForwardedTargetMethodsHaveAuditedParamPolicies fails until the
+// audit table there lists it.
+var forwardedTargetMethods = map[string]paramPolicy{
+	"Target.activateTarget": {passed: []string{"targetId"}},
+	"Target.closeTarget":    {passed: []string{"targetId"}},
+	// The context's other params set its networking or isolation apart
+	// from the browser's, and none is passed on.
+	"Target.createBrowserContext": {passed: []string{"disposeOnDetach"}},
+	"Target.createTarget": {passed: []string{
+		"url", "left", "top", "width", "height", "windowState", "browserContextId",
+		"enableBeginFrameControl", "newWindow", "background", "forTab", "hidden", "focus",
+	}},
+	"Target.disposeBrowserContext": {passed: []string{"browserContextId"}},
+	"Target.getBrowserContexts":    {passed: nil},
+	"Target.getTargetInfo":         {passed: []string{"targetId"}},
+	"Target.getTargets":            {passed: []string{"filter"}},
+}
+
+// clientAutoAttachParams is the param policy of a client's
+// Target.setAutoAttach on a session it attached itself, the one Target
+// command the gate handles whose params it passes on (rewritten by
+// withoutRootWorkers). The gate builds the params of every other command it
+// handles itself.
+var clientAutoAttachParams = paramPolicy{passed: []string{"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"}}
 
 // ownsSessionLocked reports whether sessionID is the browser itself, c's
 // root, a private session made for c, or a session c attached itself.
@@ -1151,8 +1229,15 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 		// let the worker run before the clients the gate holds it for set it
 		// up ("Worker holds").
 		// Every forwarded call is rewritten, whatever autoAttach parsed as
-		// here: the browser reads the params with its own parser.
-		rewritten, ok := withoutRootWorkers(msg.Params)
+		// here: the browser reads the params with its own parser. They are
+		// checked against the policy first, and what is rewritten is the
+		// gate's encoding of what it checked.
+		checked, err := clientAutoAttachParams.check(msg.Method, msg.Params)
+		if err != nil {
+			c.deliverError(msg.ID, sessionID, err.Error())
+			return
+		}
+		rewritten, ok := withoutRootWorkers(checked)
 		if !ok {
 			c.deliverError(msg.ID, sessionID, "Target.setAutoAttach: invalid parameters")
 			return
