@@ -79,14 +79,23 @@ RUN set -ex && \
 # Chromium for browser steps. Ubuntu ships Chromium only as a snap, so the
 # build comes from Playwright, which provides amd64 and arm64. Playwright
 # 1.61 is the last release that runs on Ubuntu's Node.js 18.
+# The Playwright version is the one ui/pnpm-lock.yaml pins, so this image
+# ships the Chromium build CI's browser tests run (TXE-7866). The lockfile is
+# the only pin; internal/tools/playwrightpin fails CI on a second.
 ARG TARGETARCH
-ARG PLAYWRIGHT_VERSION=1.61.1
-RUN set -ex; \
+RUN --mount=type=bind,source=ui/pnpm-lock.yaml,target=/tmp/pnpm-lock.yaml \
+    set -ex; \
+    PLAYWRIGHT_VERSION="$(sed -n 's/^  playwright@\([0-9][0-9.]*\):$/\1/p' /tmp/pnpm-lock.yaml | sort -u)"; \
+    if [ -z "$PLAYWRIGHT_VERSION" ] || [ "$(printf '%s\n' "$PLAYWRIGHT_VERSION" | wc -l)" -ne 1 ]; then \
+      echo "ui/pnpm-lock.yaml pins no single Playwright version: '$PLAYWRIGHT_VERSION'" >&2; \
+      exit 1; \
+    fi; \
     if [ "$TARGETARCH" = "amd64" ] || [ "$TARGETARCH" = "arm64" ]; then \
       PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
         npx --yes "playwright@${PLAYWRIGHT_VERSION}" install --with-deps --no-shell chromium && \
       ln -s "$(find /opt/ms-playwright -type f -name chrome -path '*/chromium-*' | head -n 1)" /usr/local/bin/chromium && \
-      /usr/local/bin/chromium --version && \
+      chromium_version="$(/usr/local/bin/chromium --version)" && \
+      echo "Chromium from Playwright ${PLAYWRIGHT_VERSION}: ${chromium_version}" && \
       apt-get clean && rm -rf /var/lib/apt/lists/* /root/.npm; \
     fi
 # Chromium keeps its sandbox. The seccomp profile it needs to start is
