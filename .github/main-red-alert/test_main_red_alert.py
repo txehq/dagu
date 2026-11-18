@@ -83,12 +83,12 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub(HISTORY)
         got = {r["id"]: evaluate(r, gh) for r in HISTORY}
         self.assertEqual(got[38201258145], "alert")  # first red, no earlier counted run
-        self.assertIsNone(got[39195531596])  # red after red: already alerted
-        self.assertIsNone(got[40265174723])
+        self.assertEqual(got[39195531596], "still")  # red after red: a reminder, never silence
+        self.assertEqual(got[40265174723], "still")
         self.assertEqual(got[41287012982], "clear")  # first green after the streak
         self.assertIsNone(got[41291253865])
         self.assertEqual(got[43798559034], "alert")  # the 2026-11-16 run: alerts on the first red
-        self.assertEqual([i for i, a in got.items() if a], [38201258145, 41287012982, 43798559034])
+        self.assertEqual([i for i, a in got.items() if a], [38201258145, 39195531596, 40265174723, 41287012982, 43798559034])
 
     def test_cancelled_and_skipped_runs_neither_alert_nor_break_a_streak(self):
         hist = [
@@ -100,7 +100,7 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub(hist)
         self.assertIsNone(evaluate(hist[1], gh))
         self.assertIsNone(evaluate(hist[2], gh))
-        self.assertIsNone(evaluate(hist[3], gh))
+        self.assertEqual(evaluate(hist[3], gh), "still")
 
     def test_timed_out_and_startup_failure_are_red(self):
         for c in ("timed_out", "startup_failure"):
@@ -139,7 +139,11 @@ class Rule(unittest.TestCase):
         self.assertEqual(evaluate(rerun_green, gh), "clear")
         rerun_red = run(3, "failure", "2026-01-03T00:00:00Z", attempt=2)
         gh = FakeGitHub([older_green, rerun_red], attempts={(3, 1): "failure"})
-        self.assertIsNone(evaluate(rerun_red, gh))
+        self.assertEqual(evaluate(rerun_red, gh), "still")
+        # Attempt 1 red (alerted), attempt 2 cancelled, attempt 3 green: walk back to attempt 1.
+        third = run(4, "success", "2026-01-04T00:00:00Z", attempt=3)
+        gh = FakeGitHub([older_green, third], attempts={(4, 2): "cancelled", (4, 1): "failure"})
+        self.assertEqual(evaluate(third, gh), "clear")
         # A cancelled first attempt says nothing: fall back to the earlier run.
         gh = FakeGitHub([older_green, rerun_red], attempts={(3, 1): "cancelled"})
         self.assertEqual(evaluate(rerun_red, gh), "alert")
@@ -199,12 +203,19 @@ class Notify(unittest.TestCase):
         self.assertEqual(len(posts), 1)
         self.assertIn("runs/43798559034", posts[0])
 
-    def test_no_post_for_red_after_red(self):
-        self.assertEqual(self.notify(HISTORY[1]), (0, []))
+    def test_red_after_red_posts_still_red(self):
+        # Installed mid-streak, or the first POST failed: a later red must still reach someone.
+        rc, posts = self.notify(HISTORY[1])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("is still red on main", posts[0])
+
+    def test_no_post_for_green_after_green(self):
+        self.assertEqual(self.notify(HISTORY[4]), (0, []))
 
     def test_missing_webhook_fails_when_a_post_is_due_only(self):
         self.assertEqual(self.notify(HISTORY[-1], webhook=""), (1, []))
-        self.assertEqual(self.notify(HISTORY[1], webhook=""), (0, []))
+        self.assertEqual(self.notify(HISTORY[4], webhook=""), (0, []))
 
     def test_failed_delivery_fails_the_job(self):
         rc, posts = self.notify(HISTORY[-1], post_ok=False)
@@ -258,6 +269,13 @@ on:
         bad = self.NOTIFIER.replace("types: [completed]", "types: [requested]").replace("branches: [main]", "branches: [main, dev]")
         errs = self.errors({"main-red-alert.yaml": bad, "image-security.yaml": self.SCANS})
         self.assertEqual(len(errs), 2)
+
+    def test_a_cron_that_can_fire_more_than_daily_fails(self):
+        for cron in ("*/15 * * * *", "0 */6 * * *", "0 1,13 * * *", "@hourly"):
+            body = f"name: SecurityScans\non:\n  schedule:\n    - cron: '{cron}'\n"
+            errs = self.errors({"main-red-alert.yaml": self.NOTIFIER, "image-security.yaml": body})
+            self.assertEqual(len(errs), 1, cron)
+            self.assertIn("may fire more than once a day", errs[0])
 
     def test_the_repository_itself_is_covered(self):
         root = pathlib.Path(__file__).resolve().parents[2]

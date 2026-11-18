@@ -15,12 +15,16 @@ it lists (`on.workflow_run.workflows`). The rule is stateless; it reads the run'
     head_branch "main"; its head repository is the fork, so it is ignored.
   * A conclusion of failure, timed_out or startup_failure is red; success is green. Any other
     conclusion (cancelled, skipped, neutral, ...) neither alerts nor clears.
-  * The state before the run is its own previous attempt when that attempt was red or green
-    (a re-run), otherwise the newest earlier counted run of the same workflow on main.
-  * Red after green, or after no counted run: post the alert. Green after red: post the clear.
-    Red after red: nothing, the first red was posted. Green after green: nothing.
-  * The history read fails: a red run alerts anyway (an extra post is cheaper than a missed
-    one); a green run fails this job, since it cannot tell whether a clear is due.
+  * The state before the run is its newest earlier attempt that was red or green (a re-run),
+    otherwise the newest earlier counted run of the same workflow on main.
+  * Every red run posts, so the first red is never missed: "is red" after green or no counted
+    run, "is still red" after red. A previous red is not proof that its post was delivered
+    (the notifier may have been installed mid-streak, or that POST failed), and the rule keeps
+    no state to prove it, so it repeats rather than goes quiet. A watched workflow fires at
+    most daily (SecurityScans: weekly), which bounds the repeats.
+  * Green after red: post the clear. Green after green: nothing.
+  * The history read fails: a red run posts "is red" anyway; a green run fails this job, since
+    it cannot tell whether a clear is due.
 
 The post names the repository, the workflow and the run link, nothing else: this repository
 is public and a scan's findings stay in the run.
@@ -101,9 +105,9 @@ def previous_state(run: dict, history: list[dict], repo: str) -> str | None:
 
 
 def decide(now: str | None, before: str | None, before_known: bool = True) -> str | None:
-    """'alert', 'clear' or None for a run in state `now` after state `before`."""
+    """'alert', 'still', 'clear' or None for a run in state `now` after state `before`."""
     if now == "red":
-        return None if before_known and before == "red" else "alert"
+        return "still" if before_known and before == "red" else "alert"
     if now == "green":
         if not before_known:
             raise ReadError("the run is green but the previous run's state could not be read")
@@ -114,6 +118,8 @@ def decide(now: str | None, before: str | None, before_known: bool = True) -> st
 def message(action: str, repo: str, workflow: str, run_url: str) -> str:
     if action == "alert":
         return f":rotating_light: {repo}: workflow `{workflow}` is red on {BRANCH}. Run: {run_url}"
+    if action == "still":
+        return f":rotating_light: {repo}: workflow `{workflow}` is still red on {BRANCH}. Run: {run_url}"
     return f":white_check_mark: {repo}: workflow `{workflow}` is green again on {BRANCH}. Run: {run_url}"
 
 
@@ -141,8 +147,9 @@ def gh_get(path: str, token: str | None) -> dict:
 def prior_state(run: dict, repo: str, token: str | None, get=gh_get) -> str | None:
     """The state before `run`, read from GitHub. Raises ReadError when it cannot be read."""
     attempt = int(run.get("run_attempt") or 1)
-    if attempt > 1:
-        prev = get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{attempt - 1}", token)
+    # A re-run: its newest earlier attempt that was red or green, walking past cancelled ones.
+    for n in range(attempt - 1, 0, -1):
+        prev = get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{n}", token)
         s = state_of(prev.get("conclusion"))
         if s is not None:
             return s
@@ -276,8 +283,17 @@ def coverage_errors(root: pathlib.Path) -> list[str]:
         name = doc.get("name")
         if isinstance(name, str):
             names[name] = p.name
-        if "schedule" in _on(doc):
+        on = _on(doc)
+        if "schedule" in on:
             scheduled.append((p.name, name if isinstance(name, str) else None))
+            for entry in on.get("schedule") or []:
+                cron = str((entry or {}).get("cron", "")).split()
+                if len(cron) != 5 or not (cron[0].isdigit() and cron[1].isdigit()):
+                    errors.append(
+                        f"{p.name}: cron {' '.join(cron)!r} may fire more than once a day; every red run "
+                        "posts to #infra-alert, so a watched workflow fires at most daily "
+                        "(a fixed minute and hour). A faster one needs a deduplicating rule first."
+                    )
         if p.name == NOTIFIER.name:
             notifier_doc = doc
     if notifier_doc is None:

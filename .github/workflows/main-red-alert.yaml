@@ -3,8 +3,8 @@ name: main-red-alert
 # Posts to Mattermost #infra-alert when a listed workflow's run on main turns red, and again on
 # its next green run (TXE-7846). SecurityScans went red on main on 2026-11-16 (run 43798559034)
 # and nobody was told: GitHub mails a failed scheduled run only to whoever last edited the cron.
-# The rule (first red alerts, red-after-red stays quiet, a green after red clears; only main's
-# own schedule and push runs count) is in .github/main-red-alert/main_red_alert.py.
+# The rule (every red run posts: "is red" first, then "is still red"; a green after red clears;
+# only main's own schedule and push runs count) is in .github/main-red-alert/main_red_alert.py.
 #
 # The post names the repository, the workflow and the run link only: this repository is public.
 # The job checks out this file's own commit (the default branch), never the triggering run's
@@ -12,6 +12,7 @@ name: main-red-alert
 #
 # Every workflow with `on: schedule` must be listed under workflow_run.workflows, by its `name:`.
 # The check job below fails a pull request or main push that adds one without listing it.
+# It also fails a scheduled workflow whose cron can fire more than once a day: each red run posts.
 #
 # MATTERMOST_WEBHOOK_URL is a repository secret holding the same #infra-alert incoming webhook
 # as txe's scheduled-workflow-watchdog.yml. While it is unset, a due post is printed and the
