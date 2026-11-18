@@ -198,7 +198,7 @@ class History:
         created = f"&created={urllib.parse.quote('<=' + self.as_of)}" if self.as_of else ""
         body = self.get(
             f"/repos/{self.repo}/actions/workflows/{self.run['workflow_id']}/runs"
-            f"?branch={branch}&status=completed{created}&per_page=100&page={self._page}",
+            f"?branch={branch}{created}&per_page=100&page={self._page}",
             self.token,
         )
         runs = body.get("workflow_runs")
@@ -215,13 +215,17 @@ class History:
                 # than the one being judged is a newer event.
                 latest = int(r.get("run_attempt") or 1)
                 if latest > self.attempt and not self.later_own:
-                    later = attempt_events(r, latest, self.repo, self.token, self.get)
+                    upto = latest if r.get("status") == "completed" else latest - 1
+                    later = attempt_events(r, upto, self.repo, self.token, self.get)
                     self.later_own = any(e.attempt > self.attempt for e in later)
                 continue
-            if r["id"] in self._seen or not counts(r, self.repo) or r.get("status") != "completed":
+            if r["id"] in self._seen or not counts(r, self.repo):
                 continue
             self._seen.add(r["id"])
-            self.events.extend(attempt_events(r, int(r.get("run_attempt") or 1), self.repo, self.token, self.get))
+            # A run being re-run still has its completed earlier attempts (an alerted red).
+            latest = int(r.get("run_attempt") or 1)
+            upto = latest if r.get("status") == "completed" else latest - 1
+            self.events.extend(attempt_events(r, upto, self.repo, self.token, self.get))
         self.events.sort(key=lambda e: e.key, reverse=True)
         return True
 

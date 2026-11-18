@@ -57,7 +57,7 @@ class FakeGitHub:
             rid, n = path.split("/runs/")[1].split("/attempts/")
             return {"conclusion": self.attempts[(int(rid), int(n))]}
         if f"/workflows/{WF_ID}/runs?" in path:
-            assert "branch=main" in path and "status=completed" in path
+            assert "branch=main" in path and "status=" not in path
             page = int(path.rsplit("page=", 1)[1])
             runs = self.runs
             if "&created=" in path:
@@ -331,6 +331,12 @@ class Rule(unittest.TestCase):
         noise = [run(2000 + i, "failure", f"2026-01-05T00:{i // 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(100)]
         gh = FakeGitHub([self.R1, self.G3, r, *noise], notified={10: (2, 1, OK)})
         self.assertIsNone(evaluate(self.G3, gh))
+
+    def test_a_red_run_being_rerun_keeps_its_completed_red_attempt(self):
+        # R1 failed and alerted; G3 succeeded; R1 is being re-run while G3's notify decides.
+        rerunning = dict(self.R1, status="in_progress", conclusion=None, run_attempt=2)
+        gh = FakeGitHub([self.G0, rerunning, self.G3], attempts={(2, 1): "failure"}, notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(self.G3, gh), "clear")
 
     def test_unread_history_alerts_a_red_and_fails_a_green(self):
         self.assertEqual(evaluate(self.R1, FakeGitHub([], fail=True)), "alert")
