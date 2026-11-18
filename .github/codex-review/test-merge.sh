@@ -100,6 +100,18 @@ run ci-pending    1 "workflow CI (.github/workflows/ci.yaml): queued/none" not-m
 run ci-rerun-ok   0 merged                                merged RUNS="$GATE
 "'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":8,"status":"completed","conclusion":"failure"}
 {"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"completed","conclusion":"success"}'
+# A cancelled run with no later run of its workflow on the head refuses (TXE-7841).
+run ci-cancelled  1 "workflow CI (.github/workflows/ci.yaml): completed/cancelled" not-merged RUNS="$GATE
+"'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":9,"status":"completed","conclusion":"cancelled"}'
+# A green run, then a later cancelled run of the same workflow on the head, refuses: the latest decides.
+run ci-green-then-cancelled 1 "workflow CI (.github/workflows/ci.yaml): completed/cancelled" not-merged RUNS="$GATE
+$CI
+"'{"name":"CI","path":".github/workflows/ci.yaml","workflow_id":102,"event":"pull_request","run_number":10,"status":"completed","conclusion":"cancelled"}'
+# A cancelled run's checks keep refusing even when a later suite on the head is green: each suite
+# is judged on its own, so a same-head duplicate run (draft marked ready, PR #279) is removed at
+# the workflows (internal/tools/workflowtriggers), never accepted here.
+run check-cancelled-superseded 1 "check Go Linter (linux): completed/cancelled" not-merged CHECKS="$CHK
+"'{"name":"Go Linter (linux)","app":{"id":15368},"check_suite":{"id":6},"status":"completed","conclusion":"cancelled","started_at":"2026-10-20T09:00:00Z"}'
 # Two workflow files with one display name: a later green run of one never hides the other's failure.
 run same-name     1 "workflow CI (.github/workflows/ci-extra.yaml): completed/failure" not-merged RUNS="$GATE
 $CI
