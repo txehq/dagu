@@ -178,3 +178,11 @@ body
 EOF3
 trap 'false' EXIT # want:trap-status
 cat <<< trap 'false' EXIT
+# An escaped blank and a redirection's & or | stay inside their word (connector review of PR 293).
+FOO=a\ b trap 'false' EXIT # want:trap-status
+>a\ b trap 'false' EXIT # want:trap-status
+2>&1 trap 'false' EXIT # want:trap-status
+>&2 trap 'false' EXIT # want:trap-status
+>| /dev/null trap 'false' EXIT # want:trap-status
+echo a\ b trap 'false' EXIT
+echo 2>&1 trap 'false' EXIT

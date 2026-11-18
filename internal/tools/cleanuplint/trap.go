@@ -498,6 +498,10 @@ func findTraps(text string) []trapCmd {
 	// of the line is still shell (cat <<EOF; trap ...), so the bodies are
 	// skipped at its newline (connector review of PR 293).
 	bodyEnd := -1
+	// wordEnd: the end of the last word read. Its inside is not read again
+	// (FOO=a\ b, 2>&1), except after a ( that starts a command in it,
+	// x=$(trap ...).
+	wordEnd := 0
 	for i := 0; i < len(text); {
 		c := text[i]
 		if z.q == 0 {
@@ -530,7 +534,7 @@ func findTraps(text string) []trapCmd {
 				i += 2 // a line continuation is a blank: it starts no word
 				continue
 			}
-			wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
+			wordStart := i == 0 || (i >= wordEnd && strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0) || text[i-1] == '('
 			if wordStart && c == '#' {
 				for i < len(text) && text[i] != '\n' {
 					i++
@@ -539,6 +543,7 @@ func findTraps(text string) []trapCmd {
 			}
 			if wordStart && strings.IndexByte(" \t\n;&|()", c) < 0 {
 				w, wend := wordAt(text, i)
+				wordEnd = wend
 				switch {
 				case target:
 					target = false
@@ -563,7 +568,8 @@ func findTraps(text string) []trapCmd {
 			}
 		}
 		next, plain := z.step(text, i)
-		if plain && strings.IndexByte("\n;&|()", c) >= 0 {
+		// Inside a word read whole, only a ( starts a command ($( ), <( )).
+		if plain && (c == '(' || i >= wordEnd && strings.IndexByte("\n;&|)", c) >= 0) {
 			cmd, target = true, false
 		}
 		i = next
@@ -605,13 +611,15 @@ var (
 	redirOpRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:>>?|<|<>|>\||&>>?|>&|<&)$`)
 )
 
-// wordAt returns the shell word that starts at i and the index past it.
+// wordAt returns the shell word that starts at i and the index past it. A
+// & or | of a redirection operator (>&, <&, >|) is part of the word.
 func wordAt(text string, i int) (string, int) {
 	var z quoter
 	j := i
 	for j < len(text) {
 		next, plain := z.step(text, j)
-		if plain && strings.IndexByte(" \t\n;&|)", text[j]) >= 0 {
+		if plain && strings.IndexByte(" \t\n;&|)", text[j]) >= 0 &&
+			(j == i || strings.IndexByte("&|", text[j]) < 0 || strings.IndexByte("<>", text[j-1]) < 0) {
 			break
 		}
 		j = next
