@@ -349,7 +349,8 @@ final_reread() {
   cmp -s "$tmp/pull-before.cmp" "$tmp/pull-last.cmp" \
     || refuse "PR #$pr changed after main's check (labels or base): was $(cat "$tmp/pull-before.json"), now $(cat "$tmp/pull-last.json")"
   # The snapshot this merge is made on, recorded: what was checked, not a guarantee that it held.
-  echo "merge.sh: merging on the state read just now: PR #$pr head $want, base $(jq -r .base "$tmp/pull-last.json") (PR base sha $(jq -r .base_sha "$tmp/pull-last.json"); checked against $bn tip $basetip), labels $(jq -c .labels "$tmp/pull-last.json"), codex-review run $judged (id number attempt) $lastgate, main's check at $maintip"
+  # printf, never echo: an echo with xpg_echo set would expand a backslash escape in a label name.
+  printf '%s\n' "merge.sh: merging on the state read just now: PR #$pr head $want, base $(jq -r .base "$tmp/pull-last.json") (PR base sha $(jq -r .base_sha "$tmp/pull-last.json"); checked against $bn tip $basetip), labels $(jq -c .labels "$tmp/pull-last.json"), codex-review run $judged (id number attempt) $lastgate, main's check at $maintip"
 }
 
 if [ "$method" = squash ] && [ "$maint" = false ]; then
