@@ -37,7 +37,11 @@ var (
 	runsShellInstaller   = regexp.MustCompile(`\binstaller\.sh(?:[^\w|)]|$)`)
 	// The workflow token, the only value the check accepts.
 	workflowToken = regexp.MustCompile(`^\$\{\{\s*(?:github\.token|secrets\.GITHUB_TOKEN)\s*\}\}$`)
-	webRequest    = regexp.MustCompile(`(?i)\bInvoke-(?:RestMethod|WebRequest)\b|\birm\b|\biwr\b`)
+	// A line of a cmd step that starts a batch file. Without CALL, cmd hands
+	// the rest of the step to that file and never returns, so the checks
+	// after it never run.
+	batchFileRun = regexp.MustCompile(`(?i)^(?:@?\s*)(\S+\.(?:cmd|bat))(?:\s|$)`)
+	webRequest   = regexp.MustCompile(`(?i)\bInvoke-(?:RestMethod|WebRequest)\b|\birm\b|\biwr\b`)
 )
 
 type workflowFile struct {
@@ -51,9 +55,10 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
-	Name string    `yaml:"name"`
-	Run  string    `yaml:"run"`
-	Env  yaml.Node `yaml:"env"`
+	Name  string    `yaml:"name"`
+	Shell string    `yaml:"shell"`
+	Run   string    `yaml:"run"`
+	Env   yaml.Node `yaml:"env"`
 }
 
 func TestInstallerAPICallsAreAuthenticated(t *testing.T) {
@@ -107,7 +112,10 @@ func TestInstallerAPICallsAreAuthenticatedRefuses(t *testing.T) {
 		"workflow env": "env:\n  DAGU_INSTALLER_GITHUB_TOKEN: ${{github.token}}\n" +
 			"jobs:\n  t:\n    steps:\n      - run: powershell -File scripts/installer.ps1 -NoPrompt\n",
 		"a step that never runs the installer": step("", "go build ./cmd"),
-		"a changed-paths case pattern":         step("", "case \"${file}\" in scripts/installer.cmd|scripts/installer.sh|scripts/installer.ps1) changed=true ;; esac"),
+		"a cmd step that calls the CMD installer": "jobs:\n  t:\n    steps:\n      - shell: cmd\n" +
+			"        env:\n          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}\n" +
+			"        run: |\n          call scripts\\installer.cmd -NoPrompt\n          if errorlevel 1 exit /b 1\n",
+		"a changed-paths case pattern": step("", "case \"${file}\" in scripts/installer.cmd|scripts/installer.sh|scripts/installer.ps1) changed=true ;; esac"),
 	} {
 		findings, err := check(tree(map[string]string{".github/workflows/ci.yaml": wf}))
 		require.NoError(t, err, name)
@@ -138,6 +146,12 @@ func TestInstallerAPICallsAreAuthenticatedRefuses(t *testing.T) {
 		"a step env that is an expression": {
 			files: map[string]string{".github/workflows/ci.yaml": "jobs:\n  t:\n    steps:\n      - env: ${{ fromJSON(inputs.env) }}\n        run: scripts\\installer.cmd\n"},
 			want:  `ci.yaml: job t, step 1 runs the Windows installer without DAGU_INSTALLER_GITHUB_TOKEN`,
+		},
+		"a cmd step that runs the CMD installer without call": {
+			files: map[string]string{".github/workflows/ci.yaml": "jobs:\n  t:\n    steps:\n      - name: cmd\n        shell: cmd\n" +
+				"        env:\n          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}\n" +
+				"        run: |\n          scripts\\installer.cmd -NoPrompt > \"%RUNNER_TEMP%\\x.log\" 2>&1\n          findstr /c:\"token\" \"%RUNNER_TEMP%\\x.log\"\n"},
+			want: `ci.yaml: job t, step "cmd" runs scripts\installer.cmd without call`,
 		},
 		"the shell installer": {
 			files: map[string]string{".github/workflows/smoke.yml": step(stepEnv, "bash scripts/installer.sh --no-prompt")},
@@ -218,6 +232,13 @@ func checkWorkflow(name string, data []byte) ([]string, error) {
 			}
 			if runsWindowsInstaller.MatchString(step.Run) && !hasWorkflowToken(&wf.Env, &job.Env, &step.Env) {
 				findings = append(findings, where+" runs the Windows installer without "+tokenVar+": ${{ github.token }} in its env")
+			}
+			if strings.EqualFold(step.Shell, "cmd") {
+				for line := range strings.SplitSeq(step.Run, "\n") {
+					if m := batchFileRun.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+						findings = append(findings, where+" runs "+m[1]+" without call, so the lines after it never run")
+					}
+				}
 			}
 		}
 	}

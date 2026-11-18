@@ -812,8 +812,10 @@ jobs:
           # (TXE-7871). internal/tools/installerapi requires this on every step
           # that runs the installer.
           DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
+        # A batch file run without CALL replaces this script and never returns,
+        # so every line after it would be skipped (TXE-7871).
         run: |
-          scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install" > "%RUNNER_TEMP%\dagu-cmd-install.log" 2>&1
+          call scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install" > "%RUNNER_TEMP%\dagu-cmd-install.log" 2>&1
           set "INSTALL_EXIT=%ERRORLEVEL%"
           type "%RUNNER_TEMP%\dagu-cmd-install.log"
           if not "%INSTALL_EXIT%"=="0" exit /b 1
@@ -825,7 +827,7 @@ jobs:
           )
           "%RUNNER_TEMP%\dagu-cmd-install\dagu.exe" version
           if errorlevel 1 exit /b 1
-          scripts\installer.cmd -NoPrompt -Uninstall -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
+          call scripts\installer.cmd -NoPrompt -Uninstall -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
           if errorlevel 1 exit /b 1
           if exist "%RUNNER_TEMP%\dagu-cmd-install\dagu.exe" exit /b 1
 
