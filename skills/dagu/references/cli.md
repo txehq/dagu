@@ -233,6 +233,15 @@ dagu browser session close <id> [--force] [--keep]
 dagu browser session list
 ```
 
+### dagu browser profile
+
+Claim a named browser profile (`browser.profile`, `--profile`) made before Dagu marked the profiles its browsers may change. A step or session refuses such a profile and leaves it as it is, logins and cookies included, until it is claimed. Dagu's browsers set `incognito.mode_availability = 1` in the profile's `Default/Preferences` each time they start and change nothing else there. `claim` checks the profile is `<data dir>/browser/profiles/<name>` itself, the user's alone and in use by no step, session or browser, keeps a copy of the preferences beside them (`Preferences.dagu-before-claim`) and the value it found, and prints both as JSON. `unclaim` undoes it: the value is put back and every preference the browser wrote since is kept.
+
+```sh
+dagu browser profile claim <name>
+dagu browser profile unclaim <name>
+```
+
 ### dagu computer check
 
 Check that computer steps can capture the screen and send input in the current session. Run it as the user and in the session of the worker that runs computer steps. On macOS it also asks macOS to show the Screen Recording and Accessibility prompts for missing permissions. Exits nonzero and lists the problems when the desktop cannot be automated. `--format json` prints `{os, width, height, ready, problems}`, each problem with a `code` (such as `screen_recording`, `accessibility`, `screen_locked`, or `session_disconnected` for a Remote Desktop or child session whose client has gone) and a `message`.
