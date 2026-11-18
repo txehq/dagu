@@ -128,6 +128,20 @@ with os.fdopen(efd, "w") as f:
     f.write(str(claims.get("exp", "")) + "\n")
 ' "$cand" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
 
+# The pair is still the private files the writer made: neither has become a
+# link (which kubectl and mv would follow or promote) nor another account's
+# file. Checked before the candidate is used and again before it is moved; the
+# directory is this user's alone, so nothing else can swap it in between.
+cand_intact() {
+  local p
+  for p in "$cand" "$cand.expires"; do
+    if [ -L "$p" ] || [ ! -f "$p" ] || [ ! -O "$p" ]; then
+      die "the credential candidate $p is no longer the private file this run wrote; refusing to use it, kept the previous credential"
+    fi
+  done
+}
+cand_intact
+
 # Prove the credential does what the tunnel needs, and no more than that.
 kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --subresource=portforward >/dev/null \
   || die "the new credential cannot port-forward in $TXE_DAGU_NAMESPACE; kept the previous one"
@@ -137,9 +151,12 @@ fi
 # The kubeconfig and its .expires are a pair: when the second move fails, the
 # live .expires would name the old credential's expiry, so it is removed and
 # the run fails rather than leave the pair disagreeing.
+cand_intact
 mv -f "$cand" "$out"
 if ! mv -f "$cand.expires" "$out.expires"; then
-  rm -f -- "$out.expires"
+  if ! rm -f -- "$out.expires" || [ -e "$out.expires" ] || [ -L "$out.expires" ]; then
+    printf 'txe-dagu: FATAL: %s may still hold the previous credential'"'"'s expiry beside the new credential in %s: its removal failed (rm'"'"'s error, if any, is above); remove it\n' "$out.expires" "$out" >&2
+  fi
   die "the new credential is in $out, but its expiry record could not be moved beside it; $out.expires was removed so that status.sh does not report the old expiry; run this script again"
 fi
 printf 'wrote %s (expires %s)\n' "$out" \
