@@ -186,3 +186,7 @@ FOO=a\ b trap 'false' EXIT # want:trap-status
 >| /dev/null trap 'false' EXIT # want:trap-status
 echo a\ b trap 'false' EXIT
 echo 2>&1 trap 'false' EXIT
+# coproc and eval run their arguments as a command (connector reviews of PR 293).
+coproc trap 'false' EXIT # want:trap-status
+eval trap "'exit 0'" EXIT # want:trap-status
+echo eval trap 'false' EXIT

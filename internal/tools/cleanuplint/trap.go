@@ -595,11 +595,14 @@ func keepsCommand(w string) bool {
 }
 
 // commandPrefixes are the words after which the next word is still a
-// command: reserved words, and builtins that run their argument as one.
+// command: reserved words, and builtins that run their arguments as one.
 var commandPrefixes = map[string]bool{
 	"if": true, "then": true, "else": true, "elif": true, "do": true,
 	"while": true, "until": true, "!": true, "time": true, "{": true,
-	"builtin": true, "command": true,
+	"builtin": true, "command": true, "coproc": true,
+	// eval runs its arguments as a command in this shell: eval trap ...
+	// sets a trap (connector security review of PR 293).
+	"eval": true,
 }
 
 var (
