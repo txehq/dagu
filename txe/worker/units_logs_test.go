@@ -118,7 +118,7 @@ func TestUnitRunsTheWorkerUnderTheLogWrapper(t *testing.T) {
 	assert.Empty(t, own, "the unit's own stream gets nothing on the normal path")
 	assert.Equal(t, []string{"worker", "--worker.id", agentsMachine,
 		"--worker.labels", "txe.machine=" + agentsMachine + ",txe.owner=" + agentsOwner,
-		"--worker.coordinators", "127.0.0.1:50055"}, h.lines(t, "worker.args"))
+		"--worker.health-port", "0", "--worker.coordinators", "127.0.0.1:50055"}, h.lines(t, "worker.args"))
 	assert.Equal(t, []string{h.home + "/worker-home"}, h.lines(t, "worker.home"))
 
 	archives := h.logNames(t, unitLegacy, "worker")

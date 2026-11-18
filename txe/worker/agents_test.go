@@ -80,7 +80,7 @@ func TestAgentsWithoutACredential(t *testing.T) {
 		"--path", home + "/logs/worker.log", "--max-bytes", "67108864", "--backups", "10", "--",
 		home + "/bin/dagu", "worker", "--worker.id", agentsMachine,
 		"--worker.labels", "txe.machine=" + agentsMachine + ",txe.owner=" + agentsOwner,
-		"--worker.coordinators", "127.0.0.1:50055"}, worker["ProgramArguments"])
+		"--worker.health-port", "0", "--worker.coordinators", "127.0.0.1:50055"}, worker["ProgramArguments"])
 	assert.Equal(t, home+"/logs/worker.launchd.log", worker["StandardOutPath"])
 	assert.Equal(t, home+"/logs/worker.launchd.log", worker["StandardErrorPath"])
 	stdout, _, err := python(t, agentsScript(t), "credential", filepath.Join(dir, "com.txe.dagu.worker.plist"))
