@@ -1,0 +1,70 @@
+name: main-red-alert
+
+# Posts to Mattermost #infra-alert when a listed workflow's run on main turns red, and again on
+# its next green run (TXE-7846). SecurityScans went red on main on 2026-11-16 (run 43798559034)
+# and nobody was told: GitHub mails a failed scheduled run only to whoever last edited the cron.
+# The rule (first red alerts, red-after-red stays quiet, a green after red clears; only main's
+# own schedule and push runs count) is in .github/main-red-alert/main_red_alert.py.
+#
+# The post names the repository, the workflow and the run link only: this repository is public.
+# The job checks out this file's own commit (the default branch), never the triggering run's
+# code, and reads nothing from that run but its metadata.
+#
+# Every workflow with `on: schedule` must be listed under workflow_run.workflows, by its `name:`.
+# The check job below fails a pull request or main push that adds one without listing it.
+#
+# MATTERMOST_WEBHOOK_URL is a repository secret holding the same #infra-alert incoming webhook
+# as txe's scheduled-workflow-watchdog.yml. While it is unset, a due post is printed and the
+# notify job fails, so an undelivered alert shows as a red run of this workflow.
+
+on:
+  workflow_run:
+    workflows:
+      - SecurityScans
+    types: [completed]
+    branches: [main]
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/main-red-alert/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/main-red-alert/**'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  notify:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No concurrency group: each decision reads only the run history, never an earlier
+    # decision, so two notifies cannot disagree; and a group replaces a pending run with a
+    # newer one, which would drop that run's alert.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/main-red-alert
+      - name: Alert or clear #infra-alert
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MM_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+        run: python3 -I .github/main-red-alert/main_red_alert.py notify
+
+  check:
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Every scheduled workflow is watched
+        run: python3 -I .github/main-red-alert/main_red_alert.py check
+      - name: The rule's tests
+        run: python3 -I .github/main-red-alert/test_main_red_alert.py
