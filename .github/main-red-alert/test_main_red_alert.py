@@ -1,4 +1,4 @@
-"""Tests for main_red_alert.py (TXE-7846). Offline: GitHub reads and the post are stand-ins.
+"""Tests for main_red_alert.py (TXE-7846). Offline: GitHub reads and the POST are stand-ins.
 
 Run: python3 -I .github/main-red-alert/test_main_red_alert.py
 """
@@ -10,6 +10,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import main_red_alert as m  # noqa: E402
@@ -35,13 +36,18 @@ def run(id_, conclusion, created, event="schedule", branch="main", repo=REPO, at
 
 
 class FakeGitHub:
-    """Serves runs listings newest first, 100 a page, like the API; and run attempts."""
+    """The API as the script reads it: watched runs, attempts, notifier runs and their jobs.
 
-    def __init__(self, runs, attempts=None, fail=False):
-        self.runs = sorted(runs, key=lambda r: (r["created_at"], r["id"]), reverse=True)
+    `notified` maps a notifier run id to (judged run id, attempt, {step name: conclusion}).
+    """
+
+    def __init__(self, runs, attempts=None, notified=None, fail=False, notifier_event="workflow_run"):
+        self.runs = sorted(runs, key=m.key, reverse=True)
         self.attempts = attempts or {}
+        self.notified = notified or {}
+        self.notifier_event = notifier_event
         self.fail = fail
-        self.calls = []
+        self.calls: list[str] = []
 
     def __call__(self, path, token):
         self.calls.append(path)
@@ -53,9 +59,31 @@ class FakeGitHub:
         if f"/workflows/{WF_ID}/runs?" in path:
             assert "branch=main" in path and "status=completed" in path
             page = int(path.rsplit("page=", 1)[1])
-            return {"workflow_runs": self.runs[(page - 1) * 100 : page * 100]}
+            runs = self.runs
+            if "&created=" in path:
+                bound = urllib.parse.unquote(path.split("&created=")[1].split("&")[0])
+                assert bound.startswith("<=")
+                runs = [r for r in runs if r["created_at"] <= bound[2:]]
+            return {"workflow_runs": runs[(page - 1) * 100 : page * 100]}
+        if "/workflows/main-red-alert.yaml/runs?" in path:
+            assert "event=workflow_run" in path
+            page = int(path.rsplit("page=", 1)[1])
+            rows = [
+                {"id": nid, "event": self.notifier_event, "display_title": f"notify {WF_ID} {rid} {att}"}
+                for nid, (rid, att, _) in sorted(self.notified.items(), reverse=True)
+            ]
+            return {"workflow_runs": rows[(page - 1) * 100 : page * 100]}
+        if path.endswith("/jobs?filter=all&per_page=100"):
+            nid = int(path.split("/runs/")[1].split("/")[0])
+            steps = [{"name": "Decide", "conclusion": "success"}]
+            steps += [{"name": n, "conclusion": c} for n, c in self.notified[nid][2].items()]
+            return {"jobs": [{"steps": steps}]}
         rid = int(path.rsplit("/", 1)[1])
         return next(r for r in self.runs if r["id"] == rid)
+
+
+def evaluate(r, gh):
+    return m.evaluate(r, REPO, None, gh, m.Ledger(REPO, None, gh, None))[0]
 
 
 # The SecurityScans main history as read on 2026-11-18 (gh run list --workflow
@@ -73,182 +101,282 @@ HISTORY = [
     run(43798559034, "failure", "2026-11-16T03:30:12Z"),
 ]
 
+OK = {"Post alert": "success"}
+FAILED = {"Post alert": "failure"}
 
-def evaluate(r, gh):
-    return m.evaluate(r, REPO, None, gh)[0]
+
+class Replay(unittest.TestCase):
+    """Each recorded run judged as of its own completion, its notify's outcome then recorded."""
+
+    def replay(self, undelivered=()):
+        out = {}
+        notified = {}
+        for i, r in enumerate(HISTORY):
+            gh = FakeGitHub(HISTORY[: i + 1], notified=dict(notified))
+            action = evaluate(r, gh)
+            out[r["id"]] = action
+            if action:
+                step = "Post alert" if action == "alert" else "Post clear"
+                notified[900 + i] = (r["id"], 1, {step: "failure" if r["id"] in undelivered else "success"})
+        return out
+
+    def test_the_recorded_history_alerts_once_per_streak_and_clears(self):
+        got = self.replay()
+        self.assertEqual(
+            {k: v for k, v in got.items() if v},
+            {38201258145: "alert", 41287012982: "clear", 43798559034: "alert"},
+        )
+
+    def test_activation_mid_streak_alerts_on_the_next_red(self):
+        # 2026-10-12's post fails (no secret yet); the secret is added before 2026-10-19.
+        got = self.replay(undelivered={38201258145})
+        self.assertEqual(
+            {k: v for k, v in got.items() if v},
+            {38201258145: "alert", 39195531596: "alert", 41287012982: "clear", 43798559034: "alert"},
+        )
+
+    def test_a_streak_never_delivered_gets_a_clear_that_says_so(self):
+        got = self.replay(undelivered={38201258145, 39195531596, 40265174723})
+        self.assertEqual(got[41287012982], "clear-undelivered")
+        self.assertIsNone(got[41291253865], "only the first green after an undelivered streak")
+
+
+class ReplayCommand(unittest.TestCase):
+    def replay(self, *undelivered):
+        lines = []
+        args = type("A", (), {"repo": REPO, "run_id": [r["id"] for r in HISTORY], "undelivered": list(undelivered)})
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = m.cmd_replay(args, env={}, get=FakeGitHub(HISTORY))
+        lines = buf.getvalue().splitlines()
+        return rc, {int(line.split()[1]): ("would post" in line) for line in lines}, lines
+
+    def test_replay_reads_each_run_as_of_its_creation(self):
+        rc, posted, _ = self.replay()
+        self.assertEqual(rc, 0)
+        self.assertEqual([k for k, v in posted.items() if v], [38201258145, 41287012982, 43798559034])
+
+    def test_replay_of_activation_mid_streak(self):
+        rc, posted, lines = self.replay(38201258145)
+        self.assertEqual([k for k, v in posted.items() if v], [38201258145, 39195531596, 41287012982, 43798559034])
+        self.assertIn("delivery fails (simulated)", lines[0])
 
 
 class Rule(unittest.TestCase):
-    def test_replay_of_the_recorded_history(self):
-        gh = FakeGitHub(HISTORY)
-        got = {r["id"]: evaluate(r, gh) for r in HISTORY}
-        self.assertEqual(got[38201258145], "alert")  # first red, no earlier counted run
-        self.assertEqual(got[39195531596], "still")  # red after red: a reminder, never silence
-        self.assertEqual(got[40265174723], "still")
-        self.assertEqual(got[41287012982], "clear")  # first green after the streak
-        self.assertIsNone(got[41291253865])
-        self.assertEqual(got[43798559034], "alert")  # the 2026-11-16 run: alerts on the first red
-        self.assertEqual([i for i, a in got.items() if a], [38201258145, 39195531596, 40265174723, 41287012982, 43798559034])
+    G0 = run(1, "success", "2026-01-01T00:00:00Z")
+    R1 = run(2, "failure", "2026-01-02T00:00:00Z")
+    R2 = run(3, "failure", "2026-01-03T00:00:00Z")
+    G3 = run(4, "success", "2026-01-04T00:00:00Z")
 
-    def test_cancelled_and_skipped_runs_neither_alert_nor_break_a_streak(self):
-        hist = [
-            run(1, "failure", "2026-01-01T00:00:00Z"),
-            run(2, "cancelled", "2026-01-02T00:00:00Z"),
-            run(3, "skipped", "2026-01-03T00:00:00Z"),
-            run(4, "failure", "2026-01-04T00:00:00Z"),
-        ]
-        gh = FakeGitHub(hist)
+    def test_first_red_alerts(self):
+        self.assertEqual(evaluate(self.R1, FakeGitHub([self.G0, self.R1])), "alert")
+
+    def test_red_after_a_delivered_alert_is_quiet(self):
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, OK)})
+        self.assertIsNone(evaluate(self.R2, gh))
+
+    def test_missing_secret_or_failed_post_does_not_count_as_sent(self):
+        # Both look the same in the record: the Post step concluded failure.
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, FAILED)})
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+        text = m.message("alert", REPO, "SecurityScans", self.R2["html_url"], [self.R1, self.R2])
+        self.assertIn("is still red on main, red since https://github.com/txehq/dagu/actions/runs/2.", text)
+
+    def test_a_skipped_or_cancelled_post_step_does_not_count_as_sent(self):
+        for c in ("skipped", "cancelled", None):
+            gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, {"Post alert": c})})
+            self.assertEqual(evaluate(self.R2, gh), "alert", c)
+
+    def test_duplicate_delivery_of_the_same_run_posts_once(self):
+        gh = FakeGitHub([self.G0, self.R1], notified={10: (2, 1, OK)})
+        self.assertIsNone(evaluate(self.R1, gh))
+        # A re-run of the same red run (attempt 2) is the same streak.
+        r1b = dict(self.R1, run_attempt=2)
+        gh = FakeGitHub([self.G0, r1b], attempts={(2, 1): "failure"}, notified={10: (2, 1, OK)})
+        self.assertIsNone(evaluate(r1b, gh))
+
+    def test_out_of_order_red_after_a_newer_green_is_superseded(self):
+        self.assertIsNone(evaluate(self.R1, FakeGitHub([self.G0, self.R1, self.G3])))
+
+    def test_stale_green_before_a_newer_red_does_not_clear(self):
+        gh = FakeGitHub([self.R1, self.G3, run(5, "failure", "2026-01-05T00:00:00Z")], notified={10: (2, 1, OK)})
+        self.assertIsNone(evaluate(self.G3, gh))
+
+    def test_clear_only_once(self):
+        gh = FakeGitHub([self.R1, self.G3], notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(self.G3, gh), "clear")
+        gh = FakeGitHub([self.R1, self.G3], notified={10: (2, 1, OK), 11: (4, 1, {"Post clear": "success"})})
+        self.assertIsNone(evaluate(self.G3, gh))
+
+    def test_a_clear_lost_to_a_replaced_notify_is_posted_by_the_next_green(self):
+        g5 = run(5, "success", "2026-01-05T00:00:00Z")
+        gh = FakeGitHub([self.R1, self.G3, g5], notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(g5, gh), "clear")
+        gh = FakeGitHub([self.R1, self.G3, g5], notified={10: (2, 1, OK), 11: (4, 1, {"Post clear": "success"})})
+        self.assertIsNone(evaluate(g5, gh))
+
+    def test_a_failed_clear_is_retried_by_the_next_green(self):
+        g5 = run(5, "success", "2026-01-05T00:00:00Z")
+        gh = FakeGitHub([self.R1, self.G3, g5], notified={10: (2, 1, OK), 11: (4, 1, {"Post clear": "failure"})})
+        self.assertEqual(evaluate(g5, gh), "clear")
+
+    def test_green_after_green_is_quiet(self):
+        self.assertIsNone(evaluate(self.G3, FakeGitHub([self.G0, self.G3])))
+
+    def test_only_the_notifiers_own_workflow_run_runs_count_as_delivered(self):
+        # A pull request's run of a modified notifier could name a step "Post alert": not read.
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, OK)}, notifier_event="pull_request")
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+
+    def test_the_running_notifier_is_not_its_own_record(self):
+        gh = FakeGitHub([self.G0, self.R1], notified={10: (2, 1, OK)})
+        self.assertEqual(m.evaluate(self.R1, REPO, None, gh, m.Ledger(REPO, None, gh, "10"))[0], "alert")
+
+    def test_cancelled_and_skipped_runs_are_passed_over(self):
+        hist = [self.R1, run(5, "cancelled", "2026-01-02T01:00:00Z"), run(6, "skipped", "2026-01-02T02:00:00Z"), self.G3]
+        gh = FakeGitHub(hist, notified={10: (2, 1, OK)})
         self.assertIsNone(evaluate(hist[1], gh))
-        self.assertIsNone(evaluate(hist[2], gh))
-        self.assertEqual(evaluate(hist[3], gh), "still")
+        self.assertEqual(evaluate(self.G3, gh), "clear")
 
     def test_timed_out_and_startup_failure_are_red(self):
         for c in ("timed_out", "startup_failure"):
-            hist = [run(1, "success", "2026-01-01T00:00:00Z"), run(2, c, "2026-01-02T00:00:00Z")]
-            self.assertEqual(evaluate(hist[1], FakeGitHub(hist)), "alert", c)
-
-    def test_push_red_after_a_green_schedule_alerts(self):
-        hist = [run(1, "success", "2026-01-01T00:00:00Z"), run(2, "failure", "2026-01-02T00:00:00Z", event="push")]
-        self.assertEqual(evaluate(hist[1], FakeGitHub(hist)), "alert")
+            r = run(2, c, "2026-01-02T00:00:00Z")
+            self.assertEqual(evaluate(r, FakeGitHub([self.G0, r])), "alert", c)
 
     def test_pull_request_dispatch_other_branch_and_fork_runs_are_ignored(self):
-        green = run(1, "success", "2026-01-01T00:00:00Z")
         others = [
-            run(2, "failure", "2026-01-02T00:00:00Z", event="pull_request", branch="feature"),
+            run(12, "failure", "2026-01-02T00:00:00Z", event="pull_request", branch="feature"),
             # A fork's PR from a branch named main reaches workflow_run with head_branch "main".
-            run(3, "failure", "2026-01-03T00:00:00Z", event="pull_request", repo="someone/dagu"),
-            run(4, "failure", "2026-01-04T00:00:00Z", event="push", repo="someone/dagu"),
-            run(5, "failure", "2026-01-05T00:00:00Z", event="workflow_dispatch"),
-            run(6, "failure", "2026-01-06T00:00:00Z", event="schedule", branch="maint/txe-v1-1"),
+            run(13, "failure", "2026-01-03T00:00:00Z", event="pull_request", repo="someone/dagu"),
+            run(14, "failure", "2026-01-04T00:00:00Z", event="push", repo="someone/dagu"),
+            run(15, "failure", "2026-01-05T00:00:00Z", event="workflow_dispatch"),
+            run(16, "failure", "2026-01-06T00:00:00Z", branch="maint/txe-v1-1"),
         ]
-        gh = FakeGitHub([green, *others])
+        gh = FakeGitHub([self.G0, *others])
         for r in others:
             self.assertIsNone(evaluate(r, gh), r["id"])
-        self.assertEqual(gh.calls, [], "an ignored run must not even read history")
-        # And they do not count as history: a red after them is still the first red.
-        r7 = run(7, "failure", "2026-01-07T00:00:00Z")
-        self.assertEqual(evaluate(r7, FakeGitHub([green, *others, r7])), "alert")
-        # Nor does a red fork run hide a green-after-red clear, or fake one.
-        r8 = run(8, "success", "2026-01-08T00:00:00Z")
-        self.assertEqual(evaluate(r8, FakeGitHub([green, *others, r7, r8])), "clear")
-
-    def test_rerun_judged_against_its_own_previous_attempt(self):
-        older_green = run(1, "success", "2026-01-01T00:00:00Z")
-        rerun_green = run(2, "success", "2026-01-02T00:00:00Z", attempt=2)
-        gh = FakeGitHub([older_green, rerun_green], attempts={(2, 1): "failure"})
-        self.assertEqual(evaluate(rerun_green, gh), "clear")
-        rerun_red = run(3, "failure", "2026-01-03T00:00:00Z", attempt=2)
-        gh = FakeGitHub([older_green, rerun_red], attempts={(3, 1): "failure"})
-        self.assertEqual(evaluate(rerun_red, gh), "still")
-        # Attempt 1 red (alerted), attempt 2 cancelled, attempt 3 green: walk back to attempt 1.
-        third = run(4, "success", "2026-01-04T00:00:00Z", attempt=3)
-        gh = FakeGitHub([older_green, third], attempts={(4, 2): "cancelled", (4, 1): "failure"})
-        self.assertEqual(evaluate(third, gh), "clear")
-        # A cancelled first attempt says nothing: fall back to the earlier run.
-        gh = FakeGitHub([older_green, rerun_red], attempts={(3, 1): "cancelled"})
-        self.assertEqual(evaluate(rerun_red, gh), "alert")
+        self.assertEqual(gh.calls, [], "an ignored run reads nothing")
+        r7 = run(17, "failure", "2026-01-07T00:00:00Z")
+        self.assertEqual(evaluate(r7, FakeGitHub([self.G0, *others, r7])), "alert")
 
     def test_an_earlier_red_run_whose_rerun_was_cancelled_is_still_red(self):
-        # A failed and alerted; its attempt 2 was cancelled, so the listing shows A as cancelled.
-        green = run(1, "success", "2026-01-01T00:00:00Z")
-        a = run(2, "cancelled", "2026-01-02T00:00:00Z", attempt=2)
-        b = run(3, "success", "2026-01-03T00:00:00Z")
-        gh = FakeGitHub([green, a, b], attempts={(2, 1): "failure"})
-        self.assertEqual(evaluate(b, gh), "clear")
+        r1 = dict(self.R1, conclusion="cancelled", run_attempt=2)
+        gh = FakeGitHub([self.G0, r1, self.G3], attempts={(2, 1): "failure"}, notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(self.G3, gh), "clear")
         # A run cancelled on every attempt is passed over.
-        gh = FakeGitHub([green, a, b], attempts={(2, 1): "cancelled"})
-        self.assertIsNone(evaluate(b, gh))
-        # A single-attempt cancelled run costs no attempts read.
-        c = run(4, "cancelled", "2026-01-02T00:00:00Z")
-        gh = FakeGitHub([green, c, b])
-        self.assertIsNone(evaluate(b, gh))
-        self.assertFalse(any("/attempts/" in x for x in gh.calls))
+        gh = FakeGitHub([self.G0, r1, self.G3], attempts={(2, 1): "cancelled"})
+        self.assertIsNone(evaluate(self.G3, gh))
 
-    def test_a_later_run_is_not_history(self):
-        # A run created earlier that finishes after a later one is judged by creation order.
-        hist = [run(1, "success", "2026-01-01T00:00:00Z"), run(2, "failure", "2026-01-02T00:00:00Z"), run(3, "failure", "2026-01-03T00:00:00Z")]
-        self.assertEqual(evaluate(hist[1], FakeGitHub(hist)), "alert")
-
-    def test_history_beyond_the_first_page(self):
-        reds = [run(10 + i, "failure", f"2026-02-01T00:{i // 60:02d}:{i % 60:02d}Z", event="pull_request", branch="main", repo="f/dagu") for i in range(150)]
-        old_red = run(1, "failure", "2026-01-01T00:00:00Z")
-        new_green = run(2, "success", "2026-03-01T00:00:00Z")
-        gh = FakeGitHub([old_red, *reds, new_green])
-        self.assertEqual(evaluate(new_green, gh), "clear")
-        self.assertEqual(sum("page=" in c for c in gh.calls), 2)
+    def test_a_red_run_rerun_green_clears_its_own_alert(self):
+        r1g = dict(self.R1, conclusion="success", run_attempt=2)
+        gh = FakeGitHub([self.G0, r1g], attempts={(2, 1): "failure"}, notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(r1g, gh), "clear")
+        # Its attempt-1 red was never delivered: a clear that says so.
+        gh = FakeGitHub([self.G0, r1g], attempts={(2, 1): "failure"}, notified={10: (2, 1, FAILED)})
+        self.assertEqual(evaluate(r1g, gh), "clear-undelivered")
 
     def test_unread_history_alerts_a_red_and_fails_a_green(self):
-        self.assertEqual(evaluate(run(1, "failure", "2026-01-01T00:00:00Z"), FakeGitHub([], fail=True)), "alert")
+        self.assertEqual(evaluate(self.R1, FakeGitHub([], fail=True)), "alert")
         with self.assertRaises(m.ReadError):
-            evaluate(run(2, "success", "2026-01-02T00:00:00Z"), FakeGitHub([], fail=True))
+            evaluate(self.G3, FakeGitHub([], fail=True))
 
-    def test_a_full_history_with_no_counted_run_is_unknown_not_none(self):
-        noise = [run(10 + i, "failure", f"2026-02-01T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(m.MAX_PAGES * 100)]
-        green = run(1, "success", "2026-03-01T00:00:00Z")
-        with self.assertRaises(m.ReadError):
-            evaluate(green, FakeGitHub([*noise, green]))
+    def test_history_beyond_the_first_page(self):
+        noise = [run(100 + i, "failure", f"2026-01-02T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(150)]
+        gh = FakeGitHub([self.R1, *noise, self.G3], notified={10: (2, 1, OK)})
+        self.assertEqual(evaluate(self.G3, gh), "clear")
 
-    def test_the_post_carries_repository_workflow_and_link_only(self):
+    def test_a_long_green_history_ends_quietly(self):
+        greens = [run(100 + i, "success", f"2026-01-02T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}Z") for i in range(m.MAX_PAGES * 100 + 5)]
+        g = run(9, "success", "2026-02-01T00:00:00Z")
+        self.assertIsNone(evaluate(g, FakeGitHub([*greens, g])))
+
+    def test_the_post_carries_repository_workflow_and_links_only(self):
         r = HISTORY[-1]
-        text = m.message("alert", REPO, r["name"], r["html_url"])
         self.assertEqual(
-            text,
+            m.message("alert", REPO, r["name"], r["html_url"], [r]),
             ":rotating_light: txehq/dagu: workflow `SecurityScans` is red on main. "
             "Run: https://github.com/txehq/dagu/actions/runs/43798559034",
         )
+        self.assertEqual(
+            m.message("clear-undelivered", REPO, r["name"], "https://github.com/txehq/dagu/actions/runs/5", [r]),
+            ":white_check_mark: txehq/dagu: workflow `SecurityScans` is green again on main. "
+            "Run: https://github.com/txehq/dagu/actions/runs/5 The alert for this red streak was not "
+            "delivered (red since https://github.com/txehq/dagu/actions/runs/43798559034).",
+        )
 
 
-class Notify(unittest.TestCase):
-    def notify(self, r, webhook="https://chat.example/hooks/x", post_ok=True, gh=None):
+class Steps(unittest.TestCase):
+    """notify writes the decision for the Post step; post delivers it or fails."""
+
+    def notify(self, r, gh):
+        with tempfile.TemporaryDirectory() as d:
+            ev, out, pf = (pathlib.Path(d) / n for n in ("event.json", "output", "post.txt"))
+            ev.write_text(json.dumps({"workflow_run": r}))
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_PATH": str(ev), "GITHUB_OUTPUT": str(out),
+                   "POST_FILE": str(pf), "GITHUB_RUN_ID": "77"}
+            rc = m.cmd_notify(None, env=env, get=gh)
+            return rc, out.read_text() if out.exists() else "", pf.read_text() if pf.exists() else None
+
+    def post(self, webhook, result):
         posts = []
 
-        def post(url, text):
-            posts.append(text)
-            return post_ok, "200" if post_ok else "HTTP 500"
+        def fake(url, text):
+            posts.append((url, text))
+            return result
 
         with tempfile.TemporaryDirectory() as d:
-            ev = pathlib.Path(d) / "event.json"
-            ev.write_text(json.dumps({"workflow_run": r}))
-            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_PATH": str(ev), "MM_WEBHOOK": webhook}
-            rc = m.cmd_notify(None, env=env, get=gh or FakeGitHub(HISTORY), post=post)
+            pf = pathlib.Path(d) / "post.txt"
+            pf.write_text("hello")
+            rc = m.cmd_post(None, env={"POST_FILE": str(pf), "MM_WEBHOOK": webhook}, post=fake)
         return rc, posts
 
-    def test_posts_once_for_the_first_red(self):
-        rc, posts = self.notify(HISTORY[-1])
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(posts), 1)
-        self.assertIn("runs/43798559034", posts[0])
+    def test_notify_writes_the_alert_for_the_post_alert_step(self):
+        rc, out, text = self.notify(HISTORY[-1], FakeGitHub(HISTORY))
+        self.assertEqual((rc, out), (0, "post=alert\n"))
+        self.assertEqual(text, m.message("alert", REPO, "SecurityScans", HISTORY[-1]["html_url"], [HISTORY[-1]]))
 
-    def test_red_after_red_posts_still_red(self):
-        # Installed mid-streak, or the first POST failed: a later red must still reach someone.
-        rc, posts = self.notify(HISTORY[1])
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(posts), 1)
-        self.assertIn("is still red on main", posts[0])
+    def test_notify_writes_none_when_nothing_is_due(self):
+        rc, out, text = self.notify(HISTORY[-2], FakeGitHub(HISTORY[:-1]))
+        self.assertEqual((rc, out, text), (0, "post=none\n", None))
 
-    def test_no_post_for_green_after_green(self):
-        self.assertEqual(self.notify(HISTORY[4]), (0, []))
+    def test_notify_fails_a_green_it_cannot_judge(self):
+        rc, out, _ = self.notify(HISTORY[3], FakeGitHub([], fail=True))
+        self.assertEqual((rc, out), (1, ""))
 
-    def test_missing_webhook_fails_when_a_post_is_due_only(self):
-        self.assertEqual(self.notify(HISTORY[-1], webhook=""), (1, []))
-        self.assertEqual(self.notify(HISTORY[4], webhook=""), (0, []))
+    def test_missing_secret_fails_the_post_step_and_sends_nothing(self):
+        self.assertEqual(self.post("", (True, "200")), (1, []))
 
-    def test_failed_delivery_fails_the_job(self):
-        rc, posts = self.notify(HISTORY[-1], post_ok=False)
-        self.assertEqual((rc, len(posts)), (1, 1))
+    def test_webhook_failure_and_rate_limit_fail_the_post_step(self):
+        for detail in ("HTTP 500", "HTTP 429", "URLError"):
+            rc, posts = self.post("https://hook.example/x", (False, detail))
+            self.assertEqual((rc, len(posts)), (1, 1), detail)
 
-    def test_green_with_unread_history_fails_the_job_and_posts_nothing(self):
-        self.assertEqual(self.notify(HISTORY[3], gh=FakeGitHub([], fail=True)), (1, []))
+    def test_delivered_post_passes_and_goes_only_to_the_secret(self):
+        self.assertEqual(self.post("https://hook.example/x", (True, "200")), (0, [("https://hook.example/x", "hello")]))
 
 
 class Coverage(unittest.TestCase):
-    NOTIFIER = """name: main-red-alert
+    NOTIFIER = f"""name: main-red-alert
+run-name: "{m.RUN_NAME_EXPR}"
 on:
   workflow_run:
     workflows: [SecurityScans]
     types: [completed]
     branches: [main]
+permissions:
+  actions: read
+  contents: read
+jobs:
+  notify:
+    steps:
+      - name: Decide
+      - name: Post alert
+      - name: Post clear
 """
+    SCANS = "name: SecurityScans\non:\n  push:\n  schedule:\n    - cron: '17 3 * * 1'\n"
 
     def errors(self, files):
         with tempfile.TemporaryDirectory() as d:
@@ -257,8 +385,6 @@ on:
             for name, body in files.items():
                 (wf / name).write_text(body)
             return m.coverage_errors(pathlib.Path(d))
-
-    SCANS = "name: SecurityScans\non:\n  push:\n  schedule:\n    - cron: '17 3 * * 1'\n"
 
     def test_listed_scheduled_workflow_passes(self):
         self.assertEqual(self.errors({"main-red-alert.yaml": self.NOTIFIER, "image-security.yaml": self.SCANS, "ci.yaml": "name: CI\non: [push]\n"}), [])
@@ -281,17 +407,17 @@ on:
         errs = self.errors({"main-red-alert.yaml": self.NOTIFIER})
         self.assertEqual(errs, ["main-red-alert.yaml lists `SecurityScans`, which is not the name of any workflow here"])
 
-    def test_notifier_trigger_shape_is_held(self):
-        bad = self.NOTIFIER.replace("types: [completed]", "types: [requested]").replace("branches: [main]", "branches: [main, dev]")
-        errs = self.errors({"main-red-alert.yaml": bad, "image-security.yaml": self.SCANS})
-        self.assertEqual(len(errs), 2)
-
-    def test_a_cron_that_can_fire_more_than_daily_fails(self):
-        for cron in ("*/15 * * * *", "0 */6 * * *", "0 1,13 * * *", "@hourly"):
-            body = f"name: SecurityScans\non:\n  schedule:\n    - cron: '{cron}'\n"
-            errs = self.errors({"main-red-alert.yaml": self.NOTIFIER, "image-security.yaml": body})
-            self.assertEqual(len(errs), 1, cron)
-            self.assertIn("may fire more than once a day", errs[0])
+    def test_notifier_shape_is_held(self):
+        for old, new in [
+            ("types: [completed]", "types: [requested]"),
+            ("branches: [main]", "branches: [main, dev]"),
+            ("format('notify", "format('note"),
+            ("actions: read", "actions: write"),
+            ("- name: Post alert", "- name: Post"),
+            ("- name: Post clear", "- name: Post alert"),
+        ]:
+            errs = self.errors({"main-red-alert.yaml": self.NOTIFIER.replace(old, new), "image-security.yaml": self.SCANS})
+            self.assertGreaterEqual(len(errs), 1, (old, errs))
 
     def test_the_repository_itself_is_covered(self):
         root = pathlib.Path(__file__).resolve().parents[2]

@@ -1,22 +1,32 @@
 name: main-red-alert
+run-name: ${{ github.event_name == 'workflow_run' && format('notify {0} {1} {2}', github.event.workflow_run.workflow_id, github.event.workflow_run.id, github.event.workflow_run.run_attempt) || github.workflow }}
 
 # Posts to Mattermost #infra-alert when a listed workflow's run on main turns red, and again on
-# its next green run (TXE-7846). SecurityScans went red on main on 2026-11-16 (run 43798559034)
-# and nobody was told: GitHub mails a failed scheduled run only to whoever last edited the cron.
-# The rule (every red run posts: "is red" first, then "is still red"; a green after red clears;
-# only main's own schedule and push runs count) is in .github/main-red-alert/main_red_alert.py.
+# the green run that ends the streak (TXE-7846). SecurityScans went red on main on 2026-11-16
+# (run 43798559034) and nobody was told: GitHub mails a failed scheduled run only to whoever
+# last edited the cron. The rule is in .github/main-red-alert/main_red_alert.py: one alert per
+# red streak of main's own schedule and push runs, retried on each later red run until one is
+# delivered, and a clear when it ends.
 #
-# The post names the repository, the workflow and the run link only: this repository is public.
-# The job checks out this file's own commit (the default branch), never the triggering run's
-# code, and reads nothing from that run but its metadata.
+# What was delivered is read back from this workflow's own workflow_run runs: the run-name
+# above names the run each one judged, and its `Post alert` / `Post clear` step concluded
+# success only when the POST returned 2xx. A missing secret or a failed POST fails that step,
+# so it never counts as sent. `check` holds the run-name, the step names and the permissions.
+#
+# Why workflow_run is safe on this public repository: a workflow_run run always uses this
+# file from the default branch, never a pull request's copy, even when a fork's pull request
+# triggered SecurityScans. The notify job checks out only .github/main-red-alert at this
+# commit, runs no code and reads no file from the triggering run (only its numeric ids, name,
+# event, branch and conclusion, through the API), skips any run that is not main's own, and
+# its token can only read. The post's destination is only the secret, never event data. The
+# post names the repository, the workflow and run links; a scan's findings stay in the run.
 #
 # Every workflow with `on: schedule` must be listed under workflow_run.workflows, by its `name:`.
 # The check job below fails a pull request or main push that adds one without listing it.
-# It also fails a scheduled workflow whose cron can fire more than once a day: each red run posts.
 #
 # MATTERMOST_WEBHOOK_URL is a repository secret holding the same #infra-alert incoming webhook
-# as txe's scheduled-workflow-watchdog.yml. While it is unset, a due post is printed and the
-# notify job fails, so an undelivered alert shows as a red run of this workflow.
+# as txe's scheduled-workflow-watchdog.yml. While it is unset, a due post is printed in the
+# log and its Post step fails, so the run is red and the alert is retried on the next red run.
 
 on:
   workflow_run:
@@ -43,19 +53,35 @@ jobs:
     if: github.event_name == 'workflow_run'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    # No concurrency group: each decision reads only the run history, never an earlier
-    # decision, so two notifies cannot disagree; and a group replaces a pending run with a
-    # newer one, which would drop that run's alert.
+    concurrency:
+      # One decision at a time per watched workflow, so a duplicate delivery reads the first
+      # one's Post step and does not post twice. A newer run waiting here replaces an older
+      # waiting one; the newer decision covers it (a red catches up, a green clears late).
+      group: main-red-alert-${{ github.event.workflow_run.workflow_id }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           sparse-checkout: .github/main-red-alert
-      - name: Alert or clear #infra-alert
+      - name: Decide
+        id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          MM_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+          POST_FILE: ${{ runner.temp }}/post.txt
         run: python3 -I .github/main-red-alert/main_red_alert.py notify
+      - name: Post alert
+        if: steps.decide.outputs.post == 'alert'
+        env:
+          POST_FILE: ${{ runner.temp }}/post.txt
+          MM_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+        run: python3 -I .github/main-red-alert/main_red_alert.py post
+      - name: Post clear
+        if: steps.decide.outputs.post == 'clear'
+        env:
+          POST_FILE: ${{ runner.temp }}/post.txt
+          MM_WEBHOOK: ${{ secrets.MATTERMOST_WEBHOOK_URL }}
+        run: python3 -I .github/main-red-alert/main_red_alert.py post
 
   check:
     if: github.event_name != 'workflow_run'
