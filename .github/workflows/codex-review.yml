@@ -50,9 +50,23 @@ env:
   # to the main commit that last changed the files the gate runs (test-gate-pin.sh says which).
   CODEX_REVIEW_GATE_SHA: efd1c83e1f0cda165cfcfb9df5e0b931ea6b8607
 
+# CONCURRENCY (TXE-7843). One group per PR. Only an incoming run whose event action is
+# `synchronize` cancels the run in progress; on a push that run judged a head nobody can merge any
+# more. Every other event (`edited`, `labeled`, `unlabeled`, `reopened`, `ready_for_review`,
+# `opened`) never cancels it; it waits as `pending` and runs when the active run ends, reading the
+# PR's labels and review state then. GitHub keeps at most one pending run per group and cancels an
+# older pending run when a newer one arrives (docs: "Control the concurrency of workflows and
+# jobs", queue `single`), so of several rapid re-checks the newest runs, and it reads the newest
+# state. The replaced run never started, so it leaves no check run on the head (measured,
+# README.md "Same-head re-checks"). The merge wrapper takes the newest gate run on the exact head
+# and refuses while it is pending or running, so a newer re-check it can see blocks an older
+# success. Before TXE-7843 every event cancelled the run in progress, and the cancelled check run
+# on the same head refused the merge. A re-run keeps its event's action: re-running an old
+# synchronize run still cancels an active re-check on the same head, which costs a re-run of that
+# check, never a pass.
 concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
