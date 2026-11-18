@@ -145,3 +145,14 @@ trap 'RC=$?; set +e; rm -rf "$work"; \ # want:trap-status
 trap 'RC=$?; set +e # a comment ends at its newline \ # want:trap-status
   rm -rf "$work" 2>/dev/null
   exit "$RC"' EXIT
+# A quoted assignment, a redirection and command -- keep the command position (connector review of PR 293).
+FOO="a b" trap 'false' EXIT # want:trap-status
+>/dev/null trap 'false' EXIT # want:trap-status
+2> "$log" trap 'false' EXIT # want:trap-status
+command -- trap 'false' EXIT # want:trap-status
+out=$(trap 'false' EXIT; true) # want:trap-status
+# ...and the same words after a command are arguments.
+echo "a b" trap 'false' EXIT
+echo >/dev/null trap 'false' EXIT
+printf '%s' 2> "$log" trap 'false' EXIT
+"$cmd" -- trap 'false' EXIT

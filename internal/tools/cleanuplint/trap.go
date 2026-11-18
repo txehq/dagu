@@ -491,74 +491,70 @@ func statements(body string) []string {
 func findTraps(text string) []trapCmd {
 	var out []trapCmd
 	var z quoter
+	// cmd: the next word is where the shell reads a command name; target:
+	// the next word is a redirection's target, so cmd is unchanged.
+	cmd, target := true, false
 	for i := 0; i < len(text); {
 		c := text[i]
+		if z.q == 0 {
+			if strings.HasPrefix(text[i:], "<<<") {
+				i += 3 // a here-string: its word is read as any other
+				continue
+			}
+			if strings.HasPrefix(text[i:], "<<") {
+				i = skipHeredoc(text, i)
+				continue
+			}
+			wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
+			if wordStart && c == '#' {
+				for i < len(text) && text[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			if wordStart && strings.IndexByte(" \t\n;&|()", c) < 0 {
+				w, wend := wordAt(text, i)
+				switch {
+				case target:
+					target = false
+				case !cmd:
+				case w == "trap" && wend < len(text) && (text[wend] == ' ' || text[wend] == '\t'):
+					words, end := commandWords(text, wend)
+					if t, ok := parseTrap(words); ok {
+						t.line = strings.Count(text[:i], "\n") + 1
+						out = append(out, t)
+					}
+					i, cmd = end, false
+					continue
+				case redirOpRe.MatchString(w):
+					target = true
+				case !keepsCommand(w):
+					cmd = false
+				}
+			}
+		}
 		next, plain := z.step(text, i)
-		if !plain {
-			i = next
-			continue
-		}
-		if c == '<' && strings.HasPrefix(text[i:], "<<<") {
-			i += 3 // a here-string: its word is read as any other
-			continue
-		}
-		if c == '<' && strings.HasPrefix(text[i:], "<<") {
-			i = skipHeredoc(text, i)
-			continue
-		}
-		wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
-		if c == '#' && wordStart {
-			for next < len(text) && text[next] != '\n' {
-				next++
-			}
-			i = next
-			continue
-		}
-		if wordStart && strings.HasPrefix(text[i:], "trap") && i+4 < len(text) && (text[i+4] == ' ' || text[i+4] == '\t') && commandPosition(text, i) {
-			words, end := commandWords(text, i+4)
-			if t, ok := parseTrap(words); ok {
-				t.line = strings.Count(text[:i], "\n") + 1
-				out = append(out, t)
-			}
-			i = end
-			continue
+		if plain && strings.IndexByte("\n;&|()", c) >= 0 {
+			cmd, target = true, false
 		}
 		i = next
 	}
 	return out
 }
 
-// commandPosition reports whether the word at i is where the shell reads a
-// command name, not an argument: echo trap false EXIT sets no trap (connector
-// review of PR 292, TXE-7864). It is: the start of the script, or after a
-// newline, ;, &, |, ( or ) (a subshell, or a case pattern), or after a
-// reserved word or command prefix (if, then, !, builtin, command, ...) or an
-// assignment (LC_ALL=C trap ...) that is itself in command position. Blanks
-// and backslash-newlines between are skipped. Where the text is ambiguous it
-// answers yes, so the rule reads a trap it is unsure of rather than miss one.
-func commandPosition(text string, i int) bool {
-	j := i
-	for j > 0 {
-		if text[j-1] == ' ' || text[j-1] == '\t' {
-			j--
-		} else if j >= 2 && text[j-2] == '\\' && text[j-1] == '\n' {
-			j -= 2
-		} else {
-			break
-		}
-	}
-	if j == 0 || strings.IndexByte("\n;&|()", text[j-1]) >= 0 {
-		return true
-	}
-	k := j
-	for k > 0 && strings.IndexByte(" \t\n;&|()", text[k-1]) < 0 {
-		k--
-	}
-	w := text[k:j]
-	if commandPrefixes[w] || assignmentRe.MatchString(w) {
-		return commandPosition(text, k)
-	}
-	return false
+// The trap rule reads trap only where the shell reads a command name, not
+// an argument: echo trap false EXIT sets no trap (connector review of PR 292,
+// TXE-7864). A command starts at the start of the script and after a newline,
+// ;, &, | or a parenthesis (a subshell, $( ), or a case pattern); a reserved
+// word or command prefix (if, then, !, builtin, command, ...), an option, an
+// assignment (FOO="a b") and a redirection with its target (>/dev/null,
+// 2> err) keep the next word in command position. Where the text is
+// ambiguous, a & or a parenthesis inside a word, the next word is read as a
+// command, so the rule reads a trap it is unsure of rather than miss one.
+
+// keepsCommand reports a word after which the next word is still a command.
+func keepsCommand(w string) bool {
+	return commandPrefixes[w] || assignmentRe.MatchString(w) || redirRe.MatchString(w) || strings.HasPrefix(w, "-")
 }
 
 // commandPrefixes are the words after which the next word is still a
@@ -569,8 +565,29 @@ var commandPrefixes = map[string]bool{
 	"builtin": true, "command": true,
 }
 
-// assignmentRe is a variable assignment written before a command.
-var assignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*\+?=`)
+var (
+	// assignmentRe is a variable assignment written before a command.
+	assignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=`)
+	// redirRe is a redirection, with or without its target in the word.
+	redirRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:[<>]|&>)`)
+	// redirOpRe is a redirection whose target is the next word.
+	redirOpRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:>>?|<|<>|>\||&>>?|>&|<&)$`)
+)
+
+// wordAt returns the shell word that starts at i and the index past it.
+func wordAt(text string, i int) (string, int) {
+	var z quoter
+	j := i
+	for j < len(text) {
+		next, plain := z.step(text, j)
+		if plain && strings.IndexByte(" \t\n;&|)", text[j]) >= 0 {
+			break
+		}
+		j = next
+	}
+	j = min(j, len(text))
+	return text[i:j], j
+}
 
 // commandWords reads the words of one simple command starting at i, up to a
 // newline, ;, &, | or ) outside quotes. A backslash-newline is a space.

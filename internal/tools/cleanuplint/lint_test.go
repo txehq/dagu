@@ -217,7 +217,8 @@ func TestTunnelCredentialTrapKeepsTheRule(t *testing.T) {
 	require.NoError(t, err)
 	s := source{rel: rel, lang: langShell, data: data}
 	require.True(t, isShellTrapSource(s))
-	traps := findTraps(string(data))
+	// lines drops a Windows checkout's \r, as the lint itself does.
+	traps := findTraps(strings.Join(lines(data), "\n"))
 	require.Len(t, traps, 1, "the script sets one trap")
 	assert.Equal(t, []string{"EXIT"}, traps[0].signals)
 	assert.Empty(t, lintTraps(s))
