@@ -70,7 +70,8 @@ runs:
           Write-Output "No Chrome found (CHROME_PATH or $($dirs -join '; ')); nothing to start"
           exit 0
         }
-        # A profile of its own, which no test uses, removed below.
+        # A profile of its own, which no test uses. It is left in RUNNER_TEMP,
+        # which the runner empties after the job: nothing here deletes a path.
         $userDataDir = Join-Path $env:RUNNER_TEMP ("warm-chrome-" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $userDataDir | Out-Null
         $chromeArgs = @('--headless', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
@@ -102,7 +103,6 @@ runs:
         if ($left.Count -ne 0) {
           throw "$($left.Count) Chrome processes of the warm-up profile were still running 30 s after it exited"
         }
-        Remove-Item -LiteralPath $userDataDir -Recurse -Force
         Write-Output ("Started Chrome {0} once in {1:N1} s" -f (Get-Item $chrome).VersionInfo.ProductVersion, $watch.Elapsed.TotalSeconds)
 
     # Marks the job start, an hour early, for trim-go-cache.sh: Go refreshes
