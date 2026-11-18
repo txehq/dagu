@@ -326,8 +326,11 @@ final_reread() {
     --jq '.workflow_runs[]' >"$tmp/runs-last.jsonl" || unread "the codex-review runs on $want before the merge"
   jq -s -e 'all(.[]; type == "object")' "$tmp/runs-last.jsonl" >/dev/null 2>&1 \
     || unread "the codex-review runs on $want before the merge (not objects)"
-  jq -s -e "$gate_ids_whole" "$tmp/runs-last.jsonl" >/dev/null 2>&1 \
-    || unread "the codex-review runs on $want before the merge (a run without a whole-number id, run number or attempt)"
+  # This endpoint answers only the gate's own runs for this event, so every record must be one, with a
+  # whole identity: a record that cannot be shown to be a gate run is a failed read, never dropped.
+  jq -s -e 'all(.[]; ((.path // "") | sub("@.*$"; "")) == ".github/workflows/codex-review.yml" and .event == "pull_request_target"
+      and all(.id, .run_number, .run_attempt; type == "number" and . >= 1 and . == floor))' "$tmp/runs-last.jsonl" >/dev/null 2>&1 \
+    || unread "the codex-review runs on $want before the merge (a run that is not plainly a codex-review pull_request_target run with a whole-number id, run number and attempt)"
   local last lastgate
   last="$(jq -s -r "$gate_runs | $gate_id" "$tmp/runs-last.jsonl")"
   lastgate="$(jq -s -r "$gate_runs"' | "\(.status) \(.conclusion)"' "$tmp/runs-last.jsonl")"

@@ -240,7 +240,9 @@ call. The base sha compared is the one GitHub records on the PR (it changes on a
 event, not on every push to the base). On a maintenance base the base's live tip (and on a repair,
 main's) is re-read just before these two reads and must still be the expected sha, so its window is
 those two reads longer, roughly 4-5 s; a move in it is caught only by the readback after the merge.
-Every gate run read must carry a whole-number id, run number and attempt, and the PR line must be
+Every gate run read must carry a whole-number id, run number and attempt; every record of the
+final read (an endpoint that answers only the gate's `pull_request_target` runs) must plainly be
+one, so a record without a path or an event is a failed read, never dropped; and the PR line must be
 one object with a state, a draft flag, 40-hex head and base shas, a base name and a list of label
 names; anything else is a failed read, never two partial answers that happen to compare equal. A connector review or another check run that changes on the same
 head after the check is not re-read: only the gate's own run is.

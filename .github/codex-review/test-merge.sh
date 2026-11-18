@@ -47,8 +47,11 @@ case "$*" in
   *compare/*per_page=1\ *) fail "$@"; printf '%s\n' "$COMPARE" ;;
   *compare/*per_page=100*) fail "$@"; printf '%s\n' "$COMMITS" ;;
   *actions/runs*) fail "$@"; printf '%s' "$RUNS" ;;
-  # The gate's runs on the head, the last read before the merge (TXE-7847): RUNS2 when set.
-  *actions/workflows/codex-review.yml/runs*) fail "$@"; printf '%s' "${RUNS2-$RUNS}" ;;
+  # The gate's runs on the head, the last read before the merge (TXE-7847): RUNS2 when set, else the
+  # gate's pull_request_target runs of RUNS, as the workflow- and event-filtered endpoint answers.
+  *actions/workflows/codex-review.yml/runs*) fail "$@"
+    if [ "${RUNS2+x}" = x ]; then printf '%s' "$RUNS2"
+    else printf '%s' "$RUNS" | jq -c 'select(((.path // "") | sub("@.*$"; "")) == ".github/workflows/codex-review.yml" and .event == "pull_request_target")'; fi ;;
   *check-runs*) fail "$@"; printf '%s' "$CHECKS" ;;
   */status*) fail "$@"; printf '%s\n' "$STATUS" ;;
   "pr merge"*) echo merged ;;
@@ -334,9 +337,20 @@ run before-pull-unread   2 "could not read PR #7's labels and base before main's
 # A run or a PR answer with a field missing is a failed read, never two partial answers that agree.
 run judged-no-id         2 "codex-review runs on $H (a run without a whole-number id, run number or attempt)" not-merged RUNS="$CI
 "'{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success"}'
-run last-run-no-attempt  2 "before the merge (a run without a whole-number id, run number or attempt)" not-merged RUNS="$GATE_ID
+LASTBAD="before the merge (a run that is not plainly a codex-review pull_request_target run"
+run last-run-no-attempt  2 "$LASTBAD" not-merged RUNS="$GATE_ID
 $CI" RUNS2="$GATE_ID
-"'{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":502,"run_number":null,"status":"queued","conclusion":null}'
+"'{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":502,"run_number":6,"status":"queued","conclusion":null}'
+run last-run-no-number   2 "$LASTBAD" not-merged RUNS="$GATE_ID
+$CI" RUNS2="$GATE_ID
+"'{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":502,"run_attempt":1,"status":"queued","conclusion":null}'
+# A newer record the filter could not place (no path, no event) is a failed read, never dropped.
+run last-run-no-path     2 "$LASTBAD" not-merged RUNS="$GATE_ID
+$CI" RUNS2="$GATE_ID
+"'{"name":"codex-review","workflow_id":101,"event":"pull_request_target","id":502,"run_number":6,"run_attempt":1,"status":"queued","conclusion":null}'
+run last-run-no-event    2 "$LASTBAD" not-merged RUNS="$GATE_ID
+$CI" RUNS2="$GATE_ID
+"'{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"id":502,"run_number":6,"run_attempt":1,"status":"queued","conclusion":null}'
 run last-pull-no-base-sha 2 "labels and base before the merge (not one PR object" not-merged \
     PULL2='{"base":"main","base_sha":null,"draft":false,"head":"'"$H"'","labels":[],"state":"open"}'
 run last-pull-no-labels  2 "labels and base before the merge (not one PR object" not-merged \
