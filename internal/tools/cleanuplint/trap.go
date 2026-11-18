@@ -634,7 +634,7 @@ func forwardsArgs(text, name string, memo map[string]bool) bool {
 		return false
 	}
 	for _, st := range statements(body) {
-		for _, f := range strings.Fields(st) {
+		for f := range strings.FieldsSeq(st) {
 			if allArgsRe.MatchString(f) {
 				memo[name] = true
 				return true
