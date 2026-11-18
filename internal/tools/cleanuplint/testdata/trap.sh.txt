@@ -196,3 +196,12 @@ FOO=1> /dev/null trap 'false' EXIT # want:trap-status
 > a> b trap 'false' EXIT # want:trap-status
 exec {fd}> "$log" trap 'false' EXIT
 echo> /dev/null trap 'false' EXIT
+# A function that runs its arguments in this shell runs trap as a command (connector security review of PR 293).
+run() { "$@"; }
+run trap 'exit 0' EXIT # want:trap-status
+quietly() {
+  command "${@}" >/dev/null
+}
+quietly trap 'exit 0' EXIT # want:trap-status
+say() { echo "$@"; }
+say trap 'exit 0' EXIT

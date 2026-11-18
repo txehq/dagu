@@ -502,6 +502,7 @@ func findTraps(text string) []trapCmd {
 	// (FOO=a\ b, 2>&1), except after a ( that starts a command in it,
 	// x=$(trap ...).
 	wordEnd := 0
+	forwards := map[string]bool{}
 	for i := 0; i < len(text); {
 		c := text[i]
 		if z.q == 0 {
@@ -567,7 +568,7 @@ func findTraps(text string) []trapCmd {
 					// operator at the word's end takes the next word.
 					if before, ok, needs := wordRedir(w); ok && (before == "" || redirFDRe.MatchString(before) || keepsCommand(before)) {
 						target = needs
-					} else if !keepsCommand(w) {
+					} else if !keepsCommand(w) && !forwardsArgs(text, w, forwards) {
 						cmd = false
 					}
 				}
@@ -618,6 +619,37 @@ var (
 	// word: a descriptor (2>), a {varname} (exec {fd}>), or the & of &>.
 	redirFDRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\}|&)$`)
 )
+
+// forwardsArgs reports a function the script defines that runs its
+// arguments as a command in this shell, run() { "$@"; }: run trap ... EXIT
+// sets a trap (connector security review of PR 293). memo caches the answer
+// per name.
+func forwardsArgs(text, name string, memo map[string]bool) bool {
+	if v, ok := memo[name]; ok {
+		return v
+	}
+	memo[name] = false
+	body, ok := funcBody(text, name)
+	if !ok {
+		return false
+	}
+	for _, st := range statements(body) {
+		for _, f := range strings.Fields(st) {
+			if allArgsRe.MatchString(f) {
+				memo[name] = true
+				return true
+			}
+			if !keepsCommand(f) {
+				break
+			}
+		}
+	}
+	return false
+}
+
+// allArgsRe is a word that expands to a function's arguments: "$@", $*,
+// "${@:2}".
+var allArgsRe = regexp.MustCompile(`^"?\$(?:[@*]|\{[@*][^}]*\})"?$`)
 
 // wordRedir finds the redirections of a word, outside quotes and $( ): it
 // returns the text before the first operator, whether there is one, and
