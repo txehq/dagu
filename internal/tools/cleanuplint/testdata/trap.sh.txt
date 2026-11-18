@@ -94,3 +94,9 @@ trap 'RC=$?; set +e
   rm -rf "$work" # never 2>/dev/null here
   exit "$RC"' EXIT
 trap 'RC=$?; set +e; rm -rf "$work" 2>/dev/null; echo "2>/dev/null"; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; set +e; false 2>"/dev/null"; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; set +e; false >'"'"'/dev/null'"'"' 2>&1; exit "$RC"' EXIT # want:trap-status
+# A TERM or INT handler may fix a value when it is set; only its stderr is read.
+trap "kill $child_pid; exit 143" TERM
+trap "kill $child_pid 2>/dev/null; exit 143" TERM # want:trap-status
+trap "rm -rf $work" EXIT # want:trap-status

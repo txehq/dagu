@@ -258,7 +258,10 @@ func trapFindings(rel, text string) []Finding {
 		if fn, ok := funcBody(text, body); ok {
 			where = "function " + body
 			body = fn
-		} else if t.early {
+		} else if t.early && status {
+			// Only a status-keeping handler must read $? when it runs; a
+			// TERM or INT handler may fix a value when it is set (connector
+			// review of PR 292).
 			out = append(out, Finding{Path: rel, Line: t.line, Rule: ruleTrap,
 				Msg: "the trap's handler is double-quoted or unquoted, so its $ expands when trap runs, not when the handler does; single-quote it"})
 			continue
@@ -298,6 +301,8 @@ func trapFindings(rel, text string) []Finding {
 // quotes blanked, so a redirection mentioned in a message or a comment is not
 // read as one (connector review of PR 292). Line breaks are kept.
 func shellCode(body string) string {
+	// A quoted redirection target is still a target: 2>"/dev/null".
+	body = quotedTargetRe.ReplaceAllString(body, "$1/dev/null")
 	var out strings.Builder
 	for i, l := range strings.Split(body, "\n") {
 		if i > 0 {
@@ -319,6 +324,9 @@ func shellCode(body string) string {
 	}
 	return out.String()
 }
+
+// quotedTargetRe is a redirection to a quoted /dev/null or &- target.
+var quotedTargetRe = regexp.MustCompile(`(>&?\s*)["']/dev/null["']`)
 
 // silencedRe is a redirection that discards stderr.
 var silencedRe = regexp.MustCompile(`(?:^|[^0-9>&])(?:2|&)>>?\s*/dev/null|>\s*/dev/null\s*2>&1|2>&-`)
