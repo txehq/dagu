@@ -11,9 +11,10 @@ import (
 	"path/filepath"
 )
 
-// checkProfileOwner accepts the directory: on Windows its access is the
-// access control list the directory inherited where it was created, which
-// the code that created it chose.
+// checkProfileOwner accepts the directory. On Windows its access is the
+// access control list it inherited where it was created; the gate reads
+// neither its owner nor that list, so it does not claim that another
+// account cannot write the profile there (unproven, TXE-7856).
 func checkProfileOwner(string, os.FileInfo) error {
 	return nil
 }

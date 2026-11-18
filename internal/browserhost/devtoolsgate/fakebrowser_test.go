@@ -100,6 +100,16 @@ type fakeBrowser struct {
 	// offTheRecordAtStart opens a page off the record as the root
 	// auto-attach is asked for.
 	offTheRecordAtStart bool
+	// offTheRecord says how the fake answers the gate's probe's ask for a
+	// window off the record: "refuses", as with the profile preference in
+	// force (the default), "opens", as a platform policy can make it,
+	// "hangs", never answering, or "none": no Extensions domain at all.
+	offTheRecord string
+	// keepsProbe makes Extensions.uninstall fail.
+	keepsProbe bool
+	// extensionsLoaded and uninstalled record the probe's lifecycle.
+	extensionsLoaded []string
+	uninstalled      []string
 	// unnamedContext makes Target.getBrowserContexts name no default
 	// context, as an older browser's does.
 	unnamedContext bool
@@ -217,6 +227,8 @@ func newFakeBrowser(in io.Reader, out io.Writer) *fakeBrowser {
 		inFlight:    make(map[string]*fakeRequest),
 		credentials: make(map[string]string),
 		root:        &fakeSession{browser: true},
+		// Chrome with the gate's profile preference in force.
+		offTheRecord: "refuses",
 	}
 	f.addTargetLocked("page", "about:blank", "blank")
 	return f
@@ -699,6 +711,45 @@ func (f *fakeBrowser) handle(data []byte) {
 			return
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetInfo": f.targetInfo(t)})
+	case "Extensions.loadUnpacked":
+		if f.offTheRecord == "none" {
+			f.replyError(cmd.ID, cmd.SessionID, -32601, "'Extensions.loadUnpacked' wasn't found")
+			return
+		}
+		f.extensionsLoaded = append(f.extensionsLoaded, str("path"))
+		t := f.addTargetLocked("service_worker", fakeProbeURL+"worker.js", "probe")
+		if f.autoAttach.on {
+			s := f.newSessionLocked(t.id, true)
+			f.event("", "Target.attachedToTarget", map[string]any{"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": false})
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"id": fakeProbeID})
+	case "Extensions.uninstall":
+		if f.keepsProbe {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "Failed to uninstall the extension")
+			return
+		}
+		for _, t := range f.sortedTargets() {
+			if strings.HasPrefix(t.url, "chrome-extension://"+str("id")+"/") {
+				for _, s := range f.sortedSessions() {
+					if s.targetID == t.id {
+						f.dropSessionLocked(s, "")
+					}
+				}
+				delete(f.targets, t.id)
+			}
+		}
+		f.uninstalled = append(f.uninstalled, str("id"))
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Extensions.getExtensions":
+		if f.offTheRecord == "none" {
+			f.replyError(cmd.ID, cmd.SessionID, -32601, "'Extensions.getExtensions' wasn't found")
+			return
+		}
+		listed := []map[string]any{}
+		if len(f.extensionsLoaded) > len(f.uninstalled) {
+			listed = append(listed, map[string]any{"id": fakeProbeID})
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"extensions": listed})
 	case "Fake.state":
 		f.reply(cmd.ID, cmd.SessionID, f.stateLocked())
 	case "Fake.argv":
@@ -716,6 +767,10 @@ func (f *fakeBrowser) handle(data []byte) {
 			return
 		}
 		if cmd.Method == "Runtime.evaluate" {
+			if s, ok := f.sessions[cmd.SessionID]; ok && f.targets[s.targetID] != nil && strings.HasPrefix(f.targets[s.targetID].url, fakeProbeURL) {
+				f.probeEvaluateLocked(cmd.ID, cmd.SessionID, str("expression"))
+				return
+			}
 			f.reply(cmd.ID, cmd.SessionID, map[string]any{"result": map[string]any{"type": "number", "value": 1}})
 			return
 		}
@@ -1005,6 +1060,12 @@ func runFakeBrowserProcess(args []string) int {
 			f.failStart = true
 		case "--refuse-browser-fetch":
 			f.refuseBrowserFetch = true
+		case "--opens-off-the-record":
+			f.offTheRecord = "opens"
+		case "--probe-hangs":
+			f.offTheRecord = "hangs"
+		case "--no-extensions":
+			f.offTheRecord = "none"
 		}
 		if marker, ok := strings.CutPrefix(arg, "--exit-marker="); ok {
 			f.exitMarker = marker
@@ -1026,4 +1087,36 @@ func runFakeBrowserProcess(args []string) int {
 		_ = os.WriteFile(f.exitMarker, []byte("eof\n"), 0o600)
 	}
 	return 0
+}
+
+// fakeProbeID and fakeProbeURL are the extension the fake loads for any
+// unpacked path, and its URL.
+const (
+	fakeProbeID  = "fakeprobe"
+	fakeProbeURL = "chrome-extension://" + fakeProbeID + "/"
+)
+
+// probeEvaluateLocked answers the gate's off-the-record probe.
+func (f *fakeBrowser) probeEvaluateLocked(id json.RawMessage, sessionID, expression string) {
+	value := "up"
+	if strings.Contains(expression, "incognito: true") {
+		if f.offTheRecord == "hangs" {
+			// No answer, ever.
+			return
+		}
+		value = "refused " + offTheRecordRefusal
+		if f.offTheRecord == "opens" {
+			value = "opened"
+			t := f.addTargetLocked("page", "about:blank", "otr")
+			t.context = fakeOffTheRecordContext
+			if f.autoAttach.on {
+				s := f.newSessionLocked(t.id, true)
+				if f.autoAttach.wait {
+					t.pausedBy = s.id
+				}
+				f.event("", "Target.attachedToTarget", map[string]any{"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": f.autoAttach.wait})
+			}
+		}
+	}
+	f.reply(id, sessionID, map[string]any{"result": map[string]any{"type": "string", "value": value}})
 }

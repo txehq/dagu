@@ -46,6 +46,17 @@ type testSite struct {
 	hits map[string]int
 }
 
+// totalHits returns how many requests reached the site, any path.
+func (s *testSite) totalHits() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	total := 0
+	for _, n := range s.hits {
+		total += n
+	}
+	return total
+}
+
 // hitsOf returns how many requests for path reached the site.
 func (s *testSite) hitsOf(path string) int {
 	s.mu.Lock()

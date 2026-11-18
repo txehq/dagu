@@ -17,9 +17,10 @@ import (
 // The browser the gate starts runs every target in its own context
 // (mux.go). The gate closes a target it is told of in any other, but Chrome
 // sends the first request of a window opened already navigating before the
-// gate can hold it, so the gate also keeps the browser from opening a
-// context off the record at all: before the browser starts, the profile's
-// preferences turn off-the-record windows off, whatever would open one.
+// gate can hold it, so the gate also has the browser refuse windows off the
+// record: before the browser starts, the profile's preferences turn them
+// off, and before the gate serves anyone it checks that the browser does
+// refuse one (preflight.go), since a platform policy outranks a profile.
 //
 // The gate changes the preferences of a profile only when the profile is
 // its own, never a person's or a shared one:
@@ -43,10 +44,9 @@ import (
 //   - The previous value is not put back. The profile is the gate's, and the
 //     preference is its policy for every browser it starts there.
 //
-// A platform policy that sets IncognitoModeAvailability takes precedence
-// over a profile's preferences in Chrome; on a host with such a policy the
-// gate's closing of targets outside the browser's own context remains, with
-// the first request of a window opened already navigating not held.
+// On Windows the directory's owner and access are not checked
+// (profile_windows.go): the gate's isolation of its own profiles there is
+// unproven.
 
 // ErrProfileRequired is returned for a browser whose arguments name no
 // profile directory of its own.
