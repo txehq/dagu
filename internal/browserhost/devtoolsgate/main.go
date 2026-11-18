@@ -129,6 +129,7 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	// the process and asks the browser for its version at intervals.
 	heartbeat := make(chan error, 1)
 	go func() { heartbeat <- heartbeatBrowser(ctx, m, clk) }()
+	// A browser that is gone is not served while the gate ends it.
 	select {
 	case err := <-runErr:
 		// The browser closed its pipe, which it does on its way out, or ctx
@@ -137,14 +138,17 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 			closeBrowser(m, browser)
 			return nil
 		}
+		g.stopServing()
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return browser.end()
 		}
 		return errors.Join(err, browser.end())
 	case <-browser.done:
+		g.stopServing()
 		m.close()
 		return browser.end()
 	case <-heartbeat:
+		g.stopServing()
 		m.close()
 		return browser.end()
 	case <-ended:

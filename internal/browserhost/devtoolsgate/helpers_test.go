@@ -23,6 +23,13 @@ import (
 // browser the gate launches.
 const fakeBrowserMarker = "fakebrowser"
 
+// fakeHelperMarker makes the test binary a helper process of the fake
+// browser, which lives fakeHelperLife unless it is ended.
+const (
+	fakeHelperMarker = "fakebrowserhelper"
+	fakeHelperLife   = time.Minute
+)
+
 // TestMain lets the test binary play two other roles: the gate helper, as
 // `dagu browser devtools-gate` would, and the browser the gate launches.
 func TestMain(m *testing.M) {
@@ -35,6 +42,12 @@ func TestMain(m *testing.M) {
 	}
 	if slices.Contains(os.Args, fakeBrowserMarker) {
 		os.Exit(runFakeBrowserProcess(os.Args[1:]))
+	}
+	if slices.Contains(os.Args, fakeHelperMarker) {
+		// A browser's helper process that outlives it for a while, holding
+		// what it inherited.
+		time.Sleep(fakeHelperLife)
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
