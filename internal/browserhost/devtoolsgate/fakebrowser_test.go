@@ -91,6 +91,9 @@ type fakeBrowser struct {
 	// order: the browser-session attach and its Fetch.enable, the root
 	// auto-attach, a target's first request, a resume.
 	log []string
+	// targetParams records, in order, each Target command the gate passed
+	// on with its params as the browser received them: "<method> <params>".
+	targetParams []string
 	// failStart makes the browser exit before answering, as a browser
 	// that cannot adopt its pipes does.
 	failStart bool
@@ -329,6 +332,9 @@ func (f *fakeBrowser) handle(data []byte) {
 			f.workerCommandLocked(t, s, cmd.ID, cmd.Method)
 			return
 		}
+	}
+	if strings.HasPrefix(cmd.Method, "Target.") {
+		f.targetParams = append(f.targetParams, cmd.Method+" "+string(cmd.Params))
 	}
 	switch cmd.Method {
 	case "Browser.getVersion":
@@ -617,6 +623,19 @@ func (f *fakeBrowser) handle(data []byte) {
 		_ = json.Unmarshal(cmd.Params, &raw)
 		f.event(raw.SessionID, raw.Method, raw.Params)
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Target.createBrowserContext":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextId": "CTX1"})
+	case "Target.getBrowserContexts":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{"CTX1"}})
+	case "Target.disposeBrowserContext":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Target.getTargetInfo":
+		t, ok := f.targets[str("targetId")]
+		if !ok {
+			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetInfo": f.targetInfo(t)})
 	case "Fake.state":
 		f.reply(cmd.ID, cmd.SessionID, f.stateLocked())
 	case "Fake.argv":
@@ -843,6 +862,9 @@ type fakeState struct {
 	Refused     []string           `json:"refused"`
 	Credentials map[string]string  `json:"credentials"`
 	Log         []string           `json:"log"`
+	// TargetParams are the Target commands the browser received, with
+	// their params.
+	TargetParams []string `json:"targetParams"`
 	// Queued counts, per session, the commands waiting in a worker.
 	Queued map[string]int `json:"queued"`
 }
@@ -858,13 +880,14 @@ type fakeSessionState struct {
 
 func (f *fakeBrowser) stateLocked() fakeState {
 	state := fakeState{
-		Continues:   map[string]int{},
-		Resumed:     append([]string(nil), f.resumed...),
-		Completed:   append([]string(nil), f.completed...),
-		Refused:     append([]string(nil), f.refused...),
-		Credentials: map[string]string{},
-		Log:         append([]string(nil), f.log...),
-		Queued:      map[string]int{},
+		Continues:    map[string]int{},
+		Resumed:      append([]string(nil), f.resumed...),
+		Completed:    append([]string(nil), f.completed...),
+		Refused:      append([]string(nil), f.refused...),
+		Credentials:  map[string]string{},
+		Log:          append([]string(nil), f.log...),
+		Queued:       map[string]int{},
+		TargetParams: append([]string(nil), f.targetParams...),
 	}
 	for _, s := range f.sortedSessions() {
 		state.Sessions = append(state.Sessions, fakeSessionState{ID: s.id, TargetID: s.targetID, Auto: s.auto, Browser: s.browser, FetchOn: s.fetchOn, FetchAuth: s.fetchAuth})
