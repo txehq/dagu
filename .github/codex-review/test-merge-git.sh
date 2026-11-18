@@ -95,6 +95,11 @@ merge_into_main() { # <squash|merge>: into the PR's base
 case "$*" in
   *contents/.github/codex-review/codex-review-check.sh*) printf 'exit 0' | base64 ;;
   *"pulls/7 --jq [.merged"*) fail "$@"; if [ -s "$REPO/.merged" ]; then printf 'true\t%s\n' "$(cat "$REPO/.merged")"; else printf 'false\t\n'; fi ;;
+  # The PR's state line, before main's check and as the last read before the merge (TXE-7847).
+  # LABELS_AFTER_CHECK: the labels the second read (after main's check) answers.
+  *"pulls/7 --jq {state"*) if [ -s "$REPO/.merged" ]; then state=closed; else state=open; fi
+    labels='[]'; if [ -e "$REPO/.pull-read" ]; then labels="${LABELS_AFTER_CHECK:-[]}"; fi; : >"$REPO/.pull-read"
+    printf '{"base":"%s","base_sha":"%s","draft":false,"head":"%s","labels":%s,"state":"%s"}\n' "$PR_BASE" "$(g rev-parse "$PR_BASE")" "$head" "$labels" "$state" ;;
   *pulls/7*) if [ -s "$REPO/.merged" ]; then state=closed; else state=open; fi; printf '%s\tfalse\t%s\t%s\n' "$state" "$head" "$PR_BASE" ;;
   *contents/.github/workflows/codex-review.yml*) ref="${all#*\?ref=}"; ref="${ref%% *}"; fail "$@"; g show "$ref:.github/workflows/codex-review.yml" | base64 ;;
   *branches/maint/*) b="${all#*branches/}"; b="${b%% *}"
@@ -107,7 +112,7 @@ case "$*" in
   *compare/*) spec="${all#*compare/}"; spec="${spec%%\?*}"; a="${spec%%...*}"; b="${spec##*...}"; st="$(compare "$a" "$b")" || exit 1
     case "$*" in *"per_page=1 "*) printf '%s\t%s\n' "$st" "$(g rev-list --count "$b" "^$a")" ;; *) g rev-list --reverse --parents "$b" "^$a" ;; esac ;;
   "api repos/txehq/dagu --jq .allow_merge_commit") echo "${ALLOW_MERGE:-true}" ;;
-  *actions/runs*) printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success","pull_requests":[{"number":7,"base":{"ref":"%s"}}]}\n' "$PR_BASE" ;;
+  *actions/runs*|*actions/workflows/codex-review.yml/runs*) printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success","pull_requests":[{"number":7,"base":{"ref":"%s"}}]}\n' "$PR_BASE" ;;
   *check-runs*) if [ -n "${ADVANCE_MAIN_AT_CHECKS:-}" ]; then g checkout -q main && echo moved >"$REPO/moved" && g add moved && g commit -q -m "main moved during the checks"; fi; printf '%s\n' '{"name":"CI","app":{"id":1},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-11-08T00:00:00Z"}' ;;
   */status*) printf 'success\t1\n' ;;
   "pr merge 7 -R txehq/dagu --squash --match-head-commit "*) merge_into_main squash "$@" ;;
@@ -132,6 +137,7 @@ run() {
     out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="${FAIL_ON:-}" ALLOW_MERGE="${ALLOW_MERGE:-true}" MERGE_AS="${MERGE_AS:-}" \
         ADVANCE_MAIN_AT_CHECKS="${ADVANCE_MAIN_AT_CHECKS:-}" ADVANCE_MAIN_AT_MERGE="${ADVANCE_MAIN_AT_MERGE:-}" MERGE_TAINT="${MERGE_TAINT:-}" \
         ADVANCE_BASE_AT_LAST_READ="${ADVANCE_BASE_AT_LAST_READ:-}" ADVANCE_BASE_AT_MERGE="${ADVANCE_BASE_AT_MERGE:-}" \
+        LABELS_AFTER_CHECK="${LABELS_AFTER_CHECK:-}" \
         REPO="$REPO" PR_HEAD="$branch" PR_BASE="${PR_BASE:-main}" \
         bash "$HERE/merge.sh" "$@" 7 "$(r rev-parse "$branch")" 2>&1)"; rc=$?
     if [ "$rc" = "$want_rc" ] && [[ "$out" == *"$want"* ]] \
@@ -215,6 +221,11 @@ check "readback-no-reach: the message says the ancestor is not reached" '[[ "$(c
 # A readback that cannot be completed exits 1 and says the PR was merged.
 FAIL_ON="pulls/7 --jq [.merged" run readback-unread 1 "PR #7 was merged, but its merge commit could not be read" merged sync --method merge --expect-ancestor "$TAG"
 
+# A label that changes after main's check refuses every method (TXE-7847): the last reads before
+# the merge run on the merge-commit path and the repair path too, and nothing moves.
+LABELS_AFTER_CHECK='["review-override"]' run sync-merge-label-after-check 1 "changed after main's check (labels or base)" not-merged sync --method merge --expect-ancestor "$TAG"
+LABELS_AFTER_CHECK='["review-override"]' run repair-label-after-check 1 "changed after main's check (labels or base)" not-merged repair --method merge --expect-ancestor "$TAG" --repair
+
 # ── A maintenance base (TXE-7556): reviewed and squashed under the same checks, onto that base ──
 PR_BASE="$MB1" run maint-squash 0 "merged PR #7 into $MB1 as " merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
 check "maint-squash: the base has the fix's tree as one commit on its tip; main did not move" \
@@ -238,5 +249,7 @@ ADVANCE_BASE_AT_LAST_READ=1 PR_BASE="$MB1" run maint-moved-late 1 "$MB1 moved fr
 ADVANCE_BASE_AT_MERGE=1 PR_BASE="$MB1" run maint-moved-at-merge 1 "PR #7 was merged, but its squash commit" merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
 check "maint-moved-at-merge: the squash's parent is the moved tip, named in the message, nothing rewritten" \
     '[ "$(r rev-parse "$MB1^")" != "$MB1TIP" ] && [ -e "$REPO/late-base" ]'
+LABELS_AFTER_CHECK='[]' PR_BASE="$MB1" run maint-labels-unchanged 0 "merged PR #7 into $MB1 as " merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
+LABELS_AFTER_CHECK='["review-override"]' PR_BASE="$MB1" run maint-label-after-check 1 "changed after main's check (labels or base)" not-merged maint-fix --base "$MB1" --base-sha "$MB1TIP"
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

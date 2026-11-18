@@ -24,6 +24,17 @@ case "$*" in
   *"contents/.github/workflows/codex-review.yml?ref=$MAIN_TIP "*) fail "$@"; printf '%s' "$MAIN_WF" | base64 ;;
   *contents/.github/workflows/codex-review.yml*) fail "$@"; printf '%s' "${BASE_WF-$MAIN_WF}" | base64 ;;
   "api repos/txehq/dagu/pulls/7 --jq [.merged"*) fail "$@"; printf 'true\t%s\n' "$SQUASH" ;;
+  # The PR's state line, read before main's check and again as the last read before the merge
+  # (TXE-7847): built from PR_TSV, PR_LABELS and PR_BASE_SHA; the second read answers PULL2 when set,
+  # and fails when FAIL_PULL2 is set.
+  "api repos/txehq/dagu/pulls/7 --jq {state"*) fail "$@"
+    if [ -e "$GH_LOG.pull1" ]; then
+      [ -z "${FAIL_PULL2:-}" ] || { printf '{"partial":'; exit 1; }
+      [ -z "${PULL2:-}" ] || { printf '%s\n' "$PULL2"; exit 0; }
+    fi
+    : >"$GH_LOG.pull1"
+    IFS=$'\t' read -r st dr hd bs <<<"$PR_TSV"
+    printf '{"base":"%s","base_sha":"%s","draft":%s,"head":"%s","labels":%s,"state":"%s"}\n' "$bs" "$PR_BASE_SHA" "$dr" "$hd" "$PR_LABELS" "$st" ;;
   "api repos/txehq/dagu/pulls/7 "*) fail "$@"; printf '%s\n' "$PR_TSV" ;;
   # maint/... before main: "branches/main" is a prefix of "branches/maint/". The second read of the
   # base (the last before the merge) answers BASE_TIP2 when it is set.
@@ -36,6 +47,8 @@ case "$*" in
   *compare/*per_page=1\ *) fail "$@"; printf '%s\n' "$COMPARE" ;;
   *compare/*per_page=100*) fail "$@"; printf '%s\n' "$COMMITS" ;;
   *actions/runs*) fail "$@"; printf '%s' "$RUNS" ;;
+  # The gate's runs on the head, the last read before the merge (TXE-7847): RUNS2 when set.
+  *actions/workflows/codex-review.yml/runs*) fail "$@"; printf '%s' "${RUNS2-$RUNS}" ;;
   *check-runs*) fail "$@"; printf '%s' "$CHECKS" ;;
   */status*) fail "$@"; printf '%s\n' "$STATUS" ;;
   "pr merge"*) echo merged ;;
@@ -55,9 +68,10 @@ run() {
     local name="$1" want_rc="$2" want="$3" merged="$4" out rc log="$TMP/$1.log"
     shift 4
     : >"$log"
-    rm -f "$log.base1"
+    rm -f "$log.base1" "$log.pull1"
     # shellcheck disable=SC2086  # MERGE_ARGS is this file's own flag list, split on purpose
     out="$(env PATH="$TMP/bin:$PATH" GH_LOG="$log" FAIL_ON="" PR_TSV="open	false	$H	main" \
+        PR_LABELS='[]' PR_BASE_SHA="$M" \
         MAIN_TIP="$M" COMMIT_TSV="$TREE	$M" MAIN_COMMIT_TSV="$MAIN_TREE	0000000000000000000000000000000000000000" \
         COMPARE="ahead	1" COMMITS="$H $M" MAIN_WF="$WF" SQUASH="$SQ" SQUASH_TSV="$TREE	$M" \
         RUNS="$GATE
@@ -274,6 +288,79 @@ mrun maint-check-at-tip  0 merged                         merged
 if grep -q "contents/.github/codex-review/codex-review-check.sh?ref=$M " "$TMP/maint-check-at-tip.log"; then
     PASS=$((PASS + 1)); printf '  ok   %s\n' "check-read-at-main-tip"
 else FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "check-read-at-main-tip"; fi
+# ── The last reads before the merge (TXE-7847) ──
+# After main's check passes, the gate's runs on the head and the PR (labels, base name and sha) are
+# read again as the last calls before `gh pr merge`; anything that changed since the check refuses,
+# and a read that fails refuses. Gate runs here carry their id and attempt, as the API's do.
+GATE_ID='{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":501,"run_number":5,"run_attempt":1,"status":"completed","conclusion":"success"}'
+gid() { # gid <id> <run_number> <attempt> <status> <conclusion|null>
+    local c="$5"; [ "$c" = null ] || c="\"$c\""
+    printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":%s,"run_number":%s,"run_attempt":%s,"status":"%s","conclusion":%s}\n' "$1" "$2" "$3" "$4" "$c"
+}
+pj() { # pj <base> <base sha> <labels json>: the PR's state line as the stand-in answers it
+    printf '{"base":"%s","base_sha":"%s","draft":false,"head":"%s","labels":%s,"state":"open"}' "$1" "$2" "$H" "$3"
+}
+O='["review-override"]'
+run last-passes          0 merged                                merged RUNS="$GATE_ID
+$CI" PR_LABELS="$O" PULL2="$(pj main "$M" "$O")"
+# A gate run created after the check: queued, or even green, it is not the run that was judged.
+run last-new-run         1 "is now '502 6 1' (id, number, attempt), not the judged '501 5 1' (queued null): a newer run started after the check" not-merged \
+    RUNS="$GATE_ID
+$CI" RUNS2="$GATE_ID
+$(gid 502 6 1 queued null)"
+run last-new-run-green   1 "not the judged '501 5 1' (completed success)" not-merged RUNS="$GATE_ID
+$CI" RUNS2="$GATE_ID
+$(gid 502 6 1 completed success)"
+# The judged run re-run after the check: same id and number, a new attempt.
+run last-rerun           1 "is now '501 5 2'"                    not-merged RUNS="$GATE_ID
+$CI" RUNS2="$(gid 501 5 2 in_progress null)"
+run last-gate-gone       1 "is now 'missing'"                    not-merged RUNS="$GATE_ID
+$CI" RUNS2=""
+# The labels the check read: review-override removed, or a label added, after the check.
+run last-override-removed 1 "changed after main's check (labels or base): was $(pj main "$M" "$O"), now $(pj main "$M" '[]')" not-merged \
+    PR_LABELS="$O" PULL2="$(pj main "$M" '[]')"
+run last-label-added     1 "now $(pj main "$M" '["do-not-merge","review-override"]')" not-merged \
+    PR_LABELS="$O" PULL2="$(pj main "$M" '["do-not-merge","review-override"]')"
+# The base: retargeted, or its sha moved, after the check.
+run last-retarget        1 "now $(pj maint/txe-v2.18.2-19 "$M" '[]')" not-merged PULL2="$(pj maint/txe-v2.18.2-19 "$M" '[]')"
+run last-base-moved      1 "now $(pj main 9999999999999999999999999999999999999999 '[]')" not-merged \
+    PULL2="$(pj main 9999999999999999999999999999999999999999 '[]')"
+# A read that fails is never a pass.
+run last-gate-unread     2 "could not read the codex-review runs on $H before the merge" not-merged \
+    FAIL_ON=actions/workflows/codex-review.yml/runs
+run last-pull-unread     2 "could not read PR #7's labels and base before the merge" not-merged FAIL_PULL2=1
+run last-pull-garbled    2 "labels and base before the merge (not an object)" not-merged PULL2='"labels"'
+run before-pull-unread   2 "could not read PR #7's labels and base before main's check" not-merged FAIL_ON="--jq {state"
+# Order: the PR line is read before the check and again after it, and the gate's runs and the PR
+# are the last reads, immediately before the merge call.
+order() { # order <name> <log>: the calls from the check on are: the check, gate runs, PR line, merge
+    local got
+    got="$(sed -n '/^check ran$/,$p' "$2" | sed -E 's/.*workflows\/codex-review\.yml\/runs.*/gate runs/; s/.*pulls\/7 --jq \{state.*/PR line/;
+        s/.*pulls\/7 --jq \[\.merged.*/merged?/; s/.*branches\/maint\/.*/base tip/; s/.*git\/commits\/.*/commit/; s/^pr merge.*/merge/')"
+    if [ "$(grep -c -- '--jq {state' "$2")" = 2 ] && [ "$(grep -n -- '--jq {state' "$2" | head -1 | cut -d: -f1)" -lt "$(grep -n '^check ran$' "$2" | cut -d: -f1)" ] \
+       && [ "$got" = "$3" ]; then
+        PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"
+    else FAIL=$((FAIL + 1)); printf '  FAIL %s:\n%s\n' "$1" "$(cat "$2")"; fi
+}
+LOGCHECK='echo "check ran" >>"$GH_LOG"; exit 0'
+run last-order 0 merged merged MAIN_CHECK="$LOGCHECK"
+order last-reads-order "$TMP/last-order.log" "check ran
+gate runs
+PR line
+merge"
+# A maintenance base: the same last reads, after the base's own last read.
+mrun maint-last-order    0 merged                                merged MAIN_CHECK="$LOGCHECK"
+order maint-last-reads-order "$TMP/maint-last-order.log" "check ran
+base tip
+gate runs
+PR line
+merge
+merged?
+commit"
+mrun maint-last-override-removed 1 "changed after main's check (labels or base)" not-merged \
+    PR_LABELS="$O" PULL2="$(pj "$MB" "$M" '[]')"
+mrun maint-last-new-run  1 "a newer run started after the check" not-merged RUNS2="$GATE_MB
+$(gid 502 7 1 queued null)"
 # Arguments: nothing is read and nothing merged.
 usage() {
     local name="$1" want="$2" out rc; shift 2
