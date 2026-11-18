@@ -272,7 +272,11 @@ func (f *fakeBrowser) newSessionLocked(targetID string, auto bool) *fakeSession 
 }
 
 func (f *fakeBrowser) targetInfo(t *fakeTarget) map[string]any {
-	return map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true, "browserContextId": t.context}
+	info := map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true}
+	if t.context != "" {
+		info["browserContextId"] = t.context
+	}
+	return info
 }
 
 // serve answers commands until the pipe closes. It returns nil on EOF.
@@ -445,6 +449,10 @@ func (f *fakeBrowser) handle(data []byte) {
 		if cmd.Method == "Fake.createOffTheRecord" {
 			// A window a privileged page or worker opens off the record.
 			t.context = fakeOffTheRecordContext
+			if boolean("noContext") {
+				// One whose target info names no context at all.
+				t.context = ""
+			}
 		}
 		if f.discover {
 			f.event("", "Target.targetCreated", map[string]any{"targetInfo": f.targetInfo(t)})
