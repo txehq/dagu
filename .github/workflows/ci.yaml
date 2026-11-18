@@ -195,6 +195,11 @@ jobs:
       - name: Check Go version pins
         run: go test -count=1 ./internal/tools/gopin
 
+      # ui/pnpm-lock.yaml is the one Playwright pin, read by CI's browser
+      # tests and Dockerfile.dev alike (TXE-7866).
+      - name: Check the Playwright pin
+        run: go test -count=1 ./internal/tools/playwrightpin
+
       # A pull_request type that fires on an unchanged head runs a workflow
       # twice and cancels the first run (TXE-7841). It runs here, with no path
       # gate, so a change to a workflow file alone is checked.
@@ -522,9 +527,16 @@ jobs:
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
+      # The version line matches the one the dev image's build prints
+      # (Dockerfile.dev), since both read ui/pnpm-lock.yaml (TXE-7866).
       - name: Install Playwright Chromium
         working-directory: ui
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          chrome="$(node -e "process.stdout.write(require('@playwright/test').chromium.executablePath())")"
+          playwright_version="$(pnpm exec playwright --version)"
+          chromium_version="$("${chrome}" --version)"
+          echo "Chromium from Playwright ${playwright_version#Version }: ${chromium_version}"
 
       - name: Run browser E2E tests
         env:
