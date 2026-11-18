@@ -546,7 +546,8 @@ func findTraps(text string) []trapCmd {
 				wordEnd = wend
 				switch {
 				case target:
-					target = false
+					// The target may run into the next operator: > a> b.
+					_, _, target = wordRedir(w)
 				case w == "{":
 					// A group or a function body starts a command, also
 					// after function name (function f { trap ...; }).
@@ -560,10 +561,15 @@ func findTraps(text string) []trapCmd {
 					}
 					i, cmd = end, false
 					continue
-				case redirOpRe.MatchString(w):
-					target = true
-				case !keepsCommand(w):
-					cmd = false
+				default:
+					// A redirection in the word (>/dev/null, FOO=1> f, 2>&1)
+					// keeps the position when what comes before it does; an
+					// operator at the word's end takes the next word.
+					if before, ok, needs := wordRedir(w); ok && (before == "" || redirFDRe.MatchString(before) || keepsCommand(before)) {
+						target = needs
+					} else if !keepsCommand(w) {
+						cmd = false
+					}
 				}
 			}
 		}
@@ -591,7 +597,7 @@ func findTraps(text string) []trapCmd {
 
 // keepsCommand reports a word after which the next word is still a command.
 func keepsCommand(w string) bool {
-	return commandPrefixes[w] || assignmentRe.MatchString(w) || redirRe.MatchString(w) || strings.HasPrefix(w, "-")
+	return commandPrefixes[w] || assignmentRe.MatchString(w) || strings.HasPrefix(w, "-")
 }
 
 // commandPrefixes are the words after which the next word is still a
@@ -608,11 +614,43 @@ var commandPrefixes = map[string]bool{
 var (
 	// assignmentRe is a variable assignment written before a command.
 	assignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=`)
-	// redirRe is a redirection, with or without its target in the word.
-	redirRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:[<>]|&>)`)
-	// redirOpRe is a redirection whose target is the next word.
-	redirOpRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\})?(?:>>?|<|<>|>\||&>>?|>&|<&)$`)
+	// redirFDRe is what may stand before a redirection operator in its own
+	// word: a descriptor (2>), a {varname} (exec {fd}>), or the & of &>.
+	redirFDRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\}|&)$`)
 )
+
+// wordRedir finds the redirections of a word, outside quotes and $( ): it
+// returns the text before the first operator, whether there is one, and
+// whether the last one ends the word, so that its operand is the next word
+// (FOO=1> /dev/null, >/dev/null< /dev/null; connector review of PR 293).
+func wordRedir(w string) (before string, found, needsTarget bool) {
+	var z quoter
+	depth, first, opEnd := 0, -1, -1
+	for i := 0; i < len(w); {
+		next, plain := z.step(w, i)
+		if plain {
+			switch c := w[i]; {
+			case c == '(':
+				depth++
+			case c == ')' && depth > 0:
+				depth--
+			case depth == 0 && (c == '<' || c == '>'):
+				if first < 0 {
+					first = i
+				}
+				for next < len(w) && strings.IndexByte("<>&|", w[next]) >= 0 {
+					next++
+				}
+				opEnd = next
+			}
+		}
+		i = next
+	}
+	if first < 0 {
+		return w, false, false
+	}
+	return w[:first], true, opEnd >= len(w)
+}
 
 // wordAt returns the shell word that starts at i and the index past it. A
 // & or | of a redirection operator (>&, <&, >|) is part of the word.

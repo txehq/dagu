@@ -190,3 +190,9 @@ echo 2>&1 trap 'false' EXIT
 coproc trap 'false' EXIT # want:trap-status
 eval trap "'exit 0'" EXIT # want:trap-status
 echo eval trap 'false' EXIT
+# A redirection written onto the word before it still takes the next word as its target (connector review of PR 293).
+FOO=1> /dev/null trap 'false' EXIT # want:trap-status
+>/dev/null< /dev/null trap 'false' EXIT # want:trap-status
+> a> b trap 'false' EXIT # want:trap-status
+exec {fd}> "$log" trap 'false' EXIT
+echo> /dev/null trap 'false' EXIT
