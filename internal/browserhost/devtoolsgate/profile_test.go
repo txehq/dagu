@@ -27,7 +27,7 @@ func readPrefs(t *testing.T, path string) map[string]any {
 func ownedProfile(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	require.NoError(t, ClaimProfile(dir))
+	require.NoError(t, claimProfile(dir))
 	return dir
 }
 
@@ -63,7 +63,7 @@ func TestDisableOffTheRecordSetsTheProfilePreference(t *testing.T) {
 	assert.Len(t, entries, 1, "no temporary file is left behind")
 
 	// Claiming again changes nothing.
-	require.NoError(t, ClaimProfile(used))
+	require.NoError(t, claimProfile(used))
 }
 
 // A browser on a profile the gate was not given as its own is not started,
@@ -74,7 +74,7 @@ func TestDisableOffTheRecordRefusesAProfileThatIsNotTheGates(t *testing.T) {
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--headless"}), ErrProfileRequired)
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir="}), ErrProfileRequired)
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=relative/profile"}), ErrProfileRequired)
-	assert.ErrorIs(t, ClaimProfile("relative/profile"), ErrProfileRequired)
+	assert.ErrorIs(t, claimProfile("relative/profile"), ErrProfileRequired)
 
 	persons := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(persons, "Default"), 0o700))
@@ -86,7 +86,7 @@ func TestDisableOffTheRecordRefusesAProfileThatIsNotTheGates(t *testing.T) {
 
 	file := filepath.Join(t.TempDir(), "file")
 	require.NoError(t, os.WriteFile(file, nil, 0o600))
-	assert.Error(t, ClaimProfile(file))
+	assert.Error(t, claimProfile(file))
 
 	dir := ownedProfile(t)
 	for _, profile := range []string{"", ".", "..", "../x", "a/b", `a\b`} {

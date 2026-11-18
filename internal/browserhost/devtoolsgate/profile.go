@@ -29,9 +29,13 @@ import (
 //     last one as the browser reads it, which must be an absolute path; the
 //     profile within it is --profile-directory, or "Default". There is no
 //     default directory: arguments that name none are refused.
-//   - It is the gate's when it holds the marker ClaimProfile leaves, which
-//     the code that created the directory for the browsers it starts calls
-//     right after creating it. A directory without the marker is refused.
+//   - It is the gate's when it holds the marker that NewProfile and
+//     NewTempProfile leave in the same call that creates the directory: a
+//     directory that already existed is never marked on the way. A
+//     directory without the marker is refused and left as it is. The one
+//     way to mark a directory that existed before is ClaimExistingProfile,
+//     for an explicit claim a person asks for (dagu browser profile claim),
+//     after its own checks.
 //   - The directory, the profile within it and its Preferences are refused
 //     when any is a symbolic link; on Unix the directory must belong to this
 //     user and be writable by nobody else.
@@ -53,13 +57,13 @@ import (
 var ErrProfileRequired = errors.New("devtools gate: the browser needs a profile directory of its own (--user-data-dir, an absolute path)")
 
 // ErrProfileNotOwned is returned for a profile directory the gate was not
-// given as its own (ClaimProfile).
+// given as its own (NewProfile, NewTempProfile or ClaimExistingProfile).
 var ErrProfileNotOwned = errors.New("devtools gate: the profile directory is not one created for the browsers the gate starts")
 
 // ErrProfileInUse is returned for a profile a running browser holds.
 var ErrProfileInUse = errors.New("devtools gate: a running browser holds the profile directory")
 
-// profileMarker is the file ClaimProfile leaves in a profile directory.
+// profileMarker is the file that marks a profile directory as the gate's.
 const profileMarker = ".dagu-devtools-gate-profile"
 
 // profileReleaseWait is how long a profile a browser still holds is given
@@ -86,11 +90,87 @@ func profileReleased(userDataDir string) bool {
 // incognito.mode_availability that turns off-the-record windows off.
 const offTheRecordDisabled = 1
 
-// ClaimProfile marks dir, a directory the caller has just created for the
-// browsers the gate starts, as the gate's own, so the gate may set the
-// browser's preferences in it. It refuses a directory the gate would refuse
-// to start a browser on.
-func ClaimProfile(dir string) error {
+// NewProfile creates dir, which must not exist yet, as a profile directory
+// of the gate's own for the browsers it starts. A directory that exists is
+// refused (fs.ErrExist) and left as it is.
+func NewProfile(dir string) error {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return ErrProfileRequired
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return err
+	}
+	if err := claimProfile(dir); err != nil {
+		_ = os.Remove(dir)
+		return err
+	}
+	return nil
+}
+
+// NewTempProfile creates a new temporary profile directory of the gate's
+// own, as os.MkdirTemp does with parent and pattern, and returns it.
+func NewTempProfile(parent, pattern string) (string, error) {
+	dir, err := os.MkdirTemp(parent, pattern)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(dir) {
+		_ = os.Remove(dir)
+		return "", ErrProfileRequired
+	}
+	if err := claimProfile(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+// ProfileClaimed reports whether dir holds the gate's marker.
+func ProfileClaimed(dir string) bool {
+	info, err := os.Lstat(filepath.Join(dir, profileMarker))
+	return err == nil && info.Mode().IsRegular()
+}
+
+// ClaimExistingProfile marks dir, a profile directory that existed before,
+// as the gate's own. It is for an explicit claim a person asks for, never a
+// step's launch: the caller has checked the directory is the one meant and
+// that no browser holds it. It refuses a directory the gate would refuse to
+// start a browser on, and a running browser's.
+func ClaimExistingProfile(dir string) error {
+	if ProfileInUse(dir) {
+		return fmt.Errorf("%w: %s", ErrProfileInUse, dir)
+	}
+	return claimProfile(dir)
+}
+
+// ReleaseProfileClaim removes the gate's marker from dir, undoing a claim.
+// What the gate wrote in the profile's preferences stays.
+func ReleaseProfileClaim(dir string) error {
+	if err := checkProfileDir(dir); err != nil {
+		return err
+	}
+	marker := filepath.Join(dir, profileMarker)
+	info, err := os.Lstat(marker)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", marker)
+	}
+	return os.Remove(marker)
+}
+
+// ProfileInUse reports whether a running browser holds the profile dir.
+func ProfileInUse(dir string) bool {
+	return profileInUse(dir)
+}
+
+// claimProfile leaves the gate's marker in dir, after the checks the gate
+// makes before it starts a browser there.
+func claimProfile(dir string) error {
 	if err := checkProfileDir(dir); err != nil {
 		return err
 	}

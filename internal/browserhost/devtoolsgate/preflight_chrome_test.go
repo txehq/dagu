@@ -176,7 +176,7 @@ func TestRealHeadlessShellIsRefused(t *testing.T) {
 	t.Cleanup(func() {
 		eventually(t, 15*time.Second, func() bool { return os.RemoveAll(profile) == nil }, "the profile is removed")
 	})
-	require.NoError(t, ClaimProfile(profile))
+	require.NoError(t, claimProfile(profile))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	handle, err := Start(ctx, self, Config{

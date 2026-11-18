@@ -45,7 +45,7 @@ func TestRealChromeHasNoPort(t *testing.T) {
 	self, err := os.Executable()
 	require.NoError(t, err)
 	profile := t.TempDir()
-	require.NoError(t, ClaimProfile(profile))
+	require.NoError(t, claimProfile(profile))
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 

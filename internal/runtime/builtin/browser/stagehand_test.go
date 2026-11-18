@@ -161,9 +161,8 @@ func withStartupSlot(start func() error) error {
 // browser, so the removal runs after the browser is closed.
 func browserProfileDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "dagu-browser-test-")
+	dir, err := devtoolsgate.NewTempProfile("", "dagu-browser-test-")
 	require.NoError(t, err)
-	require.NoError(t, devtoolsgate.ClaimProfile(dir))
 	t.Cleanup(func() {
 		var removeErr error
 		removed := assert.Eventually(t, func() bool {
