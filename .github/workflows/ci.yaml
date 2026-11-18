@@ -34,6 +34,9 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868).
+      - "skills/dagu/**"
+      - "llms.txt"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -70,6 +73,9 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868).
+      - "skills/dagu/**"
+      - "llms.txt"
   workflow_dispatch:
 
 permissions:
