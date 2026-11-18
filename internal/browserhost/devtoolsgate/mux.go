@@ -1059,7 +1059,7 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 			c.deliverError(msg.ID, sessionID, err.Error())
 		}
 	default:
-		if strings.HasPrefix(msg.Method, "Target.") && !forwardedTargetMethods[msg.Method] {
+		if (strings.HasPrefix(msg.Method, "Target.") && !forwardedTargetMethods[msg.Method]) || refusedMethods[msg.Method] {
 			c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
 			return
 		}
@@ -1076,6 +1076,14 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 // connection the gate never sees, sendMessageToTarget reaches any session).
 // The clients the gate serves, Stagehand's driver, the write gate and the
 // hub's, use only these and the ones it handles.
+// refusedMethods are the commands outside the Target domain the gate
+// refuses for the same reason: ServiceWorker.inspectWorker opens a DevTools
+// window on a worker, an inspector the gate never sees (TXE-6223's Codex
+// review).
+var refusedMethods = map[string]bool{
+	"ServiceWorker.inspectWorker": true,
+}
+
 var forwardedTargetMethods = map[string]bool{
 	"Target.activateTarget":        true,
 	"Target.closeTarget":           true,

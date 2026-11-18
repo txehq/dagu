@@ -237,7 +237,7 @@ func TestMuxRefusesTargetCommandsItDoesNotMediate(t *testing.T) {
 	c := tg.dial("")
 	for _, method := range []string{
 		"Target.autoAttachRelated", "Target.exposeDevToolsProtocol", "Target.sendMessageToTarget",
-		"Target.setRemoteLocations", "Target.openDevTools", "Target.someFutureCommand",
+		"Target.setRemoteLocations", "Target.openDevTools", "Target.someFutureCommand", "ServiceWorker.inspectWorker",
 	} {
 		_, err := c.call("", method, map[string]any{"targetId": "T1", "waitForDebuggerOnStart": false})
 		assert.ErrorContains(t, err, "the gate does not pass on "+method)
