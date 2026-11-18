@@ -40,7 +40,6 @@ on:
       - opened
       - reopened # new commits are pushed to the branch that the PR is based on
       - synchronize # new commits are pushed to the branch that the PR is based on
-      - ready_for_review # PR is ready for review
     paths:
       - "api/**"
       - "*.go"
@@ -195,6 +194,12 @@ jobs:
       # Every Go version a Dockerfile or workflow pins equals go.mod's (TXE-7844).
       - name: Check Go version pins
         run: go test -count=1 ./internal/tools/gopin
+
+      # A pull_request type that fires on an unchanged head runs a workflow
+      # twice and cancels the first run (TXE-7841). It runs here, with no path
+      # gate, so a change to a workflow file alone is checked.
+      - name: Check workflow pull_request triggers
+        run: go test ./internal/tools/workflowtriggers -count=1
 
   # Lint Go code
   golint:

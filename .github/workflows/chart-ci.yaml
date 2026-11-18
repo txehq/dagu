@@ -23,7 +23,6 @@ on:
       - opened
       - reopened
       - synchronize
-      - ready_for_review
     paths:
       - "charts/dagu/Chart.yaml"
       - "charts/dagu/values.yaml"
