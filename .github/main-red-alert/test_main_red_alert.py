@@ -278,6 +278,33 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([self.G0, r1g], attempts={(2, 1): "failure"}, notified={10: (2, 1, FAILED)})
         self.assertEqual(evaluate(r1g, gh), "clear-undelivered")
 
+    def test_red_green_red_attempts_of_one_run_are_two_streaks(self):
+        # Attempt 1 red (alert delivered), attempt 2 green (clear delivered), attempt 3 red.
+        r = dict(self.R1, run_attempt=3)
+        gh = FakeGitHub([self.G0, r], attempts={(2, 1): "failure", (2, 2): "success"},
+                        notified={10: (2, 1, OK), 11: (2, 2, {"Post clear": "success"})})
+        self.assertEqual(evaluate(r, gh), "alert")
+
+    def test_a_failed_clear_after_a_green_rerun_is_retried(self):
+        # Attempt 1 red (alert delivered), attempt 2 green, its clear POST failed.
+        r1g = dict(self.R1, conclusion="success", run_attempt=2)
+        notified = {10: (2, 1, OK), 11: (2, 2, {"Post clear": "failure"})}
+        gh = FakeGitHub([self.G0, r1g, self.G3], attempts={(2, 1): "failure"}, notified=notified)
+        self.assertEqual(evaluate(self.G3, gh), "clear")
+        # Or a third, green attempt of the same run.
+        r1g3 = dict(self.R1, conclusion="success", run_attempt=3)
+        gh = FakeGitHub([self.G0, r1g3], attempts={(2, 1): "failure", (2, 2): "success"}, notified=notified)
+        self.assertEqual(evaluate(r1g3, gh), "clear")
+
+    def test_an_earlier_attempt_is_superseded_by_a_later_one_of_the_same_run(self):
+        listed = dict(self.R1, conclusion="success", run_attempt=2)
+        gh = FakeGitHub([self.G0, listed], attempts={(2, 1): "failure"})
+        self.assertIsNone(evaluate(dict(self.R1, run_attempt=1), gh))
+        # A later attempt that was cancelled does not supersede.
+        listed = dict(self.R1, conclusion="cancelled", run_attempt=2)
+        gh = FakeGitHub([self.G0, listed], attempts={(2, 1): "failure"})
+        self.assertEqual(evaluate(dict(self.R1, run_attempt=1), gh), "alert")
+
     def test_unread_history_alerts_a_red_and_fails_a_green(self):
         self.assertEqual(evaluate(self.R1, FakeGitHub([], fail=True)), "alert")
         with self.assertRaises(m.ReadError):

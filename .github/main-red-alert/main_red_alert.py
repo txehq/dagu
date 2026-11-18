@@ -17,12 +17,14 @@ The watched workflow's runs (what is red):
     A pull request from a fork whose branch is named main reaches workflow_run with
     head_branch "main"; its head repository is the fork, so it is ignored.
   * failure, timed_out and startup_failure are red; success is green. Any other conclusion
-    (cancelled, skipped, ...) is passed over. A run is judged by its newest red or green
-    attempt, so a red run whose re-run was cancelled is still red.
-  * The streak of a red run is it plus the red counted runs right before it.
+    (cancelled, skipped, ...) is passed over.
+  * Each attempt is its own event, ordered by its run's creation, the run id, then the
+    attempt: a run re-run red, green, red is three events and two streaks, and a red run whose
+    re-run was cancelled stays red. A streak is the consecutive red events up to the one judged.
 
 The notifier's own runs (what was delivered):
-  * Each one is named `notify <workflow id> <run id> <attempt>` (the workflow's run-name), and
+  * Each one is named `notify <workflow id> <run id> <attempt>` (the workflow's run-name), so a
+    delivery belongs to one event, and
     only its `workflow_run` runs are read: those always run the default branch's copy of the
     workflow, which a pull request cannot change.
   * An alert or clear counts as delivered only when the `Post alert` or `Post clear` step of
@@ -31,14 +33,15 @@ The notifier's own runs (what was delivered):
     as sent.
 
 The rule:
-  * A run with a newer counted run after it is superseded: no post (no stale alert or clear;
-    the newer run's notify decides).
+  * An event with a newer event after it (a later run, or a later attempt of the same run) is
+    superseded: no post (no stale alert or clear; the newer event's notify decides).
   * Red: post the alert unless an alert for this streak was already delivered. That gives one
     post per streak; a retry on every later red run while it was not delivered (activation
     mid-streak, a failed POST); and no double post for a duplicate or re-run delivery.
-  * Green right after a red streak whose alert was delivered: post the clear, unless a clear
-    for it was already delivered. Green after a streak whose alert was never delivered: the
-    clear says so, and it is posted only for the first green run after the streak.
+  * Green after a red streak whose alert was delivered: post the clear unless one of the
+    greens since the streak delivered it, so a failed clear is retried by the next green.
+    Green after a streak whose alert was never delivered: the clear says so, and it is posted
+    only for the first green event after the streak.
   * A read fails: a red run posts the alert anyway (an extra post is cheaper than a missed
     one); a green run fails the job (it cannot tell whether a clear is due).
 
@@ -107,8 +110,9 @@ def counts(run: dict, repo: str) -> bool:
     return run.get("event") in EVENTS and run.get("head_branch") == BRANCH and head_repo == repo
 
 
-def key(run: dict) -> tuple:
-    return (run["created_at"], run["id"])
+def key(run: dict, attempt: int | None = None) -> tuple:
+    """Order of judged events: the run's creation, its id, then its attempt."""
+    return (run["created_at"], run["id"], int(attempt if attempt is not None else run.get("run_attempt") or 1))
 
 
 # ----------------------------------------------------------------------------------- GitHub
@@ -132,31 +136,58 @@ def gh_get(path: str, token: str | None) -> dict:
         raise ReadError(f"GET {path}: {type(e).__name__}") from None
 
 
-def earlier_attempts_state(run: dict, repo: str, token: str | None, get) -> str | None:
-    """The newest red or green state among the attempts before the run's current one."""
-    for n in range(int(run.get("run_attempt") or 1) - 1, 0, -1):
-        s = state_of(get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{n}", token).get("conclusion"))
+class Event:
+    """One judged attempt of a watched run: (run, attempt, red|green)."""
+
+    __slots__ = ("run", "attempt", "state")
+
+    def __init__(self, run: dict, attempt: int, state: str):
+        self.run, self.attempt, self.state = run, attempt, state
+
+    @property
+    def key(self) -> tuple:
+        return key(self.run, self.attempt)
+
+    @property
+    def ident(self) -> tuple[int, int]:
+        return (int(self.run["id"]), self.attempt)
+
+
+def attempt_events(run: dict, upto: int, repo: str, token: str | None, get) -> list[Event]:
+    """Red and green events of `run`'s attempts 1..upto. The listing's own conclusion is the
+    latest attempt's; earlier attempts are read (only when the run was re-run)."""
+    out = []
+    latest = int(run.get("run_attempt") or 1)
+    for n in range(1, upto + 1):
+        if n == latest:
+            c = run.get("conclusion")
+        else:
+            c = get(f"/repos/{repo}/actions/runs/{run['id']}/attempts/{n}", token).get("conclusion")
+        s = state_of(c)
         if s is not None:
-            return s
-    return None
-
-
-def run_state(run: dict, repo: str, token: str | None, get) -> str | None:
-    """A run's newest red or green attempt, walking past cancelled re-runs."""
-    s = state_of(run.get("conclusion"))
-    return s if s is not None else earlier_attempts_state(run, repo, token, get)
+            out.append(Event(run, n, s))
+    return out
 
 
 class History:
-    """The watched workflow's counted runs on main, newest first, each with its state."""
+    """The watched workflow's judged events on main, newest first.
+
+    Every attempt of a run is its own event, ordered after the run's earlier attempts: a run
+    re-run red, then green, then red is three events, two streaks.
+    """
 
     def __init__(self, run: dict, repo: str, token: str | None, get, as_of: str | None = None):
         self.run, self.repo, self.token, self.get = run, repo, token, get
+        self.attempt = int(run.get("run_attempt") or 1)
         # Replay only: read the history as it stood when `run` was created.
         self.as_of = as_of
-        self.runs: list[tuple[dict, str]] = []  # (run, state), newest first, judged runs only
+        self.events: list[Event] = []
         self.complete = False
+        self._seen: set[int] = set()
         self._page = 0
+        # This run's own earlier attempts come before this attempt.
+        self.events.extend(attempt_events(run, self.attempt - 1, repo, token, get) if self.attempt > 1 else [])
+        self.later_own = False
 
     def _more(self) -> bool:
         if self.complete or self._page >= MAX_PAGES:
@@ -173,26 +204,30 @@ class History:
         if not isinstance(runs, list):
             raise ReadError("workflow runs listing has no workflow_runs array")
         self.complete = len(runs) < 100
-        seen = {r["id"] for r, _ in self.runs}
-        for r in sorted(runs, key=key, reverse=True):
-            if r["id"] in seen or r["id"] == self.run["id"] or not counts(r, self.repo):
+        for r in runs:
+            if r["id"] == self.run["id"]:
+                # The listing shows this run by its latest attempt. A later red or green attempt
+                # than the one being judged is a newer event.
+                latest = int(r.get("run_attempt") or 1)
+                if latest > self.attempt and not self.later_own:
+                    later = attempt_events(r, latest, self.repo, self.token, self.get)
+                    self.later_own = any(e.attempt > self.attempt for e in later)
                 continue
-            if r.get("status") != "completed":
+            if r["id"] in self._seen or not counts(r, self.repo) or r.get("status") != "completed":
                 continue
-            s = run_state(r, self.repo, self.token, self.get)
-            if s is not None:
-                self.runs.append((r, s))
-        self.runs.sort(key=lambda rs: key(rs[0]), reverse=True)
+            self._seen.add(r["id"])
+            self.events.extend(attempt_events(r, int(r.get("run_attempt") or 1), self.repo, self.token, self.get))
+        self.events.sort(key=lambda e: e.key, reverse=True)
         return True
 
     def newer(self) -> bool:
-        """Whether a judged run was created after this one (always on the first page)."""
+        """Whether an event comes after this attempt: a later run, or a later attempt of it."""
         if not self._page:
             self._more()
-        return any(key(r) > key(self.run) for r, _ in self.runs)
+        return self.later_own or any(e.key > key(self.run, self.attempt) for e in self.events)
 
     def before(self):
-        """Judged runs created before this one, newest first, reading pages as needed.
+        """Events before this attempt, newest first, reading pages as needed.
 
         Stops at MAX_PAGES: history older than that is treated as absent. A streak longer than
         that is judged by its newest part; a red streak further back than that is not cleared.
@@ -201,9 +236,10 @@ class History:
         i = 0
         if not self._page:
             self._more()
+        me = key(self.run, self.attempt)
         while True:
             # A later page holds only older runs, so earlier positions never move.
-            older = [rs for rs in self.runs if key(rs[0]) < key(self.run)]
+            older = [e for e in self.events if e.key < me]
             while i < len(older):
                 yield older[i]
                 i += 1
@@ -217,12 +253,12 @@ class Ledger:
     def __init__(self, repo: str, token: str | None, get, self_run_id: str | None):
         self.repo, self.token, self.get = repo, token, get
         self.self_run_id = int(self_run_id) if self_run_id else None
-        self._runs: dict[tuple[int, int], list[int]] | None = None
+        self._runs: dict[tuple[int, int, int], list[int]] | None = None
         self._steps: dict[int, set[str]] = {}
 
-    def _index(self) -> dict[tuple[int, int], list[int]]:
+    def _index(self) -> dict[tuple[int, int, int], list[int]]:
         if self._runs is None:
-            idx: dict[tuple[int, int], list[int]] = {}
+            idx: dict[tuple[int, int, int], list[int]] = {}
             for page in range(1, MAX_PAGES + 1):
                 body = self.get(
                     f"/repos/{self.repo}/actions/workflows/{NOTIFIER.name}/runs"
@@ -236,7 +272,7 @@ class Ledger:
                     m = RUN_NAME.match(r.get("display_title") or r.get("name") or "")
                     if r.get("event") != "workflow_run" or not m or r["id"] == self.self_run_id:
                         continue
-                    idx.setdefault((int(m.group(1)), int(m.group(2))), []).append(r["id"])
+                    idx.setdefault((int(m.group(1)), int(m.group(2)), int(m.group(3))), []).append(r["id"])
                 if len(runs) < 100:
                     break
             self._runs = idx
@@ -253,10 +289,11 @@ class Ledger:
             }
         return self._steps[notifier_run_id]
 
-    def delivered(self, action: str, workflow_id: int, run_ids) -> bool:
+    def delivered(self, action: str, workflow_id: int, idents) -> bool:
+        """Whether a notify of any of these (run id, attempt) events delivered `action`."""
         idx = self._index()
-        for rid in run_ids:
-            for nid in idx.get((int(workflow_id), int(rid)), []):
+        for rid, att in idents:
+            for nid in idx.get((int(workflow_id), int(rid), int(att)), []):
                 if STEP[action] in self._delivered_steps(nid):
                     return True
         return False
@@ -265,17 +302,17 @@ class Ledger:
 class SimLedger:
     """A delivery record for replay: what this replay 'delivered', minus the failures it is told of."""
 
-    def __init__(self, fail: set[int] = frozenset()):
-        self.fail = set(fail)
-        self.sent: set[tuple[str, int, int]] = set()
+    def __init__(self, fail=()):
+        self.fail = {int(f) for f in fail}
+        self.sent: set[tuple[str, int, int, int]] = set()
 
-    def delivered(self, action: str, workflow_id: int, run_ids) -> bool:
-        return any((action, int(workflow_id), int(r)) in self.sent for r in run_ids)
+    def delivered(self, action: str, workflow_id: int, idents) -> bool:
+        return any((action, int(workflow_id), int(r), int(a)) in self.sent for r, a in idents)
 
-    def record(self, action: str, workflow_id: int, run_id: int) -> bool:
-        if run_id in self.fail:
+    def record(self, action: str, workflow_id: int, run_id: int, attempt: int) -> bool:
+        if int(run_id) in self.fail:
             return False
-        self.sent.add((action, int(workflow_id), int(run_id)))
+        self.sent.add((action, int(workflow_id), int(run_id), int(attempt)))
         return True
 
 
@@ -283,62 +320,59 @@ class SimLedger:
 
 
 def evaluate(run: dict, repo: str, token: str | None, get, ledger, as_of: str | None = None) -> tuple[str | None, str, list[dict]]:
-    """Decide for one completed run: (action, a one-line reason, the streak's red runs oldest first).
+    """Decide for one completed attempt: (action, a one-line reason, the streak's runs oldest first).
 
-    Raises ReadError only when a green run cannot tell whether a clear is due.
+    Raises ReadError only when a green attempt cannot tell whether a clear is due.
     """
     if not counts(run, repo):
         head_repo = (run.get("head_repository") or {}).get("full_name")
         return None, f"not a {BRANCH} schedule/push run of {repo} (event={run.get('event')} branch={run.get('head_branch')} repo={head_repo})", []
-    try:
-        now = run_state(run, repo, token, get)
-    except ReadError:
-        now = state_of(run.get("conclusion"))
+    now = state_of(run.get("conclusion"))
     if now is None:
         return None, f"conclusion {run.get('conclusion')} neither alerts nor clears", []
     wf = run["workflow_id"]
-    hist = History(run, repo, token, get, as_of)
+    me = Event(run, int(run.get("run_attempt") or 1), now)
     if now == "red":
         try:
+            hist = History(run, repo, token, get, as_of)
             if hist.newer():
-                return None, "red, superseded by a newer counted run", []
-            streak = [run]
-            for r, s in hist.before():
-                if s != "red":
+                return None, "red, superseded by a newer event", []
+            streak = [me]
+            for e in hist.before():
+                if e.state != "red":
                     break
-                streak.append(r)
+                streak.append(e)
             streak.reverse()
-            if ledger.delivered("alert", wf, [r["id"] for r in streak]):
-                return None, f"red, streak of {len(streak)}: its alert was delivered", streak
-            return "alert", f"red, streak of {len(streak)}: no alert delivered for it yet", streak
+            if ledger.delivered("alert", wf, [e.ident for e in streak]):
+                return None, f"red, streak of {len(streak)}: its alert was delivered", [e.run for e in streak]
+            return "alert", f"red, streak of {len(streak)}: no alert delivered for it yet", [e.run for e in streak]
         except ReadError as e:
             return "alert", f"red, history or delivery record unread ({e}): alerting anyway", [run]
-    # green
+    hist = History(run, repo, token, get, as_of)
     if hist.newer():
-        return None, "green, superseded by a newer counted run", []
-    # A red run re-run green: its own red attempt is the streak's newest member (same run id).
-    streak: list[dict] = [run] if earlier_attempts_state(run, repo, token, get) == "red" else []
-    greens = [run]
-    for r, s in hist.before():
-        if s == "green":
+        return None, "green, superseded by a newer event", []
+    streak: list[Event] = []
+    greens = [me]
+    for e in hist.before():
+        if e.state == "green":
             if streak:
                 break
-            greens.append(r)
+            greens.append(e)
             continue
-        streak.append(r)
+        streak.append(e)
     if not streak:
         return None, "green, no red streak before it", []
     streak.reverse()
-    ids = [r["id"] for r in streak]
-    if ledger.delivered("alert", wf, ids):
-        if ledger.delivered("clear", wf, [g["id"] for g in greens]):
-            return None, f"green after a red streak of {len(streak)}: its clear was delivered", streak
-        return "clear", f"green after a red streak of {len(streak)} whose alert was delivered", streak
+    runs = [e.run for e in streak]
+    if ledger.delivered("alert", wf, [e.ident for e in streak]):
+        if ledger.delivered("clear", wf, [g.ident for g in greens]):
+            return None, f"green after a red streak of {len(streak)}: its clear was delivered", runs
+        return "clear", f"green after a red streak of {len(streak)} whose alert was delivered", runs
     if len(greens) > 1:
-        return None, "green, an earlier green run already followed the undelivered red streak", []
-    if ledger.delivered("clear", wf, [run["id"]]):
-        return None, "green after an undelivered red streak: its clear was delivered", streak
-    return "clear-undelivered", f"green after a red streak of {len(streak)} whose alert was never delivered", streak
+        return None, "green, an earlier green already followed the undelivered red streak", []
+    if ledger.delivered("clear", wf, [me.ident]):
+        return None, "green after an undelivered red streak: its clear was delivered", runs
+    return "clear-undelivered", f"green after a red streak of {len(streak)} whose alert was never delivered", runs
 
 
 def message(action: str, repo: str, workflow: str, run_url: str, streak: list[dict]) -> str:
@@ -436,7 +470,7 @@ def cmd_replay(args, env=os.environ, get=gh_get) -> int:
             print(line + "no post")
             continue
         step = "alert" if action == "alert" else "clear"
-        ok = ledger.record(step, run["workflow_id"], run_id)
+        ok = ledger.record(step, run["workflow_id"], run_id, int(run.get("run_attempt") or 1))
         text = message(action, repo, run.get("name") or "?", run["html_url"], streak)
         print(line + ("would post: " if ok else "would post, delivery fails (simulated): ") + text)
     return rc
