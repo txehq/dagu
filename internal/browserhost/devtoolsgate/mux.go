@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -36,6 +37,9 @@ import (
 //     request of every target, such as the proxy's credential
 //     (proxyauth.go). Its events reach no client, and no client can
 //     address it;
+//   - a Target command the gate neither handles nor lists in
+//     forwardedTargetMethods is refused, so no client changes which targets
+//     are held, or reaches them, past the gate;
 //   - a service or shared worker runs only after the setup every waiting
 //     client sent on its session before resuming it took effect. See
 //     "Worker holds" below.
@@ -149,8 +153,9 @@ type target struct {
 	private          map[*client]string
 	privateAttaching map[*client]struct{}
 	// settling holds, for a worker (rootWorker), the waiting clients that
-	// resumed it and whose barrier the browser has not answered yet.
-	settling map[*client]struct{}
+	// resumed it and whose barrier the browser has not answered yet, with
+	// the barrier's command id.
+	settling map[*client]uint64
 	// released is set once the gate detached its page-level session of a
 	// worker to let go of the hold on the worker's script fetch.
 	released bool
@@ -619,7 +624,7 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		waiting:          make(map[*client]struct{}),
 		private:          make(map[*client]string),
 		privateAttaching: make(map[*client]struct{}),
-		settling:         make(map[*client]struct{}),
+		settling:         make(map[*client]uint64),
 	}
 	// A worker's children are attached under its root record; a page-level
 	// record of it never takes the root's place.
@@ -898,7 +903,7 @@ func (m *mux) forgetTargetLocked(t *target) {
 		delete(t.waiting, c)
 	}
 	for c := range t.settling {
-		delete(t.settling, c)
+		m.dropBarrierLocked(t, c)
 	}
 	for c := range t.private {
 		m.forgetPrivateLocked(c, t, true)
@@ -963,8 +968,9 @@ func (m *mux) forgetPrivateLocked(c *client, t *target, notify bool) {
 	delete(m.privateSessions, session)
 	if _, settling := t.settling[c]; settling {
 		// The session the barrier went to is gone, and the setup on it with
-		// it: nothing of this client is left to wait for.
-		delete(t.settling, c)
+		// it: nothing of this client is left to wait for, and the browser
+		// may never answer the barrier.
+		m.dropBarrierLocked(t, c)
 		m.releaseWorkerLocked(t.id)
 	}
 	if notify {
@@ -1052,8 +1058,32 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 			c.deliverError(msg.ID, sessionID, err.Error())
 		}
 	default:
+		if strings.HasPrefix(msg.Method, "Target.") && !forwardedTargetMethods[msg.Method] {
+			c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
+			return
+		}
 		m.forwardLocked(c, msg, sessionID)
 	}
+}
+
+// forwardedTargetMethods are the Target commands the gate passes on as they
+// are; it handles the others it knows itself. Any other Target command is
+// refused: the domain decides which targets are held, who is attached to
+// them and over which connection, and a command the gate does not mediate
+// could change that under it (TXE-6223's security review: autoAttachRelated
+// turns the gate's own auto-attach off, exposeDevToolsProtocol opens a
+// connection the gate never sees, sendMessageToTarget reaches any session).
+// The clients the gate serves, Stagehand's driver, the write gate and the
+// hub's, use only these and the ones it handles.
+var forwardedTargetMethods = map[string]bool{
+	"Target.activateTarget":        true,
+	"Target.closeTarget":           true,
+	"Target.createBrowserContext":  true,
+	"Target.createTarget":          true,
+	"Target.disposeBrowserContext": true,
+	"Target.getBrowserContexts":    true,
+	"Target.getTargetInfo":         true,
+	"Target.getTargets":            true,
 }
 
 // ownsSessionLocked reports whether sessionID is the browser itself, c's
@@ -1111,9 +1141,9 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 		// on one would be released only by the client's resume, which would
 		// let the worker run before the clients the gate holds it for set it
 		// up ("Worker holds").
-		if params.AutoAttach {
-			msg.Params = withoutRootWorkers(msg.Params)
-		}
+		// Every forwarded call is rewritten, whatever autoAttach parsed as
+		// here: the browser reads the params with its own parser.
+		msg.Params = withoutRootWorkers(msg.Params)
 		m.forwardLocked(c, msg, sessionID)
 		return
 	}
@@ -1332,17 +1362,36 @@ func (m *mux) resumeWorkerLocked(c *client, t *target, msg message, sessionID st
 		return
 	}
 	delete(t.waiting, c)
-	t.settling[c] = struct{}{}
-	m.gateCommand(sessionID, workerBarrier, map[string]any{}, func(json.RawMessage, *cdpError) {
+	var barrier uint64
+	settle := func(json.RawMessage, *cdpError) {
 		// An error answers in order too: it is as much proof.
-		if _, still := t.settling[c]; !still {
+		if id, still := t.settling[c]; !still || id != barrier {
 			return
 		}
 		delete(t.settling, c)
 		c.deliverResult(msg.ID, sessionID, map[string]any{})
 		m.releaseWorkerLocked(t.id)
-	})
+	}
+	id, err := m.sendLocked(sessionID, workerBarrier, map[string]any{}, &pendingCommand{onReply: settle})
+	if err != nil {
+		// Nothing was sent, so nothing of the client's setup is proven: the
+		// client stays one the worker waits for.
+		t.waiting[c] = struct{}{}
+		c.deliverError(msg.ID, sessionID, err.Error())
+		return
+	}
+	barrier = id
+	t.settling[c] = id
 	m.releaseWorkerLocked(t.id)
+}
+
+// dropBarrierLocked stops waiting for c's barrier on t, and forgets the
+// command, which the browser may never answer once the session is gone.
+func (m *mux) dropBarrierLocked(t *target, c *client) {
+	if id, ok := t.settling[c]; ok {
+		delete(m.pending, id)
+		delete(t.settling, c)
+	}
 }
 
 // ---- client lifecycle ----

@@ -188,6 +188,13 @@ func TestMuxWorkerReleasedWhenAResumingClientLeaves(t *testing.T) {
 	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
 	log := pumpUntilRunning(t, tg, watcher, worker)
 	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker), "%v", log)
+	// The barrier the browser never answered is not kept for the browser's
+	// lifetime.
+	eventually(t, 5*time.Second, func() bool {
+		tg.mux.mu.Lock()
+		defer tg.mux.mu.Unlock()
+		return len(tg.mux.pending) == 0
+	}, "the unanswered barrier dropped")
 }
 
 // A client's auto-attach on a session it attached itself is the browser's,
@@ -216,4 +223,47 @@ func TestMuxClientAutoAttachOnItsOwnSessionHoldsNoWorker(t *testing.T) {
 	child := decodeAttached(t, pageClient.waitEvent("Target.attachedToTarget", nil))
 	assert.Equal(t, "worker", child.TargetInfo.Type)
 	assert.True(t, child.WaitingForDebugger)
+}
+
+// The Target commands the gate does not mediate are refused: each could
+// change which targets are held or reach them past the gate. A client's
+// Target.autoAttachRelated turns the browser connection's own auto-attach
+// off, so workers would start unheld; Target.exposeDevToolsProtocol gives a
+// page a DevTools connection the gate never sees; Target.sendMessageToTarget
+// reaches any session by id. The gate's own auto-attach stays on.
+func TestMuxRefusesTargetCommandsItDoesNotMediate(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	c := tg.dial("")
+	for _, method := range []string{
+		"Target.autoAttachRelated", "Target.exposeDevToolsProtocol", "Target.sendMessageToTarget",
+		"Target.setRemoteLocations", "Target.openDevTools", "Target.someFutureCommand",
+	} {
+		_, err := c.call("", method, map[string]any{"targetId": "T1", "waitForDebuggerOnStart": false})
+		assert.ErrorContains(t, err, "the gate does not pass on "+method)
+	}
+	for _, method := range []string{"Target.getTargets", "Target.createTarget"} {
+		_, err := c.call("", method, map[string]any{"url": "about:blank"})
+		assert.NoError(t, err, method)
+	}
+
+	watcher := tg.dial("")
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	worker := createWorker(t, c, "T1")
+	assert.True(t, workerSession(t, watcher, worker, "").WaitingForDebugger, "the gate still holds new workers")
+}
+
+// The rewrite of a client's own auto-attach does not rest on how the gate
+// reads the params: JSON with a case variant of autoAttach, which the
+// browser does not read, is rewritten all the same.
+func TestMuxClientAutoAttachRewriteIgnoresHowTheGateParsesIt(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	pageClient, watcher := tg.dial("T1"), tg.dial("")
+	pageClient.mustCall("", "Target.setAutoAttach", map[string]any{
+		"autoAttach": true, "autoattach": false, "waitForDebuggerOnStart": true, "flatten": true,
+	})
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	createWorker(t, watcher, "T1")
+	pageClient.noEvent("Target.attachedToTarget", 300*time.Millisecond)
 }
