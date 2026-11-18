@@ -53,7 +53,13 @@ permissions:
 
 jobs:
   notify:
-    if: github.event_name == 'workflow_run'
+    # Only main's own schedule and push runs reach the job (the script checks the same again).
+    # A fork pull request's run, or any other, is skipped here so it never queues in the
+    # concurrency group below, where it could replace main's pending notify.
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.head_repository.full_name == github.repository
+      && (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:

@@ -71,7 +71,8 @@ class FakeGitHub:
             page = int(path.rsplit("page=", 1)[1])
             rows = [
                 {"id": nid, "event": self.notifier_event, "display_title": f"notify {WF_ID} {v[0]} {v[1]}",
-                 "status": v[3] if len(v) > 3 else "completed"}
+                 "status": v[3] if len(v) > 3 else "completed",
+                 "conclusion": v[4] if len(v) > 4 else "success"}
                 for nid, v in sorted(self.notified.items(), reverse=True)
             ]
             return {"workflow_runs": rows[(page - 1) * 100 : page * 100]}
@@ -362,6 +363,19 @@ class Rule(unittest.TestCase):
         with self.assertRaises(m.ReadError):
             evaluate(self.G3, gh)
 
+    def test_a_replaced_or_skipped_notifier_run_delivered_nothing(self):
+        # A pending notify replaced in the concurrency group ends cancelled, its job never started.
+        for c in ("cancelled", "skipped"):
+            gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, "NOJOBS", "completed", c)})
+            self.assertEqual(evaluate(self.R2, gh), "alert", c)
+        # One cancelled after its Post step started still reads its steps: not success, not sent.
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, {"Post alert": "cancelled"}, "completed", "cancelled")})
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+        # A failed run with no notify job is unreadable: fail closed.
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, "NOJOBS", "completed", "failure")})
+        with self.assertRaises(m.ReadError):
+            evaluate(self.R2, gh)
+
     def test_a_notifier_run_still_pending_has_delivered_nothing(self):
         gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, "NOJOBS", "queued")})
         self.assertEqual(evaluate(self.R2, gh), "alert")
@@ -474,6 +488,8 @@ permissions:
   contents: read
 jobs:
   notify:
+    if: >-
+      {m.NOTIFY_IF}
     steps:
       - name: Decide
       - name: Post alert
@@ -518,6 +534,7 @@ jobs:
             ("actions: read", "actions: write"),
             ("- name: Post alert", "- name: Post"),
             ("- name: Post clear", "- name: Post alert"),
+            ("&& github.event.workflow_run.head_repository.full_name == github.repository ", ""),
         ]:
             errs = self.errors({"main-red-alert.yaml": self.NOTIFIER.replace(old, new), "image-security.yaml": self.SCANS})
             self.assertGreaterEqual(len(errs), 1, (old, errs))

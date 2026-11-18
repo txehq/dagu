@@ -56,7 +56,9 @@ duplicate is possible only after such an uncertain send; a recorded delivery is 
 repeated.
 
 GitHub's concurrency group keeps one notify running and at most one pending per watched
-workflow; a newer pending notify replaces an older one. That is safe because no decision
+workflow; a newer pending notify replaces an older one (the replaced run ends cancelled with
+its job never started, which counts as nothing delivered). Only main's own schedule and push
+runs reach the job (its `if`), so a fork's pull request cannot queue there and replace one. That is safe because no decision
 depends on an earlier notify having run: the newer one reads the same history and record, so
 a replaced red's alert is posted by the next red of its streak, and a replaced green's clear
 by the next green.
@@ -98,6 +100,11 @@ RUN_NAME_EXPR = (
     "${{ github.event_name == 'workflow_run' && format('notify {0} {1} {2}', "
     "github.event.workflow_run.workflow_id, github.event.workflow_run.id, "
     "github.event.workflow_run.run_attempt) || github.workflow }}"
+)
+NOTIFY_IF = (
+    "github.event_name == 'workflow_run' "
+    "&& github.event.workflow_run.head_repository.full_name == github.repository "
+    "&& (github.event.workflow_run.event == 'schedule' || github.event.workflow_run.event == 'push')"
 )
 
 # chat.engapp.dev sits behind Cloudflare bot protection that 403s default library
@@ -287,13 +294,13 @@ class Ledger:
         # a re-run of a notifier that already posted keeps the same run id.
         self.self_run_id = int(self_run_id) if self_run_id else None
         self.self_attempt = int(self_attempt or 1)
-        self._runs: dict[tuple[int, int, int], list[tuple[int, bool]]] | None = None
+        self._runs: dict[tuple[int, int, int], list[tuple[int, bool, str | None]]] | None = None
         self._steps: dict[int, set[str]] = {}
 
-    def _index(self) -> dict[tuple[int, int, int], list[tuple[int, bool]]]:
-        """(workflow id, run id, attempt) -> [(notifier run id, finished)]."""
+    def _index(self) -> dict[tuple[int, int, int], list[tuple[int, bool, str | None]]]:
+        """(workflow id, run id, attempt) -> [(notifier run id, finished, its conclusion)]."""
         if self._runs is None:
-            idx: dict[tuple[int, int, int], list[tuple[int, bool]]] = {}
+            idx: dict[tuple[int, int, int], list[tuple[int, bool, str | None]]] = {}
             for page in range(1, MAX_PAGES + 1):
                 body = self.get(
                     f"/repos/{self.repo}/actions/workflows/{NOTIFIER.name}/runs"
@@ -308,18 +315,20 @@ class Ledger:
                     if r.get("event") != "workflow_run" or not m:
                         continue
                     ident = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-                    idx.setdefault(ident, []).append((r["id"], r.get("status") == "completed"))
+                    idx.setdefault(ident, []).append((r["id"], r.get("status") == "completed", r.get("conclusion")))
                 if len(runs) < 100:
                     break
             self._runs = idx
         return self._runs
 
-    def _delivered_steps(self, notifier_run_id: int, finished: bool) -> set[str]:
+    def _delivered_steps(self, notifier_run_id: int, finished: bool, conclusion: str | None = None) -> set[str]:
         """Names of the steps that concluded success in a notifier run's notify job.
 
-        A finished run (or an earlier attempt of this one) whose jobs listing has no notify job
-        (no `Decide` step) is unreadable, not "nothing delivered": ReadError, so the decision
-        fails closed. A run still queued or running has delivered nothing yet.
+        A run still queued or running has delivered nothing yet. A finished run cancelled or
+        skipped before its notify job started (a pending notify replaced in the concurrency
+        group ends this way) delivered nothing. Any other finished run (or an earlier attempt
+        of this one) whose jobs listing has no notify job (no `Decide` step) is unreadable,
+        not "nothing delivered": ReadError, so the decision fails closed.
         """
         if notifier_run_id not in self._steps:
             body = self.get(f"/repos/{self.repo}/actions/runs/{notifier_run_id}/jobs?filter=all&per_page=100", self.token)
@@ -330,7 +339,7 @@ class Ledger:
             if own:
                 jobs = [j for j in jobs if int(j.get("run_attempt") or 1) < self.self_attempt]
             # This notify's own run: only its earlier attempts are records, and they finished.
-            must_read = self.self_attempt > 1 if own else finished
+            must_read = self.self_attempt > 1 if own else (finished and conclusion not in ("cancelled", "skipped"))
             if must_read and not any(st.get("name") == "Decide" for j in jobs for st in (j.get("steps") or [])):
                 raise ReadError(f"notifier run {notifier_run_id}: no notify job in its jobs listing")
             self._steps[notifier_run_id] = {
@@ -342,8 +351,8 @@ class Ledger:
         """Whether a notify of any of these (run id, attempt) events delivered `action`."""
         idx = self._index()
         for rid, att in idents:
-            for nid, finished in idx.get((int(workflow_id), int(rid), int(att)), []):
-                if STEP[action] in self._delivered_steps(nid, finished):
+            for nid, finished, conclusion in idx.get((int(workflow_id), int(rid), int(att)), []):
+                if STEP[action] in self._delivered_steps(nid, finished, conclusion):
                     return True
         return False
 
@@ -566,7 +575,10 @@ def coverage_errors(root: pathlib.Path) -> list[str]:
         errors.append(f"{n}: run-name must be {RUN_NAME_EXPR!r}: the delivery record is read by it")
     if notifier_doc.get("permissions") != {"actions": "read", "contents": "read"}:
         errors.append(f"{n}: permissions must be exactly actions: read, contents: read")
-    steps = [st.get("name") for st in ((notifier_doc.get("jobs") or {}).get("notify") or {}).get("steps") or []]
+    notify = (notifier_doc.get("jobs") or {}).get("notify") or {}
+    if str(notify.get("if", "")).strip() != NOTIFY_IF:
+        errors.append(f"{n}: the notify job's if must be {NOTIFY_IF!r}: a fork's run must not queue in its concurrency group")
+    steps = [st.get("name") for st in notify.get("steps") or []]
     for want in STEP.values():
         if steps.count(want) != 1:
             errors.append(f"{n}: the notify job needs exactly one step named {want!r}: the delivery record is read by it")
