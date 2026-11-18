@@ -151,7 +151,7 @@ func assertNoProbeTraffic(t *testing.T, proxy *credentialProxy, site *testSite) 
 }
 
 // headlessShellEnv names Chrome's headless shell, for
-// TestRealHeadlessShellIsRefused.
+// TestRealHeadlessShellIsRefused; CI sets it.
 const headlessShellEnv = "CHROME_HEADLESS_SHELL_PATH"
 
 // Chrome's headless shell runs no extension, so the gate cannot ask it
@@ -160,6 +160,11 @@ const headlessShellEnv = "CHROME_HEADLESS_SHELL_PATH"
 func TestRealHeadlessShellIsRefused(t *testing.T) {
 	shell := os.Getenv(headlessShellEnv)
 	if shell == "" {
+		if os.Getenv("CI") != "" {
+			// CI installs the shell for every shard that runs this package
+			// (scripts/ci/install-headless-shell.sh).
+			t.Fatal(headlessShellEnv + " is required in CI")
+		}
 		t.Skip(headlessShellEnv + " is not set")
 	}
 	self, err := os.Executable()
@@ -187,4 +192,29 @@ func TestRealHeadlessShellIsRefused(t *testing.T) {
 	assert.Nil(t, handle, "nothing is served")
 	assert.Contains(t, err.Error(), errNoExtensions.Error())
 	assert.Empty(t, probeLeftovers(t, profile))
+}
+
+// The refusal the check matches is the browser's own text, and a browser in
+// another language gives the same: Chrome's extension API errors are
+// English, not localized. On Linux --lang sets the browser's interface
+// language; elsewhere it sets the language pages see.
+func TestRealChromeCheckPassesInAnotherLanguage(t *testing.T) {
+	t.Setenv("LANG", "de_DE.UTF-8")
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	t.Setenv("LANGUAGE", "de")
+	site := newTestSite(t)
+	proxy := newCredentialProxy(t, site)
+	profile := ownedProfile(t)
+	args := ChromeArgs(LaunchOptions{
+		UserDataDir: profile,
+		Headless:    true,
+		NoSandbox:   os.Getenv("CI") != "" || (runtime.GOOS == "linux" && os.Geteuid() == 0),
+		Extra:       append(proxy.chromeArgs(), "--lang=de", "--accept-lang=de-DE"),
+	})
+	require.NoError(t, disableOffTheRecord(args))
+	m := startRealMux(t, args, proxy)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	require.NoError(t, checkOffTheRecordRefused(ctx, m, args))
+	assertProbeGone(t, m, profile)
 }
