@@ -5,8 +5,8 @@ description: >-
   that owns the cache runs scripts/ci/trim-go-cache.sh, then saves it with
   actions/cache/save and the outputs below.
   On Windows it also moves the Go caches and TEMP to the D: drive for the rest
-  of the job, and reads Chrome's files once so that the job's first browser
-  does not load them from a cold C: drive.
+  of the job, and starts Chrome once so that the job's first browser does not
+  load Chrome from a cold C: drive.
 
 inputs:
   go-version:
@@ -42,44 +42,68 @@ runs:
           "TMP=$env:RUNNER_TEMP"
         ) | Add-Content -Path $env:GITHUB_ENV
 
-    # Chrome lives on the C: drive, and a fresh runner has never read its
-    # files. Read cold while a test step starts, under the I/O of go test
-    # and its first packages, they came in at 12-15 MB/s with reads taking
-    # about a second each. Chrome then needed 22-47 s just to load and did
-    # not answer its DevTools pipe in time (TXE-7834: the first four
-    # launches of the unit shard on 2 of 3 VMs). One sequential read here,
-    # while the disk is idle, takes 5-13 s. After it, every launch in the
-    # shard answered within 1.4 s. Every Windows job that sets up Go reads
-    # Chrome here, so a new job that starts Chrome cannot leave this out.
-    - name: Read Chrome's files once
+    # A fresh runner has never read Chrome's files, nor the system files
+    # Chrome loads, from its C: drive. Read cold while a test step starts,
+    # under the I/O of go test and its first packages, they came in at
+    # 12-15 MB/s with reads of about a second: the unit shard's first four
+    # Chromes took 22-47 s to answer their DevTools pipe and could miss the
+    # gate's 60 s start-up window (TXE-7834). Reading Chrome's install folder
+    # first still left one VM in nine at 10 s, as Chrome's cold set reaches
+    # outside its folder. One Chrome started here alone, while the disk is
+    # idle, takes about 5 s, and every launch after it answered within 2 s.
+    # Every Windows job that sets up Go starts it, so a new job that starts
+    # Chrome cannot leave this out (internal/test/chrometest checks it).
+    - name: Start Chrome once
       if: runner.os == 'Windows'
       shell: pwsh
       run: |
         $dirs = @()
         if ($env:CHROME_PATH) {
-          $dirs += Split-Path -Parent $env:CHROME_PATH
+          $chrome = $env:CHROME_PATH
         } else {
           foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
             if ($root) { $dirs += Join-Path $root 'Google\Chrome\Application' }
           }
+          $chrome = $dirs | ForEach-Object { Join-Path $_ 'chrome.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
         }
-        $dir = $dirs | Where-Object { Test-Path (Join-Path $_ 'chrome.exe') } | Select-Object -First 1
-        if (-not $dir) {
-          Write-Output "No Chrome found in: $($dirs -join '; ')"
+        if (-not $chrome -or -not (Test-Path $chrome)) {
+          Write-Output "No Chrome found (CHROME_PATH or $($dirs -join '; ')); nothing to start"
           exit 0
         }
+        # A profile of its own, which no test uses, removed below.
+        $userDataDir = Join-Path $env:RUNNER_TEMP ("warm-chrome-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $userDataDir | Out-Null
+        $chromeArgs = @('--headless', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+          '--disable-background-networking', '--disable-component-update',
+          "--user-data-dir=`"$userDataDir`"", '--dump-dom', 'about:blank')
         $watch = [Diagnostics.Stopwatch]::StartNew()
-        $bytes = 0
-        $buffer = New-Object byte[] (1MB)
-        foreach ($file in Get-ChildItem -LiteralPath $dir -Recurse -File) {
-          $stream = [IO.File]::OpenRead($file.FullName)
-          try {
-            while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $bytes += $n }
-          } finally {
-            $stream.Dispose()
-          }
+        $process = Start-Process -FilePath $chrome -ArgumentList $chromeArgs -PassThru -WindowStyle Hidden `
+          -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP 'warm-chrome.out') `
+          -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'warm-chrome.err')
+        $null = $process.Handle # keeps the exit code readable after the exit
+        if (-not $process.WaitForExit(120000)) {
+          $process.Kill($true)
+          throw "Chrome did not exit within 120 s of starting"
         }
-        Write-Output ("Read {0:N0} bytes of {1} in {2:N1} s" -f $bytes, $dir, $watch.Elapsed.TotalSeconds)
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+          throw "Chrome exited with code $($process.ExitCode)"
+        }
+        # Chrome's helper processes leave after the browser; none may be left
+        # holding the profile's files when the tests start. Only whether a
+        # process names this profile is read; no command line is printed.
+        $left = @()
+        foreach ($i in 1..60) {
+          $left = @(Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe'" |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($userDataDir) })
+          if ($left.Count -eq 0) { break }
+          Start-Sleep -Milliseconds 500
+        }
+        if ($left.Count -ne 0) {
+          throw "$($left.Count) Chrome processes of the warm-up profile were still running 30 s after it exited"
+        }
+        Remove-Item -LiteralPath $userDataDir -Recurse -Force
+        Write-Output ("Started Chrome {0} once in {1:N1} s" -f (Get-Item $chrome).VersionInfo.ProductVersion, $watch.Elapsed.TotalSeconds)
 
     # Marks the job start, an hour early, for trim-go-cache.sh: Go refreshes
     # the time of an entry it uses once that time is an hour old, so an

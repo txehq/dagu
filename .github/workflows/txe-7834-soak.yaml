@@ -98,4 +98,4 @@ jobs:
         with:
           name: txe7834-${{ matrix.order }}-${{ matrix.n }}
           path: ${{ runner.temp }}/txe7834
-          retention-days: 7
+          retention-days: 3
