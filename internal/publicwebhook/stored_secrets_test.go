@@ -5,11 +5,12 @@ package publicwebhook_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -58,7 +59,15 @@ func TestStoredStatusAndLogsHoldNoSecret(t *testing.T) {
 	now := time.Now()
 	signed := h.addWebhook(t, "signed", &auth.WebhookPublic{Token: tokenSigned, Sender: "github", SenderSecret: senderSecret, CreatedAt: now})
 	plain := h.addWebhook(t, "plain", &auth.WebhookPublic{Token: tokenPlain, Events: []string{"push"}, CreatedAt: now.Add(time.Second)})
-	h.run(t)
+	// The service runs until the store is read: stopped first, so nothing
+	// writes while every file is read back.
+	ctx, stop := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		h.svc.Run(ctx)
+	}()
+	t.Cleanup(func() { stop(); <-stopped })
 	ws := h.cloud.relay(t)
 	hooks := ws.next(t, "hooks")
 	ws.write(t, map[string]any{"t": "hooked", "id": hooks["id"], "url": "https://hooks.example/obj"})
@@ -68,9 +77,7 @@ func TestStoredStatusAndLogsHoldNoSecret(t *testing.T) {
 	require.NoError(t, err)
 	header := func(event string, extra map[string]string) map[string]string {
 		m := map[string]string{"X-Github-Event": event, "Authorization": "Bearer " + headerSecret}
-		for k, v := range extra {
-			m[k] = v
-		}
+		maps.Copy(m, extra)
 		return m
 	}
 	for _, d := range []struct {
@@ -92,13 +99,18 @@ func TestStoredStatusAndLogsHoldNoSecret(t *testing.T) {
 		return err == nil && l.Missed.Expired == 1 && len(l.Deliveries) == 2
 	}, 5*time.Second, 10*time.Millisecond)
 	require.Eventually(t, func() bool { return h.status(t).URL == "https://hooks.example/obj" }, 5*time.Second, 10*time.Millisecond)
+	stop()
+	<-stopped
 
 	logs := map[string]bool{}
 	require.NoError(t, filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.Type().IsRegular() {
+		if err != nil {
 			return err
 		}
-		if strings.Contains(filepath.ToSlash(p), "/.dagu_record_locks/") {
+		if d.IsDir() && d.Name() == ".dagu_record_locks" {
+			return filepath.SkipDir
+		}
+		if !d.Type().IsRegular() {
 			return nil
 		}
 		data, err := os.ReadFile(p) //nolint:gosec // a test path

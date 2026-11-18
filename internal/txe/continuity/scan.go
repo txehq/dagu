@@ -323,31 +323,39 @@ var hubDataRules = []rule{
 	// (fileutil.WriteFileAtomic: "<name>.tmp.<n>"), which is operational, and
 	// its record locks, excluded in the lock shape only.
 	//
-	// None of the four holds a secret. A public URL's token, its sender's
-	// signing secret and a webhook's HMAC secret are stored, encrypted, only
-	// in the webhooks collection, which is never read; the encryption key is
-	// under auth/, never read; a delivery's body is never stored.
+	// What may be in them, as far as the writers' source and the tests show
+	// (internal/publicwebhook TestStoredStatusAndLogsHoldNoSecret, the
+	// TXE-7830 start test): a public URL's token, its sender's signing
+	// secret and a webhook's HMAC secret are stored, encrypted, only in the
+	// webhooks collection, never read here; the encryption key is under
+	// auth/, never read; no writer stores a delivery's body or a header
+	// value. One exception is not excluded: a delivery whose run cannot
+	// start logs the run's own validation error, which can quote what the
+	// delivery's params hold, so a delivery log can hold sender-supplied
+	// data. The scan never emits it: these files are inventoried as digest,
+	// size and mode only, and a refusal never quotes a stored value.
 	//
 	// Rollback to F. F has no reader or writer for any of the four and none
 	// of its startup, cleanup or prune paths reaches them (its removals are
 	// confined to dag-runs, run work directories, tools, browser and
 	// workspace-bundle scratch and its own staging), so a rollback leaves
 	// them exactly as they are and a later start of a release that reads them
-	// resumes from them. Two limits follow:
+	// resumes from them. Two limits follow, an operational one and a
+	// security one; neither is repaired by the scan or by F:
 	//
-	//   - F's own continuity scanner does not know them: an inventory taken
-	//     with F's tool blocks on them as unclassified_area unless its keep
-	//     manifest names them (DecodeKeep, which F has).
-	//   - While F runs, nothing holds the relay connection, so the relay keeps
-	//     every public URL C last sent. A request to one waits at Dagu Cloud
-	//     (up to 7 days and 1,000 requests, then it is counted as missed) and
-	//     starts no run. A URL that F's operator turns off or deletes, with
-	//     its webhook, stays public at the relay until a release that reads
-	//     this store connects again (status Holding) and sends the current
-	//     set. A rollback that is meant to last must turn the URLs off at
-	//     Dagu Cloud; this is a semantic limit, not something the scan or F
-	//     repairs. A webhook F deletes also leaves its log and its DAG name's
-	//     claim behind; the claim is taken over when the name is next used.
+	//   - Operational: F's own continuity scanner does not know them, so an
+	//     inventory taken with F's tool blocks on them as unclassified_area
+	//     unless a keep manifest names them (DecodeKeep, which F has).
+	//   - Security: while F runs, nothing holds the relay connection, so
+	//     the relay keeps every public URL C last sent, and they stay
+	//     public: a request to one is queued at Dagu Cloud (up to 7 days and
+	//     1,000 requests, then counted as missed) and starts no run. A URL
+	//     F's operator turns off, or deletes with its webhook, stays public
+	//     until a release that reads this store connects again (Holding) and
+	//     sends the current set. A rollback meant to last, with public URLs
+	//     registered, needs an approved disposition at Dagu Cloud for them.
+	//     A webhook F deletes also leaves its log and its DAG name's claim
+	//     behind; the claim is taken over when the name is next used.
 	{name: "public-webhooks", kind: kindDir, dir: []rule{
 		// The relay connection as the scheduler last saw it
 		// (publicwebhook.Status). The scheduler stores it at every start
@@ -366,9 +374,9 @@ var hubDataRules = []rule{
 		// when it arrived, its size, the event its sender names, the outcome,
 		// the run it started and why it did not; never the body or a header
 		// value. The reason is a fixed text, a signature check's fixed text,
-		// or a run that cannot start explained by the run's own validation,
-		// which can quote what the delivery's params hold; the same params
-		// are retained with the run under dag-runs. Retained.
+		// or, for a run that cannot start, the run's own validation error,
+		// which can quote what the delivery's params hold: the exception
+		// stated above. Retained; inventoried as digest, size and mode only.
 		{name: "log", kind: kindDir, dir: []rule{
 			{pattern: regexp.MustCompile(`^` + webhookIDPattern + `\.json$`), kind: kindFile, policy: PolicyMutable, check: publicWebhookLog},
 			{pattern: regexp.MustCompile(`^` + webhookIDPattern + `\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},

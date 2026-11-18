@@ -5,6 +5,7 @@ package continuity_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,6 +123,52 @@ func TestPublicWebhookStoreRefusesWhatItsWriterDoesNotWrite(t *testing.T) {
 				assert.NotContains(t, i.Detail, "secret")
 				assert.NotContains(t, i.Detail, "queued")
 			}
+		})
+	}
+}
+
+// The scan inventories the collections added after F as digest, size and
+// mode only, and a refusal never quotes what a file holds: a stored value,
+// in a file that is accepted or in one that is refused, in a field it knows
+// or in one it does not, never reaches the inventory (TXE-7830).
+func TestScanEmitsNoStoredValue(t *testing.T) {
+	t.Parallel()
+	const marker = "stored-value-marker-0f1e2d3c"
+	accepted := map[string]string{
+		"public-webhooks/status.json":                    `{"connected":false,"url":"https://relay.example/` + marker + `","leftOut":["` + marker + `"],"error":"` + marker + `","updatedAt":"2026-10-01T00:00:00Z"}`,
+		"public-webhooks/log/" + testWebhookID + ".json": `{"deliveries":[{"id":"` + marker + `","received":"2026-10-01T00:00:00Z","size":1,"event":"` + marker + `","outcome":"failed","runId":"` + marker + `","error":"` + marker + `"}],"missed":{"expired":0,"refused":0}}`,
+		"watch_state/watch.json":                         `{"version":2,"dags":{"` + marker + `":{"path":"/in/` + marker + `","files":{"` + marker + `":{"size":1,"modTime":"2026-10-01T00:00:00Z"}}}}}`,
+		"dag-pins/pins.json":                             `{"fileNames":["` + marker + `"]}`,
+		"webhook-dag-claims/d.json":                      `{"webhookId":"` + testWebhookID + `"}`,
+	}
+	refused := map[string]string{
+		"public-webhooks/status.json":                    `{"` + marker + `":"` + marker + `"}`,
+		"public-webhooks/log/" + testWebhookID + ".json": `{"deliveries":[{"id":"d","received":"2026-10-01T00:00:00Z","size":"` + marker + `","outcome":"` + marker + `"}]}`,
+		"watch_state/watch.json":                         `{"version":"` + marker + `"}`,
+		"dag-pins/pins.json":                             `{"fileNames":["` + marker + `/x"]}`,
+		"webhook-dag-claims/d.json":                      `{"webhookId":"` + marker + `"}`,
+	}
+	for name, files := range map[string]map[string]string{"accepted": accepted, "refused": refused} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			l, _ := build(t)
+			for rel, data := range files {
+				p := filepath.Join(l.DataDir, filepath.FromSlash(rel))
+				require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o750))
+				require.NoError(t, os.WriteFile(p, []byte(data), 0o600))
+			}
+			inv := scan(t, l)
+			blocked := blockingIDs(inv)
+			for rel := range files {
+				if name == "accepted" {
+					assert.NotContains(t, blocked, "hub-data/"+rel)
+				} else {
+					assert.Contains(t, blocked, "hub-data/"+rel)
+				}
+			}
+			out, err := json.Marshal(inv)
+			require.NoError(t, err)
+			assert.NotContains(t, string(out), marker, "the inventory holds a stored value")
 		})
 	}
 }
