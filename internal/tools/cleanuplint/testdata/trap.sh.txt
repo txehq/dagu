@@ -167,3 +167,14 @@ function setup2
 {
   trap 'false' EXIT # want:trap-status
 }
+# A here-string's word and a here-document's delimiter are targets; the rest of the line is shell (connector review of PR 293).
+<<< input trap 'false' EXIT # want:trap-status
+<<< "a b" trap 'false' EXIT # want:trap-status
+cat <<EOF2; trap 'false' EXIT # want:trap-status
+trap 'false' EXIT
+EOF2
+<<EOF3 trap 'false' EXIT # want:trap-status
+body
+EOF3
+trap 'false' EXIT # want:trap-status
+cat <<< trap 'false' EXIT

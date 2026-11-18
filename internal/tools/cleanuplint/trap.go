@@ -494,15 +494,36 @@ func findTraps(text string) []trapCmd {
 	// cmd: the next word is where the shell reads a command name; target:
 	// the next word is a redirection's target, so cmd is unchanged.
 	cmd, target := true, false
+	// bodyEnd: where the here-documents started on this line end. The rest
+	// of the line is still shell (cat <<EOF; trap ...), so the bodies are
+	// skipped at its newline (connector review of PR 293).
+	bodyEnd := -1
 	for i := 0; i < len(text); {
 		c := text[i]
 		if z.q == 0 {
+			if c == '\n' && bodyEnd > i {
+				i, bodyEnd = bodyEnd, -1
+				continue
+			}
 			if strings.HasPrefix(text[i:], "<<<") {
-				i += 3 // a here-string: its word is read as any other
+				// A here-string: its word is a redirection's target, so the
+				// command position is unchanged (<<< in trap ...).
+				i += 3
+				for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+					i++
+				}
+				if i < len(text) {
+					_, i = wordAt(text, i)
+				}
 				continue
 			}
 			if strings.HasPrefix(text[i:], "<<") {
-				i = skipHeredoc(text, i)
+				if end, n := heredocAt(text, i); n > 0 {
+					bodyEnd = max(bodyEnd, end)
+					i += n // the delimiter, like any target, keeps the position
+				} else {
+					i += 2 // a shift, $((1<<n)), or a here-document no line ends
+				}
 				continue
 			}
 			if strings.HasPrefix(text[i:], "\\\n") {
@@ -695,20 +716,21 @@ func unquote(w string) (string, bool) {
 
 var heredocRe = regexp.MustCompile(`^<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][\w]*))`)
 
-// skipHeredoc returns the index past the here-document that starts with the
-// << at i, or past the << alone when it does not start one or no line ends it
-// (an arithmetic shift, $((1<<n)), reads the same): a skip never hides the
+// heredocAt reads a here-document operator at i: n is the length of the
+// operator with its delimiter word, and end the index of the newline that
+// ends its body. n is 0 when << starts none or no line ends it (an
+// arithmetic shift, $((1<<n)), reads the same), so a skip never hides the
 // rest of a script. Its body is data: an apostrophe or the word trap in it is
 // not shell.
-func skipHeredoc(text string, i int) int {
+func heredocAt(text string, i int) (end, n int) {
 	m := heredocRe.FindStringSubmatch(text[i:])
 	if m == nil {
-		return i + 2
+		return 0, 0
 	}
 	delim := m[2] + m[3] + m[4]
 	nl := strings.IndexByte(text[i:], '\n')
 	if nl < 0 {
-		return len(text)
+		return len(text), len(m[0])
 	}
 	j := i + nl + 1
 	for j < len(text) {
@@ -717,11 +739,11 @@ func skipHeredoc(text string, i int) int {
 			end = len(text) - j
 		}
 		if strings.TrimSpace(text[j:j+end]) == delim {
-			return j + end
+			return j + end, len(m[0])
 		}
 		j += end + 1
 	}
-	return i + 2
+	return 0, 0
 }
 
 // funcBody returns the body of the shell function name, if the script
