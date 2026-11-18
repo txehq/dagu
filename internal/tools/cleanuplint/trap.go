@@ -282,7 +282,7 @@ func trapFindings(rel, text string) []Finding {
 			msgs = append(msgs, fmt.Sprintf(keepStatusMsg, where, strings.Join(t.signals, " ")))
 		}
 		for _, n := range names {
-			if silencedRe.MatchString(checked[n]) {
+			if silencedRe.MatchString(shellCode(checked[n])) {
 				msgs = append(msgs, n+" sends stderr to /dev/null: a cleanup that fails must say why; let its stderr through, or print a ::warning:: on failure")
 				break
 			}
@@ -292,6 +292,32 @@ func trapFindings(rel, text string) []Finding {
 		}
 	}
 	return out
+}
+
+// shellCode returns body with its comments removed and the text inside
+// quotes blanked, so a redirection mentioned in a message or a comment is not
+// read as one (connector review of PR 292). Line breaks are kept.
+func shellCode(body string) string {
+	var out strings.Builder
+	for i, l := range strings.Split(body, "\n") {
+		if i > 0 {
+			out.WriteByte('\n')
+		}
+		l = stripComment(l)
+		var z quoter
+		for j := 0; j < len(l); {
+			next, plain := z.step(l, j)
+			for k := j; k < next && k < len(l); k++ {
+				if plain {
+					out.WriteByte(l[k])
+				} else {
+					out.WriteByte(' ')
+				}
+			}
+			j = next
+		}
+	}
+	return out.String()
 }
 
 // silencedRe is a redirection that discards stderr.

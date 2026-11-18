@@ -88,3 +88,9 @@ smoke_new() {
   exit "$status"
 }
 trap smoke_new EXIT
+# A redirection named in a message or a comment is text, not a redirection (connector review of PR 292).
+trap 'RC=$?; set +e; echo "cleanup did not use 2>/dev/null"; exit "$RC"' EXIT
+trap 'RC=$?; set +e
+  rm -rf "$work" # never 2>/dev/null here
+  exit "$RC"' EXIT
+trap 'RC=$?; set +e; rm -rf "$work" 2>/dev/null; echo "2>/dev/null"; exit "$RC"' EXIT # want:trap-status
