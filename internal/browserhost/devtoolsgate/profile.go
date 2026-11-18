@@ -33,7 +33,7 @@ import (
 //     NewTempProfile leave in the same call that creates the directory: a
 //     directory that already existed is never marked on the way. A
 //     directory without the marker is refused and left as it is. The one
-//     way to mark a directory that existed before is ClaimExistingProfile,
+//     way to mark a directory that existed before is ClaimExistingProfileRoot,
 //     for an explicit claim a person asks for (dagu browser profile claim),
 //     after its own checks.
 //   - The directory, the profile within it and its Preferences are refused
@@ -57,7 +57,7 @@ import (
 var ErrProfileRequired = errors.New("devtools gate: the browser needs a profile directory of its own (--user-data-dir, an absolute path)")
 
 // ErrProfileNotOwned is returned for a profile directory the gate was not
-// given as its own (NewProfile, NewTempProfile or ClaimExistingProfile).
+// given as its own (NewProfile, NewTempProfile or ClaimExistingProfileRoot).
 var ErrProfileNotOwned = errors.New("devtools gate: the profile directory is not one created for the browsers the gate starts")
 
 // ErrProfileInUse is returned for a profile a running browser holds.
@@ -131,41 +131,83 @@ func ProfileClaimed(dir string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// ClaimExistingProfile marks dir, a profile directory that existed before,
-// as the gate's own. It is for an explicit claim a person asks for, never a
-// step's launch: the caller has checked the directory is the one meant and
-// that no browser holds it. It refuses a directory the gate would refuse to
-// start a browser on, and a running browser's.
-func ClaimExistingProfile(dir string) error {
-	if ProfileInUse(dir) {
-		return fmt.Errorf("%w: %s", ErrProfileInUse, dir)
+// The explicit claim of a profile that existed before works on the
+// directory as it was opened and checked (an *os.Root): what it reads and
+// writes there cannot be redirected by a directory swapped in afterwards,
+// and none of it follows a symbolic link.
+
+// CheckProfileRoot refuses the profile directory open as root when the
+// gate would refuse to start a browser on it: on Unix, one another user
+// owns or may write.
+func CheckProfileRoot(root *os.Root) error {
+	info, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("devtools gate: the profile directory: %w", err)
 	}
-	return claimProfile(dir)
+	if !info.IsDir() {
+		return fmt.Errorf("devtools gate: the profile directory is not a directory: %s", root.Name())
+	}
+	return checkProfileOwner(root.Name(), info)
 }
 
-// ReleaseProfileClaim removes the gate's marker from dir, undoing a claim.
-// What the gate wrote in the profile's preferences stays.
-func ReleaseProfileClaim(dir string) error {
-	if err := checkProfileDir(dir); err != nil {
-		return err
-	}
-	marker := filepath.Join(dir, profileMarker)
-	info, err := os.Lstat(marker)
+// ProfileClaimedRoot reports whether the profile directory open as root
+// holds the gate's marker, and refuses a marker that is not a regular file.
+func ProfileClaimedRoot(root *os.Root) (bool, error) {
+	info, err := root.Lstat(profileMarker)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", marker)
+		return false, fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", filepath.Join(root.Name(), profileMarker))
 	}
-	return os.Remove(marker)
+	return true, nil
+}
+
+// ClaimExistingProfileRoot marks the profile directory open as root, one
+// that existed before, as the gate's own. It is for an explicit claim a
+// person asks for, never a step's launch, after the caller's own checks; it
+// checks the directory again and refuses one a running browser holds.
+func ClaimExistingProfileRoot(root *os.Root) error {
+	if err := CheckProfileRoot(root); err != nil {
+		return err
+	}
+	if ProfileInUseRoot(root) {
+		return fmt.Errorf("%w: %s", ErrProfileInUse, root.Name())
+	}
+	claimed, err := ProfileClaimedRoot(root)
+	if err != nil || claimed {
+		return err
+	}
+	file, err := root.OpenFile(profileMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
+	if err != nil {
+		return fmt.Errorf("devtools gate: claim the profile directory: %w", err)
+	}
+	return file.Close()
+}
+
+// ReleaseProfileClaimRoot removes the gate's marker from the profile
+// directory open as root, undoing a claim. What the gate wrote in the
+// profile's preferences stays.
+func ReleaseProfileClaimRoot(root *os.Root) error {
+	claimed, err := ProfileClaimedRoot(root)
+	if err != nil || !claimed {
+		return err
+	}
+	return root.Remove(profileMarker)
 }
 
 // ProfileInUse reports whether a running browser holds the profile dir.
 func ProfileInUse(dir string) bool {
 	return profileInUse(dir)
+}
+
+// ProfileInUseRoot reports whether a running browser holds the profile
+// directory open as root.
+func ProfileInUseRoot(root *os.Root) bool {
+	return profileInUseRoot(root)
 }
 
 // claimProfile leaves the gate's marker in dir, after the checks the gate
@@ -181,7 +223,7 @@ func claimProfile(dir string) error {
 		}
 		return nil
 	}
-	file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // a new file in the directory checked above
+	file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600) //nolint:gosec // a new file in the directory checked above
 	if err != nil {
 		return fmt.Errorf("devtools gate: claim the profile directory: %w", err)
 	}

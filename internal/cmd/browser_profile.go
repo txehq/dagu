@@ -34,12 +34,14 @@ it as it is, with its logins and cookies, until it is claimed.
 
 Dagu's browsers set incognito.mode_availability = 1 in the profile's
 Default/Preferences each time they start, so the browser opens no window off
-the record; nothing else in the profile is changed. The claim keeps a copy
-of the preferences beside them (Preferences.dagu-before-claim) and the
-value it found, and prints both.
+the record; nothing else in the profile is changed. The claim itself changes no
+preference: it keeps a copy of the preferences beside them
+(Preferences.dagu-before-claim-<time>) and the value it found, prints both,
+and marks the profile.
 
 The profile must be the directory <data dir>/browser/profiles/<name> itself,
-this user's alone, and not in use by a step, a session or a browser.
+this user's alone, and not in use by a step, a session or a browser. All of
+that is checked before anything is written; a refused claim writes nothing.
 
 Undo with: dagu browser profile unclaim <name>
 
