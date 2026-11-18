@@ -505,6 +505,10 @@ func findTraps(text string) []trapCmd {
 				i = skipHeredoc(text, i)
 				continue
 			}
+			if strings.HasPrefix(text[i:], "\\\n") {
+				i += 2 // a line continuation is a blank: it starts no word
+				continue
+			}
 			wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
 			if wordStart && c == '#' {
 				for i < len(text) && text[i] != '\n' {
@@ -517,6 +521,10 @@ func findTraps(text string) []trapCmd {
 				switch {
 				case target:
 					target = false
+				case w == "{":
+					// A group or a function body starts a command, also
+					// after function name (function f { trap ...; }).
+					cmd = true
 				case !cmd:
 				case w == "trap" && wend < len(text) && (text[wend] == ' ' || text[wend] == '\t'):
 					words, end := commandWords(text, wend)
@@ -549,8 +557,10 @@ func findTraps(text string) []trapCmd {
 // word or command prefix (if, then, !, builtin, command, ...), an option, an
 // assignment (FOO="a b") and a redirection with its target (>/dev/null,
 // 2> err) keep the next word in command position. Where the text is
-// ambiguous, a & or a parenthesis inside a word, the next word is read as a
-// command, so the rule reads a trap it is unsure of rather than miss one.
+// ambiguous, a & or a parenthesis inside a word, or a { after any word, the
+// next word is read as a command, so the rule reads a trap it is unsure of
+// rather than miss one. A backslash-newline is a blank, as it is to the
+// shell (connector review of PR 293).
 
 // keepsCommand reports a word after which the next word is still a command.
 func keepsCommand(w string) bool {

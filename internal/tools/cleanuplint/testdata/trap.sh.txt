@@ -156,3 +156,14 @@ echo "a b" trap 'false' EXIT
 echo >/dev/null trap 'false' EXIT
 printf '%s' 2> "$log" trap 'false' EXIT
 "$cmd" -- trap 'false' EXIT
+# A continuation after && and a function body keep the command position (connector review of PR 293).
+true && \
+  trap 'false' EXIT # want:trap-status
+true || \
+  \
+  trap 'false' EXIT # want:trap-status
+function setup { trap 'false' EXIT; } # want:trap-status
+function setup2
+{
+  trap 'false' EXIT # want:trap-status
+}
