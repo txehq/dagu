@@ -250,9 +250,12 @@ class History:
 class Ledger:
     """What the notifier delivered, read from its own workflow_run runs and their steps."""
 
-    def __init__(self, repo: str, token: str | None, get, self_run_id: str | None):
+    def __init__(self, repo: str, token: str | None, get, self_run_id: str | None, self_attempt: str | None = None):
         self.repo, self.token, self.get = repo, token, get
+        # This notify's own attempt is not a record of anything yet. Its earlier attempts are:
+        # a re-run of a notifier that already posted keeps the same run id.
         self.self_run_id = int(self_run_id) if self_run_id else None
+        self.self_attempt = int(self_attempt or 1)
         self._runs: dict[tuple[int, int, int], list[int]] | None = None
         self._steps: dict[int, set[str]] = {}
 
@@ -270,7 +273,7 @@ class Ledger:
                     raise ReadError("notifier runs listing has no workflow_runs array")
                 for r in runs:
                     m = RUN_NAME.match(r.get("display_title") or r.get("name") or "")
-                    if r.get("event") != "workflow_run" or not m or r["id"] == self.self_run_id:
+                    if r.get("event") != "workflow_run" or not m:
                         continue
                     idx.setdefault((int(m.group(1)), int(m.group(2)), int(m.group(3))), []).append(r["id"])
                 if len(runs) < 100:
@@ -284,8 +287,13 @@ class Ledger:
             jobs = body.get("jobs")
             if not isinstance(jobs, list):
                 raise ReadError("notifier jobs listing has no jobs array")
+            own = notifier_run_id == self.self_run_id
             self._steps[notifier_run_id] = {
-                st.get("name") for j in jobs for st in (j.get("steps") or []) if st.get("conclusion") == "success"
+                st.get("name")
+                for j in jobs
+                if not (own and int(j.get("run_attempt") or 1) >= self.self_attempt)
+                for st in (j.get("steps") or [])
+                if st.get("conclusion") == "success"
             }
         return self._steps[notifier_run_id]
 
@@ -420,7 +428,7 @@ def cmd_notify(args, env=os.environ, get=gh_get) -> int:
         return 1
     workflow = run.get("name") or "?"
     token = env.get("GH_TOKEN")
-    ledger = Ledger(repo, token, get, env.get("GITHUB_RUN_ID"))
+    ledger = Ledger(repo, token, get, env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"))
     try:
         action, why, streak = evaluate(run, repo, token, get, ledger)
     except ReadError as e:

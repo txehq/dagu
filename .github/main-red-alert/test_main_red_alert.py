@@ -75,9 +75,15 @@ class FakeGitHub:
             return {"workflow_runs": rows[(page - 1) * 100 : page * 100]}
         if path.endswith("/jobs?filter=all&per_page=100"):
             nid = int(path.split("/runs/")[1].split("/")[0])
-            steps = [{"name": "Decide", "conclusion": "success"}]
-            steps += [{"name": n, "conclusion": c} for n, c in self.notified[nid][2].items()]
-            return {"jobs": [{"steps": steps}]}
+            spec = self.notified[nid][2]
+            # {step: conclusion} for a notifier run with one attempt, or {attempt: {step: ...}}.
+            per_attempt = spec if spec and all(isinstance(k, int) for k in spec) else {1: spec}
+            jobs = []
+            for att, st in sorted(per_attempt.items()):
+                steps = [{"name": "Decide", "conclusion": "success"}]
+                steps += [{"name": n, "conclusion": c} for n, c in st.items()]
+                jobs.append({"run_attempt": att, "steps": steps})
+            return {"jobs": jobs}
         rid = int(path.rsplit("/", 1)[1])
         return next(r for r in self.runs if r["id"] == rid)
 
@@ -231,9 +237,19 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, OK)}, notifier_event="pull_request")
         self.assertEqual(evaluate(self.R2, gh), "alert")
 
-    def test_the_running_notifier_is_not_its_own_record(self):
+    def test_the_running_notifier_attempt_is_not_its_own_record(self):
+        # Its own Post step is still pending; even a stand-in success there is not read.
         gh = FakeGitHub([self.G0, self.R1], notified={10: (2, 1, OK)})
-        self.assertEqual(m.evaluate(self.R1, REPO, None, gh, m.Ledger(REPO, None, gh, "10"))[0], "alert")
+        self.assertEqual(m.evaluate(self.R1, REPO, None, gh, m.Ledger(REPO, None, gh, "10", "1"))[0], "alert")
+
+    def test_a_rerun_notifier_keeps_its_earlier_attempts_deliveries(self):
+        # Notifier run 10 posted on its attempt 1; someone re-runs it (attempt 2, same run id).
+        notified = {10: (2, 1, {1: OK, 2: {"Post alert": None}})}
+        gh = FakeGitHub([self.G0, self.R1], notified=notified)
+        self.assertIsNone(m.evaluate(self.R1, REPO, None, gh, m.Ledger(REPO, None, gh, "10", "2"))[0])
+        clear = {10: (2, 1, OK), 11: (4, 1, {1: {"Post clear": "success"}, 2: {}})}
+        gh = FakeGitHub([self.R1, self.G3], notified=clear)
+        self.assertIsNone(m.evaluate(self.G3, REPO, None, gh, m.Ledger(REPO, None, gh, "11", "2"))[0])
 
     def test_cancelled_and_skipped_runs_are_passed_over(self):
         hist = [self.R1, run(5, "cancelled", "2026-01-02T01:00:00Z"), run(6, "skipped", "2026-01-02T02:00:00Z"), self.G3]
