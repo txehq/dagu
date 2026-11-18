@@ -116,6 +116,93 @@ run runs-unread   2 "could not read the workflow runs"    not-merged FAIL_ON=act
 run checks-unread 2 "could not read the check runs"       not-merged FAIL_ON=check-runs
 run status-unread 2 "could not read the commit status"    not-merged FAIL_ON=/status
 run pull-unread   2 "could not read PR #7"                not-merged FAIL_ON=pulls/7
+# ── Same-head re-checks (TXE-7843) ──
+# The gate's runs on one head after an edit or a label change, in the shapes README.md "Same-head
+# re-checks" measured: a re-check waits as `pending` behind the active run instead of cancelling it;
+# of several rapid re-checks the older pending run is cancelled before it starts, so its check suite
+# holds no check run; the active run's check run completes in its own suite. The newest gate run
+# decides, and every check run that exists is still judged on its own.
+grun() {  # grun <run_number> <status> <conclusion|null>
+    local c="$3"; [ "$c" = null ] || c="\"$c\""
+    printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":%s,"status":"%s","conclusion":%s}\n' "$1" "$2" "$c"
+}
+gchk() {  # gchk <check_suite_id> <status> <conclusion|null> <started_at minute>
+    local c="$3"; [ "$c" = null ] || c="\"$c\""
+    printf '{"name":"codex-review","app":{"id":15368},"check_suite":{"id":%s},"status":"%s","conclusion":%s,"started_at":"2026-11-18T18:%s:00Z"}\n' "$1" "$2" "$c" "$4"
+}
+# An edit or a label during the active run: the re-check is pending, then running; neither merges.
+run recheck-pending     1 "is 'pending null'"             not-merged RUNS="$CI
+$(grun 5 in_progress null)
+$(grun 6 pending null)" CHECKS="$CHK
+$(gchk 21 in_progress null 05)"
+run recheck-running     1 "is 'in_progress null'"         not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 in_progress null)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 22 in_progress null 08)"
+# Both runs completed green on the head: merges with no rerun (the case TXE-7843 fixes).
+run recheck-done        0 merged                          merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed success)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 22 completed success 08)"
+# Rapid re-checks: run 6 was pending and replaced by run 7, so it is cancelled with no check run.
+run rapid-pending       1 "is 'pending null'"             not-merged RUNS="$CI
+$(grun 5 in_progress null)
+$(grun 6 completed cancelled)
+$(grun 7 pending null)" CHECKS="$CHK
+$(gchk 21 in_progress null 05)"
+run rapid-done          0 merged                          merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed cancelled)
+$(grun 7 completed success)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 23 completed success 09)"
+# The newest gate run on the head failed or was cancelled, with nothing newer: refuses.
+run recheck-latest-failed    1 "is 'completed failure'"   not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed failure)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 22 completed failure 08)"
+run recheck-latest-cancelled 1 "is 'completed cancelled'" not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed cancelled)" CHECKS="$CHK
+$(gchk 21 completed success 05)"
+# review-override removed during a passing run: the newest run judges the label's absence. An older
+# success never stands in for it: pending refuses, a failure refuses, and main's check run now (it
+# reads the labels again) refuses even when every recorded run is green.
+run override-removed-pending 1 "is 'pending null'"        not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 pending null)" CHECKS="$CHK
+$(gchk 21 completed success 05)"
+run override-removed-failed  1 "is 'completed failure'"   not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed failure)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 22 completed failure 08)"
+run override-removed-now     1 "check does not pass"      not-merged RUNS="$CI
+$(grun 5 completed success)
+$(grun 6 completed success)" CHECKS="$CHK
+$(gchk 21 completed success 05)
+$(gchk 22 completed success 08)" MAIN_CHECK='echo "FAIL: no review-override and no review of the head"; exit 1'
+# Unchanged fail-closed rules: an earlier run's check run that failed or was cancelled on the head
+# still refuses after a later green run (each suite is judged on its own; rerun that run). The
+# second case is the shape every same-head event left before TXE-7843.
+run recheck-older-failed     1 "check codex-review: completed/failure"   not-merged RUNS="$CI
+$(grun 5 completed failure)
+$(grun 6 completed success)" CHECKS="$CHK
+$(gchk 21 completed failure 05)
+$(gchk 22 completed success 08)"
+run recheck-older-cancelled  1 "check codex-review: completed/cancelled" not-merged RUNS="$CI
+$(grun 5 completed cancelled)
+$(grun 6 completed success)" CHECKS="$CHK
+$(gchk 21 completed cancelled 05)
+$(gchk 22 completed success 08)"
+# A new commit: everything is read at the exact head given, never at the PR's previous head.
+if grep -q -- "actions/runs?head_sha=$H&per_page=100" "$TMP/recheck-done.log" \
+   && grep -q -- "commits/$H/check-runs" "$TMP/recheck-done.log" && grep -q -- "commits/$H/status" "$TMP/recheck-done.log"; then
+    PASS=$((PASS + 1)); printf '  ok   %s\n' "reads-at-exact-head"
+else FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "reads-at-exact-head"; fi
 # The history the PR brings (TXE-6221); the real git cases are in test-merge-git.sh.
 A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 run tip-unread    2 "could not read main's tip"           not-merged FAIL_ON=branches/main

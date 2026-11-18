@@ -53,6 +53,65 @@ code), and a PR from another repository fails unless a person adds `review-overr
    it was merged after an independent review of its source and a canary of the connector on its
    own head.
 
+## Same-head re-checks (TXE-7843)
+
+An edit or a label change on an unchanged head starts a new gate run. Until TXE-7843 it cancelled
+the run in progress (`cancel-in-progress: true`), and the cancelled `codex-review` check run stayed
+in its own check suite on that head, so the wrapper refused the merge until that run was re-run
+(PR #282, head `df1d4f7f`: run 766, `ready_for_review`, cancelled by run 767, `edited`). The
+wrapper is unchanged: it still judges every check run on the head on its own. The workflow changed
+instead: `cancel-in-progress` is true only for a run whose event action is `synchronize` (a
+new head, or a re-run of such a run). Every other event waits.
+
+What GitHub does (docs, "Control the concurrency of workflows and jobs"): a run whose group already
+has one running "will be `pending`"; "any existing `pending` job or workflow in the same
+concurrency group will be canceled and the new queued job or workflow will take its place"; that is
+`queue: single`, the default, at most one pending run per group. `queue: max` keeps up to 100
+pending runs, but "ordering is not guaranteed" and it cannot be combined with
+`cancel-in-progress: true`, so it is not used. A group keyed on the head alone would not help:
+with `cancel-in-progress: true`, same-head runs share that group and still cancel each other.
+
+Measured on 2026-11-18 (raw payloads on TXE-7843): one orphan commit pushed to six
+scratch branches, so all six runs were on one head and in one group, with `cancel-in-progress`
+true only for a branch ending in `-cancel`:
+
+| run | event, at | outcome | check runs in its suite |
+| --- | --- | --- | --- |
+| 1 | queue, 18:05:45Z | ran 18:05:47–18:07:50Z, success: runs 2 and 3 did not cancel it | 1 (success) |
+| 2 | queue, 18:06:17Z | pending, then cancelled at 18:06:36Z when run 3 arrived | **0** |
+| 3 | queue, 18:06:35Z | pending until run 1 ended, ran 18:07:54–18:09:59Z, success | 1 (success) |
+| 4 | queue, 18:10:37Z | running; cancelled at 18:11:34Z by run 5 | 1 (cancelled) |
+| 5 | `-cancel`, 18:11:19Z | ran 18:11:36–18:13:38Z, success | 1 (success) |
+| 6 | queue, 18:11:37Z | pending behind run 5, ran 18:13:41–18:15:47Z, success | 1 (success) |
+
+The wrapper's own selection, applied to those payloads: runs 1–3 merge (newest run 3 success, no
+check run off green; while run 3 was pending, the newest was pending and refused); runs 1–6 refuse
+on run 4's cancelled check run, the old behaviour. On a PR that now happens across a head change,
+where the cancelled run is on the previous head and is never read, and in one same-head case: a
+person re-running an earlier run of a `synchronize` event while a re-check is active. The re-run
+keeps its event's action, so it cancels the active run, and the wrapper refuses until that run is
+re-run. That costs a re-run, never a pass.
+
+So for a PR:
+
+- **An edit or label during a run** waits as `pending`, then runs and reads the labels, the base and
+  the connector's state as they are then. The run in progress finishes and keeps its verdict in its
+  own suite. The wrapper takes the newest gate run on the exact head (`max_by(.run_number)`), so a
+  pending or running re-check it can see refuses: it blocks the older success. It also re-runs
+  main's check at the merge, which reads the labels again. What is left is
+  the wrapper's stated residual window: a label removed in the seconds between that check and the
+  merge is not seen (merge.sh header, "Residual window").
+- **Several rapid re-checks**: the replaced pending run is cancelled before it starts and leaves no
+  check run; the newest pending run carries the newest state. The newest gate run being cancelled,
+  failed or missing refuses.
+- **A new head** (`synchronize`) cancels the run in progress and any pending one. Nothing of the
+  previous head counts: the wrapper reads runs, check runs and the status at the exact head only.
+- **A run that failed** (for example a 15-minute poll that ended before the review) still refuses
+  after a later green run on the same head, as before: re-run that run.
+
+`test-gate-pin.sh` fails when the workflow's concurrency changes; `test-merge.sh` runs the wrapper
+over these shapes.
+
 ## The merge method (TXE-6221)
 
 The wrapper squashes by default, and a squash keeps the PR's tree while dropping its history. That
