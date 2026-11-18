@@ -12,6 +12,9 @@ run-name: ${{ github.event_name == 'workflow_run' && format('notify {0} {1} {2}'
 # above names the run each one judged, and its `Post alert` / `Post clear` step concluded
 # success only when the POST returned 2xx. A missing secret or a failed POST fails that step,
 # so it never counts as sent. `check` holds the run-name, the step names and the permissions.
+# An unreadable history or delivery record fails the run and posts nothing (fail closed).
+# Delivery is at-least-once: a send whose outcome was lost is retried, and every post carries
+# the streak id, so a duplicate reads as the same alert.
 #
 # Why workflow_run is safe on this public repository: a workflow_run run always uses this
 # file from the default branch, never a pull request's copy, even when a fork's pull request

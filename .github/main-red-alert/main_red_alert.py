@@ -36,14 +36,30 @@ The rule:
   * An event with a newer event after it (a later run, or a later attempt of the same run) is
     superseded: no post (no stale alert or clear; the newer event's notify decides).
   * Red: post the alert unless an alert for this streak was already delivered. That gives one
-    post per streak; a retry on every later red run while it was not delivered (activation
-    mid-streak, a failed POST); and no double post for a duplicate or re-run delivery.
+    recorded delivery per streak; a retry on every later red run while none is recorded
+    (activation mid-streak, a failed POST); and no second post for a duplicate or re-run
+    delivery whose first post was recorded.
   * Green after a red streak whose alert was delivered: post the clear unless one of the
     greens since the streak delivered it, so a failed clear is retried by the next green.
     Green after a streak whose alert was never delivered: the clear says so, and it is posted
     only for the first green event after the streak.
-  * A read fails: a red run posts the alert anyway (an extra post is cheaper than a missed
-    one); a green run fails the job (it cannot tell whether a clear is due).
+  * A read fails, or a finished notifier run has no readable notify job: the decision fails
+    closed. The job fails with ::error:: and posts nothing; it neither guesses "not
+    delivered" (and posts) nor "delivered" (and stays quiet). The next event retries.
+
+Delivery is at-least-once, not exactly-once. Mattermost incoming webhooks have no idempotency
+key, so a send whose outcome is uncertain is retried: the webhook accepted the message but the
+response was lost (a timeout), or the runner died before the step's success was recorded.
+The retry is a duplicate. Every post therefore carries the streak's stable identifier (the
+run id of its first red event), so a reader sees that two posts are the same alert. A
+duplicate is possible only after such an uncertain send; a recorded delivery is never
+repeated.
+
+GitHub's concurrency group keeps one notify running and at most one pending per watched
+workflow; a newer pending notify replaces an older one. That is safe because no decision
+depends on an earlier notify having run: the newer one reads the same history and record, so
+a replaced red's alert is posted by the next red of its streak, and a replaced green's clear
+by the next green.
 
 The post names the repository, the workflow and run links, nothing else: this repository is
 public and a scan's findings stay in the run. Its destination comes only from the
@@ -271,12 +287,13 @@ class Ledger:
         # a re-run of a notifier that already posted keeps the same run id.
         self.self_run_id = int(self_run_id) if self_run_id else None
         self.self_attempt = int(self_attempt or 1)
-        self._runs: dict[tuple[int, int, int], list[int]] | None = None
+        self._runs: dict[tuple[int, int, int], list[tuple[int, bool]]] | None = None
         self._steps: dict[int, set[str]] = {}
 
-    def _index(self) -> dict[tuple[int, int, int], list[int]]:
+    def _index(self) -> dict[tuple[int, int, int], list[tuple[int, bool]]]:
+        """(workflow id, run id, attempt) -> [(notifier run id, finished)]."""
         if self._runs is None:
-            idx: dict[tuple[int, int, int], list[int]] = {}
+            idx: dict[tuple[int, int, int], list[tuple[int, bool]]] = {}
             for page in range(1, MAX_PAGES + 1):
                 body = self.get(
                     f"/repos/{self.repo}/actions/workflows/{NOTIFIER.name}/runs"
@@ -290,25 +307,34 @@ class Ledger:
                     m = RUN_NAME.match(r.get("display_title") or r.get("name") or "")
                     if r.get("event") != "workflow_run" or not m:
                         continue
-                    idx.setdefault((int(m.group(1)), int(m.group(2)), int(m.group(3))), []).append(r["id"])
+                    ident = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                    idx.setdefault(ident, []).append((r["id"], r.get("status") == "completed"))
                 if len(runs) < 100:
                     break
             self._runs = idx
         return self._runs
 
-    def _delivered_steps(self, notifier_run_id: int) -> set[str]:
+    def _delivered_steps(self, notifier_run_id: int, finished: bool) -> set[str]:
+        """Names of the steps that concluded success in a notifier run's notify job.
+
+        A finished run (or an earlier attempt of this one) whose jobs listing has no notify job
+        (no `Decide` step) is unreadable, not "nothing delivered": ReadError, so the decision
+        fails closed. A run still queued or running has delivered nothing yet.
+        """
         if notifier_run_id not in self._steps:
             body = self.get(f"/repos/{self.repo}/actions/runs/{notifier_run_id}/jobs?filter=all&per_page=100", self.token)
             jobs = body.get("jobs")
             if not isinstance(jobs, list):
-                raise ReadError("notifier jobs listing has no jobs array")
+                raise ReadError(f"notifier run {notifier_run_id}: jobs listing has no jobs array")
             own = notifier_run_id == self.self_run_id
+            if own:
+                jobs = [j for j in jobs if int(j.get("run_attempt") or 1) < self.self_attempt]
+            # This notify's own run: only its earlier attempts are records, and they finished.
+            must_read = self.self_attempt > 1 if own else finished
+            if must_read and not any(st.get("name") == "Decide" for j in jobs for st in (j.get("steps") or [])):
+                raise ReadError(f"notifier run {notifier_run_id}: no notify job in its jobs listing")
             self._steps[notifier_run_id] = {
-                st.get("name")
-                for j in jobs
-                if not (own and int(j.get("run_attempt") or 1) >= self.self_attempt)
-                for st in (j.get("steps") or [])
-                if st.get("conclusion") == "success"
+                st.get("name") for j in jobs for st in (j.get("steps") or []) if st.get("conclusion") == "success"
             }
         return self._steps[notifier_run_id]
 
@@ -316,8 +342,8 @@ class Ledger:
         """Whether a notify of any of these (run id, attempt) events delivered `action`."""
         idx = self._index()
         for rid, att in idents:
-            for nid in idx.get((int(workflow_id), int(rid), int(att)), []):
-                if STEP[action] in self._delivered_steps(nid):
+            for nid, finished in idx.get((int(workflow_id), int(rid), int(att)), []):
+                if STEP[action] in self._delivered_steps(nid, finished):
                     return True
         return False
 
@@ -345,7 +371,7 @@ class SimLedger:
 def evaluate(run: dict, repo: str, token: str | None, get, ledger, as_of: str | None = None) -> tuple[str | None, str, list[dict]]:
     """Decide for one completed attempt: (action, a one-line reason, the streak's runs oldest first).
 
-    Raises ReadError only when a green attempt cannot tell whether a clear is due.
+    Raises ReadError when a history or the delivery record cannot be read: fail closed.
     """
     if not counts(run, repo):
         head_repo = (run.get("head_repository") or {}).get("full_name")
@@ -356,21 +382,18 @@ def evaluate(run: dict, repo: str, token: str | None, get, ledger, as_of: str | 
     wf = run["workflow_id"]
     me = Event(run, int(run.get("run_attempt") or 1), now)
     if now == "red":
-        try:
-            hist = History(run, repo, token, get, as_of)
-            if hist.newer():
-                return None, "red, superseded by a newer event", []
-            streak = [me]
-            for e in hist.before():
-                if e.state != "red":
-                    break
-                streak.append(e)
-            streak.reverse()
-            if ledger.delivered("alert", wf, [e.ident for e in streak]):
-                return None, f"red, streak of {len(streak)}: its alert was delivered", [e.run for e in streak]
-            return "alert", f"red, streak of {len(streak)}: no alert delivered for it yet", [e.run for e in streak]
-        except ReadError as e:
-            return "alert", f"red, history or delivery record unread ({e}): alerting anyway", [run]
+        hist = History(run, repo, token, get, as_of)
+        if hist.newer():
+            return None, "red, superseded by a newer event", []
+        streak = [me]
+        for e in hist.before():
+            if e.state != "red":
+                break
+            streak.append(e)
+        streak.reverse()
+        if ledger.delivered("alert", wf, [e.ident for e in streak]):
+            return None, f"red, streak of {len(streak)}: its alert was delivered", [e.run for e in streak]
+        return "alert", f"red, streak of {len(streak)}: no alert delivered for it yet", [e.run for e in streak]
     hist = History(run, repo, token, get, as_of)
     if hist.newer():
         return None, "green, superseded by a newer event", []
@@ -399,14 +422,18 @@ def evaluate(run: dict, repo: str, token: str | None, get, ledger, as_of: str | 
 
 
 def message(action: str, repo: str, workflow: str, run_url: str, streak: list[dict]) -> str:
-    first = streak[0]["html_url"] if streak else run_url
+    """The post. `streak {id}` is the run id of the streak's first red event: stable across
+    retries and the clear, so a duplicate after an uncertain send reads as the same alert."""
+    first = streak[0] if streak else {"id": run_url.rsplit("/", 1)[-1], "html_url": run_url}
+    tag = f"streak {first['id']}"
     if action == "alert":
         if len(streak) <= 1:
-            return f":rotating_light: {repo}: workflow `{workflow}` is red on {BRANCH}. Run: {run_url}"
-        return f":rotating_light: {repo}: workflow `{workflow}` is still red on {BRANCH}, red since {first}. Run: {run_url}"
-    text = f":white_check_mark: {repo}: workflow `{workflow}` is green again on {BRANCH}. Run: {run_url}"
+            return f":rotating_light: {repo}: workflow `{workflow}` is red on {BRANCH} ({tag}). Run: {run_url}"
+        return (f":rotating_light: {repo}: workflow `{workflow}` is still red on {BRANCH} ({tag}, red since "
+                f"{first['html_url']}). Run: {run_url}")
+    text = f":white_check_mark: {repo}: workflow `{workflow}` is green again on {BRANCH} ({tag} ended). Run: {run_url}"
     if action == "clear-undelivered":
-        text += f" The alert for this red streak was not delivered (red since {first})."
+        text += " The alert for this red streak was not delivered."
     return text
 
 
@@ -447,7 +474,7 @@ def cmd_notify(args, env=os.environ, get=gh_get) -> int:
     try:
         action, why, streak = evaluate(run, repo, token, get, ledger)
     except ReadError as e:
-        print(f"::error::{workflow} run {run.get('id')}: cannot tell whether a clear is due: {e}")
+        print(f"::error::{workflow} run {run.get('id')}: history or delivery record unreadable, nothing posted (fail closed): {e}")
         return 1
     print(f"{workflow} run {run.get('id')} attempt {run.get('run_attempt')}: {why}: {action or 'no post'}")
     step = None if action is None else ("alert" if action == "alert" else "clear")

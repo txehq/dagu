@@ -41,7 +41,8 @@ class FakeGitHub:
     `notified` maps a notifier run id to (judged run id, attempt, {step name: conclusion}).
     """
 
-    def __init__(self, runs, attempts=None, notified=None, fail=False, notifier_event="workflow_run"):
+    def __init__(self, runs, attempts=None, notified=None, fail=False, notifier_event="workflow_run", jobs_fail=False):
+        self.jobs_fail = jobs_fail
         self.runs = sorted(runs, key=m.key, reverse=True)
         self.attempts = attempts or {}
         self.notified = notified or {}
@@ -69,13 +70,18 @@ class FakeGitHub:
             assert "event=workflow_run" in path
             page = int(path.rsplit("page=", 1)[1])
             rows = [
-                {"id": nid, "event": self.notifier_event, "display_title": f"notify {WF_ID} {rid} {att}"}
-                for nid, (rid, att, _) in sorted(self.notified.items(), reverse=True)
+                {"id": nid, "event": self.notifier_event, "display_title": f"notify {WF_ID} {v[0]} {v[1]}",
+                 "status": v[3] if len(v) > 3 else "completed"}
+                for nid, v in sorted(self.notified.items(), reverse=True)
             ]
             return {"workflow_runs": rows[(page - 1) * 100 : page * 100]}
         if path.endswith("/jobs?filter=all&per_page=100"):
+            if self.jobs_fail:
+                raise m.ReadError("HTTP 404")
             nid = int(path.split("/runs/")[1].split("/")[0])
             spec = self.notified[nid][2]
+            if spec == "NOJOBS":
+                return {"jobs": []}
             # {step: conclusion} for a notifier run with one attempt, or {attempt: {step: ...}}.
             per_attempt = spec if spec and all(isinstance(k, int) for k in spec) else {1: spec}
             jobs = []
@@ -189,7 +195,7 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, FAILED)})
         self.assertEqual(evaluate(self.R2, gh), "alert")
         text = m.message("alert", REPO, "SecurityScans", self.R2["html_url"], [self.R1, self.R2])
-        self.assertIn("is still red on main, red since https://github.com/txehq/dagu/actions/runs/2.", text)
+        self.assertIn("is still red on main (streak 2, red since https://github.com/txehq/dagu/actions/runs/2). Run: ", text)
 
     def test_a_skipped_or_cancelled_post_step_does_not_count_as_sent(self):
         for c in ("skipped", "cancelled", None):
@@ -338,10 +344,44 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([self.G0, rerunning, self.G3], attempts={(2, 1): "failure"}, notified={10: (2, 1, OK)})
         self.assertEqual(evaluate(self.G3, gh), "clear")
 
-    def test_unread_history_alerts_a_red_and_fails_a_green(self):
-        self.assertEqual(evaluate(self.R1, FakeGitHub([], fail=True)), "alert")
+    def test_unread_history_fails_closed_for_red_and_green(self):
+        for r in (self.R1, self.G3):
+            with self.assertRaises(m.ReadError):
+                evaluate(r, FakeGitHub([], fail=True))
+
+    def test_unreadable_or_missing_jobs_history_fails_closed(self):
+        # A finished notifier run for this streak whose jobs cannot be read, or list no notify job:
+        # neither "not delivered" (post) nor "delivered" (quiet).
+        for gh in (
+            FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, OK)}, jobs_fail=True),
+            FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, "NOJOBS")}),
+        ):
+            with self.assertRaises(m.ReadError):
+                evaluate(self.R2, gh)
+        gh = FakeGitHub([self.R1, self.G3], notified={10: (2, 1, "NOJOBS")})
         with self.assertRaises(m.ReadError):
-            evaluate(self.G3, FakeGitHub([], fail=True))
+            evaluate(self.G3, gh)
+
+    def test_a_notifier_run_still_pending_has_delivered_nothing(self):
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, "NOJOBS", "queued")})
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+
+    def test_an_uncertain_send_is_retried_with_the_same_streak_id(self):
+        # R1's POST timed out after the webhook may have accepted it: the step failed, so it is
+        # not recorded, and R2 retries. Both posts name streak 2, so a reader sees one alert.
+        gh = FakeGitHub([self.G0, self.R1, self.R2], notified={10: (2, 1, {"Post alert": "failure"})})
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+        first = m.message("alert", REPO, "SecurityScans", self.R1["html_url"], [self.R1])
+        retry = m.message("alert", REPO, "SecurityScans", self.R2["html_url"], [self.R1, self.R2])
+        self.assertIn("(streak 2)", first)
+        self.assertIn("(streak 2, red since", retry)
+
+    def test_a_replaced_pending_red_notify_is_covered_by_the_newer_one(self):
+        # R1's notify was pending and replaced by R2's in the concurrency group: it never ran.
+        gh = FakeGitHub([self.G0, self.R1, self.R2])
+        self.assertEqual(evaluate(self.R2, gh), "alert")
+        # And R1's own notify, had it run late, is superseded by R2: no second post.
+        self.assertIsNone(evaluate(self.R1, gh))
 
     def test_history_beyond_the_first_page(self):
         noise = [run(100 + i, "failure", f"2026-01-02T{i // 3600:02d}:{i // 60 % 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(150)]
@@ -357,14 +397,14 @@ class Rule(unittest.TestCase):
         r = HISTORY[-1]
         self.assertEqual(
             m.message("alert", REPO, r["name"], r["html_url"], [r]),
-            ":rotating_light: txehq/dagu: workflow `SecurityScans` is red on main. "
+            ":rotating_light: txehq/dagu: workflow `SecurityScans` is red on main (streak 43798559034). "
             "Run: https://github.com/txehq/dagu/actions/runs/43798559034",
         )
         self.assertEqual(
             m.message("clear-undelivered", REPO, r["name"], "https://github.com/txehq/dagu/actions/runs/5", [r]),
-            ":white_check_mark: txehq/dagu: workflow `SecurityScans` is green again on main. "
-            "Run: https://github.com/txehq/dagu/actions/runs/5 The alert for this red streak was not "
-            "delivered (red since https://github.com/txehq/dagu/actions/runs/43798559034).",
+            ":white_check_mark: txehq/dagu: workflow `SecurityScans` is green again on main (streak "
+            "43798559034 ended). Run: https://github.com/txehq/dagu/actions/runs/5 The alert for this "
+            "red streak was not delivered.",
         )
 
 
@@ -402,15 +442,18 @@ class Steps(unittest.TestCase):
         rc, out, text = self.notify(HISTORY[-2], FakeGitHub(HISTORY[:-1]))
         self.assertEqual((rc, out, text), (0, "post=none\n", None))
 
-    def test_notify_fails_a_green_it_cannot_judge(self):
-        rc, out, _ = self.notify(HISTORY[3], FakeGitHub([], fail=True))
-        self.assertEqual((rc, out), (1, ""))
+    def test_notify_fails_closed_on_an_unreadable_record(self):
+        for r in (HISTORY[3], HISTORY[-1]):
+            rc, out, text = self.notify(r, FakeGitHub([], fail=True))
+            self.assertEqual((rc, out, text), (1, "", None))
+        rc, out, text = self.notify(HISTORY[-1], FakeGitHub(HISTORY, notified={10: (43798559034, 1, OK)}, jobs_fail=True))
+        self.assertEqual((rc, out, text), (1, "", None))
 
     def test_missing_secret_fails_the_post_step_and_sends_nothing(self):
         self.assertEqual(self.post("", (True, "200")), (1, []))
 
     def test_webhook_failure_and_rate_limit_fail_the_post_step(self):
-        for detail in ("HTTP 500", "HTTP 429", "URLError"):
+        for detail in ("HTTP 500", "HTTP 429", "URLError", "TimeoutError"):
             rc, posts = self.post("https://hook.example/x", (False, detail))
             self.assertEqual((rc, len(posts)), (1, 1), detail)
 
