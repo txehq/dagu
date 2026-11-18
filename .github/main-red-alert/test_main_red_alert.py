@@ -321,6 +321,17 @@ class Rule(unittest.TestCase):
         gh = FakeGitHub([self.G0, listed], attempts={(2, 1): "failure"})
         self.assertEqual(evaluate(dict(self.R1, run_attempt=1), gh), "alert")
 
+    def test_a_newer_run_beyond_the_first_page_supersedes(self):
+        # 100 ignored fork PR runs listed after a newer green push the green to page 2.
+        g = run(5, "success", "2026-01-02T12:00:00Z")
+        noise = [run(1000 + i, "failure", f"2026-01-03T00:{i // 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(100)]
+        self.assertIsNone(evaluate(self.R1, FakeGitHub([self.G0, self.R1, g, *noise])))
+        # And a stale green before a newer red on page 2 does not clear.
+        r = run(6, "failure", "2026-01-04T12:00:00Z")
+        noise = [run(2000 + i, "failure", f"2026-01-05T00:{i // 60:02d}:{i % 60:02d}Z", event="pull_request", repo="f/dagu") for i in range(100)]
+        gh = FakeGitHub([self.R1, self.G3, r, *noise], notified={10: (2, 1, OK)})
+        self.assertIsNone(evaluate(self.G3, gh))
+
     def test_unread_history_alerts_a_red_and_fails_a_green(self):
         self.assertEqual(evaluate(self.R1, FakeGitHub([], fail=True)), "alert")
         with self.assertRaises(m.ReadError):

@@ -188,6 +188,7 @@ class History:
         # This run's own earlier attempts come before this attempt.
         self.events.extend(attempt_events(run, self.attempt - 1, repo, token, get) if self.attempt > 1 else [])
         self.later_own = False
+        self.oldest_listed: tuple | None = None
 
     def _more(self) -> bool:
         if self.complete or self._page >= MAX_PAGES:
@@ -205,6 +206,10 @@ class History:
             raise ReadError("workflow runs listing has no workflow_runs array")
         self.complete = len(runs) < 100
         for r in runs:
+            # Every listed run, counted or not, tells how far back the read has reached.
+            rk = (r["created_at"], r["id"])
+            if self.oldest_listed is None or rk < self.oldest_listed:
+                self.oldest_listed = rk
             if r["id"] == self.run["id"]:
                 # The listing shows this run by its latest attempt. A later red or green attempt
                 # than the one being judged is a newer event.
@@ -221,9 +226,15 @@ class History:
         return True
 
     def newer(self) -> bool:
-        """Whether an event comes after this attempt: a later run, or a later attempt of it."""
-        if not self._page:
-            self._more()
+        """Whether an event comes after this attempt: a later run, or a later attempt of it.
+
+        Reads pages until the listing reaches back past this run (ignored runs, such as fork
+        pull requests from a branch named main, can push a newer counted run off page 1), or
+        until MAX_PAGES.
+        """
+        me = (self.run["created_at"], self.run["id"])
+        while (self.oldest_listed is None or self.oldest_listed >= me) and self._more():
+            pass
         return self.later_own or any(e.key > key(self.run, self.attempt) for e in self.events)
 
     def before(self):
