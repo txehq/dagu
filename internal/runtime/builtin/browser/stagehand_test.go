@@ -2310,6 +2310,56 @@ func TestStagehandWriteGateDecidesFromTheFirstPage(t *testing.T) {
 	assert.Equal(t, []string{"note"}, writes[0].Fields)
 }
 
+// A service worker a page registers starts and becomes ready under a write
+// gate and the runtime's own client, which both hold new workers until they
+// resume them. Chrome can hold such a worker before it fetches the worker's
+// script, and then answers no command on the worker until the DevTools gate
+// resumes it: a resume that waited for those answers never came, and the
+// worker never started (TXE-7832).
+func TestStagehandWriteGateLetsAServiceWorkerStart(t *testing.T) {
+	t.Parallel()
+	chrometest.Require(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sw.js" {
+			w.Header().Set("Content-Type", "text/javascript")
+			_, _ = io.WriteString(w, `self.addEventListener('install', () => self.skipWaiting());`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = io.WriteString(w, `<!doctype html><html><body><p>Worker</p><script>
+navigator.serviceWorker.register('/sw.js').then(() => navigator.serviceWorker.ready).then(() => { document.body.dataset.worker = 'ready'; });
+</script></body></html>`)
+	}))
+	t.Cleanup(server.Close)
+	launcher := stagehandLauncher{startGate: func(ctx context.Context, _ string, cfg writegate.Config) (*writegate.Handle, error) {
+		ready := make(chan writegate.Ready, 1)
+		failed := make(chan error, 1)
+		go func() {
+			failed <- writegate.Serve(context.WithoutCancel(ctx), cfg, func(r writegate.Ready) { ready <- r })
+		}()
+		select {
+		case r := <-ready:
+			return &writegate.Handle{URL: fmt.Sprintf("http://127.0.0.1:%d/%s", r.Port, cfg.Token)}, nil
+		case err := <-failed:
+			return nil, err
+		}
+	}}
+	var eng engine
+	err := withStartupSlot(func() (err error) {
+		eng, err = launcher.Launch(t.Context(), launchOptions{
+			Executable: chrometest.Path(), Headless: true, UserDataDir: browserProfileDir(t), NoSandbox: true, BrowserDir: testBrowserDir,
+			Generate: (&shopModel{}).generate, WriteGate: &writeGateOptions{Mode: writegate.ModeRehearse},
+		})
+		return err
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = eng.Close(context.WithoutCancel(t.Context())) })
+
+	require.NoError(t, eng.Goto(t.Context(), server.URL, time.Minute))
+	require.NoError(t, eng.WaitForSelector(t.Context(), "body[data-worker=ready]", 30*time.Second))
+}
+
 // serveRowForm serves a page built of frames whose form, in a frame, is laid
 // out in a table: each control is named only by the label cell of its row,
 // as forms of older sites are, two fields of a date range share one, and

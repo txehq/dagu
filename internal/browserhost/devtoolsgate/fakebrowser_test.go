@@ -98,13 +98,6 @@ type fakeBrowser struct {
 	// gate that closed the browser sees its process end and not only its
 	// pipe.
 	closing bool
-	// deferred are the sessions whose commands wait, in order, until
-	// Fake.releaseSession, as a worker's sessions wait for the worker's
-	// thread to start: commands on other sessions go on meanwhile, so the
-	// browser keeps no order between sessions. replay is what a release
-	// let go, handled next by serve.
-	deferred map[string][][]byte
-	replay   [][]byte
 }
 
 type fakeTarget struct {
@@ -169,7 +162,6 @@ func newFakeBrowser(in io.Reader, out io.Writer) *fakeBrowser {
 		inFlight:    make(map[string]*fakeRequest),
 		credentials: make(map[string]string),
 		root:        &fakeSession{browser: true},
-		deferred:    make(map[string][][]byte),
 	}
 	f.addTargetLocked("page", "about:blank", "blank")
 	return f
@@ -235,18 +227,6 @@ func (f *fakeBrowser) serve() error {
 			return err
 		}
 		f.handle(data[:len(data)-1])
-		for {
-			f.mu.Lock()
-			next := f.replay
-			f.replay = nil
-			f.mu.Unlock()
-			if len(next) == 0 {
-				break
-			}
-			for _, command := range next {
-				f.handle(command)
-			}
-		}
 		f.mu.Lock()
 		closing := f.closing
 		f.mu.Unlock()
@@ -307,10 +287,6 @@ func (f *fakeBrowser) handle(data []byte) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if queue, held := f.deferred[cmd.SessionID]; held && cmd.SessionID != "" && !strings.HasPrefix(cmd.Method, "Fake.") {
-		f.deferred[cmd.SessionID] = append(queue, append([]byte(nil), data...))
-		return
-	}
 	switch cmd.Method {
 	case "Browser.getVersion":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{
@@ -559,13 +535,6 @@ func (f *fakeBrowser) handle(data []byte) {
 		}
 		_ = json.Unmarshal(cmd.Params, &raw)
 		f.event(raw.SessionID, raw.Method, raw.Params)
-		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
-	case "Fake.deferSession":
-		f.deferred[str("sessionId")] = [][]byte{}
-		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
-	case "Fake.releaseSession":
-		f.replay = append(f.replay, f.deferred[str("sessionId")]...)
-		delete(f.deferred, str("sessionId"))
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Fake.state":
 		f.reply(cmd.ID, cmd.SessionID, f.stateLocked())

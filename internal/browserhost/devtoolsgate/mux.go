@@ -75,9 +75,6 @@ type pendingCommand struct {
 	clientID json.RawMessage
 	// onReply, when set, handles the reply in place of routing it.
 	onReply func(result json.RawMessage, cdpErr *cdpError)
-	// afterReply, when set, runs once the reply was routed to the client,
-	// with m.mu held.
-	afterReply func()
 	// closesBrowser marks a client's Browser.close, whose success means the
 	// browser is on its way out.
 	closesBrowser bool
@@ -410,9 +407,6 @@ func (m *mux) handleReplyLocked(msg message) {
 		return
 	}
 	p.client.deliverReply(p.clientID, msg)
-	if p.afterReply != nil {
-		p.afterReply()
-	}
 	if p.closesBrowser && len(msg.Error) == 0 && m.onBrowserClosing != nil {
 		m.onBrowserClosing()
 	}
@@ -1040,37 +1034,16 @@ func (m *mux) detachFromTargetLocked(c *client, msg message, sessionID string) {
 }
 
 // runIfWaitingLocked passes a client's Runtime.runIfWaitingForDebugger on to
-// its private session and counts it toward resuming the held target once
-// the browser answers it there.
-//
-// The gate resumes the target on its own session, and the browser keeps no
-// order between two sessions: a worker's sessions are each answered from
-// the worker's thread as it starts, so a resume sent at once can run the
-// worker before the setup the client sent ahead of its resume, such as
-// Network.enable, has taken effect (TXE-7832: a service worker's
-// first-statement socket went unreported). The browser answers one
-// session's commands in order, so the answer to this command means the
-// client's earlier commands on the session were applied.
+// its private session and counts it toward resuming the held target.
 func (m *mux) runIfWaitingLocked(c *client, msg message, sessionID string) {
+	m.forwardLocked(c, msg, sessionID)
 	t, ok := m.privateSessions[sessionID]
 	if !ok || t.private[c] != sessionID {
-		m.forwardLocked(c, msg, sessionID)
 		return
 	}
-	if _, waiting := t.waiting[c]; !waiting {
-		m.forwardLocked(c, msg, sessionID)
-		return
-	}
-	resume := func() {
-		if _, still := t.waiting[c]; !still || m.targets[t.id] != t {
-			return
-		}
+	if _, waiting := t.waiting[c]; waiting {
 		delete(t.waiting, c)
 		m.maybeResumeLocked(t)
-	}
-	if _, err := m.sendLocked(sessionID, msg.Method, msg.Params, &pendingCommand{client: c, clientID: msg.ID, afterReply: resume}); err != nil {
-		c.deliverError(msg.ID, sessionID, err.Error())
-		resume()
 	}
 }
 
