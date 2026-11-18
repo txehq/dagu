@@ -195,6 +195,12 @@ jobs:
       - name: Check Go version pins
         run: go test -count=1 ./internal/tools/gopin
 
+      # A pull_request type that fires on an unchanged head runs a workflow
+      # twice and cancels the first run (TXE-7841). It runs here, with no path
+      # gate, so a change to a workflow file alone is checked.
+      - name: Check workflow pull_request triggers
+        run: go test ./internal/tools/workflowtriggers -count=1
+
   # Lint Go code
   golint:
     name: Go Linter
