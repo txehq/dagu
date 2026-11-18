@@ -94,6 +94,12 @@ type fakeBrowser struct {
 	// targetParams records, in order, each Target command the gate passed
 	// on with its params as the browser received them: "<method> <params>".
 	targetParams []string
+	// keepsOffTheRecord makes Target.closeTarget fail for a page off the
+	// record, so a test can reach it after the gate tried to close it.
+	keepsOffTheRecord bool
+	// unnamedContext makes Target.getBrowserContexts name no default
+	// context, as an older browser's does.
+	unnamedContext bool
 	// failStart makes the browser exit before answering, as a browser
 	// that cannot adopt its pipes does.
 	failStart bool
@@ -121,6 +127,8 @@ type fakeTarget struct {
 	loaders map[string]bool
 	// worker is set for a target made by Fake.createWorker.
 	worker *fakeWorker
+	// context is the browser context the target runs in.
+	context string
 }
 
 // fakeWorker is a service worker starting the way Chrome starts one, as
@@ -223,9 +231,16 @@ func (f *fakeBrowser) interceptorsLocked() []*fakeSession {
 	return append([]*fakeSession{f.root}, f.sortedSessions()...)
 }
 
+// fakeOwnContext is the fake browser's own context, and
+// fakeOffTheRecordContext the one Fake.createOffTheRecord opens a page in.
+const (
+	fakeOwnContext          = "CTX-OWN"
+	fakeOffTheRecordContext = "CTX-OTR"
+)
+
 func (f *fakeBrowser) addTargetLocked(typ, url, title string) *fakeTarget {
 	f.nextTarget++
-	t := &fakeTarget{id: fmt.Sprintf("T%d", f.nextTarget), typ: typ, url: url, title: title}
+	t := &fakeTarget{id: fmt.Sprintf("T%d", f.nextTarget), typ: typ, url: url, title: title, context: fakeOwnContext}
 	f.targets[t.id] = t
 	f.rebuildLoadersLocked(t)
 	return t
@@ -250,7 +265,7 @@ func (f *fakeBrowser) newSessionLocked(targetID string, auto bool) *fakeSession 
 }
 
 func (f *fakeBrowser) targetInfo(t *fakeTarget) map[string]any {
-	return map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true}
+	return map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true, "browserContextId": t.context}
 }
 
 // serve answers commands until the pipe closes. It returns nil on EOF.
@@ -404,8 +419,15 @@ func (f *fakeBrowser) handle(data []byte) {
 			infos = append(infos, f.targetInfo(t))
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetInfos": infos})
-	case "Target.createTarget":
+	case "Target.createTarget", "Fake.createOffTheRecord":
 		t := f.addTargetLocked("page", str("url"), "new")
+		if id := str("browserContextId"); id != "" {
+			t.context = id
+		}
+		if cmd.Method == "Fake.createOffTheRecord" {
+			// A window a privileged page or worker opens off the record.
+			t.context = fakeOffTheRecordContext
+		}
 		if f.discover {
 			f.event("", "Target.targetCreated", map[string]any{"targetInfo": f.targetInfo(t)})
 		}
@@ -447,6 +469,10 @@ func (f *fakeBrowser) handle(data []byte) {
 		t, ok := f.targets[str("targetId")]
 		if !ok {
 			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		if f.keepsOffTheRecord && t.context == fakeOffTheRecordContext {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "Failed to close target")
 			return
 		}
 		for _, s := range f.sortedSessions() {
@@ -626,7 +652,11 @@ func (f *fakeBrowser) handle(data []byte) {
 	case "Target.createBrowserContext":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextId": "CTX1"})
 	case "Target.getBrowserContexts":
-		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{"CTX1"}})
+		if f.unnamedContext {
+			f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}})
+			return
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}, "defaultBrowserContextId": fakeOwnContext})
 	case "Target.disposeBrowserContext":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Target.getTargetInfo":
