@@ -85,8 +85,11 @@ true only for a branch ending in `-cancel`:
 
 The wrapper's own selection, applied to those payloads: runs 1–3 merge (newest run 3 success, no
 check run off green; while run 3 was pending, the newest was pending and refused); runs 1–6 refuse
-on run 4's cancelled check run, the old behaviour, which now happens only across a head change,
-where the cancelled run is on the previous head and is never read.
+on run 4's cancelled check run, the old behaviour. On a PR that now happens across a head change,
+where the cancelled run is on the previous head and is never read, and in one same-head case: a
+person re-running an earlier run of a `synchronize` event while a re-check is active. The re-run
+keeps its event's action, so it cancels the active run, and the wrapper refuses until that run is
+re-run. That costs a re-run, never a pass.
 
 So for a PR:
 
@@ -94,7 +97,9 @@ So for a PR:
   the connector's state as they are then. The run in progress finishes and keeps its verdict in its
   own suite. The wrapper takes the newest gate run on the exact head (`max_by(.run_number)`), so a
   pending or running re-check refuses, and an older success never stands in for a newer label or
-  base. It also re-runs main's check at the merge, which reads the labels again.
+  base. It also re-runs main's check at the merge, which reads the labels again. What is left is
+  the wrapper's stated residual window: a label removed in the seconds between that check and the
+  merge is not seen (merge.sh header, "Residual window").
 - **Several rapid re-checks**: the replaced pending run is cancelled before it starts and leaves no
   check run; the newest pending run carries the newest state. The newest gate run being cancelled,
   failed or missing refuses.

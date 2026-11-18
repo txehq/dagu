@@ -61,6 +61,8 @@ env:
 # takes the newest gate run on the exact head and refuses while it is pending or running, so an
 # older success never stands in for newer label or base state. Before TXE-7843 every event
 # cancelled the run in progress, and the cancelled check run on the same head refused the merge.
+# A re-run keeps its event's action: re-running an old synchronize run still cancels an active
+# re-check on the same head, which costs a re-run of that check, never a pass.
 concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
   cancel-in-progress: ${{ github.event.action == 'synchronize' }}
