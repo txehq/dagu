@@ -170,11 +170,12 @@ func rootWorker(typ string) bool {
 
 // withoutRootWorkers returns the params of a client's Target.setAutoAttach
 // with service and shared workers left out of its filter, ahead of the
-// client's own entries or the default.
-func withoutRootWorkers(raw json.RawMessage) json.RawMessage {
+// client's own entries or the default. Params that are not a JSON object
+// are refused (false), never passed on as they are.
+func withoutRootWorkers(raw json.RawMessage) (json.RawMessage, bool) {
 	var params map[string]json.RawMessage
-	if json.Unmarshal(raw, &params) != nil {
-		return raw
+	if json.Unmarshal(raw, &params) != nil || params == nil {
+		return nil, false
 	}
 	filter := append(targetFilter{
 		{Type: "service_worker", Exclude: true},
@@ -182,14 +183,14 @@ func withoutRootWorkers(raw json.RawMessage) json.RawMessage {
 	}, parseTargetFilter(raw)...)
 	encoded, err := json.Marshal(filter)
 	if err != nil {
-		return raw
+		return nil, false
 	}
 	params["filter"] = encoded
 	rewritten, err := json.Marshal(params)
 	if err != nil {
-		return raw
+		return nil, false
 	}
-	return rewritten
+	return rewritten, true
 }
 
 // workerBarrier is the command the gate sends on a waiting client's session
@@ -1143,7 +1144,12 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 		// up ("Worker holds").
 		// Every forwarded call is rewritten, whatever autoAttach parsed as
 		// here: the browser reads the params with its own parser.
-		msg.Params = withoutRootWorkers(msg.Params)
+		rewritten, ok := withoutRootWorkers(msg.Params)
+		if !ok {
+			c.deliverError(msg.ID, sessionID, "Target.setAutoAttach: invalid parameters")
+			return
+		}
+		msg.Params = rewritten
 		m.forwardLocked(c, msg, sessionID)
 		return
 	}

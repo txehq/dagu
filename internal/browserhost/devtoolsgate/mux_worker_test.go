@@ -267,3 +267,18 @@ func TestMuxClientAutoAttachRewriteIgnoresHowTheGateParsesIt(t *testing.T) {
 	createWorker(t, watcher, "T1")
 	pageClient.noEvent("Target.attachedToTarget", 300*time.Millisecond)
 }
+
+// Params that are not a JSON object are refused on a client's own session,
+// and the gate goes on serving: a null once crashed the rewrite of its
+// filter.
+func TestMuxClientAutoAttachWithParamsNotAnObjectIsRefused(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	pageClient := tg.dial("T1")
+	for _, params := range []any{json.RawMessage("null"), json.RawMessage("[]"), json.RawMessage(`"x"`)} {
+		_, err := pageClient.call("", "Target.setAutoAttach", params)
+		assert.Error(t, err)
+	}
+	pageClient.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	tg.state(pageClient)
+}
