@@ -60,7 +60,8 @@ the run in progress (`cancel-in-progress: true`), and the cancelled `codex-revie
 in its own check suite on that head, so the wrapper refused the merge until that run was re-run
 (PR #282, head `df1d4f7f`: run 766, `ready_for_review`, cancelled by run 767, `edited`). The
 wrapper is unchanged: it still judges every check run on the head on its own. The workflow changed
-instead: `cancel-in-progress` is true only for `synchronize`, a new head. Every other event waits.
+instead: `cancel-in-progress` is true only for a run whose event action is `synchronize` (a
+new head, or a re-run of such a run). Every other event waits.
 
 What GitHub does (docs, "Control the concurrency of workflows and jobs"): a run whose group already
 has one running "will be `pending`"; "any existing `pending` job or workflow in the same
@@ -96,8 +97,8 @@ So for a PR:
 - **An edit or label during a run** waits as `pending`, then runs and reads the labels, the base and
   the connector's state as they are then. The run in progress finishes and keeps its verdict in its
   own suite. The wrapper takes the newest gate run on the exact head (`max_by(.run_number)`), so a
-  pending or running re-check refuses, and an older success never stands in for a newer label or
-  base. It also re-runs main's check at the merge, which reads the labels again. What is left is
+  pending or running re-check it can see refuses: it blocks the older success. It also re-runs
+  main's check at the merge, which reads the labels again. What is left is
   the wrapper's stated residual window: a label removed in the seconds between that check and the
   merge is not seen (merge.sh header, "Residual window").
 - **Several rapid re-checks**: the replaced pending run is cancelled before it starts and leaves no
