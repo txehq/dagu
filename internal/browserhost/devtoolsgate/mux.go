@@ -72,10 +72,11 @@ import (
 // the root hold, on its own session, only once every waiting client's
 // barrier was answered. No step waits for a time to pass.
 //
-// One case stays as over a port: a client that asked for auto-attach on a
-// session it attached itself has the browser hold that session's children
-// for it, and its resume there is the browser's to release; the gate
-// forwards it as it is.
+// A client's auto-attach on a session it attached itself is the browser's,
+// kept for the client as over a port, and a hold there would be the
+// client's own, released by its resume alone. The gate leaves service and
+// shared workers out of that auto-attach's filter, so no client holds a
+// worker the gate holds.
 
 // outQueue is how many messages may wait for the pipe before a writer blocks.
 // The queue to the browser is unbounded: a client's command is never held
@@ -160,6 +161,30 @@ type target struct {
 // holds the gate releases as "Worker holds" describes.
 func rootWorker(typ string) bool {
 	return typ == "service_worker" || typ == "shared_worker"
+}
+
+// withoutRootWorkers returns the params of a client's Target.setAutoAttach
+// with service and shared workers left out of its filter, ahead of the
+// client's own entries or the default.
+func withoutRootWorkers(raw json.RawMessage) json.RawMessage {
+	var params map[string]json.RawMessage
+	if json.Unmarshal(raw, &params) != nil {
+		return raw
+	}
+	filter := append(targetFilter{
+		{Type: "service_worker", Exclude: true},
+		{Type: "shared_worker", Exclude: true},
+	}, parseTargetFilter(raw)...)
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		return raw
+	}
+	params["filter"] = encoded
+	rewritten, err := json.Marshal(params)
+	if err != nil {
+		return raw
+	}
+	return rewritten
 }
 
 // workerBarrier is the command the gate sends on a waiting client's session
@@ -558,6 +583,13 @@ func (m *mux) onAttachedLocked(msg message) {
 	// gets that session's children as its own, as the browser gives them.
 	if owner, ok := m.explicitSessions[msg.SessionID]; ok && msg.SessionID != "" {
 		m.explicitSessions[params.SessionID] = owner
+		if rootWorker(info.Type) {
+			// The filter the gate gave the client's auto-attach leaves
+			// workers out. Should the browser hold one for the client all
+			// the same, the client's resume is not passed on while the gate
+			// holds the worker: it then waits rather than runs unwatched.
+			m.explicitTargets[params.SessionID] = info.TargetID
+		}
 		owner.deliverEvent(msg.SessionID, "Target.attachedToTarget", msg.Params)
 		return
 	}
@@ -1074,7 +1106,14 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 	scope, ok := m.scopeOfLocked(c, sessionID)
 	if !ok {
 		// A session the client attached itself: the browser keeps that
-		// session's auto-attach for the client, as it would over a port.
+		// session's auto-attach for the client, as it would over a port,
+		// except for service and shared workers. A hold of the client's own
+		// on one would be released only by the client's resume, which would
+		// let the worker run before the clients the gate holds it for set it
+		// up ("Worker holds").
+		if params.AutoAttach {
+			msg.Params = withoutRootWorkers(msg.Params)
+		}
 		m.forwardLocked(c, msg, sessionID)
 		return
 	}

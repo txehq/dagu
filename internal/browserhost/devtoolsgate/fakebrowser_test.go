@@ -162,6 +162,8 @@ type fakeSession struct {
 	fetchAuth  bool
 	nestedAuto bool
 	nestedWait bool
+	// nestedFilter is the filter of the session's auto-attach.
+	nestedFilter targetFilter
 }
 
 // fakeChallenge is the authentication challenge a request meets at the
@@ -365,6 +367,7 @@ func (f *fakeBrowser) handle(data []byte) {
 			if s, ok := f.sessions[cmd.SessionID]; ok {
 				s.nestedAuto = boolean("autoAttach")
 				s.nestedWait = boolean("waitForDebuggerOnStart")
+				s.nestedFilter = parseTargetFilter(cmd.Params)
 			}
 			f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 			return
@@ -556,7 +559,7 @@ func (f *fakeBrowser) handle(data []byte) {
 		}
 		child := f.addTargetLocked(typ, "child://"+parent.id, "child")
 		for _, s := range f.sortedSessions() {
-			if s.targetID != parent.id || !s.nestedAuto {
+			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(typ) {
 				continue
 			}
 			cs := f.newSessionLocked(child.id, true)
@@ -586,7 +589,7 @@ func (f *fakeBrowser) handle(data []byte) {
 			})
 		}
 		for _, s := range f.sortedSessions() {
-			if s.targetID != parent.id || !s.nestedAuto {
+			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(w.typ) {
 				continue
 			}
 			cs := f.newSessionLocked(w.id, true)

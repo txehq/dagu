@@ -189,3 +189,31 @@ func TestMuxWorkerReleasedWhenAResumingClientLeaves(t *testing.T) {
 	log := pumpUntilRunning(t, tg, watcher, worker)
 	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker), "%v", log)
 }
+
+// A client's auto-attach on a session it attached itself is the browser's,
+// and so would be its hold on a worker, released by the client's resume
+// alone. The gate leaves workers out of it, so the client's resume cannot
+// let a worker the gate holds run before the clients it is held for set it
+// up. The automated security review of this change found the gap.
+func TestMuxClientAutoAttachOnItsOwnSessionHoldsNoWorker(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	pageClient, watcher := tg.dial("T1"), tg.dial("")
+	pageClient.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
+
+	worker := createWorker(t, watcher, "T1")
+	watched := workerSession(t, watcher, worker, "")
+	pageClient.noEvent("Target.attachedToTarget", 300*time.Millisecond)
+
+	watcher.send(watched.SessionID, "Network.enable", map[string]any{})
+	watcher.send(watched.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+	log := pumpUntilRunning(t, tg, watcher, worker)
+	assert.True(t, before(log, "Network.enable "+watched.SessionID+" on "+worker, "run "+worker), "%v", log)
+
+	// Other children still reach the client as the browser gives them.
+	pageClient.mustCall("", "Fake.createChild", map[string]any{"targetId": "T1", "type": "worker"})
+	child := decodeAttached(t, pageClient.waitEvent("Target.attachedToTarget", nil))
+	assert.Equal(t, "worker", child.TargetInfo.Type)
+	assert.True(t, child.WaitingForDebugger)
+}
