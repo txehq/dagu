@@ -399,7 +399,7 @@ func (s *Sessions) Open(ctx context.Context, opts SessionOptions) (OpenResult, e
 		}
 		defer lease.release()
 		userDataDir = lease.dir
-	} else if userDataDir, err = os.MkdirTemp("", "dagu-browser-"); err != nil {
+	} else if userDataDir, err = newProfileDir("dagu-browser-"); err != nil {
 		_ = store.Purge(id)
 		return OpenResult{}, fmt.Errorf("create browser profile directory: %w", err)
 	}

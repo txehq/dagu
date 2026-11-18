@@ -165,7 +165,7 @@ func (l stagehandLauncher) confirmUserAgent(ctx context.Context, opts launchOpti
 // profile of its own and without a proxy, to learn the user agent it sends
 // with one.
 func learnUserAgent(ctx context.Context, opts launchOptions, key string) (headedUserAgent, error) {
-	dir, err := os.MkdirTemp("", "dagu-browser-probe-")
+	dir, err := newProfileDir("dagu-browser-probe-")
 	if err != nil {
 		return headedUserAgent{}, fmt.Errorf("create browser profile directory: %w", err)
 	}

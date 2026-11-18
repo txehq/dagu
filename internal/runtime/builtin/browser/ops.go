@@ -824,7 +824,7 @@ func (r *run) launchOptions(ctx context.Context, recordID string) (launchOptions
 		opts.UserDataDir = lease.dir
 		return opts, nil
 	}
-	dir, err := os.MkdirTemp("", "dagu-browser-")
+	dir, err := newProfileDir("dagu-browser-")
 	if err != nil {
 		return launchOptions{}, fmt.Errorf("create browser profile directory: %w", err)
 	}

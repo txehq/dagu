@@ -30,6 +30,7 @@ import (
 
 	stagehand "github.com/browserbase/stagehand/packages/sdk-go/v4"
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/browserhost/writegate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 	"github.com/dagucloud/dagu/v2/internal/test/chrometest"
@@ -162,6 +163,7 @@ func browserProfileDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "dagu-browser-test-")
 	require.NoError(t, err)
+	require.NoError(t, devtoolsgate.ClaimProfile(dir))
 	t.Cleanup(func() {
 		var removeErr error
 		removed := assert.Eventually(t, func() bool {
@@ -1779,7 +1781,7 @@ func TestLaunchFailureSuggestsBrowserFlags(t *testing.T) {
 	_, err := stagehandLauncher{}.Launch(t.Context(), launchOptions{
 		Executable:  "/bin/false",
 		Headless:    true,
-		UserDataDir: t.TempDir(),
+		UserDataDir: browserProfileDir(t),
 	})
 	require.ErrorContains(t, err, "seccomp-chromium.json")
 	require.ErrorContains(t, err, "DAGU_BROWSER_SANDBOX=false")
@@ -1793,7 +1795,7 @@ func TestLaunchRefusesSilentSandboxOff(t *testing.T) {
 	_, err := stagehandLauncher{}.Launch(t.Context(), launchOptions{
 		Executable:  chrometest.Path(),
 		Headless:    true,
-		UserDataDir: t.TempDir(),
+		UserDataDir: browserProfileDir(t),
 	})
 	require.ErrorContains(t, err, "because CI is set")
 	require.ErrorContains(t, err, "DAGU_BROWSER_SANDBOX=false")
