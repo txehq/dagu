@@ -173,13 +173,18 @@ func TestANewCollectionConstantIsFound(t *testing.T) {
 	assert.Empty(t, withoutWriter(persisCollections(t)))
 	src, err := os.ReadFile(filepath.Join("..", "..", "persis", "collection.go"))
 	require.NoError(t, err)
-	added := strings.Replace(string(src), "const (\n", "const (\n\tCollectionAddedLater = \"added_later\"\n", 1)
-	require.NotEqual(t, string(src), added)
-	copyPath := filepath.Join(t.TempDir(), "collection.go")
-	require.NoError(t, os.WriteFile(copyPath, []byte(added), 0o600))
-	names := collectionsIn(t, copyPath)
-	assert.Contains(t, names, "added_later")
-	assert.Equal(t, []string{"added_later"}, withoutWriter(names))
+	// The checkout may have either line ending (CRLF on Windows); both are
+	// tried, whichever this one has.
+	lf := strings.ReplaceAll(string(src), "\r\n", "\n")
+	for name, text := range map[string]string{"lf": lf, "crlf": strings.ReplaceAll(lf, "\n", "\r\n")} {
+		added := strings.Replace(text, "const (", "const (\n\tCollectionAddedLater = \"added_later\"", 1)
+		require.NotEqual(t, text, added, name)
+		copyPath := filepath.Join(t.TempDir(), name+"-collection.go")
+		require.NoError(t, os.WriteFile(copyPath, []byte(added), 0o600))
+		names := collectionsIn(t, copyPath)
+		assert.Contains(t, names, "added_later", name)
+		assert.Equal(t, []string{"added_later"}, withoutWriter(names), name)
+	}
 }
 
 // backendPaths are the data directory's paths with the loader's defaults
