@@ -731,6 +731,106 @@ func TestGateSeesASocketAWorkerOpensAtStart(t *testing.T) {
 	assert.Equal(t, writegate.KindSocket, socket.Kind)
 }
 
+// The same, beside a client auto-attached at the root and on every page, as
+// a browser automation driver is, which resumes what it is given at once.
+// The DevTools gate then holds the worker under the page too, and Chrome
+// fetches the worker's script only once that hold is released, answering
+// nothing on the worker before; the driver's resume, or the release, can
+// also reach the worker before the write gate's watch. The worker must
+// start, and the gate must still see its first statement's socket
+// (TXE-6223).
+func TestGateSeesASocketAWorkerOpensAtStartBesideADriver(t *testing.T) {
+	t.Parallel()
+
+	s := startSite(t)
+	b := startBrowser(t)
+	controls, _, _ := guard(t, b, writegate.Policy{}, nil)
+	p := openPage(t, b)
+	attachDriver(t, b)
+	p.goTo(s.URL + "/")
+
+	p.eval(`navigator.serviceWorker.register('/sw-start.js').then(() => navigator.serviceWorker.ready).then(() => 'ready')`)
+	if !assert.Eventually(t, func() bool {
+		_, ok := find(events(t, controls), "/ws?from=start")
+		return ok
+	}, 10*time.Second, 50*time.Millisecond) {
+		t.Fatalf("the gate recorded no socket from the worker's first statement; the site received %d", s.startSocket.Load())
+	}
+}
+
+// attachDriver connects a client that asks for auto-attach, with
+// waitForDebuggerOnStart, at the root and on every page it is given, and
+// resumes every target at once.
+func attachDriver(t *testing.T, b *browser) {
+	t.Helper()
+	wsURL, err := browserhost.BrowserID(t.Context(), b.cdpURL)
+	require.NoError(t, err)
+	conn, response, err := websocket.Dial(t.Context(), wsURL, nil)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	require.NoError(t, err)
+	conn.SetReadLimit(-1)
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	var next atomic.Int64
+	send := func(session, method string, params map[string]any) int64 {
+		id := next.Add(1)
+		command := map[string]any{"id": id, "method": method, "params": params}
+		if session != "" {
+			command["sessionId"] = session
+		}
+		data, _ := json.Marshal(command)
+		_ = conn.Write(context.WithoutCancel(t.Context()), websocket.MessageText, data)
+		return id
+	}
+	waitForDebugger := map[string]any{"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}
+	// subscribed closes once the driver's auto-attach on a page was
+	// answered: the page's next worker is then held under it too.
+	subscribed := make(chan struct{})
+	var pageSubscriptions sync.Map
+	var once sync.Once
+	go func() {
+		for {
+			_, data, err := conn.Read(context.WithoutCancel(t.Context()))
+			if err != nil {
+				return
+			}
+			var m struct {
+				ID     int64  `json:"id"`
+				Method string `json:"method"`
+				Params struct {
+					SessionID  string `json:"sessionId"`
+					TargetInfo struct {
+						Type string `json:"type"`
+					} `json:"targetInfo"`
+					Waiting bool `json:"waitingForDebugger"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(data, &m) != nil {
+				continue
+			}
+			if _, ok := pageSubscriptions.Load(m.ID); ok && m.Method == "" {
+				once.Do(func() { close(subscribed) })
+			}
+			if m.Method != "Target.attachedToTarget" {
+				continue
+			}
+			if m.Params.TargetInfo.Type == "page" {
+				pageSubscriptions.Store(send(m.Params.SessionID, "Target.setAutoAttach", waitForDebugger), true)
+			}
+			if m.Params.Waiting {
+				send(m.Params.SessionID, "Runtime.runIfWaitingForDebugger", map[string]any{})
+			}
+		}
+	}()
+	send("", "Target.setAutoAttach", waitForDebugger)
+	select {
+	case <-subscribed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the driver's auto-attach on a page got no answer")
+	}
+}
+
 func TestGateCutsLargeBodies(t *testing.T) {
 	t.Parallel()
 
