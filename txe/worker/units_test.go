@@ -155,7 +155,7 @@ func TestUnitsMatchTheMacAgents(t *testing.T) {
 		"--max-bytes", "67108864", "--backups", "10", "--kill-timeout", "90", "--",
 		home + "/bin/dagu", "worker", "--worker.id", agentsMachine,
 		"--worker.labels", "txe.machine=" + agentsMachine + ",txe.owner=" + agentsOwner,
-		"--worker.coordinators", "127.0.0.1:50055"}, worker.argv)
+		"--worker.health-port", "0", "--worker.coordinators", "127.0.0.1:50055"}, worker.argv)
 	// The macOS tunnel agent's, without the supervisor between the wrapper's "--" and kubectl's.
 	cut = slices.Index(macTunnel, "--")
 	require.Positive(t, cut)

@@ -102,6 +102,9 @@ def write_units(units, home, kubectl, machine_id, owner_id, path, tunnel_unit, w
         f"{home}/bin/dagu", "worker",
         "--worker.id", machine_id,
         "--worker.labels", f"txe.machine={machine_id},txe.owner={owner_id}",
+        # No health server: dagu would otherwise listen on *:8092 (every interface, no auth),
+        # and nothing an install runs reads it (TXE-7850). 0 disables it; it does not pick a port.
+        "--worker.health-port", "0",
         *(["--worker.hub-url", hub_url] if hub_url else ["--worker.coordinators", f"127.0.0.1:{coord_port}"])]),
         environment)
     os.makedirs(units, exist_ok=True)

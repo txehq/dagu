@@ -259,7 +259,7 @@ func TestSystemdLifecycle(t *testing.T) {
 		assert.Equal(t, "active", l.state(l.worker))
 		assert.Equal(t, []string{"worker", "--worker.id", agentsMachine,
 			"--worker.labels", "txe.machine=" + agentsMachine + ",txe.owner=" + agentsOwner,
-			"--worker.coordinators", "127.0.0.1:50055"}, l.h.lines(t, "worker.args"), "systemd passed the arguments as written")
+			"--worker.health-port", "0", "--worker.coordinators", "127.0.0.1:50055"}, l.h.lines(t, "worker.args"), "systemd passed the arguments as written")
 		assert.Equal(t, []string{l.h.home + "/worker-home"}, l.h.lines(t, "worker.home"))
 		// The wrapper is the unit's main process; the worker and its step, in a process group
 		// of its own, are in the unit's control group, which is what systemd cleans up.
