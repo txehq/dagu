@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [base, fix]
+        variant: [fix]
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -64,7 +64,7 @@ jobs:
           ) &
           load=$!
           status=0
-          go test -timeout=40m -count=12 -v -run '^(TestAttendedBrowserOutlivesTheUnattendedCap|TestGateSeesASocketAWorkerOpensAtStart|TestBrowserWithOnlyItsWriteGateEndsWhenUnattended)$' ./internal/browserhost/writegate 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|gate_test.go' || status=1
+          go test -timeout=40m -count=30 -v -run '^(TestAttendedBrowserOutlivesTheUnattendedCap|TestGateSeesASocketAWorkerOpensAtStart|TestBrowserWithOnlyItsWriteGateEndsWhenUnattended)$' ./internal/browserhost/writegate 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|gate_test.go' || status=1
           go test -timeout=20m -count=12 -v -run '^(TestSoakStagehandKillLatency|TestStagehandReportsBrowserProcess)$' ./internal/runtime/builtin/browser 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|stagehand_test.go' || status=1
           go test -timeout=20m -count=25 -v -run '^(TestSoakActAlonePhases|TestOpenElementsCloses)$' ./internal/desktop 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|elements_windows_test.go|in chain' || status=1
           kill "${load}" 2>/dev/null || true
@@ -115,7 +115,7 @@ jobs:
           ) &
           load=$!
           status=0
-          go test -race -timeout=40m -count=40 -v -run '^(TestGateSeesASocketAWorkerOpensAtStart|TestGateRefusesSockets)$' ./internal/browserhost/writegate 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|gate_test.go' || status=1
+          go test -race -timeout=40m -count=120 -v -run '^(TestGateSeesASocketAWorkerOpensAtStart|TestGateRefusesSockets)$' ./internal/browserhost/writegate 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|gate_test.go' || status=1
           go test -race -timeout=20m -count=8 -v -run '^(TestSoakStagehandKillLatency|TestStagehandReportsBrowserProcess)$' ./internal/runtime/builtin/browser 2>&1 | grep -E 'TXE7832-SOAK|^(--- |ok|FAIL|panic)|stagehand_test.go' || status=1
           kill "${load}" 2>/dev/null || true
           exit "${status}"

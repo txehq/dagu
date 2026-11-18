@@ -95,6 +95,12 @@ func fakeElement(hr hresult) *element {
 
 // The automation client opens in any session and its thread ends on
 // Close.
+//
+// The pattern call names an element with no place and no path, so it is not
+// found without reading any window: a path would be looked for in the window
+// in front, which on a runner belongs to another process and answered in
+// 70 ms when measured, and once in more than 5 s (TXE-7832). The search
+// itself is covered by the desktop end-to-end tests, on windows they open.
 func TestOpenElementsCloses(t *testing.T) {
 	t.Parallel()
 
@@ -102,7 +108,7 @@ func TestOpenElementsCloses(t *testing.T) {
 	require.NoError(t, err)
 	_, err = els.FrontWindow()
 	require.NoError(t, err)
-	err = els.Apply(Element{Role: RoleButton, Name: "nope", Path: []PathStep{{Role: RoleButton, Name: "nope"}}}, PatternInvoke, "")
+	err = els.Apply(Element{Role: RoleButton, Name: "nope"}, PatternInvoke, "")
 	assert.ErrorIs(t, err, ErrNotFound, "a pattern call runs with a client of its own")
 	require.NoError(t, els.Close())
 	require.NoError(t, els.Close(), "closing twice is harmless")
