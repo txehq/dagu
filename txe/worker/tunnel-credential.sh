@@ -42,8 +42,19 @@ ca="$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name==\"$cluster\")]
 [ -n "$server" ] || die "context $ctx has no cluster server"
 
 umask 077
-mkdir -p "$TXE_DAGU_HOME/tunnel"
-out="$TXE_DAGU_HOME/tunnel/kubeconfig"
+tdir="$TXE_DAGU_HOME/tunnel"
+mkdir -p "$tdir"
+# The token is written only into a directory this user owns and no one else can
+# write: there, no other account can swap the candidate for a link or read it.
+# A directory that is a link, not this user's, or writable by group or others is
+# refused before any token is asked for (TXE-7864).
+if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
+  die "$tdir is not a directory this user owns (or it is a symbolic link); refusing to write a credential there"
+fi
+if [ -n "$(find "$tdir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ]; then
+  die "$tdir is writable by group or others; refusing to write a credential there (chmod 700 it)"
+fi
+out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves
 # the tunnel on the credential it already had.
@@ -52,14 +63,21 @@ cand="$(mktemp "$out.XXXXXX")"
 # a best-effort cleanup (TXE-7864, the rule of txe's TXE-7858): when its removal
 # fails, or its absence cannot be proved, the script fails, and an earlier
 # failure keeps its own status. Absence is proved, never inferred from rm's
-# status: the parent can be searched and holds no entry by that name. The
-# message names the path only, never the token or the file's contents.
+# status: the parent can be searched and holds no entry by that name. A path
+# that became a symbolic link or a file of another account is reported too: its
+# link is removed, never followed, and the run fails. The candidate and its
+# .expires are one pair, checked and reported together. The message names the
+# path only, never the token or the file's contents.
 cand_absent() {
   [ -d "${1%/*}" ] && [ -x "${1%/*}" ] && [ ! -e "$1" ] && [ ! -L "$1" ]
 }
 cleanup() {
   local p
   for p in "$cand" "$cand.expires"; do
+    if [ -L "$p" ] || { [ -e "$p" ] && [ ! -O "$p" ]; }; then
+      printf 'txe-dagu: FATAL: %s (a tunnel credential candidate) was replaced by a symbolic link or a file of another account; it was not written through, and only that entry is removed\n' "$p" >&2
+      [ "${RC:-0}" -ne 0 ] || RC=1
+    fi
     if ! rm -f -- "$p" || ! cand_absent "$p"; then
       printf 'txe-dagu: FATAL: %s (a token-bearing tunnel credential candidate) may still be on disk: its removal failed or its absence could not be verified (rm'"'"'s error, if any, is above); remove it\n' "$p" >&2
       [ "${RC:-0}" -ne 0 ] || RC=1
@@ -72,7 +90,7 @@ trap 'RC=$?; set +e; cleanup; exit "$RC"' EXIT
 # never in an argument, an environment variable or the terminal.
 kubectl --context "$ctx" -n "$TXE_DAGU_NAMESPACE" create token "$TXE_DAGU_TUNNEL_SA" --duration "$duration" \
   | python3 -I -c '
-import base64, json, os, sys
+import base64, json, os, stat, sys
 out, server, ca, ns = sys.argv[1:]
 token = sys.stdin.read().strip()
 if not token:
@@ -89,10 +107,24 @@ config = {
                   "context": {"cluster": "txe-dagu", "user": "dagu-tunnel", "namespace": ns}}],
     "current-context": "txe-dagu-tunnel",
 }
-os.chmod(out, 0o600)
-with open(out, "w") as f:
+# The candidate is the private file mktemp made: never followed if it became a
+# link, and refused unless it is a regular file of this user, with one link and
+# no access for group or others. Its .expires is created new, never reused.
+try:
+    fd = os.open(out, os.O_WRONLY | os.O_NOFOLLOW)
+except OSError:
+    sys.exit("txe-dagu: the credential candidate is not the file this run made; refusing to write the credential")
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077:
+    sys.exit("txe-dagu: the credential candidate is not a private file of this user; refusing to write the credential")
+os.ftruncate(fd, 0)
+with os.fdopen(fd, "w") as f:
     json.dump(config, f)
-with open(out + ".expires", "w") as f:
+try:
+    efd = os.open(out + ".expires", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except OSError:
+    sys.exit("txe-dagu: the credential candidate'"'"'s .expires already exists; refusing to reuse it")
+with os.fdopen(efd, "w") as f:
     f.write(str(claims.get("exp", "")) + "\n")
 ' "$cand" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
 
@@ -102,7 +134,13 @@ kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --s
 if kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i get secrets >/dev/null 2>&1; then
   die "the new credential can read Secrets; the dagu-tunnel Role is wider than intended; kept the previous one"
 fi
+# The kubeconfig and its .expires are a pair: when the second move fails, the
+# live .expires would name the old credential's expiry, so it is removed and
+# the run fails rather than leave the pair disagreeing.
 mv -f "$cand" "$out"
-mv -f "$cand.expires" "$out.expires"
+if ! mv -f "$cand.expires" "$out.expires"; then
+  rm -f -- "$out.expires"
+  die "the new credential is in $out, but its expiry record could not be moved beside it; $out.expires was removed so that status.sh does not report the old expiry; run this script again"
+fi
 printf 'wrote %s (expires %s)\n' "$out" \
   "$(date -r "$(cat "$out.expires")" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
