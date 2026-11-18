@@ -21,8 +21,16 @@
 #      status on that head to be finished and green: success, skipped or neutral; pending, missing reads, failure,
 #      cancelled, timed out or action required refuse. Path-filtered workflows that did not match
 #      the PR have no run, and that is not a failure;
-#   4. re-runs main's codex-review-check.sh at that head, with no wait and never in fixture mode;
-#   5. merges with --match-head-commit, so GitHub refuses the merge if the head moved after 1-4.
+#   4. re-runs main's codex-review-check.sh at that head, with no wait and never in fixture mode,
+#      bracketed by two reads of the PR (state, head, base name and sha, sorted labels): one just
+#      before the check, one as the last read before the merge (TXE-7847);
+#   5. as the last calls before the merge, re-reads main's codex-review runs on the head and the PR,
+#      and refuses when a gate run newer than the one judged in 2 exists (a label, an edit or a
+#      re-run starts one; matched by id, run number and attempt), when that run is no longer
+#      completed/success, or when the PR differs from the read before the check (a label added or
+#      removed, review-override included, a retarget); a re-read that fails refuses; it prints the
+#      snapshot it merges on (head, base, labels, the judged gate run);
+#   6. merges with --match-head-commit, so GitHub refuses the merge if the head moved after 1-5.
 #
 # The merge method (TXE-6221). The default is a squash, as it always was. A squash keeps the tree
 # and drops the history, which is right for a PR made of its author's own commits and wrong for a
@@ -40,11 +48,25 @@
 #     main's, and its parents must be exactly main's current tip and the expected ancestor, so a
 #     main that moved, a wrong parent or any file change refuses. A head with main's tree is
 #     accepted only this way; `--repair` with a changed tree is refused.
-# None of this bypasses anything: both methods run the same checks 1-4 and merge with
+# None of this bypasses anything: both methods run the same checks 1-5 and merge with
 # --match-head-commit. There is no flag that skips a check.
 #
-# Residual window, stated rather than hidden: a connector review or a run that changes on the SAME
-# head in the seconds between 4 and 5 is not seen; run this once the connector's state is final.
+# Steps 4-5 REDUCE stale-state exposure; they do not make the merge atomic with what was checked.
+# Residual window, stated rather than hidden. GitHub's merge call binds the head
+# (--match-head-commit) and nothing else: no label, no base, no check run. So a change made after
+# the last reads of 5 is not seen. For the labels and the base that is from the moment GitHub
+# answers the PR read to the moment it performs the merge: the rest of that call, then
+# `gh pr merge`'s own PR lookup and its merge mutation. For the gate's runs it starts one read
+# earlier. Measured from a Mac on 2026-11-19, each of those calls (the gate-runs read, the PR read,
+# a `gh pr view` lookup) took 0.7-1.5 s, so the window is roughly 2-3 s for the labels and base and
+# 3-4 s for the gate's runs. Nothing here bounds it: a slow call widens it. A label change is also
+# only as visible as GitHub's API makes it at the moment of the read. A connector review or a
+# check run that changes on the SAME head after the check (4) is not re-read: only the gate's own
+# run is; run this once the connector's state is final.
+# The PR's base sha is the one GitHub records on the PR (it does not follow pushes to the base), so
+# it is recorded, not compared; a retarget is caught by the base name. The live tip of a maintenance base
+# (or of main, for a repair) is read once more just before 5, so its window is 5's two reads longer
+# than the labels': roughly 4-5 s; a move in it is caught only by the readback after the merge.
 # --match-head-commit pins the PR's head, not main: there is no atomic check of main's tip against
 # the merge. For a repair, main's tip is re-read as the last call before the merge and a moved main
 # refuses, but a move in the seconds after that read is merged by GitHub onto the new tip. So the
@@ -56,11 +78,12 @@
 # nothing is retried or rewritten, and the person reads main.
 #
 # Maintenance bases (TXE-7556). `--base maint/txe-v<upstream>-<n> --base-sha <40-hex>` merges a PR
-# into a declared maintenance branch instead of main, under the same checks 1-5, each made against
+# into a declared maintenance branch instead of main, under the same checks 1-6, each made against
 # THAT base's tip, and these in addition:
 #   - the base is named exactly (maint/txe-v<x.y.z>-<n>), and the PR's base is that name;
-#   - the base's tip is <base-sha> when it is read first and again as the last read before the
-#     merge, so the merge is bound to the base the caller reviewed as well as to the head;
+#   - the base's tip is <base-sha> when it is read first and again as its last read before the
+#     merge (only the gate's runs and the PR are read after it, step 5), so the merge is bound to
+#     the base the caller reviewed as well as to the head;
 #   - the base's .github/workflows/codex-review.yml is main's byte for byte: pull_request_target
 #     runs the BASE's copy of the gate workflow, so a maintenance base cannot carry a gate of its own;
 #   - the codex-review run on the head names this PR on this base (its pull_requests entry);
@@ -260,21 +283,89 @@ $bad"
 read -r cstate ccount <"$tmp/status.tsv" || unread "the commit status of $want (no fields)"
 [ "$ccount" = 0 ] || [ "$cstate" = success ] || refuse "the combined commit status of $want is $cstate"
 
+# The gate run judged above: the newest codex-review run on the head, by its identity. Every gate
+# run read must carry a whole-number id, run number and attempt: a record without one cannot be
+# told apart from another ("null null null" would equal itself) or ordered, so it is a read failure.
+gate_id='"\(.id) \(.run_number) \(.run_attempt)"'
+gate_ids_whole='[.[] | select(((.path // "") | sub("@.*$"; "")) == ".github/workflows/codex-review.yml" and .event == "pull_request_target")]
+  | all(.[]; all(.id, .run_number, .run_attempt; type == "number" and . >= 1 and . == floor))'
+jq -s -e "$gate_ids_whole" "$tmp/runs.jsonl" >/dev/null 2>&1 \
+  || unread "the codex-review runs on $want (a run without a whole-number id, run number or attempt)"
+judged="$(jq -s -r "$gate_runs | $gate_id" "$tmp/runs.jsonl")"
+
+# ── The state main's check reads, bracketed (TXE-7847) ──
+# The PR as one line: state, draft, head, base name and sha, and the sorted label names. Read just
+# before the check and again as the last read before the merge; a difference in the state, draft
+# flag, head, base NAME or labels refuses, so a label added or removed (review-override included) or
+# a retarget while the check ran or after it is not merged on the earlier read.
+# The PR's base sha is read, shape-checked and recorded, but not compared: GitHub records it on the
+# PR and does not move it when the base branch moves (PR #282 kept 63309e62e after two merges to main,
+# read 2026-11-19), so it is not a live view of the base. On main, comparing it adds no safety (the
+# merge lands on main's current tip whatever it says) and would refuse only on an unrelated PR event.
+# On a maintenance base the live tip is the guard: it must still be --base-sha just before the merge.
+# Nothing is defaulted in the projection: a missing field stays null and the shape check below
+# refuses it, so two partial answers never compare equal while hiding what changed.
+pull_state='{state, draft, head: .head.sha, base: .base.ref, base_sha: .base.sha, labels: (if (.labels | type) == "array" then [.labels[] | .name] | sort else .labels end)} | tojson'
+read_pull_state() { # <out file> <what>
+  gh api "repos/$repo/pulls/$pr" --jq "$pull_state" >"$1" || unread "$2"
+  jq -s -e 'length == 1 and (.[0] | type == "object"
+    and (.state | type) == "string" and (.draft | type) == "boolean"
+    and (.head | type) == "string" and (.head | test("^[0-9a-f]{40}$"))
+    and (.base | type) == "string" and (.base | length) > 0
+    and (.base_sha | type) == "string" and (.base_sha | test("^[0-9a-f]{40}$"))
+    and (.labels | type) == "array" and all(.labels[]; type == "string"))' "$1" >/dev/null 2>&1 \
+    || unread "$2 (not one PR object with a state, draft flag, head and base sha, base name and label names)"
+}
+read_pull_state "$tmp/pull-before.json" "PR #$pr's labels and base before main's check"
+jq -e --arg h "$want" --arg b "$want_base" '.state == "open" and .draft == false and .head == $h and .base == $b' \
+  "$tmp/pull-before.json" >/dev/null || refuse "PR #$pr changed before main's check: $(cat "$tmp/pull-before.json")"
+
 # Never fixture mode: an inherited CODEX_REVIEW_FIXTURE_DIR would judge local files and merge the live PR.
 env -u CODEX_REVIEW_FIXTURE_DIR GH_REPO="$repo" PR_NUMBER="$pr" CODEX_REVIEW_WAIT_SECONDS=0 bash "$tmp/check.sh" \
   || refuse "main's codex-review check does not pass on $want"
 
+# The last reads before every merge call below (TXE-7847): the gate's runs on the head, then the PR.
+# A gate run newer than the judged one (a label, an edit or a re-run starts one), a newest run that
+# is not completed/success, or any change to the PR's line above refuses. A read that fails refuses
+# (exit 2). This narrows the window to these reads and the merge call; it does not close it.
+final_reread() {
+  gh api --paginate "repos/$repo/actions/workflows/codex-review.yml/runs?head_sha=$want&event=pull_request_target&per_page=100" \
+    --jq '.workflow_runs[]' >"$tmp/runs-last.jsonl" || unread "the codex-review runs on $want before the merge"
+  jq -s -e 'all(.[]; type == "object")' "$tmp/runs-last.jsonl" >/dev/null 2>&1 \
+    || unread "the codex-review runs on $want before the merge (not objects)"
+  # This endpoint answers only the gate's own runs for this event, so every record must be one, with a
+  # whole identity: a record that cannot be shown to be a gate run is a failed read, never dropped.
+  jq -s -e 'all(.[]; ((.path // "") | sub("@.*$"; "")) == ".github/workflows/codex-review.yml" and .event == "pull_request_target"
+      and all(.id, .run_number, .run_attempt; type == "number" and . >= 1 and . == floor))' "$tmp/runs-last.jsonl" >/dev/null 2>&1 \
+    || unread "the codex-review runs on $want before the merge (a run that is not plainly a codex-review pull_request_target run with a whole-number id, run number and attempt)"
+  local last lastgate
+  last="$(jq -s -r "$gate_runs | $gate_id" "$tmp/runs-last.jsonl")"
+  lastgate="$(jq -s -r "$gate_runs"' | "\(.status) \(.conclusion)"' "$tmp/runs-last.jsonl")"
+  [ "$last" = "$judged" ] || refuse "the newest codex-review run on $want is now '${last:-missing}' (id, number, attempt), not the judged '$judged' ($lastgate): a newer run started after the check; re-run this once it has finished"
+  [ "$lastgate" = "completed success" ] || refuse "the judged codex-review run on $want is now '${lastgate:-missing}', not completed success"
+  read_pull_state "$tmp/pull-last.json" "PR #$pr's labels and base before the merge"
+  jq -S -c 'del(.base_sha)' "$tmp/pull-before.json" >"$tmp/pull-before.cmp" || unread "PR #$pr's state line before main's check"
+  jq -S -c 'del(.base_sha)' "$tmp/pull-last.json" >"$tmp/pull-last.cmp" || unread "PR #$pr's state line before the merge"
+  cmp -s "$tmp/pull-before.cmp" "$tmp/pull-last.cmp" \
+    || refuse "PR #$pr changed after main's check (labels or base): was $(cat "$tmp/pull-before.json"), now $(cat "$tmp/pull-last.json")"
+  # The snapshot this merge is made on, recorded: what was checked, not a guarantee that it held.
+  # printf, never echo: an echo with xpg_echo set would expand a backslash escape in a label name.
+  printf '%s\n' "merge.sh: merging on the state read just now: PR #$pr head $want, base $(jq -r .base "$tmp/pull-last.json") (PR base sha $(jq -r .base_sha "$tmp/pull-last.json"); checked against $bn tip $basetip), labels $(jq -c .labels "$tmp/pull-last.json"), codex-review run $judged (id number attempt) $lastgate, main's check at $maintip"
+}
+
 if [ "$method" = squash ] && [ "$maint" = false ]; then
+  final_reread
   gh pr merge "$pr" -R "$repo" --squash --match-head-commit "$want"
   exit 0
 fi
 merged_but() { echo "merge.sh: PR #$pr was merged, but $*; check $bn by hand" >&2; exit 1; }
 if [ "$maint" = true ]; then
-  # The last read before the merge: the base must still be the tip the caller named. A move after
-  # this read is judged by the readback (not an atomic check, stated above).
+  # The base tip's last read before the merge (only final_reread's two reads follow): it must still
+  # be the tip the caller named. A move after this read is judged by the readback (not atomic).
   read_tip "$want_base" "$tmp/base2.sha" "$bn's tip before the merge"
   read -r basetip2 <"$tmp/base2.sha"
   [ "$basetip2" = "$base_sha" ] || refuse "$bn moved from $base_sha to $basetip2 while the PR was checked; review the PR against the new tip and pass it as --base-sha"
+  final_reread
   gh pr merge "$pr" -R "$repo" --squash --match-head-commit "$want"
   # Readback: the squash is one commit whose only parent is the base tip the checks were made on.
   gh api "repos/$repo/pulls/$pr" --jq '[.merged, .merge_commit_sha] | @tsv' >"$tmp/merged.tsv" || merged_but "its merge commit could not be read"
@@ -288,12 +379,13 @@ if [ "$maint" = true ]; then
   exit 0
 fi
 if [ "$repair" = true ]; then
-  # The last read before the merge: a main that moved is refused here; a move after this read is
+  # Main's last tip read before the merge (only final_reread's two reads follow): a moved main is refused here; a move after this read is
   # judged by the readback below. Neither is an atomic check (stated above).
   gh api "repos/$repo/branches/main" --jq .commit.sha >"$tmp/main2.sha" || unread "main's tip before the merge"
   read -r maintip2 <"$tmp/main2.sha" || unread "main's tip before the merge (empty)"
   [ "$maintip2" = "$maintip" ] || refuse "main moved from $maintip to $maintip2 while the repair was checked; rebuild the repair on its tip"
 fi
+final_reread
 gh pr merge "$pr" -R "$repo" --merge --match-head-commit "$want"
 
 # ── Readback: the merge commit exists, reaches the expected ancestor and, for a repair, kept the tree ──
