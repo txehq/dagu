@@ -21,7 +21,10 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
+	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis/file/dagrun"
+	"github.com/dagucloud/dagu/v2/internal/publicwebhook"
+	"github.com/dagucloud/dagu/v2/internal/schedulerstate"
 )
 
 // recordLockDirectoryName is the file collection's per-record lock
@@ -152,6 +155,9 @@ type rule struct {
 	// check, when set, reads a file the rule retains and refuses one its
 	// writer would not have written.
 	check func(name string, data []byte) error
+	// lock marks a lock directory: excluded when it has exactly the shape
+	// its writer gives it, and blocking unread when it has any other.
+	lock bool
 }
 
 func (r *rule) matches(name string) bool {
@@ -308,6 +314,212 @@ var hubDataRules = []rule{
 		{pattern: regexp.MustCompile(`^[0-9a-f]{64}(-[0-9a-f]{32})?\.json$`), kind: kindFile, policy: PolicyMutable, check: preparationEntry},
 		{pattern: regexp.MustCompile(`^[0-9a-f]{64}(-[0-9a-f]{32})?\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
 	}},
+	// The collections the file backend gained after the release before
+	// them (F, 4d164866), classified file by file (TXE-7830). Each file must
+	// decode strictly as the type its one writer stores, so a field, a name
+	// or a file that writer would not produce blocks unread; a refusal names
+	// the file and the type, never a value from it. Beside each record the
+	// collection may hold the temporary file a record is written through
+	// (fileutil.WriteFileAtomic: "<name>.tmp.<n>"), which is operational, and
+	// its record locks, excluded in the lock shape only.
+	//
+	// What may be in them, as far as the writers' source and the tests show
+	// (internal/publicwebhook TestStoredStatusAndLogsHoldNoSecret, the
+	// TXE-7830 start test): a public URL's token, its sender's signing
+	// secret and a webhook's HMAC secret are stored, encrypted, only in the
+	// webhooks collection, never read here; the encryption key is under
+	// auth/, never read; no writer stores a delivery's body or a header
+	// value. One exception is not excluded: a delivery whose run cannot
+	// start logs the run's own validation error, which can quote what the
+	// delivery's params hold, so a delivery log can hold sender-supplied
+	// data. The scan never emits it: these files are inventoried as digest,
+	// size and mode only, and a refusal never quotes a stored value.
+	//
+	// Rollback to F. F has no reader or writer for any of the four and none
+	// of its startup, cleanup or prune paths reaches them (its removals are
+	// confined to dag-runs, run work directories, tools, browser and
+	// workspace-bundle scratch and its own staging), so a rollback leaves
+	// them exactly as they are and a later start of a release that reads them
+	// resumes from them. Two limits follow, an operational one and a
+	// security one; neither is repaired by the scan or by F:
+	//
+	//   - Operational: F's own continuity scanner does not know them, so an
+	//     inventory taken with F's tool blocks on them as unclassified_area
+	//     unless a keep manifest names them (DecodeKeep, which F has).
+	//   - Security: while F runs, nothing holds the relay connection, so
+	//     the relay keeps every public URL C last sent, and they stay
+	//     public: a request to one is queued at Dagu Cloud (up to 7 days and
+	//     1,000 requests, then counted as missed) and starts no run. A URL
+	//     F's operator turns off, or deletes with its webhook, stays public
+	//     until a release that reads this store connects again (Holding) and
+	//     sends the current set. A rollback meant to last, with public URLs
+	//     registered, needs an approved disposition at Dagu Cloud for them.
+	//     A webhook F deletes also leaves its log and its DAG name's claim
+	//     behind; the claim is taken over when the name is next used.
+	{name: "public-webhooks", kind: kindDir, dir: []rule{
+		// The relay connection as the scheduler last saw it
+		// (publicwebhook.Status). The scheduler stores it at every start
+		// once it differs from the zero value, so any home a release with
+		// public webhooks started on has it, with no webhook and no cloud
+		// credentials too. Retained, not operational: Holding is what makes
+		// a returning server drop a URL turned off while it was away, and URL
+		// is the prefix the relay gave (a public URL is URL + "/" + token;
+		// the token is not stored here), valid across reconnections. Its
+		// Error is a fixed status text or the relay's refusal.
+		{name: "status.json", kind: kindFile, policy: PolicyMutable, check: publicWebhookStatus},
+		{pattern: regexp.MustCompile(`^status\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		// One log per webhook with a public URL (publicwebhook.Log): its
+		// latest deliveries, newest first, at most LogSize, and the missed
+		// counts not yet dismissed. A delivery keeps the relay's delivery ID,
+		// when it arrived, its size, the event its sender names, the outcome,
+		// the run it started and why it did not; never the body or a header
+		// value. The reason is a fixed text, a signature check's fixed text,
+		// or, for a run that cannot start, the run's own validation error,
+		// which can quote what the delivery's params hold: the exception
+		// stated above. Retained; inventoried as digest, size and mode only.
+		{name: "log", kind: kindDir, dir: []rule{
+			{pattern: regexp.MustCompile(`^` + webhookIDPattern + `\.json$`), kind: kindFile, policy: PolicyMutable, check: publicWebhookLog},
+			{pattern: regexp.MustCompile(`^` + webhookIDPattern + `\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		}},
+		{name: recordLockDirectoryName, kind: kindDir, lock: true},
+	}},
+	// One claim per DAG name, {"webhookId": <the webhook's ID>}, which keeps
+	// one webhook per DAG across processes (internal/persis/store/webhook.go
+	// claim). Written when a webhook is created or its DAG renamed; read at
+	// start only to build the index. A claim the store cannot decode fails
+	// a create for that name. Retained. The claims sit beside the webhooks
+	// directory, the data directory's "webhooks" by default.
+	{name: "webhook-dag-claims", kind: kindDir, dir: []rule{
+		{pattern: regexp.MustCompile(`^` + dagNamePattern + `\.json$`), kind: kindFile, policy: PolicyMutable, check: webhookClaim},
+		{pattern: regexp.MustCompile(`^` + dagNamePattern + `\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		{name: recordLockDirectoryName, kind: kindDir, lock: true},
+	}},
+	// The folder watcher's ledgers, one record "watch"
+	// (internal/persis/store/watchstate.go): for each DAG that watches a
+	// folder, the files it held, their sizes and times, and the arrival
+	// each started. Read at start; a record that is lost, corrupt or of a
+	// version it does not know makes every folder be watched as if for the
+	// first time (the files there are taken as seen, not run). Retained.
+	{name: "watch_state", kind: kindDir, dir: []rule{
+		{name: "watch.json", kind: kindFile, policy: PolicyMutable, check: watchState},
+		{pattern: regexp.MustCompile(`^watch\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		{name: recordLockDirectoryName, kind: kindDir, lock: true},
+	}},
+	// The pinned DAGs, one record "pins", {"fileNames": [<DAG name>...]}
+	// (internal/persis/store/dagpin.go), written only by the API. A record
+	// the store cannot decode is reported and never overwritten. Retained.
+	{name: "dag-pins", kind: kindDir, dir: []rule{
+		{name: "pins.json", kind: kindFile, policy: PolicyMutable, check: dagPins},
+		{pattern: regexp.MustCompile(`^pins\.json\.tmp\.[0-9]+$`), kind: kindFile, policy: PolicyOperational},
+		{name: recordLockDirectoryName, kind: kindDir, lock: true},
+	}},
+}
+
+// dagNamePattern is a DAG name as ir.ValidateDAGName accepts it, which the
+// claims and the pins are keyed by.
+const dagNamePattern = `[a-zA-Z0-9_.-]+`
+
+// strictly decodes a record as its writer's type. Its refusal names the type
+// and never quotes the record: a value in it could be anything.
+func strictly(data []byte, v any, what string) error {
+	if err := strict(data, v); err != nil {
+		return fmt.Errorf("it does not decode strictly as %s", what)
+	}
+	return nil
+}
+
+// webhookIDPattern is a webhook's ID as auth.NewWebhook mints it: a UUID in
+// its canonical lowercase form.
+const webhookIDPattern = `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`
+
+// publicWebhookStatus accepts the relay status the public webhook store
+// writes, and nothing with a field it does not have.
+func publicWebhookStatus(_ string, data []byte) error {
+	var st publicwebhook.Status
+	return strictly(data, &st, "the relay status (publicwebhook.Status)")
+}
+
+// publicWebhookOutcomes are the outcomes a delivery log entry may have.
+var publicWebhookOutcomes = map[string]bool{
+	publicwebhook.OutcomeStarted: true, publicwebhook.OutcomeWaiting: true, publicwebhook.OutcomeRejected: true,
+	publicwebhook.OutcomeSkipped: true, publicwebhook.OutcomeIgnored: true, publicwebhook.OutcomeFailed: true,
+}
+
+// publicWebhookLog accepts a webhook's delivery log as the store keeps it:
+// at most LogSize deliveries, each with an ID and a known outcome.
+func publicWebhookLog(_ string, data []byte) error {
+	var log publicwebhook.Log
+	if err := strictly(data, &log, "a delivery log (publicwebhook.Log)"); err != nil {
+		return err
+	}
+	if len(log.Deliveries) > publicwebhook.LogSize {
+		return fmt.Errorf("the log holds %d deliveries; its writer keeps at most %d", len(log.Deliveries), publicwebhook.LogSize)
+	}
+	for i, d := range log.Deliveries {
+		if d.ID == "" {
+			return fmt.Errorf("delivery %d has no ID", i+1)
+		}
+		if !publicWebhookOutcomes[d.Outcome] {
+			return fmt.Errorf("delivery %d has an outcome its writer does not record", i+1)
+		}
+	}
+	if log.Missed.Expired < 0 || log.Missed.Refused < 0 {
+		return errors.New("the missed counts are negative")
+	}
+	return nil
+}
+
+var webhookIDRegexp = regexp.MustCompile(`^` + webhookIDPattern + `$`)
+
+// webhookClaim accepts a DAG name's claim as the webhook store writes it.
+func webhookClaim(name string, data []byte) error {
+	var c struct {
+		WebhookID string `json:"webhookId"`
+	}
+	if err := strictly(data, &c, "a webhook claim ({\"webhookId\"})"); err != nil {
+		return err
+	}
+	if err := ir.ValidateDAGName(strings.TrimSuffix(name, ".json")); err != nil {
+		return errors.New("its name is not a DAG name")
+	}
+	if !webhookIDRegexp.MatchString(c.WebhookID) {
+		return errors.New("it does not name a webhook ID")
+	}
+	return nil
+}
+
+// watchStateVersions are the record versions the folder watcher reads.
+var watchStateVersions = map[int]bool{1: true, 2: true}
+
+// watchState accepts the folder watcher's record as it stores it.
+func watchState(_ string, data []byte) error {
+	var w struct {
+		Version int                                   `json:"version"`
+		DAGs    map[string]schedulerstate.WatchLedger `json:"dags,omitempty"`
+	}
+	if err := strictly(data, &w, "the folder watch record"); err != nil {
+		return err
+	}
+	if !watchStateVersions[w.Version] {
+		return errors.New("its version is not one the folder watcher reads; it would start afresh")
+	}
+	return nil
+}
+
+// dagPins accepts the pinned-DAG record as the pin store writes it.
+func dagPins(_ string, data []byte) error {
+	var p struct {
+		FileNames []string `json:"fileNames"`
+	}
+	if err := strictly(data, &p, "the pin record ({\"fileNames\"})"); err != nil {
+		return err
+	}
+	for i, n := range p.FileNames {
+		if n == "" || ir.ValidateDAGName(n) != nil {
+			return fmt.Errorf("pin %d is not a DAG name", i+1)
+		}
+	}
+	return nil
 }
 
 // preparationEntry accepts a preparation journal entry the journal reads:
@@ -803,6 +1015,12 @@ func (s *scanner) entry(rel string, e fs.DirEntry, rules []rule) error {
 	}
 	if r.exclude != "" {
 		s.exclude(rel, r.exclude)
+		return nil
+	}
+	if r.lock {
+		if err := s.lockDirectory(filepath.Join(s.root.Path, filepath.FromSlash(rel)), e.Name(), rel, "lock directory; operational"); !errors.Is(err, filepath.SkipDir) {
+			return err
+		}
 		return nil
 	}
 	if r.target != nil {
