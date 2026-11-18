@@ -212,6 +212,12 @@ jobs:
       - name: Check installer GitHub API calls
         run: go test -count=1 ./internal/tools/installerapi
 
+      # llms.txt is generated from skills/dagu (`make llms`). A change to the
+      # skill that skips the regeneration fails here (TXE-7868). It runs in
+      # this job because a skills/ or llms.txt change alone sets no path gate.
+      - name: Check llms.txt is generated from skills/dagu
+        run: make llms-check
+
   # Lint Go code
   golint:
     name: Go Linter
