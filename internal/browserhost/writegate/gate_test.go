@@ -291,6 +291,7 @@ func guardRecorded(t *testing.T, b *browser, mode string, policy writegate.Polic
 	// The gate reaches the browser through a relay that records its traffic
 	// as metadata, printed if the test fails (TXE-6223).
 	cdpURL, tl := relayDevTools(t, b.cdpURL, served)
+	soakStart := time.Now() // TXE-7832 soak only
 	go func() {
 		err := writegate.Serve(ctx, writegate.Config{
 			Token: token, CDPURL: cdpURL, Mode: mode, Policy: policy, Secrets: secrets,
@@ -306,8 +307,10 @@ func guardRecorded(t *testing.T, b *browser, mode string, policy writegate.Polic
 	// what a slow start shows.
 	select {
 	case r := <-readyCh:
+		t.Logf("TXE7832-SOAK gate-start %s", time.Since(soakStart).Round(time.Millisecond))
 		return guarded{controls: fmt.Sprintf("http://127.0.0.1:%d/%s", r.Port, token), stop: cancel, done: done, timeline: tl}
 	case err := <-done:
+		t.Logf("TXE7832-SOAK gate-start failed after %s", time.Since(soakStart).Round(time.Millisecond))
 		t.Fatalf("the gate did not start: %v", err)
 	case <-time.After(2 * time.Minute):
 		t.Fatal("the gate did not start in time")
