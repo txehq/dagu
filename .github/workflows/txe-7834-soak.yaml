@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/txe-7834-soak.yaml
+      - .github/actions/setup-go-cache/**
       - internal/browserhost/devtoolsgate/**
 
 permissions:
@@ -21,8 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        order: [probe-first, shard-first, prewarm-first]
-        n: [1, 2, 3]
+        order: [fix]
+        n: [1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Check out code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -70,29 +71,6 @@ jobs:
           go build -o ./.local/bin/dagu.exe ./cmd
           go test -c -o "${RUNNER_TEMP}/devtoolsgate.test.exe" ./internal/browserhost/devtoolsgate
 
-      - name: Prewarm Chrome's files
-        if: matrix.order == 'prewarm-first'
-        shell: pwsh
-        run: |
-          $sw = [Diagnostics.Stopwatch]::StartNew()
-          $bytes = 0
-          Get-ChildItem -Recurse -File 'C:\Program Files\Google\Chrome\Application' | ForEach-Object {
-            $bytes += ([IO.File]::ReadAllBytes($_.FullName)).Length
-          }
-          "prewarm bytes=$bytes ms=$($sw.ElapsedMilliseconds)" | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP 'txe7834\host.txt') -Append
-
-      - name: Probe (before the shard)
-        if: matrix.order != 'shard-first'
-        shell: bash
-        env:
-          TXE7834_PROBE: "1"
-          TXE7834_PROBE_ROUNDS: "10"
-          TXE7834_CHROME_V: "1"
-        run: |
-          export TXE7834_TRACE_DIR="${RUNNER_TEMP}/txe7834/probe-before"
-          mkdir -p "${TXE7834_TRACE_DIR}"
-          "${RUNNER_TEMP}/devtoolsgate.test.exe" -test.run '^TestTXE7834Probe$' -test.v -test.timeout 15m | tee "${TXE7834_TRACE_DIR}/probe.txt"
-
       - name: Test unit 1/2 with the trace
         shell: bash
         run: |
@@ -108,18 +86,6 @@ jobs:
             go test "${args[@]}" ${packages} 2>&1 | tee -a "${TXE7834_TRACE_DIR}/go-test.txt" || status=1
           done 3< "${RUNNER_TEMP}/go-test-plan.tsv"
           echo "shard status=${status}"
-
-      - name: Probe (after the shard)
-        if: matrix.order == 'shard-first'
-        shell: bash
-        env:
-          TXE7834_PROBE: "1"
-          TXE7834_PROBE_ROUNDS: "10"
-          TXE7834_CHROME_V: "1"
-        run: |
-          export TXE7834_TRACE_DIR="${RUNNER_TEMP}/txe7834/probe-after"
-          mkdir -p "${TXE7834_TRACE_DIR}"
-          "${RUNNER_TEMP}/devtoolsgate.test.exe" -test.run '^TestTXE7834Probe$' -test.v -test.timeout 15m | tee "${TXE7834_TRACE_DIR}/probe.txt"
 
       - name: Stop the sampler
         if: always()

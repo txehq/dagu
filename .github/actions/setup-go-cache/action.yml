@@ -5,7 +5,8 @@ description: >-
   that owns the cache runs scripts/ci/trim-go-cache.sh, then saves it with
   actions/cache/save and the outputs below.
   On Windows it also moves the Go caches and TEMP to the D: drive for the rest
-  of the job.
+  of the job, and reads Chrome's files once so that the job's first browser
+  does not load them from a cold C: drive.
 
 inputs:
   go-version:
@@ -40,6 +41,45 @@ runs:
           "TEMP=$env:RUNNER_TEMP"
           "TMP=$env:RUNNER_TEMP"
         ) | Add-Content -Path $env:GITHUB_ENV
+
+    # Chrome lives on the C: drive, and a fresh runner has never read its
+    # files. Read cold while a test step starts, under the I/O of go test
+    # and its first packages, they came in at 12-15 MB/s with reads taking
+    # about a second each. Chrome then needed 22-47 s just to load and did
+    # not answer its DevTools pipe in time (TXE-7834: the first four
+    # launches of the unit shard on 2 of 3 VMs). One sequential read here,
+    # while the disk is idle, takes 5-13 s. After it, every launch in the
+    # shard answered within 1.4 s. Every Windows job that sets up Go reads
+    # Chrome here, so a new job that starts Chrome cannot leave this out.
+    - name: Read Chrome's files once
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $dirs = @()
+        if ($env:CHROME_PATH) {
+          $dirs += Split-Path -Parent $env:CHROME_PATH
+        } else {
+          foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+            if ($root) { $dirs += Join-Path $root 'Google\Chrome\Application' }
+          }
+        }
+        $dir = $dirs | Where-Object { Test-Path (Join-Path $_ 'chrome.exe') } | Select-Object -First 1
+        if (-not $dir) {
+          Write-Output "No Chrome found in: $($dirs -join '; ')"
+          exit 0
+        }
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $bytes = 0
+        $buffer = New-Object byte[] (1MB)
+        foreach ($file in Get-ChildItem -LiteralPath $dir -Recurse -File) {
+          $stream = [IO.File]::OpenRead($file.FullName)
+          try {
+            while (($n = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $bytes += $n }
+          } finally {
+            $stream.Dispose()
+          }
+        }
+        Write-Output ("Read {0:N0} bytes of {1} in {2:N1} s" -f $bytes, $dir, $watch.Elapsed.TotalSeconds)
 
     # Marks the job start, an hour early, for trim-go-cache.sh: Go refreshes
     # the time of an entry it uses once that time is an hour old, so an
