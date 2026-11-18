@@ -190,7 +190,7 @@ that root accepts explicitly.
   It runs every check above against that base's tip: the PR's base is that name, the history rule
   is measured against the base, main's codex-review run on the head is completed/success and names
   this PR on this base, every other run is green, and main's check (read at main's tip) passes
-  now. In addition it refuses when the base's tip is not `--base-sha` at the first read or at the
+  now. In addition it refuses when the base's tip is not `--base-sha` at the first read or at its
   last read before the merge, and when the base's `.github/workflows/codex-review.yml` is not
   main's byte for byte (the gate that ran there would not be main's). A maintenance base is merged
   by squash only: `--method merge` and `--repair` are refused. After the squash it reads the merge
@@ -237,14 +237,18 @@ that is the rest of the PR read plus `gh pr merge`'s own PR lookup and merge mut
 gate's runs, one read more. Measured from a Mac on 2026-11-19 at 0.7-1.5 s per call, that is
 roughly 2-3 s for the labels and base and 3-4 s for the gate's runs, and nothing bounds a slow
 call. The base sha compared is the one GitHub records on the PR (it changes on a retarget or a PR
-event, not on every push to the base); on a maintenance base the base's live tip is also re-read
-and must still be `--base-sha`. A connector review or another check run that changes on the same
+event, not on every push to the base). On a maintenance base the base's live tip (and on a repair,
+main's) is re-read just before these two reads and must still be the expected sha, so its window is
+those two reads longer, roughly 4-5 s; a move in it is caught only by the readback after the merge.
+Every gate run read must carry a whole-number id, run number and attempt, and the PR line must be
+one object with a state, a draft flag, 40-hex head and base shas, a base name and a list of label
+names; anything else is a failed read, never two partial answers that happen to compare equal. A connector review or another check run that changes on the same
 head after the check is not re-read: only the gate's own run is.
 
 `test-merge.sh` covers each refusal with the stand-in `gh` (a gate run created after the check,
 queued or green; a re-run attempt of the judged run; the gate run gone; `review-override` removed;
-a label added; a retarget; a new base sha; each re-read failing or garbled; the read before the
-check failing) and the order of the calls: the PR line read before the check and again after it,
+a label added; a retarget; a new base sha; each re-read failing or garbled; a gate run or a PR
+answer with a field missing; the read before the check failing) and the order of the calls: the PR line read before the check and again after it,
 then the gate's runs and the PR as the last reads before the merge, on main and on a maintenance
 base. `test-merge-git.sh` refuses a label change after the check on `--method merge`, `--repair`
 and a maintenance base.

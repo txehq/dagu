@@ -112,7 +112,7 @@ case "$*" in
   *compare/*) spec="${all#*compare/}"; spec="${spec%%\?*}"; a="${spec%%...*}"; b="${spec##*...}"; st="$(compare "$a" "$b")" || exit 1
     case "$*" in *"per_page=1 "*) printf '%s\t%s\n' "$st" "$(g rev-list --count "$b" "^$a")" ;; *) g rev-list --reverse --parents "$b" "^$a" ;; esac ;;
   "api repos/txehq/dagu --jq .allow_merge_commit") echo "${ALLOW_MERGE:-true}" ;;
-  *actions/runs*|*actions/workflows/codex-review.yml/runs*) printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","run_number":5,"status":"completed","conclusion":"success","pull_requests":[{"number":7,"base":{"ref":"%s"}}]}\n' "$PR_BASE" ;;
+  *actions/runs*|*actions/workflows/codex-review.yml/runs*) printf '{"name":"codex-review","path":".github/workflows/codex-review.yml","workflow_id":101,"event":"pull_request_target","id":905,"run_number":5,"run_attempt":1,"status":"completed","conclusion":"success","pull_requests":[{"number":7,"base":{"ref":"%s"}}]}\n' "$PR_BASE" ;;
   *check-runs*) if [ -n "${ADVANCE_MAIN_AT_CHECKS:-}" ]; then g checkout -q main && echo moved >"$REPO/moved" && g add moved && g commit -q -m "main moved during the checks"; fi; printf '%s\n' '{"name":"CI","app":{"id":1},"check_suite":{"id":7},"status":"completed","conclusion":"success","started_at":"2026-11-08T00:00:00Z"}' ;;
   */status*) printf 'success\t1\n' ;;
   "pr merge 7 -R txehq/dagu --squash --match-head-commit "*) merge_into_main squash "$@" ;;
