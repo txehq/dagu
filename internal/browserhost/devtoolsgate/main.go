@@ -101,6 +101,11 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	if err := m.start(startCtx); err != nil {
 		return fail(fmt.Errorf("devtools gate: %w", err))
 	}
+	// Nobody is served by a browser that would open a window off the
+	// record (preflight.go).
+	if err := checkOffTheRecordRefused(startCtx, m, cfg.Args); err != nil {
+		return fail(fmt.Errorf("devtools gate: %w", err))
+	}
 	g := newGate(m, cfg.Token, NewToken(), version)
 	port, err := g.listen()
 	if err != nil {
