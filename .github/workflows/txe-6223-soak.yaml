@@ -1,0 +1,99 @@
+# TXE-6223 soak only, removed before the PR is ready for review. Runs the
+# worker-start tests many times beside a unit shard, for the load CI puts on
+# them, with main's mux (base) and with this branch's (fix). Every run is
+# bounded: a fixed -count per test and timeout-minutes per job.
+name: TXE-6223 soak
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.27.3
+
+jobs:
+  soak:
+    name: Soak on ${{ matrix.os }} (${{ matrix.variant }} ${{ matrix.shard }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        variant: [base, fix]
+        shard: [1, 2]
+        include:
+          - os: windows-latest
+            variant: base
+            shard: 1
+          - os: windows-latest
+            variant: fix
+            shard: 1
+    steps:
+      - name: Check out code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Use main's mux
+        if: ${{ matrix.variant == 'base' }}
+        shell: bash
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          git checkout FETCH_HEAD -- internal/browserhost/devtoolsgate/mux.go
+          git status --short
+
+      - name: Set up Go
+        uses: ./.github/actions/setup-go-cache
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p ./.local/bin
+          exe=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then exe=".exe"; fi
+          go build -o "./.local/bin/dagu${exe}" ./cmd
+          echo "DAGU_BIN=${PWD}/.local/bin/dagu${exe}" >> "${GITHUB_ENV}"
+          race=""
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then race="-race"; fi
+          echo "RACE=${race}" >> "${GITHUB_ENV}"
+          # shellcheck disable=SC2086 # race is empty or one flag.
+          go test ${race} -count=1 -run '^$' ./internal/browserhost/writegate ./internal/runtime/builtin/browser ./conformance/spec079_browser_session
+
+      - name: Soak beside a unit shard
+        shell: bash
+        run: |
+          total=3
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then total=2; fi
+          scripts/ci/go-test-suite.sh unit 1 "${total}" > "${RUNNER_TEMP}/plan.tsv"
+          (
+            while IFS=$'\t' read -r -u 3 packages run; do
+              args=(-count=1)
+              if [[ -n "${run}" ]]; then
+                args+=(-run "${run}")
+              fi
+              # shellcheck disable=SC2086 # packages is a space-separated list.
+              go test ${RACE} "${args[@]}" ${packages} > /dev/null 2>&1 || true
+            done 3< "${RUNNER_TEMP}/plan.tsv"
+          ) &
+          load=$!
+          status=0
+          # shellcheck disable=SC2086 # RACE is empty or one flag.
+          go test ${RACE} -timeout=25m -count=40 -v -run '^(TestGateSeesASocketAWorkerOpensAtStart|TestGateSeesASocketAWorkerOpensAtStartBesideADriver)$' ./internal/browserhost/writegate > "${RUNNER_TEMP}/writegate.log" 2>&1 || status=1
+          # shellcheck disable=SC2086 # RACE is empty or one flag.
+          go test ${RACE} -timeout=10m -count=10 -v -run '^TestStagehandWriteGateLetsAServiceWorkerStart$' ./internal/runtime/builtin/browser > "${RUNNER_TEMP}/stagehand.log" 2>&1 || status=1
+          go test -timeout=10m -count=3 -v -run '^TestSessionRehearsesEveryWrite$' ./conformance/spec079_browser_session > "${RUNNER_TEMP}/spec079.log" 2>&1 || status=1
+          kill "${load}" 2>/dev/null || true
+          for name in writegate stagehand spec079; do
+            log="${RUNNER_TEMP}/${name}.log"
+            echo "TXE6223-SOAK ${name} pass=$(grep -c '^    --- PASS\|^--- PASS' "${log}") fail=$(grep -c '^    --- FAIL\|^--- FAIL' "${log}")"
+            grep -E '^(--- |ok|FAIL|panic)|gate_test.go|stagehand_test.go|write_gate_test.go' "${log}" | grep -v -- '--- PASS' | head -80 || true
+          done
+          for test in TestGateSeesASocketAWorkerOpensAtStart TestGateSeesASocketAWorkerOpensAtStartBesideADriver; do
+            echo "TXE6223-SOAK ${test} pass=$(grep -c "^--- PASS: ${test} " "${RUNNER_TEMP}/writegate.log") fail=$(grep -c "^--- FAIL: ${test} " "${RUNNER_TEMP}/writegate.log")"
+          done
+          exit "${status}"
