@@ -180,7 +180,7 @@ func startBrowser(t *testing.T) *browser {
 // removed after.
 func profileDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "writegate-profile-")
+	dir, err := devtoolsgate.NewTempProfile("", "writegate-profile-")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		for range 50 {
@@ -236,7 +236,6 @@ func startBrowserFor(t *testing.T, profile string, maxUnattended time.Duration) 
 	defer func() { <-startupSlot }()
 	self, err := os.Executable()
 	require.NoError(t, err)
-	require.NoError(t, devtoolsgate.ClaimProfile(profile))
 	gate, err := devtoolsgate.Start(t.Context(), self, devtoolsgate.Config{
 		Token:         devtoolsgate.NewToken(),
 		Executable:    path,

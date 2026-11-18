@@ -246,7 +246,7 @@ func startProxiedChrome(t *testing.T, proxy *credentialProxy) (*Handle, *cdpConn
 	require.NoError(t, err)
 	profile, err := os.MkdirTemp("", "dagu-gate-proxy-auth-")
 	require.NoError(t, err)
-	require.NoError(t, ClaimProfile(profile))
+	require.NoError(t, claimProfile(profile))
 	// Registered first, so it runs last: the profile goes whether or not the
 	// browser started. Chrome's last processes may still be writing as it
 	// exits.

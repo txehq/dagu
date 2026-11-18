@@ -65,7 +65,7 @@ func TestMain(m *testing.M) {
 func fakeBrowserArgs(extra ...string) []string {
 	profile, err := os.MkdirTemp(fakeProfiles, "profile-")
 	if err == nil {
-		err = ClaimProfile(profile)
+		err = claimProfile(profile)
 	}
 	if err != nil {
 		panic(err)

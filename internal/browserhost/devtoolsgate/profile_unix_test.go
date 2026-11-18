@@ -25,7 +25,7 @@ func TestDisableOffTheRecordRefusesSymbolicLinks(t *testing.T) {
 	target := ownedProfile(t)
 	link := filepath.Join(t.TempDir(), "profile")
 	require.NoError(t, os.Symlink(target, link))
-	assert.ErrorContains(t, ClaimProfile(link), "symbolic link")
+	assert.ErrorContains(t, claimProfile(link), "symbolic link")
 	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + link}), "symbolic link")
 
 	elsewhere := t.TempDir()
@@ -54,7 +54,7 @@ func TestDisableOffTheRecordRefusesASharedOrRunningProfile(t *testing.T) {
 	shared := ownedProfile(t)
 	require.NoError(t, os.Chmod(shared, 0o777))
 	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + shared}), "others may write")
-	assert.ErrorContains(t, ClaimProfile(shared), "others may write")
+	assert.ErrorContains(t, claimProfile(shared), "others may write")
 
 	host, err := os.Hostname()
 	require.NoError(t, err)
