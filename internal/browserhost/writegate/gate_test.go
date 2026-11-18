@@ -884,10 +884,27 @@ func TestGateKeepsEachWriteOnce(t *testing.T) {
 	assert.True(t, list[1].Consequential())
 }
 
-// shortUnattended is an unattended cap a test can wait out: long enough for
-// the write gate to start on a loaded host, since the gate's clock runs from
-// launch.
+// shortUnattended is an unattended cap a test can wait out. The cap's clock
+// runs from launch and restarts when the last client leaves, so a test
+// attends the browser while its write gate starts: the cap is then counted
+// from a moment the test chose, not raced against the gate's start, which
+// took up to 4.3 s on a loaded Windows runner (TXE-7832).
 const shortUnattended = 10 * time.Second
+
+// attend connects a DevTools client to the browser, which keeps the
+// unattended cap from running until the client leaves; leave ends it.
+func attend(t *testing.T, b *browser) (leave func()) {
+	t.Helper()
+	wsURL, err := browserhost.BrowserID(t.Context(), b.cdpURL)
+	require.NoError(t, err)
+	conn, response, err := websocket.Dial(t.Context(), wsURL, nil)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	return func() { _ = conn.Close(websocket.StatusNormalClosure, "") }
+}
 
 // The write gate's connection lasts the browser's whole life, and is marked
 // a helper (TXE-6201): a browser whose only client is the write gate is
@@ -896,7 +913,9 @@ func TestBrowserWithOnlyItsWriteGateEndsWhenUnattended(t *testing.T) {
 	t.Parallel()
 
 	b := startBrowserFor(t, profileDir(t), shortUnattended)
+	leave := attend(t, b)
 	_, _, done := guard(t, b, writegate.Policy{}, nil)
+	leave()
 	require.Eventually(t, func() bool {
 		return errors.Is(browserhost.Probe(context.Background(), b.cdpURL), browserhost.ErrUnreachable)
 	}, shortUnattended+30*time.Second, 200*time.Millisecond, "the gate ends a browser only its write gate attends")
@@ -914,19 +933,13 @@ func TestAttendedBrowserOutlivesTheUnattendedCap(t *testing.T) {
 	t.Parallel()
 
 	b := startBrowserFor(t, profileDir(t), shortUnattended)
+	leave := attend(t, b)
 	_, _, _ = guard(t, b, writegate.Policy{}, nil)
-	wsURL, err := browserhost.BrowserID(t.Context(), b.cdpURL)
-	require.NoError(t, err)
-	conn, response, err := websocket.Dial(t.Context(), wsURL, nil)
-	if response != nil && response.Body != nil {
-		_ = response.Body.Close()
-	}
-	require.NoError(t, err)
 
 	time.Sleep(shortUnattended + 5*time.Second)
 	require.NoError(t, browserhost.Probe(context.Background(), b.cdpURL), "an attended browser outlives the cap")
 
-	_ = conn.Close(websocket.StatusNormalClosure, "")
+	leave()
 	require.Eventually(t, func() bool {
 		return errors.Is(browserhost.Probe(context.Background(), b.cdpURL), browserhost.ErrUnreachable)
 	}, shortUnattended+30*time.Second, 200*time.Millisecond, "the cap runs once the last client left")

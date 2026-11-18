@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,57 @@ func TestStartRunsGateAndBrowserProcesses(t *testing.T) {
 	}, "the browser's exit on end-of-file")
 	eventually(t, 15*time.Second, func() bool { return !procutil.IsAlive(handle.PID) }, "the gate's exit")
 	assert.NoError(t, handle.Kill(), "ending an ended gate is not an error")
+}
+
+// A browser that was ended is seen gone at once, though a helper process of
+// it lives on holding what it inherited: its standard output and error,
+// and on Unix the pipe's descriptors too. The gate stops answering well
+// before its heartbeat could tell (heartbeatInterval + heartbeatTimeout),
+// and long before the helper ends (TXE-7832: Chrome's helpers outlived it
+// on a Windows runner, and the gate answered for its dead browser).
+func TestStartSeesTheBrowserEndWhileItsHelperLives(t *testing.T) {
+	t.Parallel()
+	self, err := os.Executable()
+	require.NoError(t, err)
+	pidFile := filepath.Join(t.TempDir(), "helper.pid")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	handle, err := Start(ctx, self, Config{Token: NewToken(), Executable: self, Args: fakeBrowserArgs("--helper-pid-file=" + pidFile)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = handle.Kill() })
+	var helperPID int
+	eventually(t, 15*time.Second, func() bool {
+		data, err := os.ReadFile(pidFile)
+		if err != nil {
+			return false
+		}
+		helperPID, err = strconv.Atoi(string(data))
+		return err == nil && helperPID > 0
+	}, "the browser's helper process")
+	t.Cleanup(func() {
+		if helper, err := os.FindProcess(helperPID); err == nil {
+			_ = helper.Kill()
+		}
+	})
+	status, _ := get(t, handle.URL+"/json/version")
+	require.Equal(t, http.StatusOK, status)
+
+	browser, err := os.FindProcess(handle.BrowserPID)
+	require.NoError(t, err)
+	ended := time.Now()
+	require.NoError(t, browser.Kill())
+	client := &http.Client{Timeout: time.Second}
+	bound := heartbeatInterval + heartbeatTimeout - 5*time.Second
+	eventually(t, bound, func() bool {
+		response, err := client.Get(handle.URL + "/json/version")
+		if err != nil {
+			return true
+		}
+		_ = response.Body.Close()
+		return false
+	}, "the gate stops answering for its ended browser")
+	t.Logf("the gate stopped answering %s after the browser was ended", time.Since(ended).Round(time.Millisecond))
+	assert.True(t, procutil.IsAlive(helperPID), "the helper still lives, so its handles did not decide")
 }
 
 // browserIDOf reads the browser id from the gate's /json/version.

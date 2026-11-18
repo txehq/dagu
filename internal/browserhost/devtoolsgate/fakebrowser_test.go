@@ -11,7 +11,9 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -704,6 +706,23 @@ func (f *fakeBrowser) stateLocked() fakeState {
 	return state
 }
 
+// startFakeHelper starts a helper process that inherits the fake browser's
+// standard output and error, and writes its process ID to pidFile.
+func startFakeHelper(pidFile string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	helper := exec.Command(self, "-test.run=^$", "--", fakeHelperMarker) //nolint:gosec // the test binary itself
+	helper.Stdout = os.Stdout
+	helper.Stderr = os.Stderr
+	if err := helper.Start(); err != nil {
+		return err
+	}
+	go func() { _ = helper.Wait() }()
+	return os.WriteFile(pidFile, []byte(strconv.Itoa(helper.Process.Pid)), 0o600)
+}
+
 // runFakeBrowserProcess is the process form: the test binary started by
 // the gate as "the browser", reading fd 3 and writing fd 4 on Unix, or the
 // handles named by --remote-debugging-io-pipes on Windows.
@@ -724,6 +743,14 @@ func runFakeBrowserProcess(args []string) int {
 		}
 		if marker, ok := strings.CutPrefix(arg, "--exit-marker="); ok {
 			f.exitMarker = marker
+		}
+		if pidFile, ok := strings.CutPrefix(arg, "--helper-pid-file="); ok {
+			// Chrome's helper processes inherit its standard output and
+			// error and can outlive it for seconds once it was ended.
+			if err := startFakeHelper(pidFile); err != nil {
+				fmt.Fprintln(os.Stderr, "fake browser:", err)
+				return 3
+			}
 		}
 	}
 	if err := f.serve(); err != nil {
