@@ -105,6 +105,46 @@ func TestMuxWaitForDebuggerGatesResume(t *testing.T) {
 	}, "the resume after every waiting client resumed")
 }
 
+// A held target resumes only once the browser answered the waiting
+// client's resume on the client's own session, so the setup the client sent
+// ahead of it is in place first. Chrome answers a worker's sessions from the
+// worker's thread as it starts and keeps no order between sessions: a
+// resume the gate sent on its own session at once let a service worker run
+// its first statement before the client's Network.enable (TXE-7832).
+func TestMuxResumesAfterTheClientsSetupIsAnswered(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	waiter, other := tg.dial(""), tg.dial("")
+	waiter.mustCall("", "Target.setAutoAttach", autoAttach(true))
+	waiter.waitEvent("Target.attachedToTarget", nil)
+	created := other.mustCall("", "Target.createTarget", map[string]any{"url": "about:blank"})
+	var target struct {
+		TargetID string `json:"targetId"`
+	}
+	require.NoError(t, json.Unmarshal(created, &target))
+	held := decodeAttached(t, waiter.waitEvent("Target.attachedToTarget", func(m message) bool {
+		return decodeAttached(t, m).TargetInfo.TargetID == target.TargetID
+	}))
+	require.True(t, held.WaitingForDebugger)
+
+	// The client's session is answered late; the gate's own is not.
+	waiter.mustCall("", "Fake.deferSession", map[string]any{"sessionId": held.SessionID})
+	waiter.send(held.SessionID, "Fetch.enable", map[string]any{})
+	waiter.send(held.SessionID, "Runtime.runIfWaitingForDebugger", nil)
+	time.Sleep(200 * time.Millisecond)
+	assert.Contains(t, tg.state(other).Paused, target.TargetID, "the target stays held while the client's resume is unanswered")
+
+	waiter.mustCall("", "Fake.releaseSession", map[string]any{"sessionId": held.SessionID})
+	eventually(t, 5*time.Second, func() bool {
+		return slices.Contains(tg.state(other).Resumed, target.TargetID)
+	}, "the resume once the client's session answered")
+	log := tg.state(other).Log
+	setup := slices.Index(log, "Fetch.enable "+held.SessionID+" on "+target.TargetID)
+	resume := slices.Index(log, "resume "+target.TargetID)
+	require.NotEqual(t, -1, setup, "%q", log)
+	assert.Less(t, setup, resume, "the client's setup is applied before the target runs: %q", log)
+}
+
 func TestMuxDisconnectReleasesHoldAndSessions(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"time"
@@ -49,9 +48,13 @@ func launchBrowser(cfg Config) (*browserProcess, error) {
 	args = append(args, pipeFlags(browserRead, browserWrite)...)
 	args = append(args, cfg.Args...)
 	cmd := exec.Command(cfg.Executable, args...) //nolint:gosec // starting the configured browser is the gate's purpose
+	// The standard handles are the null device, never a writer: for a
+	// writer os/exec makes a pipe that the browser's helper processes
+	// inherit, and Wait, the gate's sign that the browser exited, would
+	// wait for every one of them to let go of it (TXE-7832).
 	cmd.Stdin = nil
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	cmd.Stdout = nil
+	cmd.Stderr = nil
 	attachPipes(cmd, browserRead, browserWrite)
 	err = cmd.Start()
 	// The browser holds its ends now; the gate keeps only its own, or the
