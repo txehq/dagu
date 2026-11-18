@@ -8,12 +8,14 @@ data_dir=$(mktemp -d)
 container="dagu-signal-smoke-$$"
 smoke_dir=$(cd "$(dirname "$0")" && pwd)
 
+# The trap keeps the smoke's own status; a cleanup that fails says why (TXE-7857).
 cleanup() {
   status=$?
+  set +e
   if [ "$status" -ne 0 ]; then
-    timeout 10 docker logs "$container" || true
+    timeout 10 docker logs "$container"
   fi
-  timeout 10 docker rm -f "$container" >/dev/null 2>&1 || true
+  timeout 10 docker rm -f "$container" >/dev/null || echo "::warning::could not remove container $container (above); the smoke keeps its own status"
   rm -rf "$data_dir"
   exit "$status"
 }

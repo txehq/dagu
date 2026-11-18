@@ -142,7 +142,7 @@ esac
 bin="$TXE_DAGU_HOME/bin/dagu-$version"
 if [ ! -x "$bin" ]; then
   src="$(mktemp -d)"
-  trap 'rm -rf "$src"' EXIT
+  trap 'RC=$?; set +e; rm -rf "$src"; exit "$RC"' EXIT
   git clone --quiet --depth 1 --branch "$tag" "$TXE_DAGU_REPO" "$src/dagu"
   commit="$(git -C "$src/dagu" rev-parse HEAD)"
   # GOTOOLCHAIN=auto: build with the Go release go.mod names (checksum-verified

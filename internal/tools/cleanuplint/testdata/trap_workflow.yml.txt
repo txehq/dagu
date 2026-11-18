@@ -1,0 +1,15 @@
+jobs:
+  j:
+    steps:
+      - name: txe's TXE-7835 instance (a removal that failed into /dev/null turned the step red)
+        run: |
+          trap 'docker rm -f "pg-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1' EXIT # want:trap-status
+          go test ./...
+      - name: fixed
+        run: |
+          trap 'RC=$?; docker rm -f "pg-$GITHUB_RUN_ID" >/dev/null || echo "::warning::could not remove pg"; exit "$RC"' EXIT
+          go test ./...
+      - run: trap 'rm -f "$probe"' EXIT # want:trap-status
+      - name: not shell
+        with:
+          script: trap 'rm -f x' EXIT

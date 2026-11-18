@@ -1,0 +1,522 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package main
+
+import (
+	"fmt"
+	"path"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// The trap rule (TXE-7857, the port of txehq/txe's TXE-7835) reads the shell
+// traps of CI code: workflow and action run: blocks, everything else under
+// .github, and every script those name. Under set -e, which every GitHub run:
+// step has (bash -e -o pipefail), the first command of an EXIT trap that fails
+// ends the script with that command's status, whatever the main command's
+// was, and skips the rest of the cleanup:
+//
+//	bash -e -c 'trap "false >/dev/null 2>&1" EXIT; true'     # exit=1, nothing printed
+//	bash -e -c 'trap "false >/dev/null 2>&1" EXIT; exit 3'   # exit=1, not 3
+//
+// Without set -e bash keeps the main command's status, but a script that turns
+// errexit on later, or a trap copied into a run: step, gets the first. In txe
+// it hit PR 5184: a step went red with an empty log because its trap's docker
+// rm -f failed into /dev/null. The rule, for every trap on EXIT or ERR, inline
+// or through a function the same script defines:
+//
+//   - its first statement keeps the main command's status (RC=$?) and its last
+//     returns it (exit "$RC"), so the cleanup neither fails a passing step nor
+//     hides a failing one; a cleanup whose leftover is itself a defect sets RC
+//     itself, after saying so;
+//   - between them, set +e comes first, or every command is guarded with
+//     || (cmd || echo "::warning::..."): under set -e a failing command ends
+//     the handler before its exit, with the cleanup's status;
+//   - it never sends stderr to /dev/null (2>/dev/null, &>/dev/null,
+//     >/dev/null 2>&1, 2>&-), so a cleanup that fails says why.
+//
+// The variable is any name; RC is the house form because shellcheck, which CI
+// runs on these scripts, reports a lower-case name assigned inside a trap
+// string as never assigned (SC2154).
+//
+// A trap on any other signal (TERM, INT) is held to the last rule only: it
+// ends with its own exit status, chosen by the author.
+
+const ruleTrap = "trap-status"
+
+// trapScope reports a path whose traps are always read: workflows, actions
+// and every script under .github. Scripts outside it are read when an
+// in-scope file names them (trapReach).
+func trapScope(rel string) bool {
+	return strings.HasPrefix(rel, ".github/")
+}
+
+// scriptPathRe is a repository-relative path a CI file may run.
+var scriptPathRe = regexp.MustCompile(`[A-Za-z0-9_.][A-Za-z0-9_./-]*/[A-Za-z0-9_.-]+`)
+
+// trapReach returns the shell sources the trap rule reads: every one in
+// trapScope, and, transitively, every shell source whose path one of those
+// names, written from the repository root (bash scripts/foo.sh,
+// ./scripts/foo.sh).
+func trapReach(srcs []source) map[string]bool {
+	byRel := map[string]source{}
+	for _, s := range srcs {
+		if s.lang == langShell {
+			byRel[s.rel] = s
+		}
+	}
+	reach := map[string]bool{}
+	var work []string
+	for rel := range byRel {
+		if trapScope(rel) {
+			reach[rel] = true
+			work = append(work, rel)
+		}
+	}
+	sort.Strings(work)
+	for len(work) > 0 {
+		rel := work[0]
+		work = work[1:]
+		for _, m := range scriptPathRe.FindAllString(string(byRel[rel].data), -1) {
+			m = strings.TrimPrefix(m, "./")
+			if _, ok := byRel[m]; ok && !reach[m] {
+				reach[m] = true
+				work = append(work, m)
+			}
+		}
+	}
+	return reach
+}
+
+// trapAllowedFiles allows the trap-status findings of a file from here, with
+// the reason, where a cleanuplint:allow comment in the file would itself be a
+// change the file cannot take. An entry that allows nothing is a finding, so
+// it goes when the file is fixed.
+var trapAllowedFiles = map[string]string{
+	// The codex-review gate runs this file from CODEX_REVIEW_GATE_SHA on a
+	// maintenance base, and test-gate-pin.sh fails main once main's copy
+	// differs from the pin's; moving the pin changes codex-review.yml, which
+	// every live maint/txe-v* base must then take (TXE-7556). It has no
+	// errexit (set -uo pipefail), and without errexit bash ends a script with
+	// its own status whatever its EXIT trap does (measured, TXE-7857).
+	".github/codex-review/test-codex-review-check.sh": "a gate file pinned by CODEX_REVIEW_GATE_SHA (TXE-7556); it has no errexit, so bash keeps its status whatever the trap does; fix it with the next pin move",
+}
+
+// lintTrapSources runs the trap rule over every source it reaches. The
+// findings of a file in trapAllowedFiles come back allowed, with its reason.
+func lintTrapSources(srcs []source) (findings, allowed []Finding) {
+	reach := trapReach(srcs)
+	for _, s := range srcs {
+		if !reach[s.rel] || !isShellTrapSource(s) {
+			continue
+		}
+		fs := lintTraps(s)
+		reason, ok := trapAllowedFiles[s.rel]
+		switch {
+		case !ok:
+			findings = append(findings, fs...)
+		case len(fs) == 0:
+			findings = append(findings, Finding{Path: s.rel, Line: 1, Rule: ruleDirective,
+				Msg: "trapAllowedFiles in internal/tools/cleanuplint/trap.go allows trap-status here, and this file has no such finding; remove its entry"})
+		default:
+			for _, f := range fs {
+				f.Reason = reason
+				allowed = append(allowed, f)
+			}
+		}
+	}
+	return findings, allowed
+}
+
+// isShellTrapSource reports a source the trap rule can read: shell other than
+// zsh, whose traps differ.
+func isShellTrapSource(s source) bool {
+	return s.lang == langShell && path.Ext(s.rel) != ".zsh"
+}
+
+// lintTraps reports the traps in one shell source or workflow that break the
+// rule. A workflow's run: blocks are each read as their own script.
+func lintTraps(s source) []Finding {
+	phys := lines(s.data)
+	segs := [][]string{phys}
+	if isYAML(s.rel) {
+		segs = workflowSegments(phys)
+		segs = segs[:len(segs)-1] // only run: blocks hold shell
+	}
+	var out []Finding
+	for _, seg := range segs {
+		out = mergeFindings(out, trapFindings(s.rel, strings.Join(seg, "\n")))
+	}
+	return out
+}
+
+// trapCmd is one trap command found in a script.
+type trapCmd struct {
+	line    int
+	action  string // the handler as the shell runs it, quotes removed
+	early   bool   // the handler has a $ the shell expands when trap runs, not when the handler does
+	signals []string
+}
+
+const keepStatusMsg = "%s on %s must keep the main command's status: start with RC=$?; set +e (or guard each command with ||) and end with exit \"$RC\" (under set -e, which every run: step has, a failing cleanup ends the script with its own status and skips the rest)"
+
+func trapFindings(rel, text string) []Finding {
+	var out []Finding
+	for _, t := range findTraps(text) {
+		status := false
+		for _, sig := range t.signals {
+			switch strings.TrimPrefix(strings.ToUpper(sig), "SIG") {
+			case "EXIT", "0", "ERR":
+				status = true
+			}
+		}
+		body := strings.TrimSpace(t.action)
+		if body == "" || body == "-" || body == ":" {
+			continue // ignore or reset the signal: no handler
+		}
+		where := "the trap"
+		if fn, ok := funcBody(text, body); ok {
+			where = "function " + body
+			body = fn
+		} else if t.early {
+			out = append(out, Finding{Path: rel, Line: t.line, Rule: ruleTrap,
+				Msg: "the trap's handler is double-quoted or unquoted, so its $ expands when trap runs, not when the handler does; single-quote it"})
+			continue
+		}
+		// The handler, and each function it calls that the script defines.
+		checked := map[string]string{where: body}
+		for _, st := range statements(body) {
+			if f := strings.Fields(st); len(f) > 0 {
+				if fn, ok := funcBody(text, f[0]); ok {
+					checked["function "+f[0]] = fn
+				}
+			}
+		}
+		names := make([]string, 0, len(checked))
+		for n := range checked {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		var msgs []string
+		if status && !keepsStatus(body) {
+			msgs = append(msgs, fmt.Sprintf(keepStatusMsg, where, strings.Join(t.signals, " ")))
+		}
+		for _, n := range names {
+			if silencedRe.MatchString(checked[n]) {
+				msgs = append(msgs, n+" sends stderr to /dev/null: a cleanup that fails must say why; let its stderr through, or print a ::warning:: on failure")
+				break
+			}
+		}
+		if len(msgs) > 0 {
+			out = append(out, Finding{Path: rel, Line: t.line, Rule: ruleTrap, Msg: strings.Join(msgs, "; and ")})
+		}
+	}
+	return out
+}
+
+// silencedRe is a redirection that discards stderr.
+var silencedRe = regexp.MustCompile(`(?:^|[^0-9>&])(?:2|&)>>?\s*/dev/null|>\s*/dev/null\s*2>&1|2>&-`)
+
+var (
+	captureRe = regexp.MustCompile(`^(?:local\s+)?([A-Za-z_]\w*)="?\$\?"?$`)
+	exitRe    = regexp.MustCompile(`^exit\s+"?\$\{?([A-Za-z_]\w*)\}?"?$`)
+	funcName  = regexp.MustCompile(`^[A-Za-z_][\w-]*$`)
+)
+
+// keepsStatus reports a handler whose first statement saves $? in a variable
+// and whose last exits with it.
+func keepsStatus(body string) bool {
+	stmts := statements(body)
+	if len(stmts) < 2 {
+		return false
+	}
+	c := captureRe.FindStringSubmatch(stmts[0])
+	e := exitRe.FindStringSubmatch(stmts[len(stmts)-1])
+	if c == nil || e == nil || c[1] != e[1] {
+		return false
+	}
+	// Under set -e (every run: step) a failing command ends the handler
+	// before its exit, with its own status: the handler turns errexit off
+	// first, or guards each command between with ||.
+	middle := stmts[1 : len(stmts)-1]
+	if len(middle) > 0 && middle[0] == "set +e" {
+		return true
+	}
+	for _, st := range middle {
+		if !orGuarded(st) {
+			return false
+		}
+	}
+	return true
+}
+
+// orGuarded reports a statement whose last list operator, outside quotes and
+// $( ), is ||: cmd || echo "::warning::...". Its status is the guard's.
+func orGuarded(st string) bool {
+	var z quoter
+	depth, last := 0, ""
+	for i := 0; i < len(st); {
+		c := st[i]
+		next, plain := z.step(st, i)
+		if plain {
+			switch {
+			case c == '(' || c == '{':
+				depth++
+			case (c == ')' || c == '}') && depth > 0:
+				depth--
+			case depth == 0 && strings.HasPrefix(st[i:], "||"):
+				last = "||"
+				next = i + 2
+			case depth == 0 && strings.HasPrefix(st[i:], "&&"):
+				last = "&&"
+				next = i + 2
+			case depth == 0 && c == '|':
+				last = "|"
+			}
+		}
+		i = next
+	}
+	return last == "||"
+}
+
+// statements splits a handler at ; and newlines outside quotes, $( ), ${ }
+// and braces, dropping comments and blank statements.
+func statements(body string) []string {
+	var out []string
+	var z quoter
+	depth, last := 0, 0
+	flush := func(end int) {
+		st := strings.TrimSpace(stripComment(body[last:end]))
+		if st != "" {
+			out = append(out, st)
+		}
+	}
+	for i := 0; i < len(body); {
+		c := body[i]
+		next, plain := z.step(body, i)
+		if plain {
+			switch c {
+			case '(', '{':
+				depth++
+			case ')', '}':
+				if depth > 0 {
+					depth--
+				}
+			case '#':
+				if i == 0 || strings.IndexByte(" \t\n;", body[i-1]) >= 0 {
+					for next < len(body) && body[next] != '\n' {
+						next++
+					}
+				}
+			case ';', '\n':
+				if depth == 0 {
+					flush(i)
+					last = i + 1
+				}
+			}
+		}
+		i = next
+	}
+	flush(len(body))
+	return out
+}
+
+// findTraps returns every trap command in a script, read outside quotes,
+// comments and here-documents. A handler may span lines inside its quotes.
+func findTraps(text string) []trapCmd {
+	var out []trapCmd
+	var z quoter
+	for i := 0; i < len(text); {
+		c := text[i]
+		next, plain := z.step(text, i)
+		if !plain {
+			i = next
+			continue
+		}
+		if c == '<' && strings.HasPrefix(text[i:], "<<<") {
+			i += 3 // a here-string: its word is read as any other
+			continue
+		}
+		if c == '<' && strings.HasPrefix(text[i:], "<<") {
+			i = skipHeredoc(text, i)
+			continue
+		}
+		wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
+		if c == '#' && wordStart {
+			for next < len(text) && text[next] != '\n' {
+				next++
+			}
+			i = next
+			continue
+		}
+		if wordStart && strings.HasPrefix(text[i:], "trap") && i+4 < len(text) && (text[i+4] == ' ' || text[i+4] == '\t') {
+			words, end := commandWords(text, i+4)
+			if t, ok := parseTrap(words); ok {
+				t.line = strings.Count(text[:i], "\n") + 1
+				out = append(out, t)
+			}
+			i = end
+			continue
+		}
+		i = next
+	}
+	return out
+}
+
+// commandWords reads the words of one simple command starting at i, up to a
+// newline, ;, &, | or ) outside quotes. A backslash-newline is a space.
+func commandWords(text string, i int) ([]string, int) {
+	var words []string
+	for i < len(text) {
+		for i < len(text) && (text[i] == ' ' || text[i] == '\t' || strings.HasPrefix(text[i:], "\\\n")) {
+			if text[i] == '\\' {
+				i++
+			}
+			i++
+		}
+		if i >= len(text) || strings.IndexByte("\n;&|)#", text[i]) >= 0 {
+			return words, i
+		}
+		start := i
+		var z quoter
+		for i < len(text) {
+			c := text[i]
+			next, plain := z.step(text, i)
+			if plain && strings.IndexByte(" \t\n;&|)", c) >= 0 {
+				break
+			}
+			i = next
+		}
+		i = min(i, len(text))
+		words = append(words, text[start:i])
+	}
+	return words, i
+}
+
+// parseTrap reads trap's arguments: [--] action signal..., or a signal list
+// alone (-p, -l print and set nothing).
+func parseTrap(words []string) (trapCmd, bool) {
+	if len(words) > 0 && words[0] == "--" {
+		words = words[1:]
+	}
+	if len(words) < 2 || strings.HasPrefix(words[0], "-") && words[0] != "-" {
+		return trapCmd{}, false
+	}
+	action, early := unquote(words[0])
+	// A quoted signal ("EXIT", 'ERR') names the same signal to the shell.
+	signals := make([]string, 0, len(words)-1)
+	for _, w := range words[1:] {
+		sig, _ := unquote(w)
+		signals = append(signals, sig)
+	}
+	return trapCmd{action: action, early: early, signals: signals}, true
+}
+
+// unquote removes shell quoting from a word, and reports whether it holds a $
+// the shell expands while reading it (outside single quotes).
+func unquote(w string) (string, bool) {
+	var b strings.Builder
+	early := false
+	for i := 0; i < len(w); i++ {
+		c := w[i]
+		switch c {
+		case '\'':
+			end := strings.IndexByte(w[i+1:], '\'')
+			if end < 0 {
+				end = len(w) - i - 1
+			}
+			b.WriteString(w[i+1 : i+1+end])
+			i += end + 1
+		case '"':
+			for i++; i < len(w) && w[i] != '"'; i++ {
+				if w[i] == '\\' && i+1 < len(w) && strings.IndexByte("\"\\$`\n", w[i+1]) >= 0 {
+					i++
+				} else if w[i] == '$' {
+					early = true
+				}
+				b.WriteByte(w[i])
+			}
+		case '\\':
+			if i+1 < len(w) {
+				i++
+				b.WriteByte(w[i])
+			}
+		case '$':
+			early = true
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), early
+}
+
+var heredocRe = regexp.MustCompile(`^<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][\w]*))`)
+
+// skipHeredoc returns the index past the here-document that starts with the
+// << at i, or past the << alone when it does not start one or no line ends it
+// (an arithmetic shift, $((1<<n)), reads the same): a skip never hides the
+// rest of a script. Its body is data: an apostrophe or the word trap in it is
+// not shell.
+func skipHeredoc(text string, i int) int {
+	m := heredocRe.FindStringSubmatch(text[i:])
+	if m == nil {
+		return i + 2
+	}
+	delim := m[2] + m[3] + m[4]
+	nl := strings.IndexByte(text[i:], '\n')
+	if nl < 0 {
+		return len(text)
+	}
+	j := i + nl + 1
+	for j < len(text) {
+		end := strings.IndexByte(text[j:], '\n')
+		if end < 0 {
+			end = len(text) - j
+		}
+		if strings.TrimSpace(text[j:j+end]) == delim {
+			return j + end
+		}
+		j += end + 1
+	}
+	return i + 2
+}
+
+// funcBody returns the body of the shell function name, if the script
+// defines one: name() { ... } or function name { ... }.
+func funcBody(text, name string) (string, bool) {
+	if !funcName.MatchString(name) {
+		return "", false
+	}
+	defRe := regexp.MustCompile(`(?m)^[ \t]*(?:function[ \t]+` + regexp.QuoteMeta(name) + `[ \t]*(?:\(\s*\))?|` + regexp.QuoteMeta(name) + `[ \t]*\(\s*\))\s*\{`)
+	loc := defRe.FindStringIndex(text)
+	if loc == nil {
+		return "", false
+	}
+	var z quoter
+	depth := 1
+	for i := loc[1]; i < len(text); {
+		c := text[i]
+		next, plain := z.step(text, i)
+		if plain && c == '#' && strings.IndexByte(" \t\n;", text[i-1]) >= 0 {
+			for next < len(text) && text[next] != '\n' {
+				next++
+			}
+		}
+		if plain {
+			switch c {
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					return text[loc[1]:i], true
+				}
+			}
+		}
+		i = next
+	}
+	return "", false
+}

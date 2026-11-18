@@ -143,7 +143,7 @@ read_tip() { # <branch> <out file> <what>: the branch's tip, a 40-hex sha
   printf '%s\n' "$t" >"$2"
 }
 
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+tmp="$(mktemp -d)"; trap 'RC=$?; set +e; rm -rf "$tmp"; exit "$RC"' EXIT
 # main's tip, read once: main's copy of the check is read AT this commit, so the check, and on a
 # maintenance base the gate workflow it is compared with, come from one immutable main commit.
 read_tip main "$tmp/main.sha" "main's tip"

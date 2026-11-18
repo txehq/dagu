@@ -5,13 +5,16 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,6 +47,8 @@ func TestFixtures(t *testing.T) {
 		{"harness_test.py.txt", "txe/tests/harness_test.py"},
 		{"workflow.yml.txt", ".github/workflows/x.yaml"},
 		{"workflow_steps.yml.txt", ".github/workflows/steps.yaml"},
+		{"trap.sh.txt", ".github/scripts/trap.sh"},
+		{"trap_workflow.yml.txt", ".github/workflows/trap.yaml"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.fixture, func(t *testing.T) {
@@ -97,6 +102,105 @@ func lineStrings(fs []Finding) []string {
 		out = append(out, f.String())
 	}
 	return out
+}
+
+// The trap rule reads CI code: everything under .github, and every script it
+// names, transitively. A script nothing in CI names is not read (TXE-7857).
+func TestTrapRuleReachesTheScriptsCIRuns(t *testing.T) {
+	t.Parallel()
+	bad := []byte("#!/bin/bash\ntrap 'rm -rf \"$w\"' EXIT\n")
+	res := lintSources([]source{
+		{rel: ".github/workflows/w.yml", lang: langShell, data: []byte("jobs:\n  j:\n    steps:\n      - run: bash scripts/a.sh\n")},
+		{rel: "scripts/a.sh", lang: langShell, data: []byte("#!/bin/bash\n./scripts/b.sh\n")},
+		{rel: "scripts/b.sh", lang: langShell, data: bad},
+		{rel: "scripts/unreached.sh", lang: langShell, data: bad},
+		{rel: ".github/scripts/direct.sh", lang: langShell, data: bad},
+		{rel: ".github/scripts/direct.zsh", lang: langShell, data: bad},
+	})
+	var got []string
+	for _, f := range res.Findings {
+		got = append(got, f.Path+":"+strconv.Itoa(f.Line)+":"+f.Rule)
+	}
+	assert.Equal(t, []string{".github/scripts/direct.sh:2:" + ruleTrap, "scripts/b.sh:2:" + ruleTrap}, got)
+}
+
+// A file in trapAllowedFiles has its trap findings allowed, with the entry's
+// reason; an entry whose file has no such finding is itself a finding, so it
+// cannot outlive the fix.
+func TestTrapAllowedFilesAllowAndGoStale(t *testing.T) {
+	t.Parallel()
+	const rel = ".github/codex-review/test-codex-review-check.sh"
+	require.Contains(t, trapAllowedFiles, rel)
+	bad := []byte("#!/bin/bash\nset -uo pipefail\nTMP=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP\"' EXIT\n")
+	res := lintSources([]source{{rel: rel, lang: langShell, data: bad}})
+	assert.Empty(t, res.Findings)
+	require.Len(t, res.Allowed, 1)
+	assert.Equal(t, ruleTrap, res.Allowed[0].Rule)
+	assert.Equal(t, trapAllowedFiles[rel], res.Allowed[0].Reason)
+
+	fixed := []byte("#!/bin/bash\nset -uo pipefail\nTMP=\"$(mktemp -d)\"\ntrap 'RC=$?; set +e; rm -rf \"$TMP\"; exit \"$RC\"' EXIT\n")
+	res = lintSources([]source{{rel: rel, lang: langShell, data: fixed}})
+	assert.Empty(t, res.Allowed)
+	assert.Equal(t, []string{"1:" + ruleDirective}, keys(res.Findings))
+}
+
+// The textual rule is checked against bash itself: every handler shape the
+// lint accepts keeps the main command's status when its cleanup fails, under
+// the -e -o pipefail a GitHub run: step uses, and every shape it rejects here
+// loses it. CLEANUP stands for the cleanup command, run as false. The same
+// handlers without -e keep the status either way, which is why the rule is
+// stated for errexit.
+func TestTrapShapesAgainstBash(t *testing.T) {
+	t.Parallel()
+	if runtime.GOOS == "windows" {
+		// "bash" on a Windows runner may be WSL's launcher, not a shell;
+		// the ubuntu jobs run this check.
+		t.Skip("checked against bash on Linux and macOS")
+	}
+	bash, err := exec.LookPath("bash")
+	require.NoError(t, err, "bash is required to check trap shapes against the shell")
+	cases := []struct {
+		handler string
+		accept  bool
+	}{
+		{`RC=$?; set +e; CLEANUP; exit "$RC"`, true},
+		{`RC=$?; CLEANUP || echo "::warning::cleanup failed"; exit "$RC"`, true},
+		{"RC=$?\n  set +e\n  CLEANUP\n  CLEANUP\n  exit \"${RC}\"", true},
+		{`RC=$?; set +e; fn; exit "$RC"`, true},
+		{`RC=$?; CLEANUP; exit "$RC"`, false},
+		{`RC=$?; fn; exit "$RC"`, false},
+		{`RC=$?; CLEANUP || echo warned; CLEANUP; exit "$RC"`, false},
+		{`RC=$?; echo removing && CLEANUP; exit "$RC"`, false},
+		{`CLEANUP`, false},
+	}
+	run := func(flags []string, script string) int {
+		args := append(append([]string{"--noprofile", "--norc"}, flags...), "-c", script)
+		out, err := exec.Command(bash, args...).CombinedOutput() //nolint:gosec // a fixed script this test wrote
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			return ee.ExitCode()
+		}
+		require.NoError(t, err, "%s: %s", script, out)
+		return 0
+	}
+	for _, tc := range cases {
+		handler := strings.ReplaceAll(tc.handler, "CLEANUP", "false")
+		lost := false
+		for _, main := range []struct {
+			cmd  string
+			want int
+		}{{"true", 0}, {"exit 3", 3}} {
+			script := "fn() { false; echo after; }\ntrap '" + handler + "' EXIT\n" + main.cmd + "\n"
+			if got := run([]string{"-e", "-o", "pipefail"}, script); got != main.want {
+				lost = true
+				assert.False(t, tc.accept, "accepted handler %q exits %d after main %q, want %d", tc.handler, got, main.cmd, main.want)
+			}
+			assert.Equal(t, main.want, run(nil, script), "without errexit, bash keeps the status of main %q whatever %q does", main.cmd, tc.handler)
+		}
+		assert.True(t, tc.accept || lost, "rejected handler %q keeps the status in bash; the case no longer shows why it is rejected", tc.handler)
+		src := "#!/bin/bash\nfn() { false; echo after; }\ntrap '" + handler + "' EXIT\n"
+		res := lintSources([]source{{rel: ".github/scripts/x.sh", lang: langShell, data: []byte(src)}})
+		assert.Equal(t, tc.accept, len(res.Findings) == 0, "lint accepts %q: %v", tc.handler, res.Findings)
+	}
 }
 
 // A logical line continued with a backslash is reported where it starts.

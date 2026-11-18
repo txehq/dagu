@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Traps on EXIT or ERR keep the main command's status and say when they fail (TXE-7857, from txe's TXE-7835).
+set -euo pipefail
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT # want:trap-status
+trap 'docker rm -f "pg-$RUN" >/dev/null 2>&1' EXIT # want:trap-status
+trap 'RC=$?; docker rm -f "pg-$RUN" >/dev/null 2>&1; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; kill "$pid" 2>/dev/null || true; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; rm -rf "$work" &>/dev/null; exit "$RC"' ERR # want:trap-status
+trap "RC=$?; rm -rf $work; exit \$RC" EXIT # want:trap-status
+trap 'RC=$?; set +e; rm -rf "$work"; exit 0' EXIT # want:trap-status
+trap 'rm -rf "$work"; exit "$RC"' EXIT # want:trap-status
+trap -- 'rm -rf "$work"' 0 # want:trap-status
+trap 'rm -rf "$work"' SIGEXIT # want:trap-status
+trap 'docker rm -f "$cid" 2>/dev/null; exit 143' TERM # want:trap-status
+trap 'RC=$? # want:trap-status
+  rm -rf "$work" 2>&-
+  exit "$RC"' EXIT
+cleanup() {
+  # don't let a quote in a comment end the body
+  [ -d "$work" ] && rm -rf "$work"
+}
+trap cleanup EXIT # want:trap-status
+quiet() { rm -rf "$work" 2>/dev/null || true; }
+trap 'RC=$?; quiet; exit "$RC"' EXIT # want:trap-status
+
+# Under set -e a failing cleanup ends the handler before its exit (connector review of PR 5227).
+trap 'RC=$?; rm -rf "$work"; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; cleanup; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; rm -rf "$work" || echo "::warning::kept $work"; rm -f "$lock"; exit "$RC"' EXIT # want:trap-status
+trap 'RC=$?; docker rm -f "pg" >/dev/null && echo removed; exit "$RC"' EXIT # want:trap-status
+
+# Kept: these pass.
+trap 'RC=$?; set +e; rm -rf "$work"; exit "$RC"' EXIT
+trap 'RC=$?; docker rm -f "pg-$RUN" >/dev/null || echo "::warning::could not remove pg-$RUN"; exit "$RC"' EXIT
+trap "RC=\$?; set +e; rm -rf \"\$work\"; exit \"\$RC\"" EXIT
+trap 'RC=$?
+  set +e
+  rm -rf "$work"
+  exit "${RC}"' EXIT
+trap 'RC=$?; set +e; cleanup; exit "$RC"' EXIT
+trap 'RC=$?; cleanup || echo "cleanup failed (above)" >&2; exit "$RC"' EXIT
+done_rc() {
+  local status=$?
+  set +e
+  rm -rf "$work"
+  exit "$status"
+}
+trap done_rc EXIT
+trap 'docker rm -f "$cid" >/dev/null; exit 143' TERM
+trap '' TERM
+trap - EXIT
+trap -p EXIT
+echo "trap 'rm -rf x' EXIT is text, not a trap"
+cat <<'DOC'
+trap 'rm -rf "$work"' EXIT
+it's a here-document: no trap, and the apostrophe opens no quote
+DOC
+trap 'RC=$?; set +e; rm -rf "$work"; exit "$RC"' EXIT
+# A here-string, an arithmetic shift and an unended << hide nothing after them (connector review of PR 5227).
+read -r first <<<"text"
+trap 'rm -rf "$work"' EXIT # want:trap-status
+echo $((1<<n))
+trap 'rm -rf "$work"' EXIT # want:trap-status
+cat <<NEVER_ENDED
+trap 'rm -rf "$work"' EXIT # want:trap-status
+# A quoted signal is the same signal (connector review of PR 5227).
+trap 'rm -rf "$work"' "EXIT" # want:trap-status
+trap 'rm -rf "$work"' 'ERR' # want:trap-status
+trap 'rm -rf "$work"' INT "EXIT" # want:trap-status
+# dagu's smoke cleanup before TXE-7857: it saved the status, but under set -e a failing rm ended
+# the handler before its exit, and docker's error went to /dev/null.
+smoke_old() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    timeout 10 docker logs "$container" || true
+  fi
+  timeout 10 docker rm -f "$container" >/dev/null 2>&1 || true
+  rm -rf "$data_dir"
+  exit "$status"
+}
+trap smoke_old EXIT # want:trap-status
+smoke_new() {
+  status=$?
+  set +e
+  timeout 10 docker rm -f "$container" >/dev/null || echo "::warning::could not remove $container (above)"
+  rm -rf "$data_dir"
+  exit "$status"
+}
+trap smoke_new EXIT
