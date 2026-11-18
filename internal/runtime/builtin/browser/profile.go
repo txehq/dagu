@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
 	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/internal/agentstep"
 )
@@ -48,6 +49,11 @@ func acquireProfile(ctx context.Context, browserDir, name, ownRecordID string, w
 	lockDir := dir + profileLockSuffix
 	if err := os.MkdirAll(dir, profileDirMode); err != nil {
 		return nil, fmt.Errorf("create browser profile %q: %w", name, err)
+	}
+	// The profile is Dagu's own, under its browser directory, for the
+	// browsers the DevTools gate starts.
+	if err := devtoolsgate.ClaimProfile(dir); err != nil {
+		return nil, fmt.Errorf("browser profile %q: %w", name, err)
 	}
 	if err := os.MkdirAll(lockDir, profileDirMode); err != nil {
 		return nil, fmt.Errorf("create browser profile lock %q: %w", name, err)
@@ -108,4 +114,18 @@ func (l *profileLease) release() {
 	}
 	l.stop()
 	_ = l.lock.Unlock()
+}
+
+// newProfileDir creates a temporary profile directory for a browser the
+// DevTools gate starts, and claims it as the gate's own.
+func newProfileDir(pattern string) (string, error) {
+	dir, err := os.MkdirTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	if err := devtoolsgate.ClaimProfile(dir); err != nil {
+		_ = os.RemoveAll(dir)
+		return "", err
+	}
+	return dir, nil
 }

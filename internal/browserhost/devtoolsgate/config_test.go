@@ -26,6 +26,8 @@ func TestConfigValidate(t *testing.T) {
 		"negative unattended cap": {Token: NewToken(), Executable: "/usr/bin/chrome", MaxUnattended: -time.Second},
 		"port flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-port=9222"}},
 		"pipe flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-pipe"}},
+		"no profile":              {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--headless"}},
+		"empty profile":           {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--user-data-dir="}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -34,6 +36,7 @@ func TestConfigValidate(t *testing.T) {
 	}
 	assert.True(t, errors.Is(cases["port flag"].validate(), ErrDebuggingFlagInArgs))
 	assert.True(t, errors.Is(cases["no token"].validate(), ErrTokenRequired))
+	assert.True(t, errors.Is(cases["no profile"].validate(), ErrProfileRequired))
 	// The lifetime policy is resolved in one place: zero MaxUnattended is
 	// the default, zero MaxLifetime is no hard cap, explicit values stand.
 	assert.Equal(t, lifetimePolicy{hardCap: 0, unattended: DefaultMaxUnattended}, Config{}.lifetime())

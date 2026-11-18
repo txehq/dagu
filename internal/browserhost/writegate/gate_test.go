@@ -236,6 +236,7 @@ func startBrowserFor(t *testing.T, profile string, maxUnattended time.Duration) 
 	defer func() { <-startupSlot }()
 	self, err := os.Executable()
 	require.NoError(t, err)
+	require.NoError(t, devtoolsgate.ClaimProfile(profile))
 	gate, err := devtoolsgate.Start(t.Context(), self, devtoolsgate.Config{
 		Token:         devtoolsgate.NewToken(),
 		Executable:    path,
