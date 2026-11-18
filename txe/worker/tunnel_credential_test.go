@@ -50,11 +50,16 @@ case "$*" in
   *"--subresource=portforward"*)
     # After the writer: swap the written candidate for a link, as late as the
     # script allows, with $STUB_LATE_SWAP.
-    if [ "${STUB_LATE_SWAP:-}" = symlink ]; then
-      for c in "$TXE_DAGU_HOME"/tunnel/kubeconfig.??????; do "$REAL_RM" -f "$c"; ln -s "$STUB_OUTSIDE" "$c"; done
-    fi
+    for c in "$TXE_DAGU_HOME"/tunnel/kubeconfig.??????; do
+      case "${STUB_LATE_SWAP:-}" in
+        symlink) "$REAL_RM" -f "$c"; ln -s "$STUB_OUTSIDE" "$c" ;;
+        mode) chmod 644 "$c" ;;
+      esac
+    done
     echo yes; exit "${STUB_PORTFORWARD:-0}" ;;
-  *"get secrets"*) echo no; exit 1 ;;
+  *"get secrets"*)
+    for c in "$TXE_DAGU_HOME"/tunnel/kubeconfig.??????; do [ ! -L "$c" ] || echo "followed a link" >> "$STUB_CALLS"; done
+    echo no; exit 1 ;;
   *) echo "stub kubectl: unexpected call" >&2; exit 98 ;;
 esac
 `
@@ -223,15 +228,24 @@ func TestTunnelCredentialKeepsThePairWhenExpiresCannotMove(t *testing.T) {
 // over the live kubeconfig: the run fails, custody is reported, and the
 // outside file keeps its content (independent review of PR 293).
 func TestTunnelCredentialRefusesACandidateSwappedAfterTheWrite(t *testing.T) {
-	r := runTunnelCredential(t, "STUB_LATE_SWAP=symlink")
-	assert.Equal(t, 1, r.code, "stderr:\n%s", r.stderr)
-	assert.Contains(t, r.stderr, "no longer the private file this run wrote")
-	assert.NotEmpty(t, fatalLines(r.stderr), "the swapped candidate is a custody failure:\n%s", r.stderr)
-	assert.NoFileExists(t, filepath.Join(r.tunnelDir, "kubeconfig"), "a swapped candidate replaced the live kubeconfig")
-	b, err := os.ReadFile(r.outside)
-	require.NoError(t, err)
-	assert.Equal(t, "not a credential\n", string(b))
-	assert.Empty(t, r.candidates(t))
+	for _, tc := range []struct {
+		swap  string
+		fatal bool // a link is a custody failure; a mode change is refused
+	}{{"symlink", true}, {"mode", false}} {
+		t.Run(tc.swap, func(t *testing.T) {
+			r := runTunnelCredential(t, "STUB_LATE_SWAP="+tc.swap)
+			assert.Equal(t, 1, r.code, "stderr:\n%s", r.stderr)
+			assert.Contains(t, r.stderr, "no longer the private file this run wrote")
+			assert.Equal(t, tc.fatal, len(fatalLines(r.stderr)) > 0, "custody FATAL:\n%s", r.stderr)
+			assert.NotContains(t, r.calls, "get secrets", "the changed candidate was used again")
+			assert.NotContains(t, r.calls, "followed a link")
+			assert.NoFileExists(t, filepath.Join(r.tunnelDir, "kubeconfig"), "a changed candidate replaced the live kubeconfig")
+			b, err := os.ReadFile(r.outside)
+			require.NoError(t, err)
+			assert.Equal(t, "not a credential\n", string(b))
+			assert.Empty(t, r.candidates(t))
+		})
+	}
 }
 
 // When the old .expires can be neither replaced nor removed, the run fails
@@ -244,6 +258,8 @@ func TestTunnelCredentialReportsAnExpiresItCannotRemove(t *testing.T) {
 	assert.Equal(t, 1, r.code, "stderr:\n%s", r.stderr)
 	live := filepath.Join(r.tunnelDir, "kubeconfig.expires")
 	assert.Contains(t, r.stderr, "txe-dagu: FATAL: "+live+" may still hold the previous credential's expiry")
+	assert.Contains(t, r.stderr, "the old one could not be removed")
+	assert.NotContains(t, r.stderr, "was removed so that", "the run claimed a removal that failed")
 }
 
 // A candidate that is not the private file this run made is never written
@@ -299,6 +315,10 @@ func TestTunnelCredentialRefusesAnUnsafeDirectory(t *testing.T) {
 		{"group writable", func(home, _ string) {
 			require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))
 			require.NoError(t, os.Chmod(filepath.Join(home, "tunnel"), 0o770)) //nolint:gosec // the unsafe mode under test
+		}},
+		{"group readable", func(home, _ string) {
+			require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))
+			require.NoError(t, os.Chmod(filepath.Join(home, "tunnel"), 0o750)) //nolint:gosec // the unsafe mode under test
 		}},
 		{"world writable", func(home, _ string) {
 			require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))

@@ -44,15 +44,21 @@ ca="$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name==\"$cluster\")]
 umask 077
 tdir="$TXE_DAGU_HOME/tunnel"
 mkdir -p "$tdir"
-# The token is written only into a directory this user owns and no one else can
-# write: there, no other account can swap the candidate for a link or read it.
-# A directory that is a link, not this user's, or writable by group or others is
-# refused before any token is asked for (TXE-7864).
+# The token is written only into a directory this user owns and no other account
+# can enter: there, no other account can swap the candidate for a link, or read
+# it even if its mode changes. A directory that is a link, not this user's, or
+# open to group or others in any way is refused before any token is asked for
+# (TXE-7864). The script makes it 0700 itself. What this does not cover: a
+# process of this same account, which could read the token directly anyway.
 if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
   die "$tdir is not a directory this user owns (or it is a symbolic link); refusing to write a credential there"
 fi
-if [ -n "$(find "$tdir" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ]; then
-  die "$tdir is writable by group or others; refusing to write a credential there (chmod 700 it)"
+# private PATH: no permission bit for group or others.
+private() {
+  [ -z "$(find "$1" -maxdepth 0 \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) -print)" ]
+}
+if ! private "$tdir"; then
+  die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
 fi
 out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a
@@ -129,13 +135,14 @@ with os.fdopen(efd, "w") as f:
 ' "$cand" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
 
 # The pair is still the private files the writer made: neither has become a
-# link (which kubectl and mv would follow or promote) nor another account's
-# file. Checked before the candidate is used and again before it is moved; the
-# directory is this user's alone, so nothing else can swap it in between.
+# link (which kubectl and mv would follow or promote), another account's file,
+# or open to others. Checked before each use of the candidate and before it is
+# moved; the directory is this user's alone, so no other account can swap it
+# in between.
 cand_intact() {
   local p
   for p in "$cand" "$cand.expires"; do
-    if [ -L "$p" ] || [ ! -f "$p" ] || [ ! -O "$p" ]; then
+    if [ -L "$p" ] || [ ! -f "$p" ] || [ ! -O "$p" ] || ! private "$p"; then
       die "the credential candidate $p is no longer the private file this run wrote; refusing to use it, kept the previous credential"
     fi
   done
@@ -145,17 +152,20 @@ cand_intact
 # Prove the credential does what the tunnel needs, and no more than that.
 kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --subresource=portforward >/dev/null \
   || die "the new credential cannot port-forward in $TXE_DAGU_NAMESPACE; kept the previous one"
+cand_intact
 if kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i get secrets >/dev/null 2>&1; then
   die "the new credential can read Secrets; the dagu-tunnel Role is wider than intended; kept the previous one"
 fi
 # The kubeconfig and its .expires are a pair: when the second move fails, the
 # live .expires would name the old credential's expiry, so it is removed and
-# the run fails rather than leave the pair disagreeing.
+# the run fails. Two renames are not one atomic step: if that removal fails
+# too, the pair disagrees, and the FATAL line names the stale file.
 cand_intact
 mv -f "$cand" "$out"
 if ! mv -f "$cand.expires" "$out.expires"; then
   if ! rm -f -- "$out.expires" || [ -e "$out.expires" ] || [ -L "$out.expires" ]; then
     printf 'txe-dagu: FATAL: %s may still hold the previous credential'"'"'s expiry beside the new credential in %s: its removal failed (rm'"'"'s error, if any, is above); remove it\n' "$out.expires" "$out" >&2
+    die "the new credential is in $out, but its expiry record could not be moved beside it, and the old one could not be removed; run this script again"
   fi
   die "the new credential is in $out, but its expiry record could not be moved beside it; $out.expires was removed so that status.sh does not report the old expiry; run this script again"
 fi
