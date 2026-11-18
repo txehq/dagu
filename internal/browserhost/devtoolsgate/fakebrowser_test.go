@@ -38,6 +38,9 @@ import (
 // interception turned on later does not reach it until Fetch is turned on
 // or off on one of its own sessions, which makes the browser build its
 // loaders again.
+//
+// A worker made by Fake.createWorker starts as Chrome starts a service
+// worker (TXE-6223, measured): see fakeWorker.
 type fakeBrowser struct {
 	in  *bufio.Reader
 	out io.Writer
@@ -113,6 +116,38 @@ type fakeTarget struct {
 	// target was made, or when Fetch was last turned on or off on one of
 	// its sessions.
 	loaders map[string]bool
+	// worker is set for a target made by Fake.createWorker.
+	worker *fakeWorker
+}
+
+// fakeWorker is a service worker starting the way Chrome starts one, as
+// measured for TXE-6223:
+//
+//   - the root auto-attach with waitForDebuggerOnStart holds the worker in
+//     the worker itself (held): it answers commands but runs nothing until
+//     a resume on any of its sessions is applied;
+//   - an auto-attach with waitForDebuggerOnStart on the page that started
+//     it also holds the fetch of its script (throttles): until every such
+//     session resumed it or was detached, no command on any session of the
+//     worker is applied or answered. A resume there releases the fetch at
+//     once, in the browser, and then goes on to the worker like any other;
+//     a detach releases the fetch and nothing else;
+//   - the browser keeps no order between the worker's sessions: commands
+//     wait in a queue per session, and Fake.pump applies them only when the
+//     test asks, sessions holding a resume first, the earliest resume
+//     first, each session's own commands in the order sent. A resume sent
+//     before another session's setup is so applied before it.
+type fakeWorker struct {
+	throttles map[string]bool
+	held      bool
+	running   bool
+	queues    map[string][]fakeCommand
+}
+
+// fakeCommand is a command waiting in a worker's queue.
+type fakeCommand struct {
+	id     json.RawMessage
+	method string
 }
 
 type fakeSession struct {
@@ -127,6 +162,8 @@ type fakeSession struct {
 	fetchAuth  bool
 	nestedAuto bool
 	nestedWait bool
+	// nestedFilter is the filter of the session's auto-attach.
+	nestedFilter targetFilter
 }
 
 // fakeChallenge is the authentication challenge a request meets at the
@@ -287,6 +324,12 @@ func (f *fakeBrowser) handle(data []byte) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if s, ok := f.sessions[cmd.SessionID]; ok && cmd.SessionID != "" {
+		if t, ok := f.targets[s.targetID]; ok && t.worker != nil && !strings.HasPrefix(cmd.Method, "Target.") {
+			f.workerCommandLocked(t, s, cmd.ID, cmd.Method)
+			return
+		}
+	}
 	switch cmd.Method {
 	case "Browser.getVersion":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{
@@ -324,6 +367,7 @@ func (f *fakeBrowser) handle(data []byte) {
 			if s, ok := f.sessions[cmd.SessionID]; ok {
 				s.nestedAuto = boolean("autoAttach")
 				s.nestedWait = boolean("waitForDebuggerOnStart")
+				s.nestedFilter = parseTargetFilter(cmd.Params)
 			}
 			f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 			return
@@ -382,7 +426,7 @@ func (f *fakeBrowser) handle(data []byte) {
 		}
 		s := f.newSessionLocked(t.id, false)
 		f.event(cmd.SessionID, "Target.attachedToTarget", map[string]any{
-			"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": t.pausedBy != "",
+			"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": t.pausedBy != "" || (t.worker != nil && !t.worker.running),
 		})
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"sessionId": s.id})
 	case "Target.detachFromTarget":
@@ -515,7 +559,7 @@ func (f *fakeBrowser) handle(data []byte) {
 		}
 		child := f.addTargetLocked(typ, "child://"+parent.id, "child")
 		for _, s := range f.sortedSessions() {
-			if s.targetID != parent.id || !s.nestedAuto {
+			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(typ) {
 				continue
 			}
 			cs := f.newSessionLocked(child.id, true)
@@ -527,6 +571,43 @@ func (f *fakeBrowser) handle(data []byte) {
 			})
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetId": child.id})
+	case "Fake.createWorker":
+		// A service worker the page targetId starts: attached at the root
+		// and under every session of the page that asked for auto-attach.
+		parent, ok := f.targets[str("targetId")]
+		if !ok {
+			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		w := f.addTargetLocked("service_worker", "worker://"+parent.id, "worker")
+		w.worker = &fakeWorker{throttles: map[string]bool{}, queues: map[string][]fakeCommand{}}
+		if f.autoAttach.on {
+			s := f.newSessionLocked(w.id, true)
+			w.worker.held = f.autoAttach.wait
+			f.event("", "Target.attachedToTarget", map[string]any{
+				"sessionId": s.id, "targetInfo": f.targetInfo(w), "waitingForDebugger": f.autoAttach.wait,
+			})
+		}
+		for _, s := range f.sortedSessions() {
+			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(w.typ) {
+				continue
+			}
+			cs := f.newSessionLocked(w.id, true)
+			if s.nestedWait {
+				w.worker.throttles[cs.id] = true
+			}
+			f.event(s.id, "Target.attachedToTarget", map[string]any{
+				"sessionId": cs.id, "targetInfo": f.targetInfo(w), "waitingForDebugger": s.nestedWait,
+			})
+		}
+		f.startWorkerLocked(w)
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetId": w.id})
+	case "Fake.pump":
+		applied := 0
+		for _, t := range f.sortedTargets() {
+			applied += f.pumpWorkerLocked(t)
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"applied": applied})
 	case "Fake.event":
 		var raw struct {
 			SessionID string          `json:"sessionId"`
@@ -635,7 +716,97 @@ func (f *fakeBrowser) dropSessionLocked(s *fakeSession, via string) {
 	if t, ok := f.targets[s.targetID]; ok && t.pausedBy == s.id {
 		t.pausedBy = ""
 	}
+	if t, ok := f.targets[s.targetID]; ok && t.worker != nil {
+		// What waited on the session is never applied or answered.
+		delete(t.worker.queues, s.id)
+		if t.worker.throttles[s.id] {
+			delete(t.worker.throttles, s.id)
+			f.log = append(f.log, "fetch of "+t.id+" released by the detach of "+s.id)
+			f.startWorkerLocked(t)
+		}
+	}
 	f.event(via, "Target.detachedFromTarget", map[string]any{"sessionId": s.id, "targetId": s.targetID})
+}
+
+// workerCommandLocked takes a command on a session of a worker.
+func (f *fakeBrowser) workerCommandLocked(t *fakeTarget, s *fakeSession, id json.RawMessage, method string) {
+	w := t.worker
+	if method == "Runtime.runIfWaitingForDebugger" && w.throttles[s.id] {
+		delete(w.throttles, s.id)
+		f.log = append(f.log, "fetch of "+t.id+" released by the resume on "+s.id)
+		f.startWorkerLocked(t)
+	}
+	if w.running {
+		f.applyWorkerLocked(t, s.id, fakeCommand{id: id, method: method})
+		return
+	}
+	w.queues[s.id] = append(w.queues[s.id], fakeCommand{id: id, method: method})
+}
+
+// startWorkerLocked runs a worker whose script was fetched and that nothing
+// holds.
+func (f *fakeBrowser) startWorkerLocked(t *fakeTarget) {
+	w := t.worker
+	if len(w.throttles) > 0 || w.held || w.running {
+		return
+	}
+	w.running = true
+	f.resumed = append(f.resumed, t.id)
+	f.log = append(f.log, "run "+t.id)
+}
+
+// applyWorkerLocked applies and answers one command in the worker.
+func (f *fakeBrowser) applyWorkerLocked(t *fakeTarget, sessionID string, cmd fakeCommand) {
+	result := map[string]any{}
+	switch cmd.method {
+	case "Runtime.runIfWaitingForDebugger":
+		t.worker.held = false
+		f.startWorkerLocked(t)
+	case "Network.enable":
+		f.log = append(f.log, "Network.enable "+sessionID+" on "+t.id)
+	case "Runtime.getIsolateId":
+		result["id"] = "isolate-" + t.id
+	}
+	f.reply(cmd.id, sessionID, result)
+}
+
+// pumpWorkerLocked applies what waits in a worker's queues, adversarially
+// (fakeWorker), once its script was fetched. It returns how many commands
+// it applied.
+func (f *fakeBrowser) pumpWorkerLocked(t *fakeTarget) int {
+	w := t.worker
+	if w == nil || len(w.throttles) > 0 {
+		return 0
+	}
+	firstResume := func(queue []fakeCommand) int {
+		for i, cmd := range queue {
+			if cmd.method == "Runtime.runIfWaitingForDebugger" {
+				return i
+			}
+		}
+		return len(queue) + 1<<20
+	}
+	sessions := make([]string, 0, len(w.queues))
+	for id := range w.queues {
+		sessions = append(sessions, id)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		a, b := firstResume(w.queues[sessions[i]]), firstResume(w.queues[sessions[j]])
+		if a != b {
+			return a < b
+		}
+		return sessions[i] < sessions[j]
+	})
+	applied := 0
+	for _, id := range sessions {
+		queue := w.queues[id]
+		delete(w.queues, id)
+		for _, cmd := range queue {
+			f.applyWorkerLocked(t, id, cmd)
+			applied++
+		}
+	}
+	return applied
 }
 
 func (f *fakeBrowser) sortedTargets() []*fakeTarget {
@@ -672,6 +843,8 @@ type fakeState struct {
 	Refused     []string           `json:"refused"`
 	Credentials map[string]string  `json:"credentials"`
 	Log         []string           `json:"log"`
+	// Queued counts, per session, the commands waiting in a worker.
+	Queued map[string]int `json:"queued"`
 }
 
 type fakeSessionState struct {
@@ -691,14 +864,20 @@ func (f *fakeBrowser) stateLocked() fakeState {
 		Refused:     append([]string(nil), f.refused...),
 		Credentials: map[string]string{},
 		Log:         append([]string(nil), f.log...),
+		Queued:      map[string]int{},
 	}
 	for _, s := range f.sortedSessions() {
 		state.Sessions = append(state.Sessions, fakeSessionState{ID: s.id, TargetID: s.targetID, Auto: s.auto, Browser: s.browser, FetchOn: s.fetchOn, FetchAuth: s.fetchAuth})
 	}
 	for _, t := range f.sortedTargets() {
 		state.Targets = append(state.Targets, t.id)
-		if t.pausedBy != "" {
+		if t.pausedBy != "" || (t.worker != nil && !t.worker.running) {
 			state.Paused = append(state.Paused, t.id)
+		}
+		if t.worker != nil {
+			for id, queue := range t.worker.queues {
+				state.Queued[id] = len(queue)
+			}
 		}
 	}
 	maps.Copy(state.Continues, f.continues)
