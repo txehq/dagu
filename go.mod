@@ -1,6 +1,6 @@
 module github.com/dagucloud/dagu/v2
 
-go 1.27.3
+go 1.27.4
 
 require (
 	cloud.google.com/go/secretmanager v1.20.0
@@ -80,7 +80,7 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.20.1
 	github.com/stretchr/testify v1.12.1
-	github.com/xuri/excelize/v2 v2.11.1-0.20261029001137-c5fd73bde8f6
+	github.com/xuri/excelize/v2 v2.11.1
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9
 	github.com/yoheimuta/protolint v0.55.7
 	go.opentelemetry.io/otel v1.46.0
