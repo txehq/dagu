@@ -59,9 +59,7 @@ func writeReadyLine(stdout io.Writer, line readyLine) {
 }
 
 func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
-	soakT0 := time.Now()
 	browser, err := launchBrowser(cfg)
-	soakStart := time.Since(soakT0)
 	if err != nil {
 		writeReadyLine(stdout, readyLine{Error: err.Error()})
 		return err
@@ -97,12 +95,6 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	startCtx, cancelStart := context.WithTimeout(ctx, startupTimeout)
 	defer cancelStart()
 	version, err := readVersion(startCtx, m)
-	soakRec := soakRecord{Began: soakT0.UTC().Format(time.RFC3339Nano), ChromePID: browser.pid(), StartMs: soakMs(soakStart), AnswerMs: soakMs(time.Since(soakT0))}
-	if err != nil {
-		soakRec.Err = err.Error()
-		soakRec.Exited = browser.exited()
-		soakWrite(soakRec)
-	}
 	if err != nil {
 		return fail(fmt.Errorf("devtools gate: the browser did not answer over its pipe: %w", err))
 	}
@@ -120,8 +112,6 @@ func run(ctx context.Context, cfg Config, stdout io.Writer, clk clock) error {
 	m.mu.Lock()
 	m.onBrowserClosing = g.stopServing
 	m.mu.Unlock()
-	soakRec.ReadyMs = soakMs(time.Since(soakT0))
-	soakWrite(soakRec)
 	writeReadyLine(stdout, readyLine{Ready: &Ready{
 		Port:             port,
 		BrowserID:        g.browserID,

@@ -47,7 +47,6 @@ func launchBrowser(cfg Config) (*browserProcess, error) {
 	args := make([]string, 0, len(cfg.Args)+2)
 	args = append(args, pipeFlags(browserRead, browserWrite)...)
 	args = append(args, cfg.Args...)
-	args = append(args, soakChromeArgs()...)
 	cmd := exec.Command(cfg.Executable, args...) //nolint:gosec // starting the configured browser is the gate's purpose
 	// The standard handles are the null device, never a writer: for a
 	// writer os/exec makes a pipe that the browser's helper processes
