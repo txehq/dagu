@@ -206,6 +206,12 @@ jobs:
       - name: Check workflow pull_request triggers
         run: go test ./internal/tools/workflowtriggers -count=1
 
+      # Every step that runs the Windows installer passes the workflow token
+      # for its GitHub API call, which is otherwise rate limited per shared
+      # runner IP (TXE-7871).
+      - name: Check installer GitHub API calls
+        run: go test -count=1 ./internal/tools/installerapi
+
   # Lint Go code
   golint:
     name: Go Linter
@@ -560,6 +566,12 @@ jobs:
 
       - name: Test PowerShell installer
         shell: powershell
+        env:
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $installerPath = (Resolve-Path "scripts/installer.ps1").Path
           $source = [IO.File]::ReadAllText(
@@ -690,6 +702,12 @@ jobs:
       # already in place and only the Windows service should be configured.
       - name: Test installer service-only mode
         shell: powershell
+        env:
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $installerPath = (Resolve-Path "scripts/installer.ps1").Path
           $installDir = "$env:RUNNER_TEMP\dagu-service-live"
@@ -789,9 +807,22 @@ jobs:
         shell: cmd
         env:
           _DAGU_INSTALLER_PS1_PATH: ${{ github.workspace }}\scripts\installer.ps1
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
-          if errorlevel 1 exit /b 1
+          scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install" > "%RUNNER_TEMP%\dagu-cmd-install.log" 2>&1
+          set "INSTALL_EXIT=%ERRORLEVEL%"
+          type "%RUNNER_TEMP%\dagu-cmd-install.log"
+          if not "%INSTALL_EXIT%"=="0" exit /b 1
+          REM The lookup must have used the token: an unauthenticated call can be rate limited.
+          findstr /c:"with the token in DAGU_INSTALLER_GITHUB_TOKEN" "%RUNNER_TEMP%\dagu-cmd-install.log" >nul
+          if errorlevel 1 (
+            echo The installer did not use DAGU_INSTALLER_GITHUB_TOKEN for its GitHub API call. 1>&2
+            exit /b 1
+          )
           "%RUNNER_TEMP%\dagu-cmd-install\dagu.exe" version
           if errorlevel 1 exit /b 1
           scripts\installer.cmd -NoPrompt -Uninstall -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"

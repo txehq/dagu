@@ -259,7 +259,17 @@ function Get-LatestVersion {
         $script:Version = "latest"
         return
     }
-    $release = Invoke-RestMethod -Uri $Script:ReleaseApi
+    # GitHub limits unauthenticated API calls per IP address, and hosts behind a
+    # shared address (CI runners) exhaust that limit. A caller there passes a
+    # token in DAGU_INSTALLER_GITHUB_TOKEN; it is sent only on this request to
+    # api.github.com and never printed.
+    $headers = @{}
+    $apiToken = $env:DAGU_INSTALLER_GITHUB_TOKEN
+    if (-not [string]::IsNullOrWhiteSpace($apiToken)) {
+        $headers["Authorization"] = "Bearer $apiToken"
+        Write-Info "Looking up the latest release with the token in DAGU_INSTALLER_GITHUB_TOKEN"
+    }
+    $release = Invoke-RestMethod -Uri $Script:ReleaseApi -Headers $headers
     $script:Version = $release.tag_name
 }
 
