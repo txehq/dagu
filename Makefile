@@ -204,11 +204,18 @@ api: api-validate
 	@GOBIN=${LOCAL_BIN_DIR} go install ${PKG_oapi_codegen}
 	@${LOCAL_BIN_DIR}/oapi-codegen --config=${OAPI_CONFIG_FILE_V1} ${OAPI_SPEC_FILE_V1}
 
-# llms generates the AI-agent reference file.
+# llms generates the AI-agent reference file. llms-check fails when the
+# committed file differs from what llms would write; CI runs it (TXE-7868).
+LLMSGEN_FLAGS=-source skills/dagu -source-prefix skills/dagu -output llms.txt
+
 .PHONY: llms
 llms:
 	@printf '%b\n' "${COLOR_GREEN}Generating llms.txt...${COLOR_RESET}"
-	@go run ./internal/tools/llmsgen/cmd -source skills/dagu -source-prefix skills/dagu -output llms.txt
+	@go run ./internal/tools/llmsgen/cmd ${LLMSGEN_FLAGS}
+
+.PHONY: llms-check
+llms-check:
+	@go run ./internal/tools/llmsgen/cmd -check ${LLMSGEN_FLAGS}
 
 # api-validate validates the OpenAPI specification.
 .PHONY: api-validate

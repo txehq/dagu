@@ -4,6 +4,8 @@
 package llmsgen_test
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -127,6 +129,85 @@ func TestWriteFileWritesGeneratedContent(t *testing.T) {
 	}
 	if info.Mode().Perm() != wantPerm {
 		t.Fatalf("WriteFile() perm = %o, want %o", info.Mode().Perm(), wantPerm)
+	}
+}
+
+func TestCheckFileAcceptsGeneratedContent(t *testing.T) {
+	t.Parallel()
+
+	opts := llmsgen.Options{SourceDir: writeSkillTree(t), SourcePrefix: "skills/dagu"}
+	outputPath := filepath.Join(t.TempDir(), "llms.txt")
+	if err := llmsgen.WriteFile(outputPath, opts); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if err := llmsgen.CheckFile(outputPath, opts); err != nil {
+		t.Fatalf("CheckFile() error = %v, want nil", err)
+	}
+}
+
+func TestCheckFileReportsSourceChangedWithoutRegenerating(t *testing.T) {
+	t.Parallel()
+
+	sourceDir := writeSkillTree(t)
+	opts := llmsgen.Options{SourceDir: sourceDir, SourcePrefix: "skills/dagu"}
+	outputPath := filepath.Join(t.TempDir(), "llms.txt")
+	if err := llmsgen.WriteFile(outputPath, opts); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	before, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+
+	cliPath := filepath.Join(sourceDir, "references", "cli.md")
+	if err := os.WriteFile(cliPath, []byte("# Dagu CLI Reference\n\nUse dagu validate and dagu lint.\n"), 0o644); err != nil {
+		t.Fatalf("change cli.md: %v", err)
+	}
+
+	err = llmsgen.CheckFile(outputPath, opts)
+	if !errors.Is(err, llmsgen.ErrStale) {
+		t.Fatalf("CheckFile() error = %v, want ErrStale", err)
+	}
+	wantLine := strings.Count(string(before[:strings.Index(string(before), "Use dagu validate.")]), "\n") + 1
+	if !strings.Contains(err.Error(), fmt.Sprintf("line %d", wantLine)) {
+		t.Fatalf("CheckFile() error = %q, want line %d", err, wantLine)
+	}
+
+	after, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("CheckFile() changed the output file")
+	}
+}
+
+func TestCheckFileReportsTruncatedOutput(t *testing.T) {
+	t.Parallel()
+
+	opts := llmsgen.Options{SourceDir: writeSkillTree(t), SourcePrefix: "skills/dagu"}
+	content, err := llmsgen.Generate(opts)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	outputPath := filepath.Join(t.TempDir(), "llms.txt")
+	if err := os.WriteFile(outputPath, content[:len(content)-1], 0o644); err != nil {
+		t.Fatalf("write truncated output: %v", err)
+	}
+
+	if err := llmsgen.CheckFile(outputPath, opts); !errors.Is(err, llmsgen.ErrStale) {
+		t.Fatalf("CheckFile() error = %v, want ErrStale", err)
+	}
+}
+
+func TestCheckFileFailsWhenOutputIsMissing(t *testing.T) {
+	t.Parallel()
+
+	opts := llmsgen.Options{SourceDir: writeSkillTree(t), SourcePrefix: "skills/dagu"}
+	err := llmsgen.CheckFile(filepath.Join(t.TempDir(), "llms.txt"), opts)
+	if err == nil || errors.Is(err, llmsgen.ErrStale) {
+		t.Fatalf("CheckFile() error = %v, want a read error that is not ErrStale", err)
 	}
 }
 

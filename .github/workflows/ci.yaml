@@ -34,6 +34,10 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868); the
+      # generator itself is under internal/**.
+      - "skills/**"
+      - "llms.txt"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -70,6 +74,10 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868); the
+      # generator itself is under internal/**.
+      - "skills/**"
+      - "llms.txt"
   workflow_dispatch:
 
 permissions:
@@ -211,6 +219,12 @@ jobs:
       # runner IP (TXE-7871).
       - name: Check installer GitHub API calls
         run: go test -count=1 ./internal/tools/installerapi
+
+      # llms.txt is generated from skills/dagu (`make llms`). A change to the
+      # skill that skips the regeneration fails here (TXE-7868). It runs in
+      # this job because a skills/ or llms.txt change alone sets no path gate.
+      - name: Check llms.txt is generated from skills/dagu
+        run: make llms-check
 
   # Lint Go code
   golint:
