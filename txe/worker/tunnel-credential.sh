@@ -68,15 +68,21 @@ tdir="$(cd "$tdir" && pwd -P)" || die "cannot resolve $tdir"
 # directory's "group:everyone deny delete") are harmless, so only an allow
 # entry is refused there; on Linux any ACL above it is refused.
 acl_entries() { # the ACL entries of PATH, one per line; empty when it has none
+  # Fails closed: an ls that fails, or prints a mode column of another
+  # shape, reads as "unreadable", which every caller refuses.
   local l
   if [ "$(uname -s)" = Darwin ]; then
     # shellcheck disable=SC2012 # ls -e is how macOS prints a path's ACL; the path is one argument
-    l="$(ls -lde -- "$1")" || return 0
-    printf '%s\n' "$l" | sed -n '2,$p'
+    l="$(/bin/ls -lde -- "$1")" || { echo unreadable; return 0; }
   else
     # shellcheck disable=SC2012 # the + after the mode is how ls marks a POSIX ACL
-    l="$(ls -ld -- "$1")" || return 0
-    [ "${l:10:1}" != + ] || echo "acl"
+    l="$(/bin/ls -ld -- "$1")" || { echo unreadable; return 0; }
+  fi
+  [[ "$l" =~ ^[dl-][rwxsStT-]{9}[@+.\ ] ]] || { echo unreadable; return 0; }
+  if [ "$(uname -s)" = Darwin ]; then
+    printf '%s\n' "$l" | sed -n '2,$p'
+  elif [ "${l:10:1}" = + ]; then
+    echo acl
   fi
 }
 has_acl() {
@@ -87,7 +93,7 @@ acl_allows() {
   e="$(acl_entries "$1")"
   [ -n "$e" ] || return 1
   [ "$(uname -s)" = Darwin ] || return 0
-  case "$e" in *" allow "*) return 0 ;; esac
+  case "$e" in unreadable | *" allow "*) return 0 ;; esac
   return 1
 }
 a="$tdir"
