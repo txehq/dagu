@@ -44,28 +44,20 @@ ca="$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name==\"$cluster\")]
 umask 077
 tdir="$TXE_DAGU_HOME/tunnel"
 mkdir -p "$tdir"
-# The token is written only into a directory this user owns and no other account
-# can enter: there, no other account can swap the candidate for a link, or read
-# it even if its mode changes. A directory that is a link, not this user's, or
-# open to group or others in any way is refused before any token is asked for
-# (TXE-7864). The script makes it 0700 itself. What this does not cover: a
-# process of this same account, which could read the token directly anyway.
-if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
-  die "$tdir is not a directory this user owns (or it is a symbolic link); refusing to write a credential there"
-fi
-# private PATH: no permission bit for group or others.
-private() {
-  [ -z "$(find "$1" -maxdepth 0 \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) -print)" ]
-}
-if ! private "$tdir"; then
-  die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
-fi
-# Nor can another account replace the directory itself: every directory above
-# it, by its physical path, is this user's or root's, and one that group or
-# others can write has the sticky bit, so only its owner can rename what is in
-# it (/tmp). Otherwise the tunnel directory could be renamed away and a link
-# put in its place, and the candidate and cleanup would follow the link
-# (independent review of PR 293). From here on the physical path is used.
+# The token is written only into a directory this user owns, that no other
+# account can enter or replace: there, no other account can swap the candidate
+# for a link, read it even if its mode changes, or move the directory away
+# (TXE-7864). What this does not cover: a process of this same account, which
+# could read the token directly anyway.
+#
+# The order matters (independent review of PR 293). The tunnel directory may
+# not be a link. Its physical path is resolved first; then every directory
+# above it must be this user's or root's, and one that group or others can
+# write must have the sticky bit, so only its owner can rename what is in it
+# (/tmp); only then is the resolved directory itself checked: a directory
+# whose parents no other account can change cannot be swapped after that
+# check. From here on the physical path is used.
+[ ! -L "$tdir" ] || die "$tdir is a symbolic link; refusing to write a credential there"
 tdir="$(cd "$tdir" && pwd -P)" || die "cannot resolve $tdir"
 a="$tdir"
 while [ "$a" != / ]; do
@@ -78,6 +70,16 @@ while [ "$a" != / ]; do
     die "$a, above $tdir, is writable by group or others without the sticky bit, so the tunnel directory could be replaced; refusing to write a credential there"
   fi
 done
+# private PATH: no permission bit for group or others.
+private() {
+  [ -z "$(find "$1" -maxdepth 0 \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) -print)" ]
+}
+if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
+  die "$tdir is not a directory this user owns (or it is a symbolic link); refusing to write a credential there"
+fi
+if ! private "$tdir"; then
+  die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
+fi
 out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves
