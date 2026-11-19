@@ -46,9 +46,15 @@ func TestCIRunsLLMSCheckOnSkillChanges(t *testing.T) {
 		if !ok {
 			t.Fatalf("ci.yaml has no %s trigger", event)
 		}
-		for _, want := range []string{"skills/dagu/**", "llms.txt"} {
-			if !slices.Contains(trigger.Paths, want) {
-				t.Errorf("ci.yaml on.%s.paths lacks %q: a change to it alone would start no CI run", event, want)
+		// Each input is covered by one of its patterns: the skill sources,
+		// the committed output, and the generator's own code.
+		for _, want := range [][]string{
+			{"skills/**"},
+			{"llms.txt"},
+			{"internal/tools/llmsgen/**", "internal/**"},
+		} {
+			if !slices.ContainsFunc(want, func(p string) bool { return slices.Contains(trigger.Paths, p) }) {
+				t.Errorf("ci.yaml on.%s.paths lacks %q: a change to it alone would start no CI run", event, want[0])
 			}
 		}
 	}
