@@ -59,6 +59,37 @@ mkdir -p "$tdir"
 # check. From here on the physical path is used.
 [ ! -L "$tdir" ] || die "$tdir is a symbolic link; refusing to write a credential there"
 tdir="$(cd "$tdir" && pwd -P)" || die "cannot resolve $tdir"
+# Mode bits are not the whole story: an ACL can give another account the
+# right to add, rename or delete entries in a 0700 directory (independent
+# review of PR 293). macOS lists a path's ACL entries under ls -lde (its mode
+# column shows @ for extended attributes, which hides the + of an ACL); on
+# Linux ls -ld marks a path with one by a + after its mode. The tunnel
+# directory may carry none. Above it, macOS's deny entries (the home
+# directory's "group:everyone deny delete") are harmless, so only an allow
+# entry is refused there; on Linux any ACL above it is refused.
+acl_entries() { # the ACL entries of PATH, one per line; empty when it has none
+  local l
+  if [ "$(uname -s)" = Darwin ]; then
+    # shellcheck disable=SC2012 # ls -e is how macOS prints a path's ACL; the path is one argument
+    l="$(ls -lde -- "$1")" || return 0
+    printf '%s\n' "$l" | sed -n '2,$p'
+  else
+    # shellcheck disable=SC2012 # the + after the mode is how ls marks a POSIX ACL
+    l="$(ls -ld -- "$1")" || return 0
+    [ "${l:10:1}" != + ] || echo "acl"
+  fi
+}
+has_acl() {
+  [ -n "$(acl_entries "$1")" ]
+}
+acl_allows() {
+  local e
+  e="$(acl_entries "$1")"
+  [ -n "$e" ] || return 1
+  [ "$(uname -s)" = Darwin ] || return 0
+  case "$e" in *" allow "*) return 0 ;; esac
+  return 1
+}
 a="$tdir"
 while [ "$a" != / ]; do
   a="${a%/*}"
@@ -68,6 +99,9 @@ while [ "$a" != / ]; do
   fi
   if [ -n "$(find "$a" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ] && [ ! -k "$a" ]; then
     die "$a, above $tdir, is writable by group or others without the sticky bit, so the tunnel directory could be replaced; refusing to write a credential there"
+  fi
+  if acl_allows "$a"; then
+    die "$a, above $tdir, has an ACL that may let another account change it; refusing to write a credential there"
   fi
 done
 # private PATH: no permission bit for group or others.
@@ -79,6 +113,9 @@ if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
 fi
 if ! private "$tdir"; then
   die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
+fi
+if has_acl "$tdir"; then
+  die "$tdir has an ACL, which may let another account into it; refusing to write a credential there (remove it: chmod -N on macOS, setfacl -b on Linux)"
 fi
 out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a

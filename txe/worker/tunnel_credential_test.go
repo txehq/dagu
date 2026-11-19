@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -304,6 +305,43 @@ func TestTunnelCredentialRefusesATamperedCandidate(t *testing.T) {
 			assert.Empty(t, r.candidates(t))
 			assert.NoFileExists(t, filepath.Join(r.tunnelDir, "kubeconfig"), "a refused candidate replaced the live kubeconfig")
 			assert.NotContains(t, r.calls, "auth can-i", "a refused candidate was used")
+		})
+	}
+}
+
+// An ACL that lets another account into the tunnel directory, or change a
+// directory above it, is refused before any token is asked for, whatever the
+// mode bits say (independent review of PR 293). macOS's chmod +a and Linux's
+// setfacl set one; a runner with neither skips.
+func TestTunnelCredentialRefusesAnACL(t *testing.T) {
+	var grant func(dir string) *exec.Cmd
+	if p, err := exec.LookPath("setfacl"); err == nil && runtime.GOOS == "linux" {
+		grant = func(dir string) *exec.Cmd { return exec.Command(p, "-m", "u:nobody:rwx", dir) } //nolint:gosec // a test's own temp directory
+	} else if runtime.GOOS == "darwin" {
+		grant = func(dir string) *exec.Cmd {
+			return exec.Command("/bin/chmod", "+a", "group:everyone allow list,search,add_file,delete_child", dir)
+		}
+	} else {
+		t.Skip("no way to set an ACL on this runner")
+	}
+	for _, tc := range []struct {
+		name string
+		dir  func(home string) string
+	}{
+		{"on the tunnel directory", func(home string) string { return filepath.Join(home, "tunnel") }},
+		{"on the TXE home above it", func(home string) string { return home }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runTunnelCredentialWith(t, func(home, _ string) {
+				require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))
+				out, err := grant(tc.dir(home)).CombinedOutput()
+				if err != nil {
+					t.Skipf("this filesystem refused an ACL: %s", out)
+				}
+			})
+			assert.Equal(t, 1, r.code, "stderr:\n%s", r.stderr)
+			assert.Contains(t, r.stderr, "ACL")
+			assert.NotContains(t, r.calls, "create token", "a token was asked for")
 		})
 	}
 }
