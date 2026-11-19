@@ -60,6 +60,24 @@ private() {
 if ! private "$tdir"; then
   die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
 fi
+# Nor can another account replace the directory itself: every directory above
+# it, by its physical path, is this user's or root's, and one that group or
+# others can write has the sticky bit, so only its owner can rename what is in
+# it (/tmp). Otherwise the tunnel directory could be renamed away and a link
+# put in its place, and the candidate and cleanup would follow the link
+# (independent review of PR 293). From here on the physical path is used.
+tdir="$(cd "$tdir" && pwd -P)" || die "cannot resolve $tdir"
+a="$tdir"
+while [ "$a" != / ]; do
+  a="${a%/*}"
+  [ -n "$a" ] || a=/
+  if ! { [ -O "$a" ] || [ -n "$(find "$a" -maxdepth 0 -user 0 -print)" ]; }; then
+    die "$a, above $tdir, belongs to another account; refusing to write a credential there"
+  fi
+  if [ -n "$(find "$a" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ] && [ ! -k "$a" ]; then
+    die "$a, above $tdir, is writable by group or others without the sticky bit, so the tunnel directory could be replaced; refusing to write a credential there"
+  fi
+done
 out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves

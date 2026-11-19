@@ -141,7 +141,10 @@ func runTunnelCredentialWith(t *testing.T, prepare func(home, outside string), e
 	for name, body := range map[string]string{"kubectl": stubKubectl, "rm": stubRm, "mv": stubMv} {
 		require.NoError(t, os.WriteFile(filepath.Join(tools, name), []byte(body), 0o700)) //nolint:gosec // a test's stub
 	}
-	home := filepath.Join(t.TempDir(), "txe dagu")
+	// The script names the physical path (macOS's /var is /private/var).
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	home := filepath.Join(parent, "txe dagu")
 	r := tunnelRun{home: home, tunnelDir: filepath.Join(home, "tunnel"), outside: filepath.Join(t.TempDir(), "outside")}
 	require.NoError(t, os.WriteFile(r.outside, []byte("not a credential\n"), 0o600))
 	if prepare != nil {
@@ -305,6 +308,32 @@ func TestTunnelCredentialRefusesATamperedCandidate(t *testing.T) {
 	}
 }
 
+// A parent that others can write is safe with the sticky bit (/tmp), and a
+// TXE home reached through a symbolic link is used by its physical path.
+func TestTunnelCredentialAcceptsAStickyParentAndALinkedHome(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(home, outside string)
+	}{
+		{"a sticky parent others can write", func(home, _ string) {
+			require.NoError(t, os.MkdirAll(home, 0o700))
+			require.NoError(t, os.Chmod(home, 0o777|os.ModeSticky)) //nolint:gosec // /tmp's mode, under test
+		}},
+		{"a home reached through a link", func(home, _ string) {
+			real := home + " real"
+			require.NoError(t, os.MkdirAll(real, 0o700))
+			require.NoError(t, os.Symlink(real, home))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := runTunnelCredentialWith(t, tc.prepare)
+			require.Equal(t, 0, r.code, "stdout:\n%s\nstderr:\n%s", r.stdout, r.stderr)
+			assert.Empty(t, fatalLines(r.stderr))
+			assert.FileExists(t, filepath.Join(r.tunnelDir, "kubeconfig"))
+		})
+	}
+}
+
 // The token is asked for only when the tunnel directory is this user's, not a
 // link, and not writable by group or others.
 func TestTunnelCredentialRefusesAnUnsafeDirectory(t *testing.T) {
@@ -323,6 +352,10 @@ func TestTunnelCredentialRefusesAnUnsafeDirectory(t *testing.T) {
 		{"world writable", func(home, _ string) {
 			require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))
 			require.NoError(t, os.Chmod(filepath.Join(home, "tunnel"), 0o703)) //nolint:gosec // the unsafe mode under test
+		}},
+		{"a parent others can write, without the sticky bit", func(home, _ string) {
+			require.NoError(t, os.MkdirAll(filepath.Join(home, "tunnel"), 0o700))
+			require.NoError(t, os.Chmod(home, 0o777)) //nolint:gosec // the unsafe mode under test
 		}},
 		{"a symbolic link", func(home, outside string) {
 			require.NoError(t, os.MkdirAll(home, 0o700))
