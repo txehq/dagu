@@ -105,11 +105,11 @@ func rootFixtureRun(t *testing.T, prepare func(home string), handoff bool) tunne
 	require.NoError(t, os.Chmod(filepath.Dir(base), 0o711)) //nolint:gosec // traversal only, for the unprivileged run
 	require.NoError(t, os.Chmod(base, 0o755))               //nolint:gosec // the unprivileged run must reach it
 	tools := filepath.Join(base, "tools")
-	require.NoError(t, os.Mkdir(tools, 0o755)) //nolint:gosec // as above
+	require.NoError(t, os.Mkdir(tools, 0o755))                                                        //nolint:gosec // as above
 	require.NoError(t, os.WriteFile(filepath.Join(tools, "kubectl"), []byte(stubKubectlRoot), 0o755)) //nolint:gosec // a test's stub
 	calls := filepath.Join(base, "calls")
 	require.NoError(t, os.WriteFile(calls, nil, 0o666)) //nolint:gosec // the stub appends as the unprivileged account
-	require.NoError(t, os.Chmod(calls, 0o666))           //nolint:gosec // as above, past the umask
+	require.NoError(t, os.Chmod(calls, 0o666))          //nolint:gosec // as above, past the umask
 
 	home := filepath.Join(base, "txe dagu")
 	r := tunnelRun{home: home, tunnelDir: filepath.Join(home, "tunnel")}
