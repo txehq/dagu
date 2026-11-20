@@ -6,6 +6,7 @@ package devtoolsgate
 import (
 	"errors"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,7 +16,8 @@ import (
 
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
-	valid := Config{Token: NewToken(), Executable: "/usr/bin/chrome", Args: ChromeArgs(LaunchOptions{UserDataDir: "/tmp/p"})}
+	// An absolute path on every OS: the gate refuses any other profile.
+	valid := Config{Token: NewToken(), Executable: "/usr/bin/chrome", Args: ChromeArgs(LaunchOptions{UserDataDir: filepath.Join(t.TempDir(), "p")})}
 	require.NoError(t, valid.validate())
 
 	cases := map[string]Config{
