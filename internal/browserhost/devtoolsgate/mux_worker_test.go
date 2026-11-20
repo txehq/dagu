@@ -242,10 +242,10 @@ func TestMuxRefusesTargetCommandsItDoesNotMediate(t *testing.T) {
 		_, err := c.call("", method, map[string]any{"targetId": "T1", "waitForDebuggerOnStart": false})
 		assert.ErrorContains(t, err, "the gate does not pass on "+method)
 	}
-	for _, method := range []string{"Target.getTargets", "Target.createTarget"} {
-		_, err := c.call("", method, map[string]any{"url": "about:blank"})
-		assert.NoError(t, err, method)
-	}
+	_, err := c.call("", "Target.getTargets", map[string]any{})
+	assert.NoError(t, err)
+	_, err = c.call("", "Target.createTarget", map[string]any{"url": "about:blank"})
+	assert.NoError(t, err)
 
 	watcher := tg.dial("")
 	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
@@ -254,15 +254,20 @@ func TestMuxRefusesTargetCommandsItDoesNotMediate(t *testing.T) {
 }
 
 // The rewrite of a client's own auto-attach does not rest on how the gate
-// reads the params: JSON with a case variant of autoAttach, which the
-// browser does not read, is rewritten all the same.
+// reads the params: a repeated autoAttach, which the gate's parse and the
+// browser's could read differently, reaches the browser once, and the call
+// is rewritten all the same. A case variant of autoAttach, which the browser
+// does not read, is a param outside the policy and refused (TXE-7856).
 func TestMuxClientAutoAttachRewriteIgnoresHowTheGateParsesIt(t *testing.T) {
 	t.Parallel()
 	tg := startTestGate(t)
 	pageClient, watcher := tg.dial("T1"), tg.dial("")
-	pageClient.mustCall("", "Target.setAutoAttach", map[string]any{
+	_, err := pageClient.call("", "Target.setAutoAttach", map[string]any{
 		"autoAttach": true, "autoattach": false, "waitForDebuggerOnStart": true, "flatten": true,
 	})
+	assert.ErrorContains(t, err, `the gate does not pass on Target.setAutoAttach with the param "autoattach"`)
+	pageClient.mustCall("", "Target.setAutoAttach", json.RawMessage(
+		`{"autoAttach":false,"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true}`))
 	watcher.mustCall("", "Target.setAutoAttach", autoAttach(true))
 	createWorker(t, watcher, "T1")
 	pageClient.noEvent("Target.attachedToTarget", 300*time.Millisecond)

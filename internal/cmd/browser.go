@@ -30,7 +30,7 @@ func Browser() *cobra.Command {
 		return ctx.Command.Help()
 	})
 
-	cmd.AddCommand(browserCacheCommand(), browserSessionCommand(), browserWritesCommand(), browserCertProxyCommand(), browserWriteGateCommand(), browserDevToolsGateCommand())
+	cmd.AddCommand(browserCacheCommand(), browserSessionCommand(), browserProfileCommand(), browserWritesCommand(), browserCertProxyCommand(), browserWriteGateCommand(), browserDevToolsGateCommand())
 	return cmd
 }
 

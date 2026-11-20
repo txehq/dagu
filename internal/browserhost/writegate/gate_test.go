@@ -180,7 +180,7 @@ func startBrowser(t *testing.T) *browser {
 // removed after.
 func profileDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "writegate-profile-")
+	dir, err := devtoolsgate.NewTempProfile("", "writegate-profile-")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		for range 50 {

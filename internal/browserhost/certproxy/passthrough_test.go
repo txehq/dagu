@@ -382,7 +382,7 @@ func TestGuardPassesChromesOwnHandshake(t *testing.T) {
 // completes.
 func runChrome(t *testing.T, chrome string, ready Ready, url string) {
 	t.Helper()
-	profile, err := os.MkdirTemp("", "dagu-certproxy-chrome-")
+	profile, err := devtoolsgate.NewTempProfile("", "dagu-certproxy-chrome-")
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		// Chrome's last processes may still be writing as it exits.

@@ -1541,7 +1541,7 @@ steps:
 
 Browser behavior:
 
-- Before writing a browser step for a page you have not seen, work the page in a browser session (`dagu browser session`, see `references/cli.md`) with the same operations, looking at its outline after each, instead of guessing at its fields, buttons, or addresses. Export what worked: the step comes out with its acts recorded, so its first run replays them. With `browser.profile`, sign-in operations run only while the site asks for them, so guard them with `when: {selector: ...}` on the sign-in form.
+- Before writing a browser step for a page you have not seen, work the page in a browser session (`dagu browser session`, see `references/cli.md`) with the same operations, looking at its outline after each, instead of guessing at its fields, buttons, or addresses. Export what worked: the step comes out with its acts recorded, so its first run replays them. With `browser.profile`, sign-in operations run only while the site asks for them, so guard them with `when: {selector: ...}` on the sign-in form. A named profile made before Dagu marked its profiles is refused until `dagu browser profile claim <name>` (see `references/cli.md`).
 - Each `do` item sets exactly one of `goto`, `act`, `upload`, `extract`, `expect`, `wait` (`selector` or `duration`), `screenshot`, or `ask`, plus optional `when` (skip unless it holds) and `timeout`.
 - An `act` performs one action: "Sign in with %user% and %password%" types into one field and stops. Write one act per field and one for the button. A dropdown that is not a native `<select>` takes two acts: one opens it, the next picks the option.
 - `upload: {files, into}` gives local files to a file input; an `act` cannot. `files` is a path or glob pattern relative to the step's working directory, a list of them, or an earlier step's output holding a JSON list of paths, of objects with a `path`, or of `mail.search` emails, whose attachments saved with `save_attachments: true` are uploaded. Each file is at most 50 MB. `into` names the file input, or the button or drop area that opens the file picker, in plain words; the model finds it once and later runs replay it like an act. Leave `into` out when the page has one file input; no model is asked then. The element gets the files directly when it is or holds one file input; otherwise Dagu clicks it and hands the files to the file picker it opens, which never shows; when none opens, the file input nearest it gets them. A file input that takes one file fails when given several. The model never sees the files. Follow an upload with an `expect` for what the site shows once it has the files, such as `{text: "Uploaded", within: 1m}`.
@@ -2068,6 +2068,15 @@ dagu browser session describe <id> [--find TEXT] [--format text] [--screenshot N
 dagu browser session export <id> --dag <name|file> --step <id> [--skip N]... [--dry-run] [--close] [--format yaml]
 dagu browser session close <id> [--force] [--keep]
 dagu browser session list
+```
+
+### dagu browser profile
+
+Claim a named browser profile (`browser.profile`, `--profile`) made before Dagu marked the profiles its browsers may change. A step or session refuses such a profile and leaves it as it is, logins and cookies included, until it is claimed. Dagu's browsers set `incognito.mode_availability = 1` in the profile's `Default/Preferences` each time they start and change nothing else there. `claim` checks the profile is `<data dir>/browser/profiles/<name>` itself, the user's alone and in use by no step, session or browser, checks all of that before writing anything, keeps a copy of the preferences beside them (`Preferences.dagu-before-claim-<time>`) and the value it found, and prints both as JSON; the claim itself changes no preference. `unclaim` undoes it: the value is put back and every preference the browser wrote since is kept.
+
+```sh
+dagu browser profile claim <name>
+dagu browser profile unclaim <name>
 ```
 
 ### dagu computer check

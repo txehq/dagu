@@ -6,6 +6,7 @@ package devtoolsgate
 import (
 	"errors"
 	"net/url"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,7 +16,8 @@ import (
 
 func TestConfigValidate(t *testing.T) {
 	t.Parallel()
-	valid := Config{Token: NewToken(), Executable: "/usr/bin/chrome", Args: ChromeArgs(LaunchOptions{UserDataDir: "/tmp/p"})}
+	// An absolute path on every OS: the gate refuses any other profile.
+	valid := Config{Token: NewToken(), Executable: "/usr/bin/chrome", Args: ChromeArgs(LaunchOptions{UserDataDir: filepath.Join(t.TempDir(), "p")})}
 	require.NoError(t, valid.validate())
 
 	cases := map[string]Config{
@@ -26,6 +28,8 @@ func TestConfigValidate(t *testing.T) {
 		"negative unattended cap": {Token: NewToken(), Executable: "/usr/bin/chrome", MaxUnattended: -time.Second},
 		"port flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-port=9222"}},
 		"pipe flag":               {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--remote-debugging-pipe"}},
+		"no profile":              {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--headless"}},
+		"empty profile":           {Token: NewToken(), Executable: "/usr/bin/chrome", Args: []string{"--user-data-dir="}},
 	}
 	for name, cfg := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -34,6 +38,7 @@ func TestConfigValidate(t *testing.T) {
 	}
 	assert.True(t, errors.Is(cases["port flag"].validate(), ErrDebuggingFlagInArgs))
 	assert.True(t, errors.Is(cases["no token"].validate(), ErrTokenRequired))
+	assert.True(t, errors.Is(cases["no profile"].validate(), ErrProfileRequired))
 	// The lifetime policy is resolved in one place: zero MaxUnattended is
 	// the default, zero MaxLifetime is no hard cap, explicit values stand.
 	assert.Equal(t, lifetimePolicy{hardCap: 0, unattended: DefaultMaxUnattended}, Config{}.lifetime())

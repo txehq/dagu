@@ -49,14 +49,33 @@ func TestMain(m *testing.M) {
 		time.Sleep(fakeHelperLife)
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	dir, err := os.MkdirTemp("", "dagu-gate-fake-profiles-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fakeProfiles = dir
+	code := m.Run()
+	_ = os.RemoveAll(fakeProfiles)
+	os.Exit(code)
 }
 
 // fakeBrowserArgs are the browser arguments that make the test binary the
 // browser, with extra flags for the fake.
 func fakeBrowserArgs(extra ...string) []string {
-	return append([]string{"-test.run=^$", "--", fakeBrowserMarker}, extra...)
+	profile, err := os.MkdirTemp(fakeProfiles, "profile-")
+	if err == nil {
+		err = claimProfile(profile)
+	}
+	if err != nil {
+		panic(err)
+	}
+	return append([]string{"-test.run=^$", "--", fakeBrowserMarker, "--user-data-dir=" + profile}, extra...)
 }
+
+// fakeProfiles holds the profile directories of the fake browsers the
+// tests start, removed when the tests end.
+var fakeProfiles string
 
 // testGate is a gate over an in-process fake browser.
 type testGate struct {

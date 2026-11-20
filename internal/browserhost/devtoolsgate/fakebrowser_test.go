@@ -91,6 +91,28 @@ type fakeBrowser struct {
 	// order: the browser-session attach and its Fetch.enable, the root
 	// auto-attach, a target's first request, a resume.
 	log []string
+	// targetParams records, in order, each Target command the gate passed
+	// on with its params as the browser received them: "<method> <params>".
+	targetParams []string
+	// keepsOffTheRecord makes Target.closeTarget fail for a page off the
+	// record, so a test can reach it after the gate tried to close it.
+	keepsOffTheRecord bool
+	// offTheRecordAtStart opens a page off the record as the root
+	// auto-attach is asked for.
+	offTheRecordAtStart bool
+	// offTheRecord says how the fake answers the gate's probe's ask for a
+	// window off the record: "refuses", as with the profile preference in
+	// force (the default), "opens", as a platform policy can make it,
+	// "hangs", never answering, or "none": no Extensions domain at all.
+	offTheRecord string
+	// keepsProbe makes Extensions.uninstall fail.
+	keepsProbe bool
+	// extensionsLoaded and uninstalled record the probe's lifecycle.
+	extensionsLoaded []string
+	uninstalled      []string
+	// unnamedContext makes Target.getBrowserContexts name no default
+	// context, as an older browser's does.
+	unnamedContext bool
 	// failStart makes the browser exit before answering, as a browser
 	// that cannot adopt its pipes does.
 	failStart bool
@@ -118,6 +140,8 @@ type fakeTarget struct {
 	loaders map[string]bool
 	// worker is set for a target made by Fake.createWorker.
 	worker *fakeWorker
+	// context is the browser context the target runs in.
+	context string
 }
 
 // fakeWorker is a service worker starting the way Chrome starts one, as
@@ -164,6 +188,10 @@ type fakeSession struct {
 	nestedWait bool
 	// nestedFilter is the filter of the session's auto-attach.
 	nestedFilter targetFilter
+	// parent is the session a child was auto-attached under, "" for a
+	// session attached at the root. As in Chrome, a child's session is
+	// detached only on its parent.
+	parent string
 }
 
 // fakeChallenge is the authentication challenge a request meets at the
@@ -199,6 +227,8 @@ func newFakeBrowser(in io.Reader, out io.Writer) *fakeBrowser {
 		inFlight:    make(map[string]*fakeRequest),
 		credentials: make(map[string]string),
 		root:        &fakeSession{browser: true},
+		// Chrome with the gate's profile preference in force.
+		offTheRecord: "refuses",
 	}
 	f.addTargetLocked("page", "about:blank", "blank")
 	return f
@@ -220,9 +250,16 @@ func (f *fakeBrowser) interceptorsLocked() []*fakeSession {
 	return append([]*fakeSession{f.root}, f.sortedSessions()...)
 }
 
+// fakeOwnContext is the fake browser's own context, and
+// fakeOffTheRecordContext the one Fake.createOffTheRecord opens a page in.
+const (
+	fakeOwnContext          = "CTX-OWN"
+	fakeOffTheRecordContext = "CTX-OTR"
+)
+
 func (f *fakeBrowser) addTargetLocked(typ, url, title string) *fakeTarget {
 	f.nextTarget++
-	t := &fakeTarget{id: fmt.Sprintf("T%d", f.nextTarget), typ: typ, url: url, title: title}
+	t := &fakeTarget{id: fmt.Sprintf("T%d", f.nextTarget), typ: typ, url: url, title: title, context: fakeOwnContext}
 	f.targets[t.id] = t
 	f.rebuildLoadersLocked(t)
 	return t
@@ -247,7 +284,11 @@ func (f *fakeBrowser) newSessionLocked(targetID string, auto bool) *fakeSession 
 }
 
 func (f *fakeBrowser) targetInfo(t *fakeTarget) map[string]any {
-	return map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true}
+	info := map[string]any{"targetId": t.id, "type": t.typ, "url": t.url, "title": t.title, "attached": true}
+	if t.context != "" {
+		info["browserContextId"] = t.context
+	}
+	return info
 }
 
 // serve answers commands until the pipe closes. It returns nil on EOF.
@@ -330,6 +371,9 @@ func (f *fakeBrowser) handle(data []byte) {
 			return
 		}
 	}
+	if strings.HasPrefix(cmd.Method, "Target.") {
+		f.targetParams = append(f.targetParams, cmd.Method+" "+string(cmd.Params))
+	}
 	switch cmd.Method {
 	case "Browser.getVersion":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{
@@ -376,10 +420,21 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.autoAttach.on = boolean("autoAttach")
 		f.autoAttach.wait = boolean("waitForDebuggerOnStart")
 		if f.autoAttach.on {
+			var opening *fakeTarget
+			if f.offTheRecordAtStart {
+				// A page off the record that opens as the auto-attach is
+				// asked for, and is held by it.
+				opening = f.addTargetLocked("page", "about:blank#otr", "otr")
+				opening.context = fakeOffTheRecordContext
+			}
 			for _, t := range f.sortedTargets() {
 				s := f.newSessionLocked(t.id, true)
+				held := t == opening && f.autoAttach.wait
+				if held {
+					t.pausedBy = s.id
+				}
 				f.event("", "Target.attachedToTarget", map[string]any{
-					"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": false,
+					"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": held,
 				})
 			}
 		}
@@ -398,8 +453,19 @@ func (f *fakeBrowser) handle(data []byte) {
 			infos = append(infos, f.targetInfo(t))
 		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetInfos": infos})
-	case "Target.createTarget":
+	case "Target.createTarget", "Fake.createOffTheRecord":
 		t := f.addTargetLocked("page", str("url"), "new")
+		if id := str("browserContextId"); id != "" {
+			t.context = id
+		}
+		if cmd.Method == "Fake.createOffTheRecord" {
+			// A window a privileged page or worker opens off the record.
+			t.context = fakeOffTheRecordContext
+			if boolean("noContext") {
+				// One whose target info names no context at all.
+				t.context = ""
+			}
+		}
 		if f.discover {
 			f.event("", "Target.targetCreated", map[string]any{"targetInfo": f.targetInfo(t)})
 		}
@@ -431,6 +497,9 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"sessionId": s.id})
 	case "Target.detachFromTarget":
 		s, ok := f.sessions[str("sessionId")]
+		if ok && s.parent != "" && s.parent != cmd.SessionID {
+			ok = false
+		}
 		if !ok {
 			f.replyError(cmd.ID, cmd.SessionID, -32602, "No session with given id")
 			return
@@ -441,6 +510,10 @@ func (f *fakeBrowser) handle(data []byte) {
 		t, ok := f.targets[str("targetId")]
 		if !ok {
 			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		if f.keepsOffTheRecord && t.context == fakeOffTheRecordContext {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "Failed to close target")
 			return
 		}
 		for _, s := range f.sortedSessions() {
@@ -558,11 +631,15 @@ func (f *fakeBrowser) handle(data []byte) {
 			typ = "worker"
 		}
 		child := f.addTargetLocked(typ, "child://"+parent.id, "child")
+		if id := str("browserContextId"); id != "" {
+			child.context = id
+		}
 		for _, s := range f.sortedSessions() {
 			if s.targetID != parent.id || !s.nestedAuto || !s.nestedFilter.matches(typ) {
 				continue
 			}
 			cs := f.newSessionLocked(child.id, true)
+			cs.parent = s.id
 			if s.nestedWait {
 				child.pausedBy = cs.id
 			}
@@ -617,6 +694,62 @@ func (f *fakeBrowser) handle(data []byte) {
 		_ = json.Unmarshal(cmd.Params, &raw)
 		f.event(raw.SessionID, raw.Method, raw.Params)
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Target.createBrowserContext":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextId": "CTX1"})
+	case "Target.getBrowserContexts":
+		if f.unnamedContext {
+			f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}})
+			return
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}, "defaultBrowserContextId": fakeOwnContext})
+	case "Target.disposeBrowserContext":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Target.getTargetInfo":
+		t, ok := f.targets[str("targetId")]
+		if !ok {
+			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"targetInfo": f.targetInfo(t)})
+	case "Extensions.loadUnpacked":
+		if f.offTheRecord == "none" {
+			f.replyError(cmd.ID, cmd.SessionID, -32601, "'Extensions.loadUnpacked' wasn't found")
+			return
+		}
+		f.extensionsLoaded = append(f.extensionsLoaded, str("path"))
+		t := f.addTargetLocked("service_worker", fakeProbeURL+"worker.js", "probe")
+		if f.autoAttach.on {
+			s := f.newSessionLocked(t.id, true)
+			f.event("", "Target.attachedToTarget", map[string]any{"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": false})
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"id": fakeProbeID})
+	case "Extensions.uninstall":
+		if f.keepsProbe {
+			f.replyError(cmd.ID, cmd.SessionID, -32000, "Failed to uninstall the extension")
+			return
+		}
+		for _, t := range f.sortedTargets() {
+			if strings.HasPrefix(t.url, "chrome-extension://"+str("id")+"/") {
+				for _, s := range f.sortedSessions() {
+					if s.targetID == t.id {
+						f.dropSessionLocked(s, "")
+					}
+				}
+				delete(f.targets, t.id)
+			}
+		}
+		f.uninstalled = append(f.uninstalled, str("id"))
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Extensions.getExtensions":
+		if f.offTheRecord == "none" {
+			f.replyError(cmd.ID, cmd.SessionID, -32601, "'Extensions.getExtensions' wasn't found")
+			return
+		}
+		listed := []map[string]any{}
+		if len(f.extensionsLoaded) > len(f.uninstalled) {
+			listed = append(listed, map[string]any{"id": fakeProbeID})
+		}
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"extensions": listed})
 	case "Fake.state":
 		f.reply(cmd.ID, cmd.SessionID, f.stateLocked())
 	case "Fake.argv":
@@ -634,6 +767,10 @@ func (f *fakeBrowser) handle(data []byte) {
 			return
 		}
 		if cmd.Method == "Runtime.evaluate" {
+			if s, ok := f.sessions[cmd.SessionID]; ok && f.targets[s.targetID] != nil && strings.HasPrefix(f.targets[s.targetID].url, fakeProbeURL) {
+				f.probeEvaluateLocked(cmd.ID, cmd.SessionID, str("expression"))
+				return
+			}
 			f.reply(cmd.ID, cmd.SessionID, map[string]any{"result": map[string]any{"type": "number", "value": 1}})
 			return
 		}
@@ -843,6 +980,9 @@ type fakeState struct {
 	Refused     []string           `json:"refused"`
 	Credentials map[string]string  `json:"credentials"`
 	Log         []string           `json:"log"`
+	// TargetParams are the Target commands the browser received, with
+	// their params.
+	TargetParams []string `json:"targetParams"`
 	// Queued counts, per session, the commands waiting in a worker.
 	Queued map[string]int `json:"queued"`
 }
@@ -858,13 +998,14 @@ type fakeSessionState struct {
 
 func (f *fakeBrowser) stateLocked() fakeState {
 	state := fakeState{
-		Continues:   map[string]int{},
-		Resumed:     append([]string(nil), f.resumed...),
-		Completed:   append([]string(nil), f.completed...),
-		Refused:     append([]string(nil), f.refused...),
-		Credentials: map[string]string{},
-		Log:         append([]string(nil), f.log...),
-		Queued:      map[string]int{},
+		Continues:    map[string]int{},
+		Resumed:      append([]string(nil), f.resumed...),
+		Completed:    append([]string(nil), f.completed...),
+		Refused:      append([]string(nil), f.refused...),
+		Credentials:  map[string]string{},
+		Log:          append([]string(nil), f.log...),
+		Queued:       map[string]int{},
+		TargetParams: append([]string(nil), f.targetParams...),
 	}
 	for _, s := range f.sortedSessions() {
 		state.Sessions = append(state.Sessions, fakeSessionState{ID: s.id, TargetID: s.targetID, Auto: s.auto, Browser: s.browser, FetchOn: s.fetchOn, FetchAuth: s.fetchAuth})
@@ -919,6 +1060,12 @@ func runFakeBrowserProcess(args []string) int {
 			f.failStart = true
 		case "--refuse-browser-fetch":
 			f.refuseBrowserFetch = true
+		case "--opens-off-the-record":
+			f.offTheRecord = "opens"
+		case "--probe-hangs":
+			f.offTheRecord = "hangs"
+		case "--no-extensions":
+			f.offTheRecord = "none"
 		}
 		if marker, ok := strings.CutPrefix(arg, "--exit-marker="); ok {
 			f.exitMarker = marker
@@ -940,4 +1087,36 @@ func runFakeBrowserProcess(args []string) int {
 		_ = os.WriteFile(f.exitMarker, []byte("eof\n"), 0o600)
 	}
 	return 0
+}
+
+// fakeProbeID and fakeProbeURL are the extension the fake loads for any
+// unpacked path, and its URL.
+const (
+	fakeProbeID  = "fakeprobe"
+	fakeProbeURL = "chrome-extension://" + fakeProbeID + "/"
+)
+
+// probeEvaluateLocked answers the gate's off-the-record probe.
+func (f *fakeBrowser) probeEvaluateLocked(id json.RawMessage, sessionID, expression string) {
+	value := "up"
+	if strings.Contains(expression, "incognito: true") {
+		if f.offTheRecord == "hangs" {
+			// No answer, ever.
+			return
+		}
+		value = "refused " + offTheRecordRefusal
+		if f.offTheRecord == "opens" {
+			value = "opened"
+			t := f.addTargetLocked("page", "about:blank", "otr")
+			t.context = fakeOffTheRecordContext
+			if f.autoAttach.on {
+				s := f.newSessionLocked(t.id, true)
+				if f.autoAttach.wait {
+					t.pausedBy = s.id
+				}
+				f.event("", "Target.attachedToTarget", map[string]any{"sessionId": s.id, "targetInfo": f.targetInfo(t), "waitingForDebugger": f.autoAttach.wait})
+			}
+		}
+	}
+	f.reply(id, sessionID, map[string]any{"result": map[string]any{"type": "string", "value": value}})
 }
