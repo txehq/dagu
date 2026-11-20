@@ -6,6 +6,7 @@ package devtoolsgate
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"slices"
 	"testing"
 	"time"
@@ -219,6 +220,13 @@ func TestMuxHidesATargetOutsideTheBrowsersOwnContext(t *testing.T) {
 	assert.NotEmpty(t, listed.TargetInfos, "the browser's own targets are listed")
 	_, err := c.call("", "Target.getTargetInfo", map[string]any{"targetId": foreign})
 	assert.ErrorContains(t, err, "the gate serves only targets in the browser's own context")
+	// The gate's HTTP discovery lists the same targets a client hears of.
+	for _, path := range []string{"/json", "/json/list"} {
+		status, body := get(t, tg.baseURL()+path)
+		require.Equal(t, http.StatusOK, status, path)
+		assert.NotContains(t, body, foreign, path)
+		assert.Contains(t, body, `"T1"`, "%s lists the browser's own page", path)
+	}
 	exists, resumed := fakeTargetState(tg.fake, foreign)
 	assert.True(t, exists, "the browser refused to close it")
 	assert.False(t, resumed, "it stays held")

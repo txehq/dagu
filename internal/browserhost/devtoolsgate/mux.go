@@ -1247,21 +1247,7 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 // browser's own context.
 var targetReplyFilters = map[string]func(m *mux, result json.RawMessage) (any, error){
 	"Target.getTargets": func(m *mux, result json.RawMessage) (any, error) {
-		var reply struct {
-			TargetInfos []json.RawMessage `json:"targetInfos"`
-		}
-		if err := json.Unmarshal(result, &reply); err != nil {
-			return nil, err
-		}
-		kept := make([]json.RawMessage, 0, len(reply.TargetInfos))
-		for _, raw := range reply.TargetInfos {
-			var info targetInfo
-			if json.Unmarshal(raw, &info) != nil || m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
-				continue
-			}
-			kept = append(kept, raw)
-		}
-		return map[string]any{"targetInfos": kept}, nil
+		return m.visibleTargetsLocked(result)
 	},
 	"Target.getTargetInfo": func(m *mux, result json.RawMessage) (any, error) {
 		var reply struct {
@@ -1275,6 +1261,44 @@ var targetReplyFilters = map[string]func(m *mux, result json.RawMessage) (any, e
 		}
 		return result, nil
 	},
+}
+
+// visibleTargetsLocked rewrites a Target.getTargets result to the targets a
+// client may hear of: those in the browser's own context that the gate has
+// not hidden. Every list of targets the gate gives out, over DevTools or
+// HTTP, goes through it.
+func (m *mux) visibleTargetsLocked(result json.RawMessage) (map[string]any, error) {
+	var reply struct {
+		TargetInfos []json.RawMessage `json:"targetInfos"`
+	}
+	if err := json.Unmarshal(result, &reply); err != nil {
+		return nil, err
+	}
+	kept := make([]json.RawMessage, 0, len(reply.TargetInfos))
+	for _, raw := range reply.TargetInfos {
+		var info targetInfo
+		if json.Unmarshal(raw, &info) != nil || m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	return map[string]any{"targetInfos": kept}, nil
+}
+
+// listTargets is the browser's target list as a client hears it, for the
+// gate's own HTTP discovery (/json, /json/list).
+func (m *mux) listTargets(ctx context.Context) (json.RawMessage, error) {
+	result, err := m.call(ctx, "", "Target.getTargets", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	visible, err := m.visibleTargetsLocked(result)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(visible)
 }
 
 // forwardFilteredLocked passes a command through and answers the client
