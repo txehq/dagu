@@ -21,8 +21,10 @@ const sdkModule = "github.com/browserbase/stagehand/packages/sdk-go/v4"
 
 func TestChromeArgs(t *testing.T) {
 	t.Parallel()
+	// An absolute path on every OS: the gate refuses any other profile.
+	profile := filepath.Join(t.TempDir(), "profile")
 	args := ChromeArgs(LaunchOptions{
-		UserDataDir: "/tmp/profile",
+		UserDataDir: profile,
 		Headless:    true,
 		Viewport:    &Viewport{Width: 800, Height: 600},
 		ProxyServer: "http://127.0.0.1:3128",
@@ -31,7 +33,7 @@ func TestChromeArgs(t *testing.T) {
 	})
 	assert.Equal(t, "about:blank", args[len(args)-1], "the initial page comes last")
 	assert.Contains(t, args, "--window-size=800,600")
-	assert.Contains(t, args, "--user-data-dir=/tmp/profile")
+	assert.Contains(t, args, "--user-data-dir="+profile)
 	assert.Contains(t, args, "--headless")
 	assert.Contains(t, args, "--no-sandbox")
 	assert.Contains(t, args, "--proxy-server=http://127.0.0.1:3128")
@@ -41,7 +43,7 @@ func TestChromeArgs(t *testing.T) {
 	}
 	require.NoError(t, Config{Token: NewToken(), Executable: "x", Args: args}.validate())
 
-	plain := ChromeArgs(LaunchOptions{UserDataDir: "/tmp/p"})
+	plain := ChromeArgs(LaunchOptions{UserDataDir: profile})
 	assert.Contains(t, plain, "--window-size=1280,800", "the SDK's default window")
 	assert.NotContains(t, plain, "--headless")
 	assert.NotContains(t, plain, "--no-sandbox")
