@@ -100,3 +100,108 @@ trap 'RC=$?; set +e; false >'"'"'/dev/null'"'"' 2>&1; exit "$RC"' EXIT # want:tr
 trap "kill $child_pid; exit 143" TERM
 trap "kill $child_pid 2>/dev/null; exit 143" TERM # want:trap-status
 trap "rm -rf $work" EXIT # want:trap-status
+# The word trap where the shell reads an argument sets no trap (TXE-7864, connector comment 4620462371).
+echo trap false EXIT
+printf '%s\n' done trap 'rm -rf "$work"' EXIT
+echo FOO=1 trap 'rm -rf "$work"' EXIT
+echo then trap 'rm -rf "$work"' EXIT
+echo 'if' trap 'rm -rf "$work"' EXIT
+echo done \
+  trap 'rm -rf "$work"' EXIT
+# ...and where it reads a command, it is still a trap.
+if true; then trap 'rm -rf "$work"' EXIT; fi # want:trap-status
+true && trap 'rm -rf "$work"' EXIT # want:trap-status
+{ trap 'rm -rf "$work"' EXIT; } # want:trap-status
+( trap 'rm -rf "$work"' EXIT ) # want:trap-status
+LC_ALL=C trap 'rm -rf "$work"' EXIT # want:trap-status
+if ! builtin trap 'rm -rf "$work"' EXIT; then :; fi # want:trap-status
+case x in x) trap 'rm -rf "$work"' EXIT ;; esac # want:trap-status
+true \
+  && trap 'rm -rf "$work"' EXIT # want:trap-status
+# A handler's backslash-newline joins its lines when the handler runs (TXE-7864, connector comment 4620462381).
+trap 'RC=$?; \
+  set +e; \
+  rm -rf "$work"; \
+  exit "$RC"' EXIT
+trap "RC=\$?; \
+  set +e; rm -rf \"\$work\"; \
+  exit \"\$RC\"" EXIT
+joined_rc() {
+  local rc=$?; \
+    set +e
+  rm -rf "$work"
+  exit "$rc"
+}
+trap joined_rc EXIT
+# ...and a joined handler that breaks the rule is still reported.
+trap 'RC=$?; \ # want:trap-status
+  rm -rf "$work"; \
+  exit "$RC"' EXIT
+trap 'RC=$?; set +e; \ # want:trap-status
+  rm -rf "$work" 2>/dev/null; \
+  exit "$RC"' EXIT
+trap 'RC=$?; set +e; rm -rf "$work"; \ # want:trap-status
+  exit 0' EXIT
+trap 'RC=$?; set +e # a comment ends at its newline \ # want:trap-status
+  rm -rf "$work" 2>/dev/null
+  exit "$RC"' EXIT
+# A quoted assignment, a redirection and command -- keep the command position (connector review of PR 293).
+FOO="a b" trap 'false' EXIT # want:trap-status
+>/dev/null trap 'false' EXIT # want:trap-status
+2> "$log" trap 'false' EXIT # want:trap-status
+command -- trap 'false' EXIT # want:trap-status
+out=$(trap 'false' EXIT; true) # want:trap-status
+# ...and the same words after a command are arguments.
+echo "a b" trap 'false' EXIT
+echo >/dev/null trap 'false' EXIT
+printf '%s' 2> "$log" trap 'false' EXIT
+"$cmd" -- trap 'false' EXIT
+# A continuation after && and a function body keep the command position (connector review of PR 293).
+true && \
+  trap 'false' EXIT # want:trap-status
+true || \
+  \
+  trap 'false' EXIT # want:trap-status
+function setup { trap 'false' EXIT; } # want:trap-status
+function setup2
+{
+  trap 'false' EXIT # want:trap-status
+}
+# A here-string's word and a here-document's delimiter are targets; the rest of the line is shell (connector review of PR 293).
+<<< input trap 'false' EXIT # want:trap-status
+<<< "a b" trap 'false' EXIT # want:trap-status
+cat <<EOF2; trap 'false' EXIT # want:trap-status
+trap 'false' EXIT
+EOF2
+<<EOF3 trap 'false' EXIT # want:trap-status
+body
+EOF3
+trap 'false' EXIT # want:trap-status
+cat <<< trap 'false' EXIT
+# An escaped blank and a redirection's & or | stay inside their word (connector review of PR 293).
+FOO=a\ b trap 'false' EXIT # want:trap-status
+>a\ b trap 'false' EXIT # want:trap-status
+2>&1 trap 'false' EXIT # want:trap-status
+>&2 trap 'false' EXIT # want:trap-status
+>| /dev/null trap 'false' EXIT # want:trap-status
+echo a\ b trap 'false' EXIT
+echo 2>&1 trap 'false' EXIT
+# coproc and eval run their arguments as a command (connector reviews of PR 293).
+coproc trap 'false' EXIT # want:trap-status
+eval trap "'exit 0'" EXIT # want:trap-status
+echo eval trap 'false' EXIT
+# A redirection written onto the word before it still takes the next word as its target (connector review of PR 293).
+FOO=1> /dev/null trap 'false' EXIT # want:trap-status
+>/dev/null< /dev/null trap 'false' EXIT # want:trap-status
+> a> b trap 'false' EXIT # want:trap-status
+exec {fd}> "$log" trap 'false' EXIT
+echo> /dev/null trap 'false' EXIT
+# A function that runs its arguments in this shell runs trap as a command (connector security review of PR 293).
+run() { "$@"; }
+run trap 'exit 0' EXIT # want:trap-status
+quietly() {
+  command "${@}" >/dev/null
+}
+quietly trap 'exit 0' EXIT # want:trap-status
+say() { echo "$@"; }
+say trap 'exit 0' EXIT
