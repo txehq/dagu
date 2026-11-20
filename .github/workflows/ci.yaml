@@ -34,6 +34,10 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868); the
+      # generator itself is under internal/**.
+      - "skills/**"
+      - "llms.txt"
   pull_request:
     # Keep this workflow directly rerunnable from PR-only maintenance commits.
     types:
@@ -70,6 +74,10 @@ on:
       - "**/*.ps1"
       # The Go pin check compares each Dockerfile's golang: image with go.mod (TXE-7844).
       - "**/Dockerfile*"
+      # Cleanup lint checks llms.txt against skills/dagu (TXE-7868); the
+      # generator itself is under internal/**.
+      - "skills/**"
+      - "llms.txt"
   workflow_dispatch:
 
 permissions:
@@ -195,11 +203,28 @@ jobs:
       - name: Check Go version pins
         run: go test -count=1 ./internal/tools/gopin
 
+      # ui/pnpm-lock.yaml is the one Playwright pin, read by CI's browser
+      # tests and Dockerfile.dev alike (TXE-7866).
+      - name: Check the Playwright pin
+        run: go test -count=1 ./internal/tools/playwrightpin
+
       # A pull_request type that fires on an unchanged head runs a workflow
       # twice and cancels the first run (TXE-7841). It runs here, with no path
       # gate, so a change to a workflow file alone is checked.
       - name: Check workflow pull_request triggers
         run: go test ./internal/tools/workflowtriggers -count=1
+
+      # Every step that runs the Windows installer passes the workflow token
+      # for its GitHub API call, which is otherwise rate limited per shared
+      # runner IP (TXE-7871).
+      - name: Check installer GitHub API calls
+        run: go test -count=1 ./internal/tools/installerapi
+
+      # llms.txt is generated from skills/dagu (`make llms`). A change to the
+      # skill that skips the regeneration fails here (TXE-7868). It runs in
+      # this job because a skills/ or llms.txt change alone sets no path gate.
+      - name: Check llms.txt is generated from skills/dagu
+        run: make llms-check
 
   # Lint Go code
   golint:
@@ -522,9 +547,16 @@ jobs:
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
+      # The version line matches the one the dev image's build prints
+      # (Dockerfile.dev), since both read ui/pnpm-lock.yaml (TXE-7866).
       - name: Install Playwright Chromium
         working-directory: ui
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          pnpm exec playwright install --with-deps chromium
+          chrome="$(node -e "process.stdout.write(require('@playwright/test').chromium.executablePath())")"
+          playwright_version="$(pnpm exec playwright --version)"
+          chromium_version="$("${chrome}" --version)"
+          echo "Chromium from Playwright ${playwright_version#Version }: ${chromium_version}"
 
       - name: Run browser E2E tests
         env:
@@ -548,6 +580,12 @@ jobs:
 
       - name: Test PowerShell installer
         shell: powershell
+        env:
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $installerPath = (Resolve-Path "scripts/installer.ps1").Path
           $source = [IO.File]::ReadAllText(
@@ -678,6 +716,12 @@ jobs:
       # already in place and only the Windows service should be configured.
       - name: Test installer service-only mode
         shell: powershell
+        env:
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
         run: |
           $installerPath = (Resolve-Path "scripts/installer.ps1").Path
           $installDir = "$env:RUNNER_TEMP\dagu-service-live"
@@ -777,12 +821,27 @@ jobs:
         shell: cmd
         env:
           _DAGU_INSTALLER_PS1_PATH: ${{ github.workspace }}\scripts\installer.ps1
+          # The installer's latest-release lookup calls api.github.com, whose
+          # unauthenticated limit is per IP, and hosted runners share IPs
+          # (TXE-7871). internal/tools/installerapi requires this on every step
+          # that runs the installer.
+          DAGU_INSTALLER_GITHUB_TOKEN: ${{ github.token }}
+        # A batch file run without CALL replaces this script and never returns,
+        # so every line after it would be skipped (TXE-7871).
         run: |
-          scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
-          if errorlevel 1 exit /b 1
+          call scripts\installer.cmd -NoPrompt -Service no -OpenBrowser no -InstallDir "%RUNNER_TEMP%\dagu-cmd-install" > "%RUNNER_TEMP%\dagu-cmd-install.log" 2>&1
+          set "INSTALL_EXIT=%ERRORLEVEL%"
+          type "%RUNNER_TEMP%\dagu-cmd-install.log"
+          if not "%INSTALL_EXIT%"=="0" exit /b 1
+          REM The lookup must have used the token: an unauthenticated call can be rate limited.
+          findstr /c:"with the token in DAGU_INSTALLER_GITHUB_TOKEN" "%RUNNER_TEMP%\dagu-cmd-install.log" >nul
+          if errorlevel 1 (
+            echo The installer did not use DAGU_INSTALLER_GITHUB_TOKEN for its GitHub API call. 1>&2
+            exit /b 1
+          )
           "%RUNNER_TEMP%\dagu-cmd-install\dagu.exe" version
           if errorlevel 1 exit /b 1
-          scripts\installer.cmd -NoPrompt -Uninstall -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
+          call scripts\installer.cmd -NoPrompt -Uninstall -InstallDir "%RUNNER_TEMP%\dagu-cmd-install"
           if errorlevel 1 exit /b 1
           if exist "%RUNNER_TEMP%\dagu-cmd-install\dagu.exe" exit /b 1
 

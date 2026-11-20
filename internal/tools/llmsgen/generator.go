@@ -5,6 +5,7 @@ package llmsgen
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -85,6 +86,40 @@ func WriteFile(outputPath string, opts Options) error {
 		return fmt.Errorf("write %s: %w", outputPath, err)
 	}
 	return nil
+}
+
+// ErrStale reports that a committed llms.txt differs from what Generate
+// produces from its sources.
+var ErrStale = errors.New("llms.txt is stale")
+
+// CheckFile compares outputPath with freshly generated content. It returns
+// an error wrapping ErrStale, naming the first differing line, when they
+// differ, and any other error when the file or a source cannot be read. It
+// never writes.
+func CheckFile(outputPath string, opts Options) error {
+	want, err := Generate(opts)
+	if err != nil {
+		return err
+	}
+	got, err := os.ReadFile(outputPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", outputPath, err)
+	}
+	if bytes.Equal(got, want) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s differs from its sources at line %d", ErrStale, outputPath, firstDifferingLine(got, want))
+}
+
+func firstDifferingLine(a, b []byte) int {
+	al := bytes.Split(a, []byte("\n"))
+	bl := bytes.Split(b, []byte("\n"))
+	for i := 0; i < len(al) && i < len(bl); i++ {
+		if !bytes.Equal(al[i], bl[i]) {
+			return i + 1
+		}
+	}
+	return min(len(al), len(bl)) + 1
 }
 
 func stripFrontMatter(content string) string {
