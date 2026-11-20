@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +38,9 @@ case "$*" in
   *"config view"*"cluster.server"*) printf '%s' https://127.0.0.1:1 ;;
   *"config view"*"certificate-authority-data"*) ;;
   *"create token"*)
+    # With $STUB_HANG set, signal that the candidate exists and wait to be
+    # interrupted.
+    if [ -n "${STUB_HANG:-}" ]; then : > "$STUB_CALLS.hang"; sleep 30; fi
     # Before the token reaches the writer, tamper with the candidate the way
     # $STUB_SWAP says: the writer opens it only after kubectl has finished.
     for c in "$TXE_DAGU_HOME"/tunnel/kubeconfig.??????; do
@@ -60,6 +65,7 @@ case "$*" in
     echo yes; exit "${STUB_PORTFORWARD:-0}" ;;
   *"get secrets"*)
     for c in "$TXE_DAGU_HOME"/tunnel/kubeconfig.??????; do [ ! -L "$c" ] || echo "followed a link" >> "$STUB_CALLS"; done
+    if [ "${STUB_SECRETS:-}" = yes ]; then echo yes; exit 0; fi
     echo no; exit 1 ;;
   *) echo "stub kubectl: unexpected call" >&2; exit 98 ;;
 esac
@@ -83,11 +89,13 @@ esac
 `
 
 // stubMv stands in for mv: with $STUB_MV=fail-expires the move of the
-// .expires fails; every other move is the real one ($REAL_MV).
+// .expires fails, with fail-first the move of the candidate over the live
+// kubeconfig fails; every other move is the real one ($REAL_MV).
 const stubMv = `#!/bin/sh
 for last in "$@"; do :; done
 case "${STUB_MV:-}:$last" in
   fail-expires:*.expires) echo "mv: refused by the test's stub" >&2; exit 1 ;;
+  fail-first:*/kubeconfig) echo "mv: refused by the test's stub" >&2; exit 1 ;;
 esac
 exec "$REAL_MV" "$@"
 `
@@ -126,6 +134,21 @@ func runTunnelCredential(t *testing.T, env ...string) tunnelRun {
 // runTunnelCredentialWith runs it after prepare, given the TXE home and a
 // file outside it, has set the scene.
 func runTunnelCredentialWith(t *testing.T, prepare func(home, outside string), env ...string) tunnelRun {
+	t.Helper()
+	c := newTunnelCmd(t, prepare, env...)
+	return c.finish(t, c.cmd.Run())
+}
+
+// tunnelCmd is a prepared, not yet started, run of tunnel-credential.sh, for a
+// test that acts on the running script.
+type tunnelCmd struct {
+	cmd            *exec.Cmd
+	run            tunnelRun
+	stdout, stderr bytes.Buffer
+	calls          string // the stub kubectl's call log
+}
+
+func newTunnelCmd(t *testing.T, prepare func(home, outside string), env ...string) *tunnelCmd {
 	t.Helper()
 	script, err := filepath.Abs("tunnel-credential.sh")
 	require.NoError(t, err)
@@ -167,16 +190,23 @@ func runTunnelCredentialWith(t *testing.T, prepare func(home, outside string), e
 		"STUB_OUTSIDE=" + r.outside,
 		"STUB_TOKEN=eyJhbGciOiJSUzI1NiJ9." + payload + "." + tokenMarker,
 	}, env...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err = cmd.Run()
+	c := &tunnelCmd{cmd: cmd, run: r, calls: calls}
+	cmd.Stdout, cmd.Stderr = &c.stdout, &c.stderr
+	return c
+}
+
+// finish records the outcome of the run that ended with err. A run ended by
+// a signal has code -1.
+func (c *tunnelCmd) finish(t *testing.T, err error) tunnelRun {
+	t.Helper()
+	r := c.run
 	var exit *exec.ExitError
 	if err != nil {
 		require.True(t, errors.As(err, &exit), "run: %v", err)
 		r.code = exit.ExitCode()
 	}
-	r.stdout, r.stderr = stdout.String(), stderr.String()
-	if b, err := os.ReadFile(calls); err == nil {
+	r.stdout, r.stderr = c.stdout.String(), c.stderr.String()
+	if b, err := os.ReadFile(c.calls); err == nil {
 		r.calls = string(b)
 	}
 	assert.NotContains(t, r.stdout+r.stderr, tokenMarker, "the token was printed")
@@ -418,6 +448,74 @@ func TestTunnelCredentialRefusedRenewalRemovesItsCandidate(t *testing.T) {
 	assert.Empty(t, r.candidates(t))
 	assert.Empty(t, fatalLines(r.stderr))
 	assert.NoFileExists(t, filepath.Join(r.tunnelDir, "kubeconfig"))
+}
+
+// entries are the names left in the tunnel directory.
+func (r tunnelRun) entries(t *testing.T) []string {
+	t.Helper()
+	ents, err := os.ReadDir(r.tunnelDir)
+	require.NoError(t, err)
+	var out []string
+	for _, e := range ents {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
+// A token that can read Secrets is refused like one that cannot
+// port-forward: the previous credential stays, and the candidate pair goes.
+func TestTunnelCredentialRefusesATokenThatCanReadSecrets(t *testing.T) {
+	r := runTunnelCredential(t, "STUB_SECRETS=yes")
+	assert.Equal(t, 1, r.code, "stderr:\n%s", r.stderr)
+	assert.Contains(t, r.stderr, "can read Secrets")
+	assert.Empty(t, r.entries(t), "the candidate pair was left, or a credential was installed")
+	assert.Empty(t, fatalLines(r.stderr))
+}
+
+// When the candidate cannot be moved over the live kubeconfig, the previous
+// pair stays exactly as it was and the candidate pair is removed.
+func TestTunnelCredentialKeepsThePreviousPairWhenTheMoveFails(t *testing.T) {
+	r := runTunnelCredentialWith(t, func(home, _ string) {
+		dir := filepath.Join(home, "tunnel")
+		require.NoError(t, os.MkdirAll(dir, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "kubeconfig"), []byte("previous\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "kubeconfig.expires"), []byte("1\n"), 0o600))
+	}, "STUB_MV=fail-first")
+	assert.NotEqual(t, 0, r.code, "stderr:\n%s", r.stderr)
+	assert.ElementsMatch(t, []string{"kubeconfig", "kubeconfig.expires"}, r.entries(t))
+	assert.Empty(t, fatalLines(r.stderr))
+	b, err := os.ReadFile(filepath.Join(r.tunnelDir, "kubeconfig"))
+	require.NoError(t, err)
+	assert.Equal(t, "previous\n", string(b))
+	b, err = os.ReadFile(filepath.Join(r.tunnelDir, "kubeconfig.expires"))
+	require.NoError(t, err)
+	assert.Equal(t, "1\n", string(b))
+}
+
+// A renewal interrupted while kubectl is issuing the token (Ctrl-C reaches
+// the whole process group; a closed terminal sends SIGHUP; a stop sends
+// SIGTERM) still removes its candidate: bash runs the EXIT trap when a signal
+// ends it. The candidate exists from mktemp on, before any token.
+func TestTunnelCredentialSignalRemovesItsCandidate(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP} {
+		t.Run(sig.String(), func(t *testing.T) {
+			c := newTunnelCmd(t, nil, "STUB_HANG=1")
+			c.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			c.cmd.WaitDelay = 10 * time.Second
+			require.NoError(t, c.cmd.Start())
+			pgid := c.cmd.Process.Pid
+			t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+			require.Eventually(t, func() bool {
+				_, err := os.Stat(c.calls + ".hang")
+				return err == nil
+			}, 20*time.Second, 20*time.Millisecond, "the stub never reached create token")
+			require.Len(t, c.run.candidates(t), 1, "no candidate to interrupt")
+			require.NoError(t, syscall.Kill(-pgid, sig))
+			r := c.finish(t, c.cmd.Wait())
+			assert.NotEqual(t, 0, r.code, "stderr:\n%s", r.stderr)
+			assert.Empty(t, r.entries(t), "an interrupted run left its candidate:\n%s", r.stderr)
+		})
+	}
 }
 
 // Each way the candidate can outlive the script, after a renewal that
