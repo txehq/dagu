@@ -5,6 +5,7 @@
 The fixtures are Python and shell SOURCE TEXT, parsed and never run. Temporary trees hold only that text. The last
 class scans this repository's real txe/ tree (reads only).
 """
+import ast
 import hashlib
 import importlib.util
 import tempfile
@@ -192,7 +193,9 @@ class Refused(unittest.TestCase):
             "dynamic-fstring-no-shell": 'import subprocess\n\ndef f(y):\n    cmd = f"docker run {y}"\n'
                                         '    subprocess.run(cmd)\n',
         }
-        self.assertEqual(len(cases), 18)
+        cases["for-loop-shell"] = ('import subprocess\nfor c in ["docker run a", "docker run b"]:\n'
+                                   '    subprocess.run(c, shell=True)\n')
+        self.assertEqual(len(cases), 19)
         for label, src in cases.items():
             with self.subTest(label):
                 self.assertIn("C16", codes(src, head=""), label)
@@ -206,6 +209,10 @@ class Refused(unittest.TestCase):
             "docker-list-no-shell": 'import subprocess\nsubprocess.run(["docker", "ps"])\n',
             "docker-list-shell-false": 'import subprocess\nsubprocess.run(["docker", "ps"], shell=False)\n',
             "guarded-argv-with-sh-c-payload": HEAD + textwrap.dedent(GOOD.replace(ARGV, payload_argv)),
+            # PR 299 CG-r5: an item or attribute assignment on a name elsewhere is not a string bound to that name
+            "item-assigned-argv-elsewhere": HEAD + textwrap.dedent(GOOD) + '\ndef other(argv):\n    argv[2] = "n2"\n',
+            "attribute-on-argv-elsewhere": HEAD + textwrap.dedent(GOOD) +
+                                           '\ndef other(argv):\n    argv.text = "docker run x"\n',
         }
         for label, src in cases.items():
             with self.subTest(label):
@@ -228,6 +235,65 @@ def launch(schema):
         raise SystemExit(1)
     subprocess.run(argv)
 """
+
+
+class Bindings(unittest.TestCase):
+    """The two binding helpers have different jobs, and each is asserted against its own semantics, form by form
+    (PR 299 CG-r5: _bindings read `argv[2] = "n2"` as argv being bound to a string). Inert source, parsed only."""
+
+    def test_bindings_record_only_store_bound_names_with_their_values(self):
+        cases = {
+            "name": ("x = 'docker run'", {"x": ["'docker run'"]}),
+            "tuple-unpack": ("a, b = v", {"a": ["v"], "b": ["v"]}),
+            "list-unpack": ("[a, b] = v", {"a": ["v"], "b": ["v"]}),
+            "starred": ("a, *rest = v", {"a": ["v"], "rest": ["v"]}),
+            "chained": ("a = b = v", {"a": ["v"], "b": ["v"]}),
+            "subscript": ("x[2] = 'n2'", {}),
+            "attribute": ("x.text = 'docker run x'", {}),
+            "subscript-of-attribute": ("x.y[0] = v", {}),
+            "augassign": ("x += ' --rm'", {"x": ["' --rm'"]}),
+            "annassign-value": ("x: str = 'docker'", {"x": ["'docker'"]}),
+            "annassign-bare": ("x: str", {}),
+            "walrus": ("(x := 'docker run')", {"x": ["'docker run'"]}),
+            "walrus-in-subscript-target": ("x[(i := 1)] = v", {"i": ["1"]}),
+            "for": ("for c in cmds:\n    pass", {"c": ["cmds"]}),
+            "for-unpack": ("for a, b in pairs:\n    pass", {"a": ["pairs"], "b": ["pairs"]}),
+            "async-for": ("async def f():\n    async for c in cmds:\n        pass", {"c": ["cmds"]}),
+            "comprehension": ("[c for c in cmds]", {"c": ["cmds"]}),
+            "with-as": ("with open(p) as f:\n    pass", {}),
+            "import-def-param": ("import os\n\ndef f(a):\n    pass", {}),
+        }
+        for label, (src, want) in cases.items():
+            with self.subTest(label):
+                got = {k: [ast.unparse(v) for v in vs] for k, vs in C._bindings(ast.parse(src)).items()}
+                self.assertEqual(got, want, label)
+
+    def test_binding_counts_count_every_rebinding_but_never_a_target_base(self):
+        cases = {
+            "name": ("x = 1", {"x": 1}),
+            "unpack-starred": ("a, *rest = v", {"a": 1, "rest": 1, "v": 0}),
+            "subscript-base": ("x[0] = 1", {"x": 0}),
+            "attribute-base": ("o.a = 1", {"o": 0}),
+            "augassign": ("x += 1", {"x": 1}),
+            "annassign-bare": ("x: int", {"x": 1}),
+            "walrus": ("(x := 1)", {"x": 1}),
+            "for-and-comprehension": ("for x in y:\n    pass\n[z for z in y]", {"x": 1, "z": 1, "y": 0}),
+            "with-as": ("with c as x:\n    pass", {"x": 1, "c": 0}),
+            "del": ("del x", {"x": 1}),
+            "def-class-param": ("def f(a, *b, c=1, **d):\n    pass\n\nclass K:\n    pass",
+                                {"f": 1, "a": 1, "b": 1, "c": 1, "d": 1, "K": 1}),
+            "imports": ("import a.b\nimport m as n\nfrom p import q as r, s",
+                        {"a": 1, "n": 1, "r": 1, "s": 1, "m": 0, "q": 0}),
+            "except": ("try:\n    pass\nexcept E as e:\n    pass", {"e": 1, "E": 0}),
+            "global": ("def f():\n    global g", {"g": 1, "f": 1}),
+            "match": ("match v:\n    case [a, *r]:\n        pass\n    case {'k': b, **rest}:\n        pass",
+                      {"a": 1, "r": 1, "b": 1, "rest": 1}),
+            "rebinding-twice": ("x = 1\nx = 2", {"x": 2}),
+        }
+        for label, (src, want) in cases.items():
+            with self.subTest(label):
+                counts = C._binding_counts(ast.parse(src))
+                self.assertEqual({k: counts.get(k, 0) for k in want}, want, label)
 
 
 class ClosedPattern(unittest.TestCase):

@@ -244,8 +244,11 @@ def _escapes(node, name):
 
 
 def _binding_counts(tree):
-    """How many times each name is bound anywhere in the file: assignment, loop, with, comprehension and walrus
-    targets, del, def and class names, parameters, imports, except names, global/nonlocal and match captures."""
+    """How many times each name is bound anywhere in the file (C14's shadowing evidence), valued or not: assignment,
+    augmented, annotated (even with no value: it makes the name local), unpacking, starred, loop, with, comprehension
+    and walrus targets, del, def and class names, parameters, imports, except names, global/nonlocal and match
+    captures. Only a Name in a Store or Del context counts, so the base of a Subscript or Attribute target is not a
+    binding."""
     counts = {}
 
     def add(n):
@@ -388,14 +391,34 @@ def _dotted(node, names):
 
 
 def _bindings(tree):
-    """Name -> every value assigned to it anywhere in the file. One level, no data flow."""
+    """Name -> the values this file gives it (C16's evidence), one level, no data flow. Only a name a statement BINDS
+    counts: a Subscript or Attribute target (`x[i] = v`, `x.a = v`) changes an object and binds no name, so its base
+    is never recorded (PR 299 CG-r5: `argv[2] = "n2"` was read as argv being the string "n2"). Per form:
+    - `x = v`, `x: T = v`, `(x := v)`: v;
+    - unpacking (`a, b = v`, `[a, *rest] = v`): v for each name;
+    - `x += v`: v, an increment (a str increment makes x a string);
+    - `for x in it` and a comprehension's `for x in it`: it (x takes its elements);
+    - `x: T` with no value, `with … as x`, imports, except names, defs, classes and parameters: nothing, because the
+      file shows no value for them.
+    This differs from _binding_counts on purpose: that one counts every (re)binding, valued or not."""
     out = {}
+
+    def bind(target, value):
+        if isinstance(target, ast.Name):
+            out.setdefault(target.id, []).append(value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for e in target.elts:
+                bind(e, value)
+        elif isinstance(target, ast.Starred):
+            bind(target.value, value)
     for n in ast.walk(tree):
-        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and n.value is not None:
-            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
-                for x in ast.walk(t):
-                    if isinstance(x, ast.Name):
-                        out.setdefault(x.id, []).append(n.value)
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                bind(t, n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and n.value is not None:
+            bind(n.target, n.value)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(n.target, n.iter)
     return out
 
 
