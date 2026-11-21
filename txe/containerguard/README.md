@@ -138,7 +138,8 @@ A **launch** is a list literal that has:
 It is ACCEPTED only in the recipe's shape:
 - the site (`argv = <list>` or `argv = build(...)`) is a statement **directly in a function body**;
 - the next use is `bad = violations(argv, …)`, with `violations` bound to `txe.containerguard.argv_guard` by one
-  module-level import. The name is bound once in the file and the module is never patched;
+  module-level import. The name is bound once in the file, the module is never patched, and the guard name occurs
+  ONLY in that import and as the check call's callee;
 - the next statement is `if bad:` whose first statement is `raise …` or `return …`, with no call (other than an
   exception class), await, yield or walrus in it;
 - after that, the argv's name appears exactly ONCE, as the launch's command argument. That is a positional argument
@@ -185,6 +186,10 @@ A recognised launch in any other form fails for review. These forms include:
     an attribute of the function (`g.violations.__code__ = …`) and a subscript of the module
     (`g.__dict__[…] = …`);
   - an unresolved rebinding: a write into `globals()`, `vars()` or `locals()`, or any `exec` or `eval`;
+  - ANY other reference to the guard name: a read or alias (`h = g.violations`), an argument (`f(violations)`,
+    `vars(g)`), or a namespace mutation through any API (`g.__dict__.update(…)`, `.setdefault`, `.__setitem__`).
+    Only the import and the check call are allowed;
+  - the guard module reached by name: a string naming it, `sys.modules`, `importlib` or `__import__`;
   - a dynamic `importlib` load;
   - a module other than `txe.containerguard.argv_guard`. That includes the bare `argv_guard`, which can resolve to a
     sibling `argv_guard.py`. A path or name suffix is not provenance;
@@ -215,7 +220,12 @@ The heuristic does not see these, so the code under it is unchecked, and reviewe
 - **executable identity.** Which `docker` binary `PATH` resolves is outside both this check and the guard;
 - arbitrary Python effects in general. The check refuses the unresolved rebindings it can see (`exec`, `eval`, a
   write into `globals()`, `vars()` or `locals()`), but it does not claim completeness against every way Python code
-  can change behaviour at run time.
+  can change behaviour at run time;
+- **guard tampering beyond this file.** The closed-use rule is a static rule over the recognised forms in one file:
+  the guard's own module-level import and its check call, with any other reference to the guard name or module in
+  that file refused. It does not make tampering impossible. Another module, an import-time side effect, a
+  monkeypatch from a test harness, or other run-time state can still change the guard. The runtime
+  `argv_guard.violations` call remains the enforcer.
 
 These limits cover forms the AST cannot observe. They do not excuse a recognised shape: an accepted shape that
 launches, aborts with a side effect, or calls a fake guard is a bug in this check, and is fixed rather than

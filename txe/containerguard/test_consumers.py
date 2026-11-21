@@ -414,6 +414,19 @@ class ClosedPattern(unittest.TestCase):
                                          GUARDED),
             "globals-rebinding": (HEAD + "globals()['violations'] = lambda *a: []\n", GOOD),
             "exec-rebinding": (HEAD + "exec('violations = lambda *a: []')\n", GOOD),
+            # PR 299 security review of 166b76cc: the guard may be referenced ONLY by its import and its check call
+            "dict-update-repro": (PKG_AS + "argv_guard.__dict__.update({'violations': lambda *_: []})\n",
+                                  GUARDED.replace(ARGV, '["docker", "run", "--privileged", "alpine"]')),
+            "dict-setdefault": (PKG_AS + "argv_guard.__dict__.setdefault('violations', None)\n", GUARDED),
+            "dict-setitem-method": (PKG_AS + "argv_guard.__dict__.__setitem__('violations', lambda *a: [])\n",
+                                    GUARDED),
+            "vars-update": (PKG_AS + "vars(argv_guard).update(violations=lambda *a: [])\n", GUARDED),
+            "attribute-read-alias": (PKG_AS + "check = argv_guard.violations\n", GUARDED),
+            "passed-as-argument": (HEAD + "register(violations)\n", GOOD),
+            "sys-modules": (PKG_AS + "import sys\nsys.modules['x'].violations = lambda *a: []\n", GUARDED),
+            "importlib-by-name": (PKG_AS + "import importlib\nimportlib.import_module('m').violations = None\n",
+                                  GUARDED),
+            "module-name-string": (PKG_AS + "NAME = 'txe.containerguard.argv_guard'\n", GUARDED),
             "dynamic-load": ("import importlib.util\nimport subprocess\n"
                              "spec = importlib.util.spec_from_file_location('argv_guard', 'x/argv_guard.py')\n"
                              "G = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(G)\n",

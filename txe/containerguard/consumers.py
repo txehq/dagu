@@ -306,7 +306,10 @@ def _guard_bindings(tree):
       starred, augmented, annotated, deleted, or as a for, comprehension or with target), including an attribute of
       the function (`g.violations.__code__ = …`) or a subscript of the module (`g.__dict__[…] = …`);
     - setattr or delattr on either;
-    - an unresolved rebinding: a write into globals(), vars() or locals(), or any exec or eval call.
+    - an unresolved rebinding: a write into globals(), vars() or locals(), or any exec or eval call;
+    - ANY occurrence of a guard name other than its import and the root of a check call's callee (the allowlist
+      that subsumes the forms above: `g.__dict__.update(…)`, `vars(g)`, `h = g.violations`, `f(violations)`);
+    - the guard module reached by name: a string naming it, sys.modules, importlib or __import__.
     An import inside a try, if or def is not module level, so a fallback definition cannot stand in for the guard."""
     if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
         return {}
@@ -336,6 +339,27 @@ def _guard_bindings(tree):
             return {}
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("setattr", "delattr") and \
                 n.args and _dotted(n.args[0], out) is not None:
+            return {}
+    # PR 299 security review of 166b76cc (`g.__dict__.update(...)`): an ALLOWLIST rather than another blocked form.
+    # A guard name may occur only in its import (an ast.alias, not a Name) and as the root of a check call's callee
+    # (`violations(...)`, `g.violations(...)`). Any other occurrence (a read, an alias, an argument, a namespace or
+    # function mutation through any API) voids the bindings.
+    allowed = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and _dotted(n.func, out) in GUARD_CALLS:
+            root = n.func
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            allowed.add(id(root))
+    if any(isinstance(n, ast.Name) and n.id in out and id(n) not in allowed for n in ast.walk(tree)):
+        return {}
+    # ... and the guard module may not be reached by NAME: a string naming it, sys.modules, importlib or __import__
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Constant) and n.value in GUARD_MODULES) or \
+                (isinstance(n, ast.Attribute) and n.attr == "modules" and isinstance(n.value, ast.Name) and
+                 n.value.id == "sys") or (isinstance(n, ast.Name) and n.id == "__import__") or \
+                (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "importlib" for a in n.names)) or \
+                (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] == "importlib"):
             return {}
     return out
 
