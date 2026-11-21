@@ -60,12 +60,19 @@ a context can be repointed inside its file. This directory holds the source of t
     word, and its attached short form (`-d1`, `-ifoo`) is unsupported: unknown, so refused when a client
     follows. A word consumed as a REQUIRED value never names a client (`watch -n kubectl ...` is H03), so a
     wrong table entry fails closed;
-  - the installed kube-run is accepted only as a BARE command word, in a line that changes no environment
-    (H16). Any assignment (`PATH=/tmp/bin kube-run ...`, `PATH=...; kube-run ...`), `export`, `declare`,
-    `typeset`, `local`, `readonly`, `unset`, `alias`, `hash`, `enable`, `shopt`, `source` or `.`,
-    anywhere in the line and at any depth, and any wrapper before kube-run (`env`, `sudo`, `timeout`, `nohup`,
-    `command`, `time`, ...), is refused. Variables are not enumerated: any change could choose the interpreter
-    of kube-run's `#!/usr/bin/env python3`;
+  - the installed kube-run is accepted only as a BARE command word, with no wrapper before it (`env`, `sudo`,
+    `timeout`, `nohup`, `command`, `time`, ...). It must also sit in a line whose every other command, at any
+    depth, is in a SMALL CLOSED SET of environment-neutral commands, with no assignment of any form (`NAME=`,
+    `NAME+=`, `NAME[i]=`) (H16). The set is:
+    - the data set above, used as data;
+    - `[ ... ]`, `cd` and `set`;
+    - a client's local forms and `kustomize`;
+    - `command -v`;
+    - a shell running checked text in a child process.
+    Anything else is refused. That includes `export`, `read`, `printf -v`, `mapfile`, `let`, `getopts`, `eval`,
+    `source`, interpreters and unknown commands. It is an allowlist, because any environment change could choose
+    the interpreter of kube-run's `#!/usr/bin/env python3`, and the builtins that make one cannot be enumerated
+    safely;
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
     always checked as a program;
   - local version, help, config-read and kustomize commands pass.
@@ -162,8 +169,10 @@ name at run time. Its classification also ASSUMES things it cannot see:
 These are deployment prerequisites, not things the hook proves. It does not guard every way a shell can execute a
 command: it refuses the ones it can see that it does not understand.
 
-H16 also refuses legitimate lines that set a variable for a kube-run call (`NS=arc-runners; kube-run ... -n
-"$NS"`) or wrap it (`timeout 60 kube-run ...`). Pass values literally, and use kube-run's own `--timeout`.
+H16 also refuses legitimate lines. Examples are setting a variable for a kube-run call (`NS=arc-runners;
+kube-run ... -n "$NS"`), wrapping it (`timeout 60 kube-run ...`), and combining it with any command outside the
+neutral set (`date; kube-run ...`). Pass values literally, use kube-run's own `--timeout`, and run other commands
+in a separate tool call.
 
 **Installation contract for kube-run (a prerequisite of any install; nothing here installs it):** the installed
 kube-run must start through an ABSOLUTE, pinned interpreter in isolated mode. For example, it can be a small

@@ -291,6 +291,16 @@ class Refused(unittest.TestCase):
                     f"PATH=/tmp/bin bash -c '{kr()}'", f"bash -c 'X=1; {kr()}'", f"declare -x PATH=/tmp/bin; {kr()}",
                     f"set -a; X=1; {kr()}", f"hash -p /tmp/py python3; {kr()}", f"unset PATH; {kr()}"):
             self.deny(cmd, "H16", "kube-run")
+        # cc3's review of 1f761b1d: H16 is an ALLOWLIST. Every other command must be environment-neutral, so the
+        # builtins a denylist would miss, other assignment forms and unknown commands are all refused.
+        for cmd in (f"PATH+=:/tmp/bin; {kr()}", f"PYTHONPATH+=/x {kr()}", f"arr[0]=x; {kr()}",
+                    f"read -r PATH <<< /tmp/bin; {kr()}", f"printf -v PATH %s /tmp/bin; {kr()}",
+                    f"mapfile -t PATH < f; {kr()}", f"let X=1; {kr()}", f"getopts ab PATH; {kr()}", f"foo; {kr()}",
+                    f"python3 x.py; {kr()}", f"eval true; {kr()}", f"bash -c 'read PATH'; {kr()}"):
+            self.deny(cmd, "H16", "kube-run")
+        # The widened assignment forms get the H04 check on their value too.
+        for cmd in ("X+=kubectl", "a[1]=kubectl", "K[0]+=kubectl true"):
+            self.deny(cmd, "H04")
 
     def test_a_client_named_where_the_hook_does_not_understand_it_is_refused(self):
         # Class rule (H15): outside the positions the hook classifies (a client's own argv, kube-run, local
