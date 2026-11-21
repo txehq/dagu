@@ -19,8 +19,8 @@ spells out one run's exact argv:
   - nothing is mounted from or onto a Docker socket or the runtime directories;
   - --network none, --pull never, --cap-drop ALL, --security-opt no-new-privileges and
     --read-only are fixed;
-  - the user is a canonical nonzero numeric uid, with an optional canonical nonzero numeric gid (no name, which
-    resolves inside the image; no sign or leading zero, which Docker's Atoi still reads as 0);
+  - the user is exactly uid:gid, both canonical nonzero decimals (no bare uid, whose group the image would choose;
+    no name, which resolves inside the image; no sign or leading zero, which Docker's Atoi still reads as 0);
   - the image is an immutable digest;
   - env and label keys are well formed and unique, and env names that carry credentials by
     convention, or point at a Docker daemon or an SSH agent, are refused;
@@ -107,8 +107,8 @@ CODES = {
     "S10": "two mounts share a target",
     "S11": "an env key is malformed, duplicated, denied, or names a credential",
     "S12": "a label key is malformed or duplicated",
-    "S13": "the user is absent (the image's default), or is not a canonical nonzero numeric uid[:gid] (root, uid or "
-           "gid 0 in any spelling, a sign, a leading zero, or a name, which resolves inside the image)",
+    "S13": "the user is absent (the image's default), or is not exactly uid:gid with both canonical nonzero decimals "
+           "(a bare uid, root, 0 in any spelling, a sign, a leading zero, or a name, which resolves inside the image)",
     "S14": "the image is not an immutable digest",
     "S15": "the payload is not a non-empty tuple of strings",
     "S16": "a tmpfs is not an absolute normalised path outside the system trees",
@@ -245,10 +245,10 @@ def check_schema(s):
                                              SINGLE_KIND | FLOOR_FLAGS | set(CREATE_OPTIONS))))
     # absent means the image's user, root for most images. Docker reads a numeric id with strconv.Atoi, so "00", "+0"
     # and "-0" are uid 0, and a NAME resolves inside the image, where any name can be uid 0 (PR 299 review of
-    # 32dc13f1: `--user 00:0` ran as root). So the user is a canonical nonzero decimal uid, and the group, when given,
-    # a canonical nonzero decimal gid.
+    # 32dc13f1: `--user 00:0` ran as root). So the user is EXACTLY uid:gid, both canonical nonzero decimals. A bare
+    # uid is refused: its primary group would resolve through the image's defaults. An extra colon fails in the gid.
     uid, sep, gid = s.single.get("--user", "").partition(":")
-    if not NONZERO_ID.fullmatch(uid) or (sep and not NONZERO_ID.fullmatch(gid)):
+    if sep != ":" or not NONZERO_ID.fullmatch(uid) or not NONZERO_ID.fullmatch(gid):
         bad.append(Violation("S13", "--user"))
     if not IMMUTABLE_IMAGE.fullmatch(s.image):
         bad.append(Violation("S14"))

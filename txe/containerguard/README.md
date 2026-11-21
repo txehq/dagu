@@ -41,8 +41,9 @@ launch(argv)
   runtime trees, and read-only unless their target is declared writable;
 - nothing is mounted from or onto a Docker socket;
 - `--network none`, `--pull never`, `--cap-drop ALL`, `--security-opt no-new-privileges` and `--read-only` are fixed;
-- the user is set to a canonical positive decimal uid, with an optional canonical positive decimal gid:
-  `--user 1000:1000`, or a bare uid such as `--user 1000`. Refused (`S13`):
+- the user is set to exactly `uid:gid`, BOTH required and both canonical positive decimals (`--user 1000:1000`).
+  Refused (`S13`):
+  - a bare uid (`--user 1000`): its primary group would resolve through the image's defaults;
   - a name, which resolves inside the image, where any name can be uid 0;
   - uid or gid 0 in any spelling (Docker's `strconv.Atoi` reads `00`, `+0` and `-0` as 0);
   - a leading zero, a sign or whitespace;

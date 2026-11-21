@@ -301,14 +301,15 @@ class PolicyFloor(unittest.TestCase):
 
     def test_the_user_must_be_a_canonical_nonzero_numeric_id(self):
         """PR 299 review of 32dc13f1: `--user 00:0` passed, and Docker reads "00" with strconv.Atoi as uid 0 (root).
-        The user is a canonical nonzero decimal uid, with an optional canonical nonzero decimal gid."""
+        The user is exactly uid:gid, both canonical nonzero decimals. A bare uid is refused (root's r14 correction)."""
         refused = ("00:0", "", ":", "00", "+0", "-0", "0000", "007", "root", "toor", " 1000", "1000 ", "1000:",
-                   "1000:0", "1000:+0", "1000:01", "1000:1000:1000", "0:1000")
-        self.assertEqual(len(refused), 18)
+                   "1000:0", "1000:+0", "1000:01", "1000:1000:1000", "0:1000",
+                   "1", "1000")    # a bare uid: no unspecified-gid exception, the image's default group is refused
+        self.assertEqual(len(refused), 20)
         for user in refused:
             with self.subTest(user):
                 self.assertIn("S13", codes(G.check_schema(schema_single(**{"--user": user}))), user)
-        for user in ("1000:1000", "501:20", "1"):        # "1": a bare uid, with no group, is allowed
+        for user in ("1000:1000", "501:20"):
             with self.subTest(user):
                 self.assertEqual(G.check_schema(schema_single(**{"--user": user})), [], user)
 
