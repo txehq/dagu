@@ -23,7 +23,11 @@ a context can be repointed inside its file. This directory holds the source of t
   - every true spelling of `--all-namespaces` and `-A`;
   - a `cp` operand that names its own namespace is refused;
   - `auth` and `rollout` are authorized with their subcommand (`auth can-i`, `rollout restart`), from an
-    allowlist.
+    allowlist;
+  - only options kube-run knows are forwarded. Any other option, and any attached or clustered short option
+    (`-wA`, `-inother`, `-ojson`), is refused: write each option and its value separately;
+  - file-based and create requests (`apply`, `create`, `replace`, `diff`, `-f`, `-k`; `logs -f` excepted) are
+    refused, because the kinds and namespaces they act on cannot be read from the arguments before contact.
 - **`b5_custody.py`**: the reviewed B5 host-process custody, copied byte for byte (provenance below) and
   pinned by sha256 in `kube_run.py`.
 - **`kubectl-context-guard.py`**: a PreToolUse hook that lets an agent's cluster API call through only on the
@@ -56,7 +60,7 @@ a context can be repointed inside its file. This directory holds the source of t
 | Claude Code PreToolUse, `tool_name == "Bash"`, `tool_input.command` a string | **Guarded.** Parsed by the hook's lexer and checked by H01 to H13. Tested with synthetic events in Claude Code's documented shape. Not yet observed in a live harness |
 | Any other tool or harness with a command-like field (`tool_input.command` or `tool_input.cmd`, a string or an argv list), for example a Codex shell call | **Unsupported, NOT guarded.** It is refused (H14) when the text names a cluster client, and allowed otherwise. Nothing in it is parsed, so a kube-run call in this shape passes unchecked by the hook (kube-run still runs its own checks). No Codex payload has been captured or tested; the shapes in the tests are hand-written |
 | Events with no command-like field (Read, Edit, MCP tools, ...) | Allowed, not guarded. MCP cluster tools are out of scope (TXE-7874) |
-| Script files (`bash ops/x.sh` that runs kubectl inside), client-go programs | Not visible to the hook |
+| Script files (`bash ops/x.sh` that runs kubectl inside), client-go programs, and interpreter code that builds a client's name at run time (`python3 -c '...execlp("kube"+"ctl", ...)'`) | **Not visible to the hook.** It is a heuristic over command text, and it refuses interpreter payloads only when they name a client. Keeping such calls off a production cluster needs the agent's environment to hold no usable default credential. That is a deployment decision, not something this hook can enforce |
 | Any harness where the hook is not wired | **Not installed**: no protection at all |
 
 Only the first row is positive protection. An H14 refusal is a fail-closed stop, not a claim of coverage.

@@ -495,6 +495,29 @@ class RequestScope(Base):
             self.assertFalse(kr.is_override(a), a)
         self.refused(["txe-onprem-ci", "--", "get", "pods", "-shttps://other.example"], "KR04")
 
+    def test_only_known_options_are_forwarded(self):
+        # pflag reads `-wA` as -w -A (all namespaces) and `-inother` as -i -n other (connector review of
+        # bcca1dcc). Unknown, attached and clustered options are refused instead of being forwarded unchecked.
+        for args in (["get", "pods", "-wA"], ["exec", "pod-a", "-inother", "--", "id"], ["get", "pods", "-ojson"],
+                     ["get", "pods", "--raw", "/api/v1/secrets"], ["get", "pods", "--frob=x"], ["-w", "get", "pods"]):
+            self.refused_by_parser(args)
+        r = self.scope(["get", "pods", "-w", "-o", "json", "--show-labels", "-l", "app=x", "--output=wide"])
+        self.assertEqual((r["resources"], r["namespace"]), (["pods"], "ctx-ns"))
+        self.assertEqual(self.scope(["exec", "-it", "pod-a", "--", "sh", "-c", "id"])["resources"], ["pods"])
+        self.assertEqual(self.scope(["logs", "pod-a", "--tail", "10", "-f"])["resources"], ["pods"])
+        self.refused(["txe-onprem-ci", "--", "get", "pods", "-wA"], "KR05")
+
+    def test_file_based_and_create_requests_are_refused(self):
+        # A manifest names its own kinds and namespaces, and `create <kind>` can be cluster-scoped (connector
+        # review of 85bde125); neither can be read from the arguments before contact.
+        for args in (["apply", "-f", "x.yaml"], ["create", "clusterrolebinding", "x", "--clusterrole", "admin"],
+                     ["create", "-f", "x.yaml"], ["replace", "-f", "x.yaml"], ["diff", "-f", "x.yaml"],
+                     ["delete", "-f", "x.yaml"], ["get", "pods", "-f", "x.yaml"], ["delete", "-k", "dir"],
+                     ["get", "pods", "--filename=x.yaml"], ["apply", "-k", "dir"]):
+            self.refused_by_parser(args)
+        F.write_record(verbs=["apply", "create"], resources=["<files>", "clusterrolebindings"])
+        self.refused(["txe-onprem-ci", "--", "apply", "-f", "x.yaml"], "KR05")
+
     def test_auth_and_rollout_carry_their_subcommand(self):
         r = self.scope(["auth", "can-i", "get", "pods"])
         self.assertEqual((r["verb"], r["resources"]), ("auth can-i", ["selfsubjectaccessreviews"]))

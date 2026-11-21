@@ -193,6 +193,14 @@ class Refused(unittest.TestCase):
                     "tmux send-keys 'kubectl get pods' Enter"):
             self.deny(cmd, "H03")
 
+    def test_help_is_its_final_value_and_server_side_template_is_an_api_call(self):
+        # Connector review of bcca1dcc and 85bde125: help counts only when its LAST value is true, and helm
+        # template --dry-run=server may contact the cluster.
+        for cmd in ("kubectl get secrets --help --help=false", "kubectl get secrets -h --help=0"):
+            self.deny(cmd, "H01", "kubectl", "get")
+        for cmd in ("helm template demo ./chart --dry-run=server", "helm template demo ./chart --dry-run=bogus"):
+            self.deny(cmd, "H07", "helm", "template")
+
     def test_other_clients_are_a_compatibility_decision(self):
         for cmd, client in (("helm list -A", "helm"), ("helm upgrade x ./c --kube-context a", "helm"),
                             ("helm template x ./c --validate", "helm"), ("flux get ks -A", "flux"),
@@ -290,6 +298,11 @@ class Allowed(unittest.TestCase):
 
     def test_run_time_command_words_without_cluster_signs(self):
         for cmd in ('"$PY" -m pip list', '"$PY" -c "print(1)"', "$EDITOR notes.md", '"$GO" test ./...'):
+            self.allow(cmd)
+
+    def test_help_and_client_side_template(self):
+        for cmd in ("kubectl get pods --help=false --help", "kubectl get pods -h", "helm template x ./c --dry-run",
+                    "helm template x ./c --dry-run=client", "helm template x ./c --dry-run=none"):
             self.allow(cmd)
 
     def test_unknown_wrapper_options_without_a_client(self):

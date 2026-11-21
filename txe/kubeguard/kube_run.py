@@ -19,7 +19,10 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     arguments. A plugin, an unknown verb or an ambiguous flag is refused. Every resource operand counts
     (`get pods/a secrets/b` is pods AND secrets), every true spelling of --all-namespaces/-A means all
     namespaces, a `cp` operand naming its own namespace is refused, and auth and rollout carry their
-    subcommand ("auth can-i", "rollout restart") so a record grants exactly the operation it names.
+    subcommand ("auth can-i", "rollout restart") so a record grants exactly the operation it names. Only
+    options kube-run knows are forwarded; any other option, and any attached or clustered short option
+    (`-wA`, `-inother`), is refused. File-based and create requests (apply, create, replace, diff, -f, -k)
+    are refused, because the kinds and namespaces they act on cannot be read from the arguments.
  2. REGISTRY. The entry for the id gives the pinned kubeconfig path, context, server URL, CA SHA-256 and
     kube-system Namespace UID. The registry path is fixed (~/.coding_global/kube-clusters.json); the CLI
     cannot point it elsewhere.
@@ -154,6 +157,15 @@ TRUE_WORDS = {"1", "t", "T", "TRUE", "true", "True"}
 FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
 # Operands of these verbs that are labels or annotations (key=value, key-), not resources.
 KEY_VALUE_VERBS = {"label", "annotate"}
+# Options known to take no value. Together with VALUE_FLAGS, NAMESPACE_FLAGS and ALL_NS_FLAGS, these are the
+# only options kube-run forwards; any other option is refused, attached and clustered short forms included.
+BOOL_FLAGS = {"-w", "--watch", "--watch-only", "-i", "-t", "-it", "-ti", "--stdin", "--tty", "-q", "--quiet",
+              "--show-labels", "--no-headers", "--all", "-R", "--recursive", "--previous", "--timestamps",
+              "--all-containers", "--ignore-not-found", "--show-kind", "--output-watch-events", "--prefix",
+              "--follow"}
+# Options that read objects from files or kustomizations, and verbs that take their scope from them.
+FILE_FLAGS = {"-f", "--filename", "-k", "--kustomize"}
+FILE_VERBS = {"apply", "create", "replace", "diff"}
 
 
 # kubectl's short options that take a value. In a pflag shorthand cluster (`-it`, `-ojson`), every letter up to
@@ -194,7 +206,7 @@ def parse_request(args, default_namespace):
     if any(is_override(a) for a in args):
         raise Refused("KR04", "an argument selects or changes the cluster, identity or TLS; kube-run supplies "
                               "the kubeconfig and context from the registry")
-    pos, namespaces, all_ns, unknown_at = [], [], False, None
+    pos, namespaces, all_ns, unknown_at, files = [], [], False, None, False
     i = 0
     while i < len(args):
         a = args[i]
@@ -223,12 +235,22 @@ def parse_request(args, default_namespace):
             elif value not in FALSE_WORDS:
                 raise Refused("KR05", "an all-namespaces flag has a value that is not a boolean")
         elif a in VALUE_FLAGS:
+            files = files or a in FILE_FLAGS
             i += 1
         elif a.startswith("--") and "=" in a:
-            pass
+            name = a.partition("=")[0]
+            if name not in VALUE_FLAGS and name not in BOOL_FLAGS:
+                raise Refused("KR05", "an option kube-run does not recognise")
+            files = files or name in FILE_FLAGS
+        elif a in BOOL_FLAGS:
+            if not pos:
+                raise Refused("KR05", "an option comes before the verb")
         elif a.startswith("-") and a != "-":
-            if unknown_at is None:
-                unknown_at = len(pos)
+            # Only options kube-run knows are forwarded. An unknown option may select scope (pflag reads `-wA`
+            # as -w -A and `-inother` as -i -n other), so attached and clustered short options are refused too:
+            # write each option and its value separately.
+            raise Refused("KR05", "an option kube-run does not recognise (write each short option and its value "
+                                  "separately)")
         else:
             pos.append(a)
         i += 1
@@ -239,6 +261,11 @@ def parse_request(args, default_namespace):
         raise Refused("KR05", "the verb is not one kube-run supports (plugins and unknown verbs are refused)")
     if unknown_at == 0:
         raise Refused("KR05", "an unknown flag comes before the verb")
+    if verb in FILE_VERBS or (files and verb != "logs"):
+        # A manifest or kustomization carries its own kinds and namespaces, and `create <kind>` can name a
+        # cluster-scoped object; none of that can be read from the arguments before contact.
+        raise Refused("KR05", "file-based and create requests are refused: their resources and namespaces cannot "
+                              "be established from the arguments before contact")
     how = VERBS[verb]
     if how is None:
         raise Refused("KR05", "interactive verbs are not supported")

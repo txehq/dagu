@@ -654,8 +654,12 @@ def parse_flags(args, valued):
         a = args[i]
         if a == "--":
             break
+        # Help is whatever the LAST occurrence sets: pflag updates the value each time, and cobra shows help only
+        # when the final value is true (`get secrets --help --help=false` is an API call).
         if a in ("--help", "-h"):
             help_ = True
+        elif a.startswith("--help=") or a.startswith("-h="):
+            help_ = a.partition("=")[2] in ("1", "t", "T", "TRUE", "true", "True")
         if a.startswith("--") and "=" in a:
             name, _, v = a.partition("=")
             flags.add(name)
@@ -710,7 +714,10 @@ def classify(fam, p):
         return "api"
     if fam == "helm":
         if sub == "template":
-            return "api" if _truthy(p, "--validate") else "local"
+            # --validate and --dry-run=server contact the cluster; only the client-side forms stay local.
+            dry = p["values"].get("--dry-run")
+            local_dry = dry is None or dry[-1] in ("true", "client", "none", "false")
+            return "api" if _truthy(p, "--validate") or not local_dry else "local"
         return "local" if sub in HELM_LOCAL else "api"
     if fam == "flux":
         if sub == "version":
