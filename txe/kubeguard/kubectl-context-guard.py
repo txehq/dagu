@@ -28,7 +28,8 @@ and checks the kube-system UID at contact. This hook only makes sure that kube-r
 
 It fails closed. A client reached through something the hook cannot see into is refused: a command word built
 at run time (H02); a client inside python -c, ssh, find -exec, docker and the like (H03); an assignment or
-alias whose value is a client (H04); text it cannot read that names a client (H05); nesting too deep (H12).
+alias whose value is a client (H04); a command or nested shell text it cannot parse, whatever it names (H05);
+nesting too deep (H12).
 sh/bash/zsh -c, eval, here-documents and here-strings fed to a shell, $(...), backticks and <(...) are parsed
 recursively, and wrappers (timeout, env, xargs, watch, sudo, nice, nohup, ...) are unwrapped. A wrapper option
 the hook does not know may take a value, so it cannot tell which word is the command: when a cluster client
@@ -160,7 +161,7 @@ RULES = {
     "H02": "the command word is built at run time, so the hook cannot tell which client it runs",
     "H03": "a cluster client is run through an interpreter or executor whose payload the hook cannot parse",
     "H04": "an assignment or alias hides a cluster client",
-    "H05": "the command could not be read and it names a cluster client",
+    "H05": "the command could not be read, so it is refused whatever it names",
     "H06": "the command changes the default kubeconfig or its current context",
     "H07": "a helm, flux, k9s or stern API call; these have no identity-bound path (compatibility decision, open)",
     "H08": "the command prints kubeconfig credentials",
@@ -332,7 +333,8 @@ def lex(s):
                 m = re.match(r"[ \t]*(['\"]?)([^\s'\";|&<>()]+)\1", s[i:])
                 if not m:
                     raise ParseError("here-document without a delimiter")
-                pending.append((m.group(2), op == "<<-", len(bodies)))
+                # Bash removes quoting from the delimiter word (<<\EOF, <<'EOF', <<"EOF" all end at a line EOF).
+                pending.append((re.sub(r"[\\'\"]", "", m.group(2)), op == "<<-", len(bodies)))
                 toks.append(("hd", len(bodies)))
                 bodies.append("")
                 i += m.end()
@@ -411,7 +413,8 @@ def substitutions(text):
 
 
 def mentions(text):
-    return bool(MENTION.search(text))
+    # Also on a copy without backslashes: bash removes them (`kube\ctl` runs kubectl).
+    return bool(MENTION.search(text)) or ("\\" in text and bool(MENTION.search(text.replace("\\", ""))))
 
 
 class Refusal(Exception):
@@ -440,9 +443,9 @@ class Guard:
         try:
             cmds = simple_commands(text)
         except ParseError:
-            if mentions(text):
-                raise Refusal("H05")
-            return
+            # A command the hook cannot parse is ambiguous: refused whether or not its raw text names a client,
+            # because bash may unquote what the text hides (`kube\ctl ... <<\EOF`).
+            raise Refusal("H05")
         for k, cmd in enumerate(cmds, 1):
             try:
                 self.check_cmd(cmd, 0)
@@ -461,11 +464,10 @@ class Guard:
         try:
             cmds = simple_commands(text)
         except ParseError:
-            if mentions(text):
-                r = Refusal("H05")
-                r.nested = True
-                raise r
-            return
+            # Nested text is a shell program (-c, eval, a here-document fed to a shell): the same rule applies.
+            r = Refusal("H05")
+            r.nested = True
+            raise r
         for cmd in cmds:
             try:
                 self.check_cmd(cmd, depth)
@@ -635,20 +637,23 @@ class Guard:
         return rest
 
     def _shell(self, args, cmd, depth):
+        # The -c string is checked when present. Standard input fed to a shell is ALWAYS checked as a program:
+        # with -s (or no operand) bash runs it, and its operands are only positional parameters (`bash -s x <<<
+        # '...'`); with a script operand, the script may still run it (eval, `. /dev/stdin`). Fail closed.
         i = 0
         while i < len(args):
             a = args[i]
             if a == "-c" or (re.match(r"^-[a-zA-Z]+$", a) and "c" in a[1:]):
                 if i + 1 < len(args):
                     self.check_text(args[i + 1], depth + 1)
-                return
+                break
             if a in ("-o", "+o", "-O", "+O"):
                 i += 2
                 continue
             if a.startswith("-") or a.startswith("+"):
                 i += 1
                 continue
-            return
+            break
         for text in cmd["stdin"]:
             self.check_text(text, depth + 1)
 

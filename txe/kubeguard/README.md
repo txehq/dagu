@@ -33,9 +33,15 @@ a context can be repointed inside its file. This directory holds the source of t
   - `--subresource=<s>` is authorized as `<resource>/<s>`;
   - `auth` and `rollout` are authorized with their subcommand (`auth can-i`, `rollout status`);
   - an attached or clustered `-s` (`-sURL`, `-its`) is a server override, refused like `--server`;
-  - only options kube-run knows are forwarded. Any other option (`--raw` included), and any attached or
-    clustered short option (`-wA`, `-ojson`), is refused: write each option and its value separately;
-  - `-f`/`-k` (file or kustomization reads) are refused on every verb but `logs`, where `-f` is follow.
+  - options follow a per-verb arity table (`VERB_OPTIONS` in `kube_run.py`): for each read verb, the options
+    that take a value and the options that take none. In `logs`, `-f` (follow) and `-p` (previous) take no
+    value. Only the options in that table, plus a few global ones, are forwarded. Any other option (`--raw`
+    included), and any attached or clustered short option (`-wA`, `-ojson`), is refused: write each option and
+    its value separately;
+  - a value is never another option, so `-o --namespace x` and `-l -A` are refused. A value that looks like an
+    option (`--tail=-1`, `--tail -1`) is refused rather than reinterpreted. `--opt=value` is read explicitly,
+    and after `--` every token is an operand;
+  - `-f`/`--filename`/`-k`/`--kustomize` (file or kustomization reads) are refused on every verb.
   The registry entry must pin kubectl by absolute path. kube-run never looks kubectl up on the caller's PATH.
   Example: `kube-run --authorization rec.json txe-onprem-ci -- get pods -n arc-runners -o wide`.
 - **`b5_custody.py`**: the reviewed B5 host-process custody, copied byte for byte (provenance below) and
@@ -44,6 +50,8 @@ a context can be repointed inside its file. This directory holds the source of t
   installed kube-run path:
   - direct kubectl API calls are refused (H01), and so are helm, flux, k9s and stern API calls (H07);
   - anything it cannot read fails closed (H02 to H05, H12 to H14);
+  - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
+    always checked as a program;
   - local version, help, config-read and kustomize commands pass.
 
 ## What state this is in
@@ -74,6 +82,20 @@ a context can be repointed inside its file. This directory holds the source of t
 | Any harness where the hook is not wired | **Not installed**: no protection at all |
 
 Only the first row is positive protection. An H14 refusal is a fail-closed stop, not a claim of coverage.
+
+## Shell parsing: its scope and its cost
+
+The hook reads Bash command text with its own lexer. That covers quoting, `$(...)`, backticks, `<(...)`,
+here-documents and here-strings, `sh -c`/`eval`/stdin fed to a shell, and wrappers. Here-document delimiters
+follow Bash's quote removal (`<<EOF`, `<<'EOF'`, `<<"EOF"`, `<<\EOF`, `<<-EOF`). It is **not** a full Bash
+parser, and it does not parse interpreter code.
+
+**A command the hook cannot parse is refused (H05), whatever it names.** That is the conservative choice for
+an unwired prototype, and its effect is broad. Once wired, some legitimate NON-cluster Bash commands that this
+lexer cannot read would be refused as well, for example a partly quoted here-document delimiter (`<<"E"OF`) or
+other constructs outside the forms above. Such a refusal says H05; the remedy is to write the command in a
+form the lexer reads. The extra raw-text check, which also matches a client name with its backslashes removed
+(`kube\ctl`), is a second line only, never the parser.
 
 ## Platform and syscall constraints
 

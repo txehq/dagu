@@ -237,6 +237,24 @@ class Refused(unittest.TestCase):
         for extra in H11_EXTRAS:
             self.deny(kr(f"txe-onprem-ci -- get pods {extra}"), "H11", "kube-run", "get")
 
+    def test_shell_stdin_is_always_checked_as_a_program(self):
+        # Connector review of a338d882: with -s, bash runs standard input and its operands are only positional
+        # parameters (`bash -s placeholder <<< '...'`). A script operand may run its input too, so stdin fed to a
+        # shell is always checked.
+        for cmd in ("bash -s placeholder <<< 'kubectl get secrets'", "sh -s a b <<'EOF'\nkubectl get pods\nEOF",
+                    "bash -s -- x <<< 'kubectl get ns'", "bash -xs y <<< 'kubectl get ns'", "bash <<< 'kubectl get ns'",
+                    "bash ./script.sh <<< 'kubectl get ns'", "bash -c 'cat' <<< 'kubectl get ns'"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+
+    def test_a_command_the_hook_cannot_parse_is_refused(self):
+        # Connector review of a338d882: `kube\ctl get secrets <<\EOF ...` hid the client from a raw-text match.
+        # Any parse failure is now refused (H05); quoted and escaped here-document delimiters parse as bash
+        # reads them, and `kube\ctl` is matched without its backslash.
+        self.deny("kube\\ctl get secrets <<\\EOF\nx\nEOF", "H01", "kubectl")
+        for cmd in ("echo 'unterminated", 'printf "%s', "cat <<EOF\nno end"):
+            self.deny(cmd, "H05")
+
     def test_unreadable_input(self):
         self.deny("kubectl get pods 'unterminated", "H05")
         decision, reason = F.run(None, raw='{"tool_name": "Bash", "tool_input": {"command": "kubectl get')
@@ -305,6 +323,11 @@ class Allowed(unittest.TestCase):
 
     def test_run_time_command_words_without_cluster_signs(self):
         for cmd in ('"$PY" -m pip list', '"$PY" -c "print(1)"', "$EDITOR notes.md", '"$GO" test ./...'):
+            self.allow(cmd)
+
+    def test_here_documents_with_quoted_delimiters_and_script_stdin(self):
+        for cmd in ("cat <<\\EOF\nhello\nEOF", 'cat <<"EOF"\nhello\nEOF', "cat <<-'EOF'\n\thello\n\tEOF",
+                    "bash ./script.sh <<< 'plain data'"):
             self.allow(cmd)
 
     def test_help_and_client_side_template(self):

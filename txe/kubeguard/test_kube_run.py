@@ -516,6 +516,68 @@ class RequestScope(Base):
             self.assertFalse(kr.is_override(a), a)
         self.refused(["txe-onprem-ci", "--", "get", "pods", "-shttps://other.example"], "KR04")
 
+    def test_an_option_value_never_swallows_an_option(self):
+        # Connector review of a338d882: `logs -f --namespace kube-system pod-a` let -f (taken as --filename)
+        # swallow --namespace. In logs, -f is --follow; and no value-taking option consumes a token that starts
+        # with "-", so the swallowed-scope class is refused, not only this spelling.
+        r = self.scope(["logs", "-f", "--namespace", "kube-system", "pod-a"])
+        self.assertEqual((r["resources"], r["namespace"]), (["pods"], "kube-system"))
+        r = self.scope(["logs", "pod-a", "-f", "-n", "x"])
+        self.assertEqual(r["namespace"], "x")
+        for args in (["get", "pods", "-n", "-A"], ["get", "pods", "-n"], ["get", "pods", "-l", "-A"],
+                     ["get", "pods", "--namespace="], ["get", "pods", "--namespace=-x"]):
+            self.refused_by_parser(args)
+        self.refused(["txe-onprem-ci", "--", "logs", "-f", "--namespace", "kube-system", "pod-a"], "KR08")
+
+    # A valid request per supported verb, which each option case below extends.
+    VERB_SAMPLES = {
+        "get": ["get", "pods"], "describe": ["describe", "pods"], "top": ["top", "pods"], "logs": ["logs", "pod-a"],
+        "events": ["events"], "rollout": ["rollout", "status", "deploy/x"], "auth": ["auth", "can-i", "get", "pods"],
+        "api-resources": ["api-resources"], "api-versions": ["api-versions"], "explain": ["explain", "pods"],
+        "version": ["version"], "cluster-info": ["cluster-info"],
+    }
+
+    def test_every_verb_and_option_follows_the_arity_table(self):
+        # Table-driven over VERB_OPTIONS (connector review of a338d882, root: "every supported verb/option
+        # combination"). For each verb, each option it takes, in every form, and each option it does not take.
+        self.assertEqual(set(self.VERB_SAMPLES), set(kr.VERB_OPTIONS))
+        self.assertEqual(set(kr.VERB_OPTIONS), set(kr.VERBS))
+        every = set().union(*(t["value"] | t["bool"] for t in kr.VERB_OPTIONS.values()))
+        for verb, base in self.VERB_SAMPLES.items():
+            table = kr.VERB_OPTIONS[verb]
+            want_ns = self.scope(base)["namespace"]
+            for opt in sorted(table["value"]):
+                for ok in ([opt, "v"], [f"{opt}=v"]):
+                    self.assertEqual(self.scope(base + ok)["namespace"], want_ns, (verb, ok))
+                for bad in ([opt], [opt, "-n", "kube-system"], [opt, "-A"], [f"{opt}="], [f"{opt}=-1"], [opt, "-1"]):
+                    self.refused_by_parser(base + bad)
+            for opt in sorted(table["bool"]):
+                for ok in ([opt], [f"{opt}=true"], [f"{opt}=false"]):
+                    self.scope(base + ok)
+                # A no-value option never takes the next token: the namespace after it is still read.
+                self.assertEqual(self.scope(base + [opt, "-n", "kube-system"])["namespace"], "kube-system", (verb, opt))
+                self.refused_by_parser(base + [f"{opt}=maybe"])
+            for opt in sorted(every - table["value"] - table["bool"]):
+                self.refused_by_parser(base + [opt, "v"])           # an option this verb does not take
+            for opt in sorted(kr.FILE_FLAGS - table["bool"]):
+                self.refused_by_parser(base + [opt, "x.yaml"])
+            for glob in (["-v", "5"], ["--request-timeout", "5s"], ["--v=5"]):
+                self.scope(base + glob)
+        # Before the verb, only the global, namespace and all-namespaces options.
+        self.assertEqual(self.scope(["-v", "5", "-n", "x", "get", "pods"])["namespace"], "x")
+        for args in (["-o", "json", "get", "pods"], ["-w", "get", "pods"], ["-f", "logs", "pod-a"]):
+            self.refused_by_parser(args)
+
+    def test_the_terminator_boundary(self):
+        # After `--`, the operands of a resource verb are still authorized; for a fixed-resource verb they are
+        # ignored by kube-run's scope (kubectl reads no option there either).
+        # After `--`, "-n kube-system" is two operands (names), never a namespace option.
+        self.assertEqual(self.scope(["get", "pods", "--", "-n", "kube-system"])["namespace"], "ctx-ns")
+        self.refused_by_parser(["get", "pods/a", "--", "-n", "kube-system"])   # a typeless operand in a TYPE/NAME list
+        self.refused_by_parser(["get", "pods", "--", "secrets/b"])
+        self.assertEqual(self.scope(["logs", "pod-a", "--", "-n", "x"])["namespace"], "ctx-ns")
+        self.assertEqual(self.scope(["rollout", "status", "deploy/x", "--", "deploy/y"])["resources"], ["deploy"])
+
     def test_only_known_options_are_forwarded(self):
         # pflag reads `-wA` as -w -A (all namespaces) and `-inother` as -i -n other (connector review of
         # bcca1dcc). Unknown, attached and clustered options are refused instead of being forwarded unchecked.

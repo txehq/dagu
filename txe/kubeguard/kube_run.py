@@ -25,9 +25,10 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     - every true spelling of --all-namespaces/-A means all namespaces;
     - --subresource=<s> is authorized as <resource>/<s>;
     - auth and rollout carry their subcommand ("auth can-i", "rollout status");
-    - only options kube-run knows are forwarded, and any other option, or any attached or clustered short
-      option (`-wA`, `-ojson`), is refused;
-    - -f/-k (file or kustomization reads) are refused on every verb but logs, where -f is follow.
+    - options follow the per-verb arity table VERB_OPTIONS (in logs, -f and -p take no value). Any other
+      option, or any attached or clustered short option (`-wA`, `-ojson`), is refused;
+    - a value is never another option or a dash-looking token (`-o --namespace x`, `--tail=-1` are refused);
+    - -f/--filename/-k/--kustomize (file or kustomization reads) are refused on every verb.
  2. REGISTRY. The entry for the id gives the pinned kubeconfig path, context, server URL, CA SHA-256 and
     kube-system Namespace UID. The registry path is fixed (~/.coding_global/kube-clusters.json); the CLI
     cannot point it elsewhere.
@@ -152,23 +153,48 @@ SUBCOMMANDS = {
     "auth": {"can-i": ["selfsubjectaccessreviews"], "whoami": ["selfsubjectreviews"]},
     "rollout": {"status": None, "history": None},
 }
-# Options kube-run forwards that take a value. Together with NAMESPACE_FLAGS, ALL_NS_FLAGS and BOOL_FLAGS these
-# are the only options it forwards; any other option is refused, attached and clustered short forms included.
-VALUE_FLAGS = {"-o", "--output", "-l", "--selector", "-f", "--filename", "-c", "--container", "--field-selector",
-               "--template", "--since", "--tail", "--sort-by", "-L", "--label-columns", "--chunk-size", "--for",
-               "--request-timeout", "--since-time", "--limit-bytes", "--revision", "-k", "--kustomize",
-               "--subresource", "-v", "--v"}
 NAMESPACE_FLAGS = ("-n", "--namespace")
 ALL_NS_FLAGS = ("-A", "--all-namespaces")
-# pflag's boolean spellings (strconv.ParseBool), for --all-namespaces=<value> and -A=<value>.
+# pflag's boolean spellings (strconv.ParseBool), for --all-namespaces=<value>, -A=<value> and --<bool>=<value>.
 TRUE_WORDS = {"1", "t", "T", "TRUE", "true", "True"}
 FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
-# Options kube-run forwards that take no value (-p is logs --previous).
-BOOL_FLAGS = {"-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--recursive", "-p", "--previous",
-              "--timestamps", "--all-containers", "--ignore-not-found", "--show-kind", "--output-watch-events",
-              "--prefix", "--follow"}
-# Options that read objects from files or kustomizations. They are refused on every verb but logs (-f is follow).
+# PER-VERB OPTION ARITY. For each read verb, the ONLY options kube-run forwards, as the options that take a value
+# and the options that take none. Arity is per verb because kubectl's is (in logs, -f is --follow and -p is
+# --previous, both booleans). Together with GLOBAL_OPTIONS, NAMESPACE_FLAGS and ALL_NS_FLAGS, these are all the
+# options kube-run accepts; any other option is refused, and so is any attached or clustered short form.
+GLOBAL_OPTIONS = {"value": {"-v", "--v", "--request-timeout"}, "bool": set()}
+VERB_OPTIONS = {
+    "get": {"value": {"-o", "--output", "-l", "--selector", "--field-selector", "--template", "--sort-by", "-L",
+                      "--label-columns", "--chunk-size", "--subresource"},
+            "bool": {"-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--ignore-not-found",
+                     "--show-kind", "--output-watch-events"}},
+    "describe": {"value": {"-l", "--selector", "--chunk-size"}, "bool": set()},
+    "top": {"value": {"-l", "--selector", "--sort-by"}, "bool": {"--no-headers", "--containers"}},
+    "logs": {"value": {"-c", "--container", "-l", "--selector", "--since", "--since-time", "--tail",
+                       "--limit-bytes"},
+             "bool": {"-f", "--follow", "-p", "--previous", "--timestamps", "--all-containers", "--prefix"}},
+    "events": {"value": {"--for", "-o", "--output"}, "bool": {"-w", "--watch", "--no-headers"}},
+    "rollout": {"value": {"--revision"}, "bool": {"-w", "--watch"}},
+    "auth": {"value": {"-o", "--output"}, "bool": set()},
+    "api-resources": {"value": {"-o", "--output", "--api-group", "--verbs"}, "bool": {"--no-headers", "--namespaced"}},
+    "api-versions": {"value": set(), "bool": set()},
+    "explain": {"value": {"--api-version", "--output"}, "bool": {"--recursive"}},
+    "version": {"value": {"-o", "--output"}, "bool": set()},
+    "cluster-info": {"value": set(), "bool": set()},
+}
+# Options that read objects from files or kustomizations. No verb accepts them (logs -f is --follow above); they
+# are named here only so that the refusal can say why.
 FILE_FLAGS = {"-f", "--filename", "-k", "--kustomize"}
+
+
+def option_arity(verb, name):
+    """"value", "bool" or None (not accepted) for option `name` of `verb` (None before the verb is known)."""
+    for table in (GLOBAL_OPTIONS, VERB_OPTIONS.get(verb, {"value": set(), "bool": set()}) if verb else None):
+        if table and name in table["value"]:
+            return "value"
+        if table and name in table["bool"]:
+            return "bool"
+    return None
 # Fixed-resource verbs that take no operand in kube-run. An operand there is a subcommand kube-run does not
 # model (`cluster-info dump` reads nodes, pods and logs across namespaces), so it is refused.
 NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "cluster-info", "events"}
@@ -212,7 +238,7 @@ def parse_request(args, default_namespace):
     if any(is_override(a) for a in args):
         raise Refused("KR04", "an argument selects or changes the cluster, identity or TLS; kube-run supplies "
                               "the kubeconfig and context from the registry")
-    pos, namespaces, all_ns, unknown_at, files, subresources = [], [], False, None, False, []
+    pos, namespaces, all_ns, unknown_at, subresources = [], [], False, None, []
     i = 0
     while i < len(args):
         a = args[i]
@@ -223,13 +249,17 @@ def parse_request(args, default_namespace):
                 pos.extend(args[i + 1:])
             break
         if a in NAMESPACE_FLAGS:
-            if i + 1 >= len(args):
-                raise Refused("KR05", "a namespace flag has no value")
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                raise Refused("KR05", "a namespace flag has no value, or its value looks like an option")
             namespaces.append(args[i + 1])
             i += 2
             continue
+        verb_so_far = pos[0] if pos else None
         if a.startswith("--namespace="):
-            namespaces.append(a.partition("=")[2])
+            value = a.partition("=")[2]
+            if not value or value.startswith("-"):
+                raise Refused("KR05", "a namespace value is empty or looks like an option")
+            namespaces.append(value)
         elif a.startswith("-n") and a != "-n" and not a.startswith("--"):
             raise Refused("KR05", "an attached short namespace flag is not accepted; use -n <namespace>")
         elif a in ALL_NS_FLAGS:
@@ -240,27 +270,36 @@ def parse_request(args, default_namespace):
                 all_ns = True
             elif value not in FALSE_WORDS:
                 raise Refused("KR05", "an all-namespaces flag has a value that is not a boolean")
-        elif a in VALUE_FLAGS:
-            files = files or a in FILE_FLAGS
-            if a == "--subresource":
-                subresources.append(args[i + 1] if i + 1 < len(args) else "")
-            i += 1
-        elif a.startswith("--") and "=" in a:
-            name = a.partition("=")[0]
-            if name == "--subresource":
-                subresources.append(a.partition("=")[2])
-            if name not in VALUE_FLAGS and name not in BOOL_FLAGS:
-                raise Refused("KR05", "an option kube-run does not recognise")
-            files = files or name in FILE_FLAGS
-        elif a in BOOL_FLAGS:
-            if not pos:
-                raise Refused("KR05", "an option comes before the verb")
         elif a.startswith("-") and a != "-":
-            # Only options kube-run knows are forwarded. An unknown option may select scope (pflag reads `-wA`
-            # as -w -A and `-inother` as -i -n other), so attached and clustered short options are refused too:
-            # write each option and its value separately.
-            raise Refused("KR05", "an option kube-run does not recognise (write each short option and its value "
-                                  "separately)")
+            # `--opt=value` and `-o=value` name the option before the first "="; anything else is the token itself.
+            name, eq, value = a.partition("=")
+            arity = option_arity(verb_so_far, name)
+            if arity is None:
+                if name in FILE_FLAGS:
+                    raise Refused("KR05", "file-based requests are refused: their resources and namespaces cannot "
+                                          "be established from the arguments before contact")
+                if verb_so_far is None:
+                    raise Refused("KR05", "an option comes before the verb")
+                # Only options this verb is known to take are forwarded. An unknown option may select scope (pflag
+                # reads `-wA` as -w -A and `-inother` as -i -n other), so attached and clustered short options are
+                # refused too: write each option and its value separately.
+                raise Refused("KR05", "an option kube-run does not recognise for this verb (write each short option "
+                                      "and its value separately)")
+            if arity == "bool":
+                if eq and value not in TRUE_WORDS and value not in FALSE_WORDS:
+                    raise Refused("KR05", "a no-value option was given a value that is not a boolean")
+            else:
+                if not eq:
+                    value = args[i + 1] if i + 1 < len(args) else ""
+                    i += 1
+                # A value-taking option never swallows an option (`-o --namespace x`, `-l -A` would hide the scope
+                # the swallowed token selects), and a value that looks like an option (`--tail=-1`) is refused
+                # rather than reinterpreted. A missing or empty value is refused too.
+                if not value or value.startswith("-"):
+                    raise Refused("KR05", "an option's value is missing, empty or looks like an option; write the "
+                                          "value right after the option")
+                if name == "--subresource":
+                    subresources.append(value)
         else:
             if not pos and a in MUTATING_VERBS:
                 raise Refused("KR05", "kube-run is read-only: mutating, interactive and tunnelling verbs are "
@@ -275,11 +314,6 @@ def parse_request(args, default_namespace):
                               "are refused)")
     if unknown_at == 0:
         raise Refused("KR05", "an unknown flag comes before the verb")
-    if files and verb != "logs":
-        # A manifest or kustomization carries its own kinds and namespaces, which cannot be read from the
-        # arguments before contact.
-        raise Refused("KR05", "file-based requests are refused: their resources and namespaces cannot be "
-                              "established from the arguments before contact")
     how = VERBS[verb]
     if how is None:
         raise Refused("KR05", "interactive verbs are not supported")
