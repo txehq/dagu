@@ -271,6 +271,11 @@ class Refused(unittest.TestCase):
                 "bash --rcfile=/dev/null -c 'kubectl get ns'", "bash --norc=1 -c 'kubectl get ns'",
                 "bash --frob -c 'kubectl get ns'", "bash -Z -c 'kubectl get ns'", "bash -o kubectl -c 'x'",
                 "bash -oc pipefail 'kubectl get ns'",
+                # Root's review of f7b4da60: an empty word reached a[0] (IndexError). Empty words, missing, empty
+                # or non-literal option values, and non-literal option words are refused, never indexed or inferred.
+                "bash '' -c 'kubectl get ns'", 'bash "" -c \'kubectl get ns\'', "bash -c '' 'kubectl get ns'",
+                "bash -o '' -c 'kubectl get ns'", "bash -o; kubectl version --client",
+                "bash -o \"$V\" -c 'kubectl get ns'", "bash -$X -c 'kubectl get ns'", 'bash "$OPT" -c \'kubectl get ns\'',
                 # P2 4655180803: input redirections, process substitutions included, are opaque.
                 "bash < <(printf 'kubectl get secrets -A\\n')", "bash < script.sh; kubectl version --client",
                 "sh <&3; kubectl version --client", "eval 'kubectl get ns' < f",

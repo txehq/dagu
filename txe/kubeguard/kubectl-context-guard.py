@@ -920,9 +920,13 @@ class Guard:
                 raise Refusal("H03")
             programs.append(" ".join(w[0] for w in args))
         else:                                     # a shell: a CLOSED option grammar
+            if any(w[0] == "" for w in args):
+                raise Refusal("H03")              # an empty word in the option or operand walk: refused, not indexed
             i, c_mode, s_mode = 0, False, False
             while i < len(args):
                 a = args[i][0]
+                if a.startswith(("-", "+")) and not literal(args[i]):
+                    raise Refusal("H03")          # an option word must be literal: arity is never inferred
                 if a == "--" or a == "-":
                     i += 1
                     break
@@ -937,7 +941,9 @@ class Guard:
                     for k, ch in enumerate(letters):
                         if ch in SHELL_SHORT_VALUED:
                             # -o/+o name and -O/+O shopt take the NEXT word; it must be last in its cluster.
-                            if k != len(letters) - 1 or i >= len(args) or mentions(args[i][0]):
+                            # The value must exist, be literal and non-empty, and name no client.
+                            if (k != len(letters) - 1 or i >= len(args) or not literal(args[i])
+                                    or not args[i][0] or mentions(args[i][0])):
                                 raise Refusal("H03")
                             i += 1
                         elif ch in SHELL_SHORT_FLAGS and not (a[0] == "+" and ch in "cs"):
