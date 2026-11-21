@@ -8,16 +8,20 @@ recognise. Importing violations() and calling it somewhere does not show that th
 the findings were enforced. So the check demands this exact shape, in one function and one block:
 
     argv = <a docker argv list literal>        or   argv = <a builder in this file>(...)
-    bad = violations(argv, <schema>)               # argv_guard's, on the SAME name, result kept
+    bad = violations(argv, <schema>)               # argv_guard's: imported once, at module level, never shadowed
     if bad:
-        raise ... | return ... | sys.exit(...)     # fail closed, first statement of the branch
+        raise ... | return ... | sys.exit(...)     # fail closed, first statement of the branch, NO side effect
     ... launch(argv) ...                           # argv not reassigned, extended, item-set or deleted after the check
 
-A docker argv is a list literal holding "create" or "run" and one of LAUNCH_MARKS. A builder is a function in the
-same file that returns such a list. A call to a builder outside an assignment, a list used inline, a builder with no
-caller in its file (cross-module use is not analysed), a shell `docker run/create`, an unparsable file, a check in a
-different block, an ignored result, a different argv checked, the argv used before its check, a mutation after it, a
-checked argv that escapes or is never launched: each is a finding. Anything ambiguous fails for review.
+A docker argv is a list literal with a launch verb and a launch mark, or a mark and a dynamic element, or a constant
+"docker" followed by a dynamic verb (is_docker_list). A builder is a function in the same file that returns such a list
+and does nothing else with it but construct it (C17). The abort's expression may not call, await, yield or assign
+(C05). violations() counts only when it resolves to argv_guard through a module-level import bound once in the file;
+a dynamic load, a fallback definition, a shadowing or a patch is C14. A call to a builder outside an assignment, a list
+used inline, a builder with no caller in its file (cross-module use is not analysed), a shell `docker run/create`, an
+unparsable file, a check in a different block, an ignored result, a different argv checked, the argv used before its
+check, a mutation after it, a checked argv that escapes or is never launched: each is a finding. Anything ambiguous
+fails for review. The README lists what is recognised and validated, what is refused, and what is not detected.
 
 In Python, a known process-launch call (subprocess, os or asyncio, through any import alias) that names docker and
 uses a shell (shell=True with a string or a list, os.system, os.popen, create_subprocess_shell), a shell's -c list, a
@@ -79,11 +83,19 @@ FINDINGS = {
     "C11": "a builder has no caller in its own file (cross-module use is not analysed)",
     "C12": "the checked argv escapes the function (returned or stored); its launch is not analysed",
     "C13": "the checked argv is never passed to a call after the check",
-    "C14": "violations() is called but argv_guard is not imported in this file",
+    "C14": "the violations() call is not bound to argv_guard's: it is not imported exactly once, at module level, from "
+           "argv_guard (a dynamic load is refused), or its name or module is rebound, shadowed or patched",
     "C15": "the abort conditional has an else or elif branch (it runs after a passing check, unanalysed)",
     "C16": "a Python process launch that names docker uses a shell, a shell's -c, a string command, or an exec/spawn "
            "call: an unsupported launch form, not analysed",
+    "C17": "a builder uses its docker argv other than to construct and return it (a launch, call, alias or escape "
+           "before any caller's check)",
 }
+# C14: the only modules whose violations() counts, by import name. A module path suffix is not provenance: neither
+# `evil.argv_guard` nor a file path ending argv_guard.py is trusted, and a dynamic load (importlib) is refused.
+GUARD_MODULES = ("argv_guard", "txe.containerguard.argv_guard")
+GUARD_CALLS = frozenset(f"{m}.violations" for m in GUARD_MODULES)
+CONSTRUCTORS = frozenset({"append", "extend", "insert"})
 # C16: the process-launch calls the recogniser knows, by their canonical dotted name. Import aliases resolve to these
 # (`import subprocess as sp`, `from os import system as sh`), and a bare `subprocess`, `os` or `asyncio` stands for
 # itself. A call outside these names (exec(), importlib, a wrapper defined elsewhere) is not recognised (README).
@@ -128,10 +140,23 @@ def _strs(node):
 
 
 def is_docker_list(node):
+    """A list literal that launches a container. Any one of these makes it a launch site:
+    - a constant launch verb and a launch mark;
+    - a launch mark and any non-constant element: the verb may be dynamic (PR 299 security review,
+      ['docker', verb, '--network', 'host', ...]);
+    - a constant first element naming docker with a non-constant second element, which is a dynamic verb or subcommand.
+    An all-constant list without a verb or a mark (["--mount", "x"], ["docker", "ps"]) is not a launch."""
     if not isinstance(node, ast.List):
         return False
     s = _strs(node)
-    return bool(s & LAUNCH_VERBS) and any(x in LAUNCH_MARKS or x.startswith("--network=") for x in s)
+    marks = any(x in LAUNCH_MARKS or x.startswith("--network=") for x in s)
+    dynamic = any(not (isinstance(e, ast.Constant) and isinstance(e.value, str)) for e in node.elts)
+    first = node.elts[0] if node.elts else None
+    docker_first = isinstance(first, ast.Constant) and isinstance(first.value, str) and \
+        first.value.rsplit("/", 1)[-1] == "docker"
+    dynamic_second = len(node.elts) > 1 and not (isinstance(node.elts[1], ast.Constant) and
+                                                 isinstance(node.elts[1].value, str))
+    return (bool(s & LAUNCH_VERBS) and marks) or (marks and dynamic) or (docker_first and dynamic_second)
 
 
 def _uses(node, name):
@@ -149,14 +174,35 @@ def _is_violations_call(node, name=None):
     return name is None or (bool(node.args) and isinstance(node.args[0], ast.Name) and node.args[0].id == name)
 
 
+def _pure(expr):
+    """No call, await, yield or assignment expression anywhere in expr: evaluating it has no side effect this
+    heuristic can see (a property or __init__ with one is not detected; README)."""
+    return expr is None or not any(isinstance(n, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr))
+                                   for n in ast.walk(expr))
+
+
+def _pure_call(call):
+    return _pure(call.func) and all(_pure(a) for a in call.args) and all(_pure(k.value) for k in call.keywords)
+
+
 def _is_abort(stmt):
-    if isinstance(stmt, (ast.Raise, ast.Return)):
-        return True
+    """A fail-closed abort whose evaluation has no side effect (PR 299 security review: `return subprocess.run(argv)`
+    launched the refused argv while aborting):
+    - `return` with a pure value, or a bare `return`;
+    - `raise`, bare, or of a pure exception, or of an exception class called with pure arguments;
+    - `sys.exit(...)`, `exit(...)` or `os._exit(...)` with pure arguments.
+    Anything else, a nested launch included, is not an abort (C05)."""
+    if isinstance(stmt, ast.Return):
+        return _pure(stmt.value)
+    if isinstance(stmt, ast.Raise):
+        exc = stmt.exc
+        ok = exc is None or (_pure_call(exc) if isinstance(exc, ast.Call) else _pure(exc))
+        return ok and _pure(stmt.cause)
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
         f = stmt.value.func
-        return (isinstance(f, ast.Name) and f.id == "exit") or (
+        return ((isinstance(f, ast.Name) and f.id == "exit") or (
             isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and
-            (f.value.id, f.attr) in (("sys", "exit"), ("os", "_exit")))
+            (f.value.id, f.attr) in (("sys", "exit"), ("os", "_exit")))) and _pure_call(stmt.value)
     return False
 
 
@@ -195,6 +241,107 @@ def _escapes(node, name):
                 isinstance(t, (ast.Attribute, ast.Subscript)) for t in n.targets):
             return True
     return False
+
+
+def _binding_counts(tree):
+    """How many times each name is bound anywhere in the file: assignment, loop, with, comprehension and walrus
+    targets, del, def and class names, parameters, imports, except names, global/nonlocal and match captures."""
+    counts = {}
+
+    def add(n):
+        counts[n] = counts.get(n, 0) + 1
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            add(n.id)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            add(n.name)
+        elif isinstance(n, ast.arg):
+            add(n.arg)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for a in n.names:
+                add(a.asname or a.name.split(".")[0])
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            for x in n.names:
+                add(x)
+        elif isinstance(n, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and n.name:
+            add(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            add(n.rest)
+    return counts
+
+
+def _guard_bindings(tree):
+    """{local name: what it stands for} for argv_guard's violations, from MODULE-LEVEL `import M [as g]` and
+    `from M import violations [as v]` (M in GUARD_MODULES) only, each local name bound exactly once in the file.
+    Empty when the file has a star import (it could shadow anything) or patches the module (an attribute assignment,
+    deletion, setattr or delattr on it). An import inside a try, if or def is not module level, so a fallback
+    definition cannot stand in for the guard."""
+    if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
+        return {}
+    out = {}
+    for st in tree.body:
+        if isinstance(st, ast.Import):
+            for a in st.names:
+                if a.name in GUARD_MODULES:
+                    out[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+        elif isinstance(st, ast.ImportFrom) and not st.level and st.module in GUARD_MODULES:
+            for a in st.names:
+                if a.name == "violations":
+                    out[a.asname or a.name] = f"{st.module}.violations"
+    counts = _binding_counts(tree)
+    out = {k: v for k, v in out.items() if counts.get(k) == 1}
+    for n in ast.walk(tree):
+        targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else \
+            [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
+        if any(isinstance(t, ast.Attribute) and _dotted(t, out) is not None for t in targets):
+            return {}
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("setattr", "delattr") and \
+                n.args and _dotted(n.args[0], out) is not None:
+            return {}
+    return out
+
+
+def _uses_only_to_construct(stmts, name):
+    """The line of the first use of `name` in stmts that is not pure argv construction, or None. Allowed:
+    name.append/extend/insert(...) and `name += ...` whose arguments do not mention name; `name[i] = ...`;
+    `return name` or `return name + ...`; and compound statements whose headers do not mention name and whose bodies
+    follow the same rules. Anything else (a call taking name, an alias, a store elsewhere, a yield) is a use."""
+    for st in stmts:
+        if not _uses(st, name):
+            continue
+        if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) and \
+                isinstance(st.value.func, ast.Attribute) and st.value.func.attr in CONSTRUCTORS and \
+                isinstance(st.value.func.value, ast.Name) and st.value.func.value.id == name and \
+                not any(_uses(a, name) for a in st.value.args) and \
+                not any(_uses(k.value, name) for k in st.value.keywords):
+            continue
+        if isinstance(st, ast.AugAssign) and isinstance(st.target, ast.Name) and st.target.id == name and \
+                isinstance(st.op, ast.Add) and not _uses(st.value, name):
+            continue
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Subscript) and \
+                isinstance(st.targets[0].value, ast.Name) and st.targets[0].value.id == name and \
+                not _uses(st.targets[0].slice, name) and not _uses(st.value, name):
+            continue
+        if isinstance(st, ast.Return) and st.value is not None and (
+                (isinstance(st.value, ast.Name) and st.value.id == name) or
+                (isinstance(st.value, ast.BinOp) and isinstance(st.value.op, ast.Add) and
+                 isinstance(st.value.left, ast.Name) and st.value.left.id == name and
+                 not _uses(st.value.right, name))):
+            continue
+        if isinstance(st, (ast.If, ast.For, ast.While, ast.With, ast.Try)):
+            headers = [getattr(st, "test", None), getattr(st, "iter", None), getattr(st, "target", None)] + \
+                [i.context_expr for i in getattr(st, "items", [])] + \
+                [i.optional_vars for i in getattr(st, "items", []) if i.optional_vars] + \
+                [h.type for h in getattr(st, "handlers", []) if h.type]
+            if not any(h is not None and _uses(h, name) for h in headers):
+                bodies = [st.body, getattr(st, "orelse", []), getattr(st, "finalbody", [])] + \
+                    [h.body for h in getattr(st, "handlers", [])]
+                inner = next((ln for b in bodies for ln in [_uses_only_to_construct(b, name)] if ln is not None), None)
+                if inner is None:
+                    continue
+                return inner
+        return st.lineno
+    return None
 
 
 def _blocks(tree):
@@ -316,11 +463,7 @@ def scan_python(rel, text):
     except SyntaxError as e:
         return [Finding(rel, e.lineno or 0, "C10")]
     found = _unsupported_launches(rel, tree)
-    imports_guard = any(
-        (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[-1] == "argv_guard") or
-        (isinstance(n, ast.Import) and any(a.name.split(".")[-1] == "argv_guard" for a in n.names)) or
-        (isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.endswith("argv_guard.py"))
-        for n in ast.walk(tree))
+    guard = _guard_bindings(tree)
     parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     blocks = _blocks(tree)
     where = {id(st): (block, i, fn) for block, fn in blocks for i, st in enumerate(block)}
@@ -339,6 +482,9 @@ def scan_python(rel, text):
             if fn is not None and any(_escapes(st, name) for st in block[i + 1:]) and \
                     not any(_is_violations_call(c, name) for st in block[i + 1:] for c in ast.walk(st)):
                 builders.add(fn.name)      # it builds and returns the argv: the launch is at its callers
+                impure = _uses_only_to_construct(block[i + 1:], name)
+                if impure is not None:     # PR 299 review: a builder that launched before its caller's check
+                    found.append(Finding(rel, impure, "C17"))
                 continue
             sites.append((p, name))
             continue
@@ -366,11 +512,11 @@ def scan_python(rel, text):
         if fn.name in builders and fn.name not in called:
             found.append(Finding(rel, fn.lineno, "C11"))
     for assign, name in sites:
-        found += _check_site(rel, assign, name, where, imports_guard, tree)
+        found += _check_site(rel, assign, name, where, guard, tree)
     return sorted(set(found), key=lambda f: (f.line, f.code))
 
 
-def _check_site(rel, assign, name, where, imports_guard, tree):
+def _check_site(rel, assign, name, where, guard, tree):
     block, i, fn = where[id(assign)]
     rest = block[i + 1:]
     first = next((k for k, st in enumerate(rest) if _uses(st, name)), None)
@@ -387,7 +533,7 @@ def _check_site(rel, assign, name, where, imports_guard, tree):
         other = any(_is_violations_call(c) and not _is_violations_call(c, name) for c in ast.walk(scope))
         return [Finding(rel, t.lineno, "C07" if other else "C03")]
     out = []
-    if not imports_guard:
+    if _dotted(t.value.func, guard) not in GUARD_CALLS:     # PR 299 security review: bind the call to the guard
         out.append(Finding(rel, t.lineno, "C14"))
     result = t.targets[0].id
     u = rest[first + 1] if first + 1 < len(rest) else None

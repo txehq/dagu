@@ -215,6 +215,123 @@ class Refused(unittest.TestCase):
         self.assertEqual(codes('def f():\n    a = ["--mount", "x"]\n    b = ["run", "fast"]\n    return a, b\n'), [])
 
 
+BUILDER = """
+def build(x, log, CACHE):
+    argv = {argv}
+    {use}
+    return argv
+
+def launch(schema):
+    argv = build(1, print, {{}})
+    bad = violations(argv, schema)
+    if bad:
+        raise SystemExit(1)
+    subprocess.run(argv)
+"""
+
+
+class ClosedPattern(unittest.TestCase):
+    """PR 299 security and connector reviews of 6fd887bb and 9f83216a: an ACCEPTED shape must not launch, abort with a
+    side effect, call a fake guard, or build and launch. Each reviewer's exact reproduction, plus negatives."""
+
+    def test_an_abort_with_a_side_effect_fails(self):
+        cases = {
+            "return-launch": "return subprocess.run(argv)",
+            "exit-launch": "sys.exit(subprocess.run(argv))",
+            "raise-nested-launch": "raise SystemExit(str(subprocess.run(argv)))",
+            "raise-helper-call": "raise RuntimeError(report(bad))",
+            "return-mutation": 'return argv.append("--privileged")',
+            "raise-from-call": "raise SystemExit(1) from launch_anyway()",
+            "walrus": "return (n := bad)",
+        }
+        for label, abort in cases.items():
+            with self.subTest(label):
+                self.assertIn("C05", codes(GOOD.replace('raise SystemExit("refused")', abort)), label)
+
+    def test_a_pure_abort_passes(self):
+        for label, abort in (("fstring", 'raise SystemExit(f"refused: {bad}")'),
+                             ("from-none", 'raise RuntimeError("refused") from None'), ("bare-return", "return")):
+            with self.subTest(label):
+                self.assertEqual(codes(GOOD.replace('raise SystemExit("refused")', abort)), [], label)
+
+    def test_a_dynamic_launch_verb_is_a_launch_site(self):
+        head = "def launch(verb, DOCKER, m, sub, rest):\n"
+        cases = {
+            "repro-docker-verb-network": '    argv = ["docker", verb, "--network", "host", "img"]\n',
+            "name-binary-verb-mount": '    argv = [DOCKER, verb, "--mount", m]\n',
+            "docker-dynamic-subcommand": '    argv = ["docker", sub, "x"]\n',
+            "docker-starred": '    argv = ["docker", *rest]\n',
+        }
+        for label, line in cases.items():
+            with self.subTest(label):
+                self.assertIn("C03", codes(head + line + "    subprocess.run(argv)\n"), label)
+
+    def test_a_checked_dynamic_verb_launch_passes(self):
+        src = GOOD.replace("def launch(schema):", "def launch(schema, verb):").replace(
+            ARGV, '["docker", verb, "--network", "none", "img", "true"]')
+        self.assertEqual(codes(src), [])
+
+    def test_violations_must_be_argv_guards(self):
+        host = GOOD.replace('"none"', '"host"')
+        cases = {
+            "repro-local-def-and-path-string": ("import subprocess\nGUARD = 'vendor/argv_guard.py'\n\n"
+                                                "def violations(a, s):\n    return []\n", host),
+            "shadowed-after-import": (HEAD + "violations = lambda a, s: []\n", GOOD),
+            "parameter-shadow": (HEAD, GOOD.replace("def launch(schema):", "def launch(schema, violations):")),
+            "try-fallback": ("import subprocess\ntry:\n    from argv_guard import violations\nexcept ImportError:\n"
+                             "    def violations(a, s):\n        return []\n", GOOD),
+            "suffix-module": ("import subprocess\nfrom evil.argv_guard import violations\n", GOOD),
+            "other-module": ("import subprocess\nfrom fake_guard import violations\n", GOOD),
+            "method-on-other-object": ("import subprocess\nimport argv_guard\n",
+                                       GOOD.replace("def launch(schema):", "def launch(schema, checker):")
+                                       .replace("violations(argv", "checker.violations(argv")),
+            "module-patched": ("import subprocess\nimport argv_guard\nargv_guard.violations = lambda a, s: []\n",
+                               GOOD.replace("violations(argv", "argv_guard.violations(argv")),
+            "setattr-patch": ("import subprocess\nimport argv_guard\n"
+                              "setattr(argv_guard, 'violations', lambda a, s: [])\n",
+                              GOOD.replace("violations(argv", "argv_guard.violations(argv")),
+            "star-import": ("import subprocess\nfrom argv_guard import violations\nfrom helpers import *\n", GOOD),
+            "dynamic-load": ("import importlib.util\nimport subprocess\n"
+                             "spec = importlib.util.spec_from_file_location('argv_guard', 'x/argv_guard.py')\n"
+                             "G = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(G)\n",
+                             GOOD.replace("violations(argv", "G.violations(argv")),
+            "import-in-function": ("import subprocess\n",
+                                   GOOD.replace("    argv = ", "    from argv_guard import violations\n    argv = ")),
+        }
+        for label, (head, src) in cases.items():
+            with self.subTest(label):
+                self.assertIn("C14", codes(src, head), label)
+
+    def test_the_recognised_guard_bindings_pass(self):
+        cases = {
+            "import-as": ("import subprocess\nimport argv_guard as g\n", "g.violations(argv"),
+            "package-from-import": ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n",
+                                    "violations(argv"),
+            "package-import": ("import subprocess\nimport txe.containerguard.argv_guard\n",
+                               "txe.containerguard.argv_guard.violations(argv"),
+        }
+        for label, (head, call) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(codes(GOOD.replace("violations(argv", call), head), [], label)
+
+    def test_a_builder_may_only_construct_its_argv(self):
+        cases = {
+            "repro-launch-then-return": "subprocess.run(argv)",
+            "launch-in-branch": "if x:\n        subprocess.run(argv)",
+            "pass-to-helper": "log(argv)",
+            "alias": "alias = argv",
+            "store-elsewhere": 'CACHE["last"] = argv',
+            "constructor-mentions-argv": "argv.extend(argv)",
+        }
+        for label, use in cases.items():
+            with self.subTest(label):
+                self.assertIn("C17", codes(BUILDER.format(argv=ARGV, use=use)), label)
+
+    def test_a_builder_that_only_constructs_passes(self):
+        use = 'argv.append("--rm")\n    if x:\n        argv.insert(1, "--init")\n    argv[2] = "n2"\n    argv += ["y"]'
+        self.assertEqual(codes(BUILDER.format(argv=ARGV, use=use)), [])
+
+
 def tree(files):
     d = tempfile.TemporaryDirectory()
     root = Path(d.name)

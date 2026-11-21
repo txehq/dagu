@@ -77,30 +77,52 @@ argv. **It is not a safe logger of arbitrary argv**, and a caller must not print
 
 `consumers.py` scans `*.py`, `*.sh` and `*.bash` under `txe/`. It skips `testdata/` and this directory.
 
-**It recognises a launch:** a list literal holding `create` or `run` and one of `--network`, `--mount`, `--cidfile`,
-`--entrypoint`, `--cap-drop` or `--security-opt`. That list is either assigned directly, or returned by a builder in
-the same file whose result is assigned.
+It sorts what it sees into three categories. **It does not claim complete coverage.**
 
-**It accepts exactly one shape,** in the same function and block:
+### 1. Recognised and validated
+
+A **launch** is a list literal that has:
+- a launch verb (`create` or `run`) and a launch mark (`--network`, `--mount`, `--cidfile`, `--entrypoint`,
+  `--cap-drop`, `--security-opt`); or
+- a launch mark and any dynamic element, since the verb may be in a variable; or
+- a constant `docker` followed by a dynamic second element.
+
+The list is assigned directly, or returned by a builder in the same file whose result is assigned. A builder may only
+construct the argv (`append`, `extend`, `insert`, `+=`, item assignment, possibly inside a branch or loop) and return
+it.
+
+It is ACCEPTED only in exactly this shape, in the same function and block:
 
 ```python
 argv = …                       # the docker list, or builder(...)
-bad = violations(argv, schema) # argv_guard's, on the SAME name, result kept
-if bad:                         # no else or elif
-    raise … / return … / sys.exit(…)
+bad = violations(argv, schema) # argv_guard's: `from argv_guard import violations` or `import argv_guard [as g]`
+                               # at module level, the name bound once in the file, the module never patched
+if bad:                        # no else or elif
+    raise … / return … / sys.exit(…)   # with NO side effect: no call (other than the exception or exit
+                                       # itself), await, yield or walrus anywhere in it
 … launch(argv) …               # argv never reassigned, extended, item-set, deleted or aliased after the check
 ```
 
-**Everything else is a finding** (codes `C01`–`C16`), and ambiguity fails for review. That includes:
-- an ignored result;
-- a different argv checked;
+### 2. Unsupported, so refused (a finding, codes `C01`–`C17`)
+
+A recognised launch in any other form fails for review. These forms include:
+- an ignored result, or a different argv checked;
 - use before the check, or a change after it, including an alias (`x = argv`);
-- an `else` or `elif` on the abort (it runs after a passing check);
-- an inline or dynamic list;
+- an `else` or `elif` on the abort, or an abort with a side effect (`return subprocess.run(argv)`,
+  `sys.exit(launch(argv))`) (`C05`);
+- an inline list;
 - a builder used inline, or never called in its file (cross-module use is not analysed);
+- a builder that launches, passes, aliases, stores or yields its argv before returning it (`C17`);
 - a check inside a branch;
 - a checked argv that escapes or is never launched;
-- a missing `argv_guard` import;
+- a `violations` that is not argv_guard's (`C14`):
+  - a local or fallback definition;
+  - an import inside a `try`, `if` or `def`;
+  - a name bound twice;
+  - a star import;
+  - a patched module;
+  - a module other than `argv_guard` or `txe.containerguard.argv_guard` (a path or name suffix is not provenance);
+  - a dynamic `importlib` load;
 - a shell `docker run/create` in a `.sh` or `.bash` file;
 - in Python, a process launch that names `docker` in an unsupported form (`C16`). The launch is a call to a known
   `subprocess`, `os` or `asyncio` function, through any import alias (`import subprocess as sp`,
@@ -109,21 +131,23 @@ if bad:                         # no else or elif
   - a shell's `-c` list (`["sh", "-c", …]`);
   - a string command, including one built from an f-string, a concatenation or `.format`, directly or through a name
     bound in the file;
-  - an `exec*`, `spawn*` or `create_subprocess_exec` call.
+  - an `exec*`, `spawn*` or `create_subprocess_exec` call;
 - an unparsable file.
 
-Importing `violations` and calling it somewhere is NOT accepted as proof that the launched argv was validated. The
-heuristic also cannot see a callee that changes its argument in place (for example `extend_args(argv)` after the
-check). Reviewers still read the launch path.
+### 3. Not detected
 
-**What `C16` does not cover, and does not claim to.** It detects the literal word `docker` in a launch call's
-arguments, or in values the file assigns to names used there. It does not cover:
-- a shell or string command that does not contain that word (non-Docker strings are out of scope);
-- an obfuscated or data-flow-built command (`"dock" + "er"`, a value read from a file or another module);
-- arguments passed through `**kwargs`;
-- a launch through a function the recogniser does not know (`exec()`, `importlib`, a wrapper in another module).
+The heuristic does not see these, so the code under it is unchecked, and reviewers still read the launch path:
+- a launch whose argv is not a list literal of the shapes above: built in another module, read from data, or
+  `[DOCKER, verb, *opts]` with no constant mark;
+- a shell or string command without the word `docker`, and an obfuscated or data-flow-built command
+  (`"dock" + "er"`);
+- arguments passed through `**kwargs`, and launch functions the recogniser does not know (`exec()`, `importlib`, a
+  wrapper in another module);
+- a callee that changes its argument in place (`extend_args(argv)` after the check), and side effects inside a
+  property or an exception's `__init__`.
 
-A list argv without a shell is the list rule's, above.
+These limits cover forms the AST cannot observe. They do not excuse a recognised shape: an accepted shape that
+launches, aborts with a side effect, or calls a fake guard is a bug in this check.
 
 ### Launchers that do not use the guard (`UNGUARDED.tsv`)
 
