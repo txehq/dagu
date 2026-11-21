@@ -77,8 +77,20 @@ a context can be repointed inside its file. This directory holds the source of t
     inherited keyword mode. This is a bounded POSITIVE grammar: the hook does not claim to know which other
     shell syntax leaves kube-run's environment alone, and it is not proof of a trusted pre-existing
     environment (see the installation contract below);
-  - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
-    always checked as a program;
+  - **in a line that names a cluster client, a code-running command (a shell, `source`/`.`, `eval`, an
+    interpreter) is inspected only through EXACTLY ONE literal inline program channel** (`inline_program`):
+    | Caller | `-c` literal | literal args | literal here-doc / here-string | script or file operand | input redirect, `< <(..)`, pipe | other |
+    |---|---|---|---|---|---|---|
+    | shell (`bash`, `sh`, `zsh`, ...) | recurse | (positional) | recurse | refuse | refuse | refuse: unknown option, `--rcfile`/`--init-file` (either form), any `--opt=v`, two channels, none |
+    | `eval` | n/a | recurse | refuse if combined (two channels) | n/a | refuse | refuse: no args, a non-literal arg |
+    | `source` / `.` | n/a | n/a | refuse (a file is always opaque, `/dev/stdin` included) | refuse | refuse | refuse |
+    | interpreter (`python3`, `node`, ...) | refuse | refuse | refuse | refuse | refuse | refuse (no channel of theirs is modelled) |
+    "Literal" means: a `-c` word or `eval` argument that quote removal alone decodes, and a here-document with a
+    QUOTED delimiter (`<<'EOF'`). The shell options are a CLOSED grammar: single letters from
+    `abefhkmnptuvxBCEHPTcsilr`, `-o`/`+o`/`-O`/`+O` with the next word, and the long flags `--norc`,
+    `--noprofile`, `--login`, `--posix`, `--verbose`, `--restricted`, `--noediting`, `--debugger` and
+    `--protected`. In a line naming no client, the earlier behaviour applies: the `-c` text and standard input
+    are checked. This makes no claim about code hidden elsewhere;
   - local version, help, config-read and kustomize commands pass.
 
 ## What state this is in
@@ -123,6 +135,12 @@ lexer cannot read would be refused as well, for example a partly quoted here-doc
 other constructs outside the forms above. Such a refusal says H05; the remedy is to write the command in a
 form the lexer reads. The extra raw-text check, which also matches a client name with its backslashes removed
 (`kube\ctl`), is a second line only, never the parser.
+
+**The parser boundary is a limit.** The input-channel classifier refuses the shapes it models: script and file
+operands, input redirections, pipes, startup-file and unknown options, more than one channel, and non-literal
+ones. It does NOT show that every way a shell, `source`, `eval` or an interpreter can obtain code is covered. An
+input channel this lexer does not represent (one it does not see as a word, a redirection or a here-document) is
+not claimed to be caught.
 
 ## Positive classification: where a client's name is accepted
 

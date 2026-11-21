@@ -176,6 +176,14 @@ OPTIONAL_VALUE = {
     "xargs": {"-i", "--replace", "-e", "--eof", "-l", "--max-lines"},
 }
 DURATION_WRAPPERS = {"timeout", "gtimeout"}
+# The closed shell-option grammar used in a client-relevant line (inline_program). Bash's single-letter
+# invocation options; -o/+o and -O/+O take the next word. Long options take no value; --rcfile and --init-file
+# (an opaque startup file) and every other long option are refused there.
+SHELL_SHORT_FLAGS = set("abefhkmnptuvxBCEHPTcsilr")
+SHELL_SHORT_VALUED = set("oO")
+SHELL_LONG_FLAGS = {"--norc", "--noprofile", "--login", "--posix", "--verbose", "--restricted", "--noediting",
+                    "--debugger", "--protected"}
+INPUT_REDIRECTS = {"<", "<>", "<&"}
 # H16, THE KUBE-RUN EXCEPTION'S GRAMMAR. A Bash command that relies on the kube-run exception (one in which the
 # installed kube-run is accepted, at any depth) must be EXACTLY ONE simple command:
 #   <installed kube-run, absolute and literal> <literal word> ...
@@ -454,7 +462,8 @@ def lex(s):
                     raise ParseError("here-document without a delimiter")
                 # Bash removes quoting from the delimiter word (<<\EOF, <<'EOF', <<"EOF" all end at a line EOF).
                 pending.append((re.sub(r"[\\'\"]", "", m.group(2)), op == "<<-", len(bodies)))
-                toks.append(("hd", len(bodies)))
+                # A quoted delimiter makes the body literal (no expansion); an unquoted one expands it.
+                toks.append(("hd", len(bodies), bool(m.group(1)) or bool(re.search(r"[\\'\"]", m.group(2)))))
                 bodies.append("")
                 i += m.end()
                 continue
@@ -495,20 +504,23 @@ def simple_commands(s):
                 # A pipe edge is kept: the next command READS what the previous one writes.
                 cur = {"words": [], "stdin": [], "piped": op in ("|", "|&")}
             elif op in REDIRECTS:
-                skip_next = True
+                skip_next = op            # the next word is this redirection's target
             elif op == "<<<":
                 herestr = True
             continue
         if t[0] == "hd":
             cur["stdin"].append(bodies[t[1]])
+            cur.setdefault("stdin_literal", []).append(t[2])      # a quoted delimiter: a literal body
             continue
         if skip_next:
             cur.setdefault("redirect_targets", []).append(t[1])
+            cur.setdefault("redirects", []).append((skip_next, t[1]))     # (operator, target)
             skip_next = False
             continue
         if herestr:
             herestr = False
             cur["stdin"].append(t[1])
+            cur.setdefault("stdin_literal", []).append(literal_word(s[t[3]:t[4]]))
             continue
         cur["words"].append((t[1], t[2], t[3], t[4]))
     cmds.append(cur)
@@ -517,6 +529,7 @@ def simple_commands(s):
         # (`-O'kubectl get ns'`) has no word boundary in the unquoted word, but does in the source.
         ws = c["words"]
         c["raw"] = s[ws[0][2]:ws[-1][3]] if ws else ""
+        c["src"] = s                      # the text the word positions index, for per-word literal checks
     return [c for c in cmds if c["words"] or c["stdin"]]
 
 
@@ -675,13 +688,14 @@ class Guard:
         self._command(cmd, depth)
 
     def _command(self, cmd, depth):
-        words = [(w[0], w[1]) for w in cmd["words"]]
+        # Words keep their source positions (text, flags, start, end) where the lexer gave them, for literal checks.
+        words = list(cmd["words"])
         env = {}
         while words and words[0][0] in KEYWORDS:
             words.pop(0)
         words = self._take_assignments(words, env)
         while words:
-            w, fl = words[0]
+            w, fl = words[0][0], words[0][1]
             if w == "[" and "ansi" not in fl:
                 # The exact command word `[` is the POSIX test command, not a glob: classified HERE, before the
                 # generic DYNAMIC check. It needs its closing `]` as the last argument; malformed bracket syntax is
@@ -724,6 +738,11 @@ class Guard:
             # (`printf 'kubectl ...' | bash`, `bash <(echo kubectl ...)`, `source <(...)`), runs text the hook
             # cannot place.
             raise Refusal("H03")
+        kind = ("shell" if base in SHELLS else "eval" if base == "eval" else "source" if base in ("source", ".")
+                else "interpreter" if INTERPRETERS.match(base) else None)
+        if kind and self.whole_mentions:
+            # A client-relevant line: the code-running command must have exactly one inline program channel.
+            return self.check_text(self.inline_program(kind, cmd, words), depth + 1)
         if base in SHELLS:
             return self._shell(args, cmd, depth)
         if base == "eval":
@@ -865,7 +884,81 @@ class Guard:
             rest = self._take_assignments(rest, env)
         return rest
 
+    def inline_program(self, kind, cmd, words):
+        """The ONE inline program a code-running command runs, in a line that names a cluster client, or H03.
+
+        The shared input-channel classifier for shells, source/., eval and interpreters. The only channels it
+        accepts for recursive inspection are a literal `-c` argument (shells), literal eval arguments, and one
+        literal here-document (quoted delimiter) or here-string. It refuses (H03):
+        - any opaque input: a script, a file or a device operand, an input redirection (`<`, `<>`, `<&`,
+          `< <(...)`) or a pipe;
+        - `source`/`.` of any file (even `/dev/stdin` with inspected input), and any interpreter (none of their
+          program channels is modelled);
+        - more than one program channel, no channel at all, or a non-literal one;
+        - a shell option outside the closed grammar (see SHELL_SHORT_FLAGS).
+        The parser boundary is a limit: a channel this classifier does not know is refused only where it shows
+        up as one of the shapes above."""
+        if cmd.get("piped") or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", [])):
+            raise Refusal("H03")
+        if kind in ("source", "interpreter"):
+            raise Refusal("H03")
+        programs = []
+        for body, literal in zip(cmd["stdin"], cmd.get("stdin_literal", [])):
+            if not literal:
+                raise Refusal("H03")              # an unquoted here-document delimiter expands its body
+            programs.append(body)
+        if len(cmd.get("stdin_literal", [])) != len(cmd["stdin"]):
+            raise Refusal("H03")
+        src = cmd.get("src", "")
+        args = words[1:]
+
+        def literal(word):
+            return len(word) >= 4 and literal_word(src[word[2]:word[3]])
+
+        if kind == "eval":
+            if not args or not all(literal(w) for w in args):
+                raise Refusal("H03")
+            programs.append(" ".join(w[0] for w in args))
+        else:                                     # a shell: a CLOSED option grammar
+            i, c_mode, s_mode = 0, False, False
+            while i < len(args):
+                a = args[i][0]
+                if a == "--" or a == "-":
+                    i += 1
+                    break
+                if a.startswith("--"):
+                    # No recognised long option takes a value; --rcfile/--init-file add an opaque startup file.
+                    if "=" in a or a not in SHELL_LONG_FLAGS:
+                        raise Refusal("H03")
+                    i += 1
+                    continue
+                if a[0] in "-+" and len(a) > 1:
+                    letters, i = a[1:], i + 1
+                    for k, ch in enumerate(letters):
+                        if ch in SHELL_SHORT_VALUED:
+                            # -o/+o name and -O/+O shopt take the NEXT word; it must be last in its cluster.
+                            if k != len(letters) - 1 or i >= len(args) or mentions(args[i][0]):
+                                raise Refusal("H03")
+                            i += 1
+                        elif ch in SHELL_SHORT_FLAGS and not (a[0] == "+" and ch in "cs"):
+                            c_mode = c_mode or ch == "c"
+                            s_mode = s_mode or ch == "s"
+                        else:
+                            raise Refusal("H03")  # unknown: argument boundaries cannot be established
+                    continue
+                break
+            if c_mode:
+                if i >= len(args) or not literal(args[i]):
+                    raise Refusal("H03")
+                programs.append(args[i][0])       # later words are positional parameters
+            elif i < len(args) and not s_mode:
+                raise Refusal("H03")              # a script or file operand: opaque
+        if len(programs) != 1:
+            raise Refusal("H03")
+        return programs[0]
+
     def _shell(self, args, cmd, depth):
+        # Used only in a line that names NO client (a client-relevant line goes through inline_program instead).
         # The -c string is checked when present. Standard input fed to a shell is ALWAYS checked as a program:
         # with -s (or no operand) bash runs it, and its operands are only positional parameters (`bash -s x <<<
         # '...'`); with a script operand, the script may still run it (eval, `. /dev/stdin`). Fail closed.

@@ -242,10 +242,52 @@ class Refused(unittest.TestCase):
         # parameters (`bash -s placeholder <<< '...'`). A script operand may run its input too, so stdin fed to a
         # shell is always checked.
         for cmd in ("bash -s placeholder <<< 'kubectl get secrets'", "sh -s a b <<'EOF'\nkubectl get pods\nEOF",
-                    "bash -s -- x <<< 'kubectl get ns'", "bash -xs y <<< 'kubectl get ns'", "bash <<< 'kubectl get ns'",
-                    "bash ./script.sh <<< 'kubectl get ns'", "bash -c 'cat' <<< 'kubectl get ns'"):
+                    "bash -s -- x <<< 'kubectl get ns'", "bash -xs y <<< 'kubectl get ns'", "bash <<< 'kubectl get ns'"):
             r = self.deny(cmd, "H01", "kubectl")
             self.assertIn("nested", r, cmd)
+        # Root's channel contract (e8f4de9f review): a script operand is an opaque channel, and -c plus a
+        # here-string is two channels. Both are refused, not inspected.
+        for cmd in ("bash ./script.sh <<< 'kubectl get ns'", "bash -c 'cat' <<< 'kubectl get ns'"):
+            self.deny(cmd, "H03")
+
+    def test_every_input_of_a_code_running_command_is_one_inline_program_or_refused(self):
+        # Connector review of e8f4de9f, and root's narrower contract: in a line that names a client, a shell,
+        # source/., eval or interpreter is inspected only through EXACTLY ONE literal inline program channel.
+        # Everything else is refused (H03). All inert strings; nothing is executed.
+        # The literal inline channels, inspected recursively (H01 nested):
+        for cmd in ("bash -c 'kubectl get secrets'", "bash --norc -c 'kubectl get ns'",
+                    "bash --noprofile --login -c 'kubectl get ns'", "bash -o pipefail -c 'kubectl get ns'",
+                    "bash +O extglob -c 'kubectl get ns'", "sh <<'EOF'\nkubectl get pods\nEOF",
+                    "bash <<< 'kubectl get ns'", "eval kubectl get ns", "eval 'kubectl get ns'"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+        for cmd in (
+                # P1 4655152382: source/. of any file is opaque, even /dev/stdin with inspected input.
+                "source /dev/stdin <<< 'kubectl get secrets'", ". /dev/stdin <<< 'kubectl get ns'",
+                "source /dev/stdin <<'EOF'\nkubectl get pods\nEOF", "source ./x.sh; kubectl version --client",
+                # P1 4655152390: startup-file options are opaque, even with a later visible -c; unknown and
+                # attached long options fail closed.
+                "bash --rcfile /dev/null -c 'kubectl get secrets'", "bash --init-file /dev/null -c 'kubectl get ns'",
+                "bash --rcfile=/dev/null -c 'kubectl get ns'", "bash --norc=1 -c 'kubectl get ns'",
+                "bash --frob -c 'kubectl get ns'", "bash -Z -c 'kubectl get ns'", "bash -o kubectl -c 'x'",
+                "bash -oc pipefail 'kubectl get ns'",
+                # P2 4655180803: input redirections, process substitutions included, are opaque.
+                "bash < <(printf 'kubectl get secrets -A\\n')", "bash < script.sh; kubectl version --client",
+                "sh <&3; kubectl version --client", "eval 'kubectl get ns' < f",
+                # More than one channel, none, or a non-literal one.
+                "bash -c 'kubectl get ns' <<'EOF'\nx\nEOF", "eval true <<< x; kubectl version --client",
+                "bash <<EOF\nkubectl get pods\nEOF", 'bash -c "$CMD"; kubectl version --client',
+                "bash -c; kubectl version --client", "bash; kubectl version --client", "eval; kubectl version --client",
+                'eval "$X"; kubectl version --client', "bash x.sh; kubectl version --client",
+                # Interpreters: no program channel of theirs is modelled.
+                "python3 x.py; kubectl version --client", "python3 - <<'EOF'\nprint(1)\nEOF\nkubectl version --client",
+                "node -e 1; kubectl version --client"):
+            self.deny(cmd, "H03")
+        # No-client positives: the classifier applies only to client-relevant lines. This makes no wider claim
+        # about hidden code (see the README's limits).
+        for cmd in ("source ./env.sh", "bash --rcfile /dev/null -c 'echo hi'", "bash < <(echo date)",
+                    "python3 x.py", "bash ./script.sh <<< 'plain data'"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_watch_shell_option_terminator_and_pipes(self):
         # Connector review of bb40b10c. watch runs its words with `sh -c` unless --exec; a shell's -c string is
