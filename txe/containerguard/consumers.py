@@ -153,8 +153,9 @@ def is_docker_list(node):
     - a constant launch verb and a launch mark;
     - a launch mark and any non-constant element: the verb may be dynamic (PR 299 security review,
       ['docker', verb, '--network', 'host', ...]);
-    - a constant first element naming docker with a non-constant second element, which is a dynamic verb or subcommand.
-    An all-constant list without a verb or a mark (["--mount", "x"], ["docker", "ps"]) is not a launch."""
+    - a constant first element naming docker with a non-constant second element, which is a dynamic verb or subcommand;
+    - a constant first element naming docker with a constant launch verb, with or without marks.
+    An all-constant list without a verb or a mark (["--mount", "x"], ["docker", "ps"], ["docker"]) is not a launch."""
     if not isinstance(node, ast.List):
         return False
     s = _strs(node)
@@ -165,7 +166,8 @@ def is_docker_list(node):
         first.value.rsplit("/", 1)[-1] == "docker"
     dynamic_second = len(node.elts) > 1 and not (isinstance(node.elts[1], ast.Constant) and
                                                  isinstance(node.elts[1].value, str))
-    return (bool(s & LAUNCH_VERBS) and marks) or (marks and dynamic) or (docker_first and dynamic_second)
+    return (bool(s & LAUNCH_VERBS) and marks) or (marks and dynamic) or (docker_first and dynamic_second) or \
+        (docker_first and bool(s & LAUNCH_VERBS))      # PR 299 security review: ["docker", "run", "--privileged", …]
 
 
 def _uses(node, name):
@@ -279,12 +281,33 @@ def _binding_counts(tree):
     return counts
 
 
+def _written_bases(target):
+    """Every object an assignment target writes into, through any unpacking (PR 299 review of b3a9a422:
+    `(g.violations,) = (...)` hid the patch inside a tuple). An Attribute target writes into the attribute itself,
+    and a Subscript target into its container (`g.__dict__["violations"] = ...`). A plain Name writes into no
+    object, so it yields nothing (_binding_counts covers rebinding)."""
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for e in target.elts:
+            yield from _written_bases(e)
+    elif isinstance(target, ast.Starred):
+        yield from _written_bases(target.value)
+    elif isinstance(target, ast.Attribute):
+        yield target
+    elif isinstance(target, ast.Subscript):
+        yield target.value
+
+
 def _guard_bindings(tree):
     """{local name: what it stands for} for argv_guard's violations, from MODULE-LEVEL `import M [as g]` and
     `from M import violations [as v]` (M in GUARD_MODULES) only, each local name bound exactly once in the file.
-    Empty when the file has a star import (it could shadow anything) or patches the module (an attribute assignment,
-    deletion, setattr or delattr on it). An import inside a try, if or def is not module level, so a fallback
-    definition cannot stand in for the guard."""
+    Empty when any of these appears in the file:
+    - a star import, which could shadow anything;
+    - a write to the guard module or the guard function through ANY assignment target (plain, unpacked, nested,
+      starred, augmented, annotated, deleted, or as a for, comprehension or with target), including an attribute of
+      the function (`g.violations.__code__ = …`) or a subscript of the module (`g.__dict__[…] = …`);
+    - setattr or delattr on either;
+    - an unresolved rebinding: a write into globals(), vars() or locals(), or any exec or eval call.
+    An import inside a try, if or def is not module level, so a fallback definition cannot stand in for the guard."""
     if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
         return {}
     out = {}
@@ -301,8 +324,15 @@ def _guard_bindings(tree):
     out = {k: v for k, v in out.items() if counts.get(k) == 1}
     for n in ast.walk(tree):
         targets = n.targets if isinstance(n, (ast.Assign, ast.Delete)) else \
-            [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign)) else []
-        if any(isinstance(t, ast.Attribute) and _dotted(t, out) is not None for t in targets):
+            [n.target] if isinstance(n, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor, ast.comprehension)) \
+            else [n.optional_vars] if isinstance(n, ast.withitem) and n.optional_vars is not None else []
+        bases = [b for t in targets for b in _written_bases(t)]
+        if any(_dotted(b, out) is not None for b in bases):
+            return {}
+        # an unresolved rebinding refuses: a write into globals(), vars() or locals(), or any exec or eval
+        if any(isinstance(b, ast.Call) and isinstance(b.func, ast.Name) and b.func.id in ("globals", "vars", "locals")
+               for b in bases) or (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and
+                                   n.func.id in ("exec", "eval")):
             return {}
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("setattr", "delattr") and \
                 n.args and _dotted(n.args[0], out) is not None:
@@ -564,6 +594,12 @@ DEFERRED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast
 COMMAND_KEYWORDS = {api: frozenset({"args"}) for api in PROCESS_APIS}
 
 
+def _docker_prefix(node):
+    """["docker"] or ["/path/to/docker"]: a list of exactly one constant string naming the docker binary."""
+    return isinstance(node, ast.List) and len(node.elts) == 1 and isinstance(node.elts[0], ast.Constant) and \
+        isinstance(node.elts[0].value, str) and node.elts[0].value.rsplit("/", 1)[-1] == "docker"
+
+
 def _one_launch(rel, assign, check, after, name, fn, parent, names):
     """C21: within its function, the argv's name occurs exactly three times: as the site's target, as the check's
     argument, and as the command argument of ONE launch call after the check. Any other occurrence (a use before the
@@ -572,22 +608,27 @@ def _one_launch(rel, assign, check, after, name, fn, parent, names):
     - positional: Name -> Call (in Call.args) -> Expr | Assign -> the function;
     - command keyword: Name -> keyword (arg in COMMAND_KEYWORDS for the resolved API) -> Call -> Expr | Assign -> the
       function. ast.keyword sits between the value and the Call (PR 299 CG-r7);
+    - the docker executable prefix, as either of those: Name -> BinOp(["docker"] + argv) -> ... The guard validates
+      the `docker create` arguments starting at "create", so the launch puts the binary in front (PR 299 review of
+      b3a9a422: a recipe argv starting with "docker" always failed the runtime guard);
     and the launch statement (that Expr, or that Assign whose value is the Call) is one of the statements after the
     check, directly in the function body. So nothing deferred can enclose the call. Refused, as not analysed:
-    Starred (*argv), a **argv keyword (arg None), any other keyword, an attribute or call on argv, Await, IfExp,
-    BoolOp, a with item, return, and a lambda, def, class or comprehension."""
+    Starred (*argv), a **argv keyword (arg None), any other keyword, an attribute or call on argv, any other prefix
+    or concatenation, Await, IfExp, BoolOp, a with item, return, and a lambda, def, class or comprehension."""
     occ = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
     later = [n for st in after for n in ast.walk(st) if isinstance(n, ast.Name) and n.id == name]
     known = {id(assign.targets[0]), id(check.args[0])}
     ok = len(later) == 1 and len(occ) == 3 and {id(n) for n in occ} == known | {id(later[0])}
     if ok:
-        use, p = later[0], parent.get(later[0])
+        arg, p = later[0], parent.get(later[0])
+        if isinstance(p, ast.BinOp) and isinstance(p.op, ast.Add) and p.right is arg and _docker_prefix(p.left):
+            arg, p = p, parent.get(p)
         if isinstance(p, ast.keyword):
             call = parent.get(p)
             ok = isinstance(call, ast.Call) and p.arg in COMMAND_KEYWORDS.get(_dotted(call.func, names), ())
         else:
             call = p
-            ok = isinstance(call, ast.Call) and use in call.args
+            ok = isinstance(call, ast.Call) and arg in call.args
         stmt = parent.get(call)
         ok = ok and isinstance(stmt, (ast.Expr, ast.Assign)) and stmt.value is call and stmt in after
         node = call
@@ -628,8 +669,9 @@ def _check_site(rel, assign, name, where, guard, tree, parent):
         out.append(Finding(rel, u.lineno, "C06"))
     if any(_escapes(st, name) for st in after):
         out.append(Finding(rel, u.lineno, "C12"))
+    # C13 asks only whether the argv reaches some call's argument after the check; C21 checks that argument's form
     launched = any(isinstance(c, ast.Call) and not _is_violations_call(c) and
-                   any(isinstance(a, ast.Name) and a.id == name for a in list(c.args) + [k.value for k in c.keywords])
+                   any(_uses(a, name) for a in list(c.args) + [k.value for k in c.keywords])
                    for st in after for c in ast.walk(st))
     if not launched:
         out.append(Finding(rel, u.lineno, "C13"))

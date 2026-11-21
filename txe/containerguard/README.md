@@ -93,21 +93,38 @@ from txe.containerguard.argv_guard import Schema, violations   # package-qualifi
 
 
 def launch(schema: Schema) -> None:
-    argv = ["docker", "create", "--name", "n", "--network", "none", "img", "true"]   # directly in the function body
+    # The `docker create` arguments argv_guard validates: from "create", every option the schema lists, the pinned
+    # image, then the payload. The site is a statement directly in the function body.
+    argv = ["create", "--name", "txe-example", "--pull", "never", "--network", "none", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges", "--read-only", "--user", "1000:1000", "--entrypoint", "/bin/true",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "x"]
     bad = violations(argv, schema)                     # the SAME name, the result kept
     if bad:                                            # no else or elif
         raise SystemExit("argv_guard refused the launch")   # raise or return, with no call in it
-    subprocess.run(argv, check=True)                   # ONE launch: argv appears nowhere else in the function
+    subprocess.run(["docker"] + argv, check=True)      # ONE launch: the docker binary, then the validated argv
 ```
 
-`test_consumers.py` reads this block from the README and requires the check to accept it, so the recipe cannot drift
-from the check. Accepted variants:
+`test_consumers.py` reads this block from the README and checks it, so the recipe cannot drift:
+- the consumer check must accept it;
+- it is EXECUTED against the real runtime guard, with a fake `subprocess` that records its call and never starts a
+  process:
+  - for the matching schema, `check_schema` and `violations` return `[]`, and `launch` calls `subprocess.run` exactly
+    once, with `["docker"] + argv`;
+  - for a schema the argv does not match, `launch` raises `SystemExit` and calls nothing.
+
+**A separate prerequisite: the executable.** `"docker"` is resolved by the launcher's `PATH`, or the absolute path
+given in the prefix. Neither this check nor the guard verifies which binary that is: making it the reviewed Docker
+client is the launcher's environment's job.
+
+Accepted variants:
 - the list built by a builder function in the same file, which only constructs and returns it, and whose result is
   assigned (`argv = build(...)`);
 - `import txe.containerguard.argv_guard as guard` with `guard.violations(...)`;
 - the launch taking the argv as the API's own command keyword: `args=` on `subprocess.run`, `Popen`, `call`,
   `check_call` or `check_output` (`subprocess.run(args=argv)`), through any import alias of `subprocess`;
-- the launch's result assigned (`proc = subprocess.run(argv)`).
+- the launch's result assigned (`proc = subprocess.run(["docker"] + argv)`);
+- the argv itself as the argument (`subprocess.run(argv)`). The AST check accepts this, but the runtime guard only
+  passes an argv that starts with `create`, so this form launches nothing useful. Use the docker prefix.
 
 ### 1. Recognised and validated
 
@@ -115,7 +132,8 @@ A **launch** is a list literal that has:
 - a launch verb (`create` or `run`) and a launch mark (`--network`, `--mount`, `--cidfile`, `--entrypoint`,
   `--cap-drop`, `--security-opt`); or
 - a launch mark and any dynamic element, since the verb may be in a variable; or
-- a constant `docker` followed by a dynamic second element.
+- a constant `docker` followed by a dynamic second element; or
+- a constant `docker` with a constant launch verb, with or without marks (`["docker", "run", "--privileged", …]`).
 
 It is ACCEPTED only in the recipe's shape:
 - the site (`argv = <list>` or `argv = build(...)`) is a statement **directly in a function body**;
@@ -123,13 +141,15 @@ It is ACCEPTED only in the recipe's shape:
   module-level import. The name is bound once in the file and the module is never patched;
 - the next statement is `if bad:` whose first statement is `raise …` or `return …`, with no call (other than an
   exception class), await, yield or walrus in it;
-- after that, the argv's name appears exactly ONCE, as the launch's command argument: a positional argument, or the
-  API's command keyword above. In the whole function it appears only as the site's target, the check's argument and
-  that one argument. The launch call is an expression statement, or the value of an assignment, directly in the
-  function body after the check. `test_consumers.py` asserts the AST chain of each supported and refused context on
-  parsed source:
+- after that, the argv's name appears exactly ONCE, as the launch's command argument. That is a positional argument
+  or the API's command keyword above, either as `argv` itself or with the docker binary in front (`["docker"] + argv`,
+  a one-element list naming docker). In the whole function it appears only as the site's target, the check's
+  argument and that one argument. The launch call is an expression statement, or the value of an assignment,
+  directly in the function body after the check. `test_consumers.py` asserts the AST chain of each supported and
+  refused context on parsed source:
   - `f(argv)`: Name → Call → Expr / Assign;
-  - `f(args=argv)`: Name → keyword → Call → Expr / Assign.
+  - `f(args=argv)`: Name → keyword → Call → Expr / Assign;
+  - `f(["docker"] + argv)`: Name → BinOp → Call (or → keyword → Call) → Expr / Assign.
 
 ### 2. Unsupported, so refused (a finding, codes `C01`–`C21`)
 
@@ -141,7 +161,8 @@ A recognised launch in any other form fails for review. These forms include:
   - an alias;
   - a launch inside a nested def, lambda or comprehension;
   - the argv as any other keyword (`env=`, `stdout=`, `cwd=`, `input=`, or `args=` on an API not listed);
-  - `*argv`, `**argv`, or an attribute or call on it (`argv.copy()`);
+  - `*argv`, `**argv`, an attribute or call on it (`argv.copy()`), or any prefix or concatenation other than a
+    one-element list naming docker (`["podman"] + argv`, `argv + […]`, `[DOCKER] + argv`);
   - a launch that is awaited, conditional (`… if … else …`), a `with` item or returned;
 - an ignored result, or a different argv checked;
 - use before the check, or a change after it, including an alias (`x = argv`);
@@ -159,7 +180,11 @@ A recognised launch in any other form fails for review. These forms include:
   - an import inside a `try`, `if` or `def`;
   - a name bound twice;
   - a star import;
-  - a patched module;
+  - a patched module or guard function. That covers any assignment target, including unpacking
+    (`(g.violations,) = …`), nesting, starred, augmented, annotated, deleted, or a for or with target. It also covers
+    an attribute of the function (`g.violations.__code__ = …`) and a subscript of the module
+    (`g.__dict__[…] = …`);
+  - an unresolved rebinding: a write into `globals()`, `vars()` or `locals()`, or any `exec` or `eval`;
   - a dynamic `importlib` load;
   - a module other than `txe.containerguard.argv_guard`. That includes the bare `argv_guard`, which can resolve to a
     sibling `argv_guard.py`. A path or name suffix is not provenance;
@@ -186,7 +211,11 @@ The heuristic does not see these, so the code under it is unchecked, and reviewe
 - a callee that changes its argument in place, and side effects inside a property or an exception's `__init__`;
 - **module identity.** The package-qualified import reduces accidental resolution to a sibling module, but it is
   NOT cryptographic module identity. The check assumes the repository's source root is what Python imports
-  `txe.containerguard.argv_guard` from. It makes no claim about an arbitrary Python path or arbitrary code.
+  `txe.containerguard.argv_guard` from. It makes no claim about an arbitrary Python path or arbitrary code;
+- **executable identity.** Which `docker` binary `PATH` resolves is outside both this check and the guard;
+- arbitrary Python effects in general. The check refuses the unresolved rebindings it can see (`exec`, `eval`, a
+  write into `globals()`, `vars()` or `locals()`), but it does not claim completeness against every way Python code
+  can change behaviour at run time.
 
 These limits cover forms the AST cannot observe. They do not excuse a recognised shape: an accepted shape that
 launches, aborts with a side effect, or calls a fake guard is a bug in this check, and is fixed rather than

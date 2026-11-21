@@ -3,11 +3,16 @@
     python3 -I -B test_consumers.py -v
 
 The fixtures are Python and shell SOURCE TEXT, parsed and never run. Temporary trees hold only that text. The last
-class scans this repository's real txe/ tree (reads only).
+class scans this repository's real txe/ tree (reads only). One exception: the README's supported recipe is executed
+against the real argv_guard, with a fake `subprocess` that records its call (no process is ever started) and an
+import hook that resolves only the recipe's two imports.
 """
 import ast
+import builtins
+import dataclasses
 import hashlib
 import importlib.util
+import types
 import tempfile
 import textwrap
 import unittest
@@ -36,6 +41,14 @@ def launch(schema):
         raise SystemExit("refused")
     subprocess.run(argv, check=True)
 """
+GUARDED = GOOD.replace("violations(argv", "argv_guard.violations(argv")    # GOOD through `import … as argv_guard`
+
+
+def readme_recipe():
+    """The README's supported-recipe block, as source text."""
+    text = (HERE / "README.md").read_text()
+    start = text.index("```python\n# The supported recipe") + len("```python\n")
+    return text[start:text.index("```", start)]
 
 
 class Recognised(unittest.TestCase):
@@ -335,10 +348,26 @@ class ClosedPattern(unittest.TestCase):
             "name-binary-verb-mount": '    argv = [DOCKER, verb, "--mount", m]\n',
             "docker-dynamic-subcommand": '    argv = ["docker", sub, "x"]\n',
             "docker-starred": '    argv = ["docker", *rest]\n',
+            # PR 299 security review of b3a9a422: a constant docker verb is a site with or without launch marks
+            "mark-free-docker-run-repro": '    argv = ["docker", "run", "--privileged", "alpine"]\n',
+            "mark-free-docker-create": '    argv = ["docker", "create", "alpine"]\n',
         }
         for label, line in cases.items():
             with self.subTest(label):
                 self.assertIn("C03", codes(head + line + "    subprocess.run(argv)\n"), label)
+
+    def test_non_docker_and_non_launch_lists_are_not_sites(self):
+        """U3's boundary: a constant docker verb makes a site without marks, but neither a non-docker binary with a
+        verb nor a docker command that is not run/create does, so neither needs a check."""
+        cases = {
+            "podman-run": '["podman", "run", "x"]',
+            "docker-ps": '["docker", "ps"]',
+            "docker-images": '["docker", "images", "-q"]',
+            "bare-run": '["run", "x"]',
+        }
+        for label, lst in cases.items():
+            with self.subTest(label):
+                self.assertEqual(codes(f"def f():\n    argv = {lst}\n    subprocess.run(argv)\n"), [], label)
 
     def test_a_checked_dynamic_verb_launch_passes(self):
         src = GOOD.replace("def launch(schema):", "def launch(schema, verb):").replace(
@@ -370,6 +399,21 @@ class ClosedPattern(unittest.TestCase):
                                  GOOD.replace("violations(argv", "argv_guard.violations(argv")),
             "top-level-import-as": ("import subprocess\nimport argv_guard as g\n",
                                     GOOD.replace("violations(argv", "g.violations(argv")),
+            # PR 299 review of b3a9a422: a patch hidden in an unpacking, a for target or a subscript of the module
+            "tuple-unpack-patch": (PKG_AS + "(argv_guard.violations,) = (lambda *a: [],)\n", GUARDED),
+            "list-unpack-patch": (PKG_AS + "[argv_guard.violations] = [lambda *a: []]\n", GUARDED),
+            "starred-unpack-patch": (PKG_AS + "first, *argv_guard.violations = (1, 2)\n", GUARDED),
+            "for-target-patch": (PKG_AS + "for argv_guard.violations in [lambda *a: []]:\n    pass\n", GUARDED),
+            "module-dict-patch": (PKG_AS + "argv_guard.__dict__['violations'] = lambda *a: []\n", GUARDED),
+            "nested-unpack-patch": (PKG_AS + "((argv_guard.violations, x), y) = ((lambda *a: [], 1), 2)\n", GUARDED),
+            "with-target-patch": (PKG_AS + "with ctx() as argv_guard.violations:\n    pass\n", GUARDED),
+            "annotated-patch": (PKG_AS + "argv_guard.violations: object = lambda *a: []\n", GUARDED),
+            "augmented-patch": (PKG_AS + "argv_guard.violations += ()\n", GUARDED),
+            "delete-patch": (PKG_AS + "del argv_guard.violations\n", GUARDED),
+            "function-object-mutation": (PKG_AS + "argv_guard.violations.__code__ = (lambda *a: []).__code__\n",
+                                         GUARDED),
+            "globals-rebinding": (HEAD + "globals()['violations'] = lambda *a: []\n", GOOD),
+            "exec-rebinding": (HEAD + "exec('violations = lambda *a: []')\n", GOOD),
             "dynamic-load": ("import importlib.util\nimport subprocess\n"
                              "spec = importlib.util.spec_from_file_location('argv_guard', 'x/argv_guard.py')\n"
                              "G = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(G)\n",
@@ -475,8 +519,23 @@ class ClosedPattern(unittest.TestCase):
             "return": ("    return subprocess.run(argv)\n", "C21"),
             "comprehension": ("    [subprocess.run(argv) for _ in range(1)]\n", "C21"),
             "await": ("    await runner(argv)\n", "C21"),
+            # PR 299 review of b3a9a422: the guard validates from "create", so the launch puts docker in front
+            "docker-prefix": ("    subprocess.run(['docker'] + argv, check=True)\n", None),
+            "docker-path-prefix": ("    subprocess.run(['/usr/bin/docker'] + argv)\n", None),
+            "docker-prefix-command-keyword": ("    subprocess.run(args=['docker'] + argv)\n", None),
+            "non-docker-prefix": ("    subprocess.run(['podman'] + argv)\n", "C21"),
+            "two-element-prefix": ("    subprocess.run(['docker', 'run'] + argv)\n", "C21"),
+            "argv-on-the-left": ("    subprocess.run(argv + ['docker'])\n", "C21"),
+            "non-constant-prefix": ("    subprocess.run([DOCKER] + argv)\n", "C21"),
+            "prefix-with-a-flag": ("    subprocess.run(['docker', '--debug'] + argv)\n", "C21"),
+            "concatenation-after": ("    subprocess.run(['docker'] + argv + ['--rm'])\n", "C21"),
+            "concatenation-before": ("    subprocess.run(['docker'] + ['--debug'] + argv)\n", "C21"),
+            "conditional-prefix": ("    subprocess.run((['docker'] if schema else []) + argv)\n", "C21"),
+            "aliased-prefix": ("    prefix = ['docker']\n    subprocess.run(prefix + argv)\n", "C21"),
+            "aliased-command": ("    cmd = ['docker'] + argv\n    subprocess.run(cmd)\n", "C21"),
+            "deferred-prefixed-launch": ("    go = lambda: subprocess.run(['docker'] + argv)\n    go()\n", "C21"),
         }
-        self.assertEqual(len(cases), 20)
+        self.assertEqual(len(cases), 34)
         for label, (block, code) in cases.items():
             with self.subTest(label):
                 src = GOOD.replace(launch, block)
@@ -512,17 +571,59 @@ class ClosedPattern(unittest.TestCase):
             "with-item": ("with run(argv) as p:\n        pass", False, ["Call", "withitem", "With", "FunctionDef"]),
             "return": ("return run(argv)", False, ["Call", "Return", "FunctionDef"]),
             "conditional": ("run(argv) if c else None", False, ["Call", "IfExp", "Expr", "FunctionDef"]),
+            "docker-prefix": ("run(['docker'] + argv)", False, ["BinOp", "Call", "Expr", "FunctionDef"]),
+            "docker-prefix-keyword": ("run(args=['docker'] + argv)", False,
+                                      ["BinOp", "keyword", "Call", "Expr", "FunctionDef"]),
         }
         for label, (body, is_async, want) in cases.items():
             with self.subTest(label):
                 self.assertEqual(chain(body, is_async), want, label)
 
+    def test_the_documented_recipe_runs_end_to_end_with_a_fake_launch(self):
+        """PR 299 review of b3a9a422: the recipe's argv started with "docker", which the runtime guard always refuses
+        (G01). The README's literal recipe is now EXECUTED against the real argv_guard, with a fake `subprocess` that
+        records its call and never runs a process:
+        - its argv starts with "create" and passes check_schema and violations for its schema;
+        - launch(schema) calls subprocess.run exactly once, with ["docker"] + argv;
+        - for a schema the argv does not match, launch raises SystemExit and never calls the fake."""
+        spec_g = importlib.util.spec_from_file_location("argv_guard_for_recipe", HERE / "argv_guard.py")
+        G = importlib.util.module_from_spec(spec_g)
+        spec_g.loader.exec_module(G)
+        recipe = readme_recipe()
+        launch = next(n for n in ast.walk(ast.parse(recipe)) if isinstance(n, ast.FunctionDef) and n.name == "launch")
+        argv = ast.literal_eval(next(st.value for st in launch.body if isinstance(st, ast.Assign) and
+                                     isinstance(st.targets[0], ast.Name) and st.targets[0].id == "argv"))
+        self.assertEqual(argv[0], "create")
+        schema = G.Schema(image=argv[-2], work_dir="/s/runs/example", scratch="/s/runs",
+                          flags=frozenset({"--read-only"}),
+                          single={"--name": "txe-example", "--pull": "never", "--network": "none", "--cap-drop": "ALL",
+                                  "--security-opt": "no-new-privileges", "--user": "1000:1000",
+                                  "--entrypoint": "/bin/true"},
+                          repeated={}, last_option="--entrypoint", payload=(argv[-1],))
+        self.assertEqual(G.check_schema(schema), [])
+        self.assertEqual(G.violations(argv, schema), [])
+
+        calls = []
+        fake_subprocess = types.SimpleNamespace(run=lambda *a, **kw: calls.append((a, kw)))
+        modules = {"subprocess": fake_subprocess, "txe.containerguard.argv_guard": G}
+
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):   # the recipe's two imports only
+            if level or name not in modules:
+                raise ImportError(f"the recipe imported {name!r}")
+            return modules[name]
+        ns: dict = {"__builtins__": {**builtins.__dict__, "__import__": fake_import}}
+        exec(compile(recipe, "README.md supported recipe", "exec"), ns)
+        ns["launch"](schema)
+        self.assertEqual(calls, [((["docker"] + argv,), {"check": True})])
+        calls.clear()
+        with self.assertRaises(SystemExit):
+            ns["launch"](dataclasses.replace(schema, single={**schema.single, "--user": "1001:1001"}))
+        self.assertEqual(calls, [])
+
     def test_the_documented_recipe_passes(self):
         """The supported recipe, as the README documents it, and its accepted variants are clean. The README's own
         block is read from the file, so the documentation cannot drift from what the check accepts."""
-        text = (HERE / "README.md").read_text()
-        start = text.index("```python\n# The supported recipe") + len("```python\n")
-        recipe = text[start:text.index("```", start)]
+        recipe = readme_recipe()
         builder = ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n\n\ndef build(extra):\n"
                    f"    argv = {ARGV}\n    argv += extra\n    return argv\n\n\ndef launch(schema):\n"
                    "    argv = build([])\n    bad = violations(argv, schema)\n    if bad:\n"
