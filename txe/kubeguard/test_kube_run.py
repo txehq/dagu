@@ -428,17 +428,19 @@ class Arguments(Base):
     def test_kubectl_must_be_found(self):
         # The registry must pin an absolute kubectl. The caller's PATH is never consulted, even when it holds a
         # kubectl (connector review of 2ce8d2d2: a PATH-selected binary could answer the probe and ignore the
-        # request).
+        # request). The two ways to get the pin wrong are refused at different points, both before contact:
+        # - a NON-ABSOLUTE pin is invalid registry data, refused when the registry is loaded (KR02, load_entry);
+        # - a MISSING pin passes loading and is refused in run() when the kubectl is selected (KR19).
         bindir = F.root / "caller-bin"
         bindir.mkdir(exist_ok=True)
         fake = bindir / "kubectl"
         fake.write_text("#!/bin/sh\nexit 0\n")
         fake.chmod(0o700)
-        for pinned in (None, "kubectl", "bin/kubectl"):
+        for pinned, code in ((None, "KR19"), ("kubectl", "KR02"), ("bin/kubectl", "KR02")):
             F.write_registry(kubectl=pinned)
-            rc, _, e, t = call(ARGS, environ={"PATH": str(bindir)})
-            self.assertEqual((rc, len(t.calls)), (3, 0), pinned)
-            self.assertIn("[KR19 ", e)
+            rc, o, e, t = call(ARGS, environ={"PATH": str(bindir)})
+            self.assertEqual((rc, len(t.calls), o), (3, 0, ""), pinned)
+            self.assertIn(f"[{code} ", e, pinned)
 
 
 class RequestScope(Base):
