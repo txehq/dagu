@@ -109,6 +109,12 @@ if args[:2] == ["rm", "-f"]:
     if os.path.exists(LOG + ".rmtamper"):  # the stand-in for a boundary failing during cleanup
         with open(open(LOG + ".rmtamper").read().strip(), "a") as fh:
             fh.write("tampered during rm\n")
+    if os.path.exists(LOG + ".rmrace"):  # docker's own --rm finishing first: rm fails, the container goes
+        r = reg()
+        r.pop(args[2], None)
+        save(r)
+        print("Error response from daemon: removal of container is already in progress", file=sys.stderr)
+        sys.exit(1)
     if os.path.exists(LOG + ".rmfail"):
         print("Error response from daemon: removal failed", file=sys.stderr)
         sys.exit(1)
@@ -2530,4 +2536,69 @@ func TestUnexpectedErrorIsFinding(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A pass whose work directory cannot be removed (its ownership token changed under it, here by the
+// fake docker) is a finding, and BOTH reports say so: the removal is attempted before either report
+// is written, so <work>/report.json and --report carry the process's own exit, 5.
+func TestCleanupFailureInBothReports(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	f.docker = fakeDocker(t, f.root, f.log,
+		`open(os.path.join(os.path.dirname(mounts["/work"]), ".mutate-sandboxed-owned"), "w").write("someone else")`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 5, o.report["exit"])
+	assert.Contains(t, o.report["cleanup_error"], "ownership token")
+	raw, err := os.ReadFile(filepath.Join(o.report["workdir"].(string), "report.json"))
+	require.NoError(t, err, "the kept work directory receives the report")
+	var inner map[string]any
+	require.NoError(t, json.Unmarshal(raw, &inner))
+	assert.EqualValues(t, 5, inner["exit"], "<work>/report.json carries the final exit too")
+}
+
+// A closed stdout (`| head`) neither loses the reports nor changes the exit: both reports are written
+// before the DIAGNOSTIC line, and a broken pipe on that line is absorbed.
+func TestDiagnosticClosedStdout(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	report := filepath.Join(f.root, "report.json")
+	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--diagnostic", "--tree", f.tree,
+		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
+		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image",
+		"--", "sh", "check.sh")
+	cmd.Stdout = w
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	err = cmd.Run()
+	require.NoError(t, w.Close())
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 7, code, errb.String())
+	assert.NotContains(t, errb.String(), "Traceback")
+	raw, err := os.ReadFile(report)
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 7, rep["exit"])
+	inner, err := os.ReadFile(filepath.Join(rep["workdir"].(string), "report.json"))
+	require.NoError(t, err)
+	assert.Equal(t, raw, inner)
+}
+
+// docker's own --rm can finish while the runner's rm -f is refused ("removal already in
+// progress"); one more inspect that finds it gone counts as absent, so the diagnostic settles: 7.
+func TestRemovalInProgressCountsAbsent(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmrace", nil, 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.Equal(t, "confirmed", o.report["diagnostic"].(map[string]any)["settlement"])
+	assert.Contains(t, o.stderr, ": absent")
+	assert.Empty(t, registry(t, f.log))
 }

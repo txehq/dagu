@@ -809,7 +809,15 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
         return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
     rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env,
                         timeout=call_limit(30, hard_end))
-    return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
+    if rm.returncode == 0:
+        return f"{target}: removed"
+    # rm -f can fail while docker's own --rm is still removing it ("removal already in progress"):
+    # look once more, and count only docker's own "no such" as absent.
+    again = subprocess.run([docker, "inspect", "--format", "{{.Name}}", target], capture_output=True, text=True,
+                           env=env, timeout=call_limit(15, hard_end))
+    if again.returncode != 0 and NO_SUCH.search(again.stderr):
+        return f"{target}: absent"
+    return f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
 def output_tail(log_path: Path, size: int = 8192) -> str:
@@ -947,6 +955,12 @@ class Runner:
         self.diagnostic = bool(getattr(args, "diagnostic", False))
         self.err_log = None  # the open stderr file of the run in progress, in diagnostic mode
         self.err_path: Path | None = None  # the last run's stderr file, in diagnostic mode
+
+    def check_allowance(self) -> float | None:
+        """The deadline for a check after a run: FINAL_CHECK_S from now, never past the hard deadline."""
+        if self.hard_end is None:
+            return None
+        return min(self.hard_end, time.monotonic() + FINAL_CHECK_S)
 
     def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
         """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
@@ -1177,7 +1191,9 @@ class Runner:
         for f, digest in self.live.items():
             if file_digest(self.args.tree / f) != digest:
                 raise SharedStateChanged(f"after {label}: the live tree's {f} changed")
-        self.verify_ro_mounts(f"after {label}")
+        # A run that used its whole limit still gets its after-run check: a fixed allowance, capped at
+        # the hard deadline (the cleanup reserve lies between the run deadline and it).
+        self.verify_ro_mounts(f"after {label}", self.check_allowance())
         if outcome is None:
             if code in DOCKER_INFRA_EXITS:
                 outcome = "ERROR"
@@ -1650,29 +1666,42 @@ def main(argv: list[str]) -> int:
             report["identity_after"] = watch.snapshot()
         except OSError as e:
             report["identity_after"] = f"unreadable: {e}"
-        report["exit"] = code
-        if code == EXIT_DIAGNOSTIC:  # only now: every cleanup and end-of-run check has held
-            d = report["diagnostic"]
-            print(f"DIAGNOSTIC: command exit {d['command_exit']} (evidence only, never a pass; runner exit "
-                  f"{EXIT_DIAGNOSTIC}); stdout {d['stdout']['path']}, stderr {d['stderr']['path']}", flush=True)
-        text = json.dumps(report, indent=2, default=str)
-        if args.report:
-            args.report.write_text(text)
+        # The work directory goes (when it may) BEFORE either report is written, so the exit both
+        # reports carry is final: a removal that fails turns a pass into a finding, and the
+        # directory, kept then, receives the report.
+        kept = True
         if work:
-            (work.path / "report.json").write_text(text)
             if args.keep or code in (EXIT_BASELINE, EXIT_FINDINGS):  # a failure keeps its evidence
                 print(f"work directory kept: {work.path}", file=sys.stderr)
             else:
                 try:
                     work.remove()
+                    kept = False
                 except (Refused, OSError) as e:
                     print(f"mutate-sandboxed: cleanup error: {e}", file=sys.stderr)
+                    report["cleanup_error"] = f"{type(e).__name__}: {e}"
                     if code == EXIT_OK:  # a pass whose cleanup failed is a finding, and says so
                         code = EXIT_FINDINGS
-                        report["exit"] = code
-                        report["cleanup_error"] = f"{type(e).__name__}: {e}"
-                        if args.report:
-                            args.report.write_text(json.dumps(report, indent=2, default=str))
+                    print(f"work directory kept: {work.path}", file=sys.stderr)
+        report["exit"] = code
+        text = json.dumps(report, indent=2, default=str)
+        if args.report:
+            args.report.write_text(text)
+        if work and kept:
+            try:
+                (work.path / "report.json").write_text(text)
+            except OSError as e:  # a partly removed directory: --report, if given, still holds it
+                print(f"mutate-sandboxed: cannot write {work.path / 'report.json'}: {e}", file=sys.stderr)
+        if code == EXIT_DIAGNOSTIC:  # only now: settled, checked and both reports written
+            d = report["diagnostic"]
+            try:
+                print(f"DIAGNOSTIC: command exit {d['command_exit']} (evidence only, never a pass; runner exit "
+                      f"{EXIT_DIAGNOSTIC}); stdout {d['stdout']['path']}, stderr {d['stderr']['path']}", flush=True)
+            except OSError:  # stdout closed (`| head`): the reports already hold the result
+                try:
+                    os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # no second error at exit
+                except OSError:
+                    pass
     return code
 
 
