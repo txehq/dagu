@@ -77,7 +77,7 @@ def budget_doc():
 
 def res(rid, state, cpus, mem, match, disk=(), grant="msg_000000000002"):
     return {"id": rid, "state": state, "owner": {"ticket": "TXE-1", "session": "cc0-other", "grant": grant},
-            "cpus_milli": cpus, "memory_bytes": mem, "disk": [{"path": p, "cap_bytes": c} for p, c in disk],
+            "cpus_milli": cpus, "memory_bytes": mem, "disk": [{"path": p, "cap_bytes": c, "root_id": [7, 4242]} for p, c in disk],
             "match": match, "deadline": "2026-11-21T09:00:00Z"}
 
 
@@ -161,7 +161,8 @@ class World:
         return SimpleNamespace(st_dev=7)
 
     def walker(self, roots, max_s, max_entries, monotonic):
-        return {r: self.walk.get(r, (None, ["lookup_failed"])) for r in roots}
+        assert all(len(r) == 3 for r in roots)                         # (rid, path, root_id)
+        return {r[:2]: self.walk.get(r[:2], (None, ["lookup_failed"])) for r in roots}
 
     def go(self, receipt=None):
         b = os.path.join(self.dir, "budget.json")
@@ -686,6 +687,48 @@ class Walk(unittest.TestCase):
         self.root = tempfile.mkdtemp(prefix="capgate-walk-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
+    @staticmethod
+    def rid(path):
+        """The [st_dev, st_ino] a coordinator would record for this root at grant time ([0, 0] when absent)."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return [0, 0]
+        return [st.st_dev, st.st_ino]
+
+    def walk(self, pairs, *args, **kwargs):
+        """walk_used with each root bound to the identity it has NOW, as the grant would have recorded it."""
+        return G.walk_used([(r, p, self.rid(p)) for r, p in pairs], *args, **kwargs)
+
+    def test_a_root_replaced_after_the_grant_is_not_credited(self):
+        claim = os.path.join(self.root, "claim")
+        os.makedirs(claim)
+        granted = self.rid(claim)                                     # recorded at grant time
+        os.rename(claim, os.path.join(self.root, "claim-old"))        # later: same path, a new directory
+        os.makedirs(claim)
+        self.mk("claim/big.bin", 65536)
+        out = G.walk_used([("c", claim, granted)], 30, 1000)
+        self.assertEqual(out[("c", claim)], (None, ["root_id_mismatch"]))
+
+    def test_an_ancestor_redirected_before_the_walk_is_not_credited(self):
+        os.makedirs(os.path.join(self.root, "a", "claim"))
+        granted = self.rid(os.path.join(self.root, "a", "claim"))     # the intended root, at grant time
+        self.mk("b/claim/big.bin", 262144)                            # another tree with a same-named claim dir
+        os.rename(os.path.join(self.root, "a"), os.path.join(self.root, "a-old"))
+        os.symlink(os.path.join(self.root, "b"), os.path.join(self.root, "a"))   # the ANCESTOR now redirects
+        path = os.path.join(self.root, "a", "claim")
+        self.assertFalse(os.path.islink(path))                        # the final component is still a real dir
+        out = G.walk_used([("c", path, granted)], 30, 1000)
+        self.assertEqual(out[("c", path)], (None, ["root_id_mismatch"]))
+
+    def test_a_matching_root_id_is_walked(self):
+        claim = os.path.join(self.root, "claim")
+        os.makedirs(claim)
+        self.mk("claim/a.bin", 4096)
+        used, flags = G.walk_used([("c", claim, self.rid(claim))], 30, 1000)[("c", claim)]
+        self.assertIsNotNone(used)
+        self.assertEqual(flags, [])
+
     def mk(self, rel, size):
         p = os.path.join(self.root, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -699,7 +742,7 @@ class Walk(unittest.TestCase):
         os.symlink("/", os.path.join(self.root, "r1", "escape"))
         os.makedirs(os.path.join(self.root, "r1", "sub"))
         r1 = os.path.join(self.root, "r1")
-        out = G.walk_used([("r1", r1), ("r1b", os.path.join(r1, "sub"))], 30, 1000)
+        out = self.walk([("r1", r1), ("r1b", os.path.join(r1, "sub"))], 30, 1000)
         used, flags = out[("r1", r1)]
         blocks = os.lstat(a).st_blocks * 512
         self.assertGreaterEqual(used, blocks)
@@ -710,19 +753,19 @@ class Walk(unittest.TestCase):
     def test_root_symlink_special_file_and_bounds_fail_to_full_cap(self):
         os.makedirs(os.path.join(self.root, "real"))
         os.symlink(os.path.join(self.root, "real"), os.path.join(self.root, "link"))
-        out = G.walk_used([("x", os.path.join(self.root, "link"))], 30, 1000)
+        out = self.walk([("x", os.path.join(self.root, "link"))], 30, 1000)
         self.assertEqual(out[("x", os.path.join(self.root, "link"))], (None, ["root_not_a_real_directory"]))
         os.mkfifo(os.path.join(self.root, "real", "fifo"))
-        out = G.walk_used([("x", os.path.join(self.root, "real"))], 30, 1000)
+        out = self.walk([("x", os.path.join(self.root, "real"))], 30, 1000)
         self.assertEqual(out[("x", os.path.join(self.root, "real"))][0], None)
         for i in range(3):
             self.mk(f"many/{i}", 1)
-        out = G.walk_used([("x", os.path.join(self.root, "many"))], 30, 2)
+        out = self.walk([("x", os.path.join(self.root, "many"))], 30, 2)
         self.assertEqual(out[("x", os.path.join(self.root, "many"))], (None, ["entry_bound"]))
         ticks = iter([0.0, 100.0, 100.0, 100.0])
-        out = G.walk_used([("x", os.path.join(self.root, "many"))], 30, 1000, monotonic=lambda: next(ticks))
+        out = self.walk([("x", os.path.join(self.root, "many"))], 30, 1000, monotonic=lambda: next(ticks))
         self.assertEqual(out[("x", os.path.join(self.root, "many"))], (None, ["time_bound"]))
-        out = G.walk_used([("x", os.path.join(self.root, "absent"))], 30, 1000)
+        out = self.walk([("x", os.path.join(self.root, "absent"))], 30, 1000)
         self.assertEqual(out[("x", os.path.join(self.root, "absent"))], (None, ["lookup_failed"]))
 
     def racing_open(self, victim, swap):
@@ -746,7 +789,7 @@ class Walk(unittest.TestCase):
         def swap():
             os.rmdir(os.path.join(claim, "sub"))
             os.symlink(os.path.join(self.root, "elsewhere"), os.path.join(claim, "sub"))
-        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
+        out = self.walk([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
         self.assertEqual(out[("c", claim)], (None, ["open_refused"]))   # O_NOFOLLOW refuses it; the full cap is charged
 
     def test_a_directory_replaced_mid_walk_fails_closed_on_identity(self):
@@ -757,7 +800,7 @@ class Walk(unittest.TestCase):
         def swap():
             os.rename(os.path.join(claim, "sub"), os.path.join(self.root, "sub-moved"))
             os.makedirs(os.path.join(claim, "sub"))
-        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
+        out = self.walk([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
         self.assertEqual(out[("c", claim)], (None, ["identity_changed"]))
 
     def test_a_root_replaced_before_it_is_opened_fails_closed(self):
@@ -767,7 +810,7 @@ class Walk(unittest.TestCase):
         def swap():
             os.rename(claim, os.path.join(self.root, "claim-moved"))
             os.makedirs(claim)
-        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("claim", swap))
+        out = self.walk([("c", claim)], 30, 1000, _open=self.racing_open("claim", swap))
         self.assertEqual(out[("c", claim)], (None, ["identity_changed"]))
 
 
@@ -836,6 +879,46 @@ class DiskSampling(unittest.TestCase):
         v = w.go()
         self.assertEqual(v.exit_code, 75)
         self.assertEqual({f.code for f in v.failures if f.reading == "disk"}, {"D04"})
+
+
+class RootIdContract(unittest.TestCase):
+    """Every inventory disk claim carries root_id [st_dev, st_ino]; a missing or malformed one refuses (78)."""
+
+    def test_a_missing_root_id_refuses(self):
+        w = World(self)
+        del w.inventory["reservations"][0]["disk"][0]["root_id"]
+        v = w.go()
+        self.assertEqual(v.exit_code, 78)
+        self.assertEqual([f.code for f in v.failures if f.reading == "inventory"], ["N04"])
+
+    def test_each_malformed_root_id_refuses(self):
+        for bad in ([7], [7, 1, 2], ["7", 1], [True, 1], [7, -1], [7.0, 1], "7:1", None, {}):
+            w = World(self)
+            w.inventory["reservations"][0]["disk"][0]["root_id"] = bad
+            v = w.go()
+            self.assertEqual(v.exit_code, 78, bad)
+            self.assertEqual([f.code for f in v.failures if f.reading == "inventory"], ["N17"], bad)
+
+    def test_the_walker_receives_each_running_claims_root_id(self):
+        w = World(self)
+        seen = []
+        real = w.walker
+
+        def walker(roots, *a):
+            seen.extend(roots)
+            return real(roots, *a)
+        w.walker = walker
+        self.assertTrue(w.go().admit)
+        self.assertEqual(seen, [("r1-running", "/w/r1-running", (7, 4242))])
+
+    def test_the_decision_binding_covers_root_id(self):
+        w = World(self)
+        self.assertTrue(w.go().admit)
+        inv_path = os.path.join(w.dir, "inventory.json")
+        w.inventory["reservations"][0]["disk"][0]["root_id"] = [7, 4243]   # same generation, only root_id changed
+        with open(inv_path, "w") as f:
+            f.write(json.dumps(w.inventory))
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=lambda: NOW), 78)
 
 
 class ReservedId(unittest.TestCase):

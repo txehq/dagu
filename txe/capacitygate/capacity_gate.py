@@ -363,7 +363,7 @@ def parse_inspect(text, ncpu):
 INV_TOP = {"schema", "generation", "owner", "written_at", "valid_until", "foreign_cpu_policy", "reservations"}
 INV_OWNER = {"session", "run"}
 RES_KEYS = {"id", "state", "owner", "cpus_milli", "memory_bytes", "disk", "match", "deadline"}
-RES_DISK = {"path", "cap_bytes"}
+RES_DISK = {"path", "cap_bytes", "root_id"}
 POLICY_CPU_KEYS = {"milli", "grant", "generation"}
 RUN_RE = re.compile(r"run_[0-9a-f]{12}")
 
@@ -375,7 +375,7 @@ class Reservation:
     owner: tuple
     cpus_milli: int              # total, across the reservation's containers
     memory_bytes: int            # total
-    disk: tuple                  # of (path, cap_bytes)
+    disk: tuple                  # of (path, cap_bytes, root_id (st_dev, st_ino) observed at grant time)
     match_kind: str              # "label" or "ids"
     match_ids: tuple
     deadline: object
@@ -477,7 +477,11 @@ def parse_inventory(data):
             if rid not in p.split("/"):
                 raise Bad("unreadable", "N14", f"{dw}.path does not name its reservation")
             seen_paths.add(p)
-            disk.append((p, _ipos(d, "cap_bytes", dw, 0)))
+            # The claim root's identity, observed by the coordinator at grant time (README 4.2): [st_dev, st_ino].
+            ri = d["root_id"]
+            if not isinstance(ri, list) or len(ri) != 2 or not all(runbudget.is_int(x) and x >= 0 for x in ri):
+                raise Bad("unreadable", "N17", f"{dw}.root_id is not [st_dev, st_ino] as two non-negative integers")
+            disk.append((p, _ipos(d, "cap_bytes", dw, 0), (ri[0], ri[1])))
         m = r["match"]
         if not isinstance(m, dict) or m.get("kind") not in ("label", "ids"):
             raise Bad("unreadable", "N15", f"{where}.match")
@@ -525,7 +529,7 @@ def check_inventory(inv, now, max_validity_s, budget=None):
         raise Bad("conflict", "K03", "owner or grant differs from the budget")
     if me.cpus_milli != budget.need_cpus_milli or me.memory_bytes != budget.need_memory_bytes:
         raise Bad("conflict", "K04", "caps differ from the budget")
-    if sorted(me.disk) != sorted((d.path, d.need_bytes) for d in budget.disk):
+    if sorted((p, c) for p, c, _ in me.disk) != sorted((d.path, d.need_bytes) for d in budget.disk):
         raise Bad("conflict", "K05", "disk claims differ from the budget")
 
 
@@ -670,8 +674,9 @@ class _WalkStop(Exception):
 
 
 def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open):
-    """Bytes in use under each (reservation id, path) root. Returns {(rid, path): (used or None, flags)}; None means
-    the walk failed and the caller charges the full remaining cap.
+    """Bytes in use under each (reservation id, path, root_id) root. Returns {(rid, path): (used or None, flags)}; None
+    means the walk failed and the caller charges the full remaining cap. root_id is the [st_dev, st_ino] the coordinator
+    observed for the intended root at grant time.
 
     The claim tree may be written by the running reservation WHILE it is walked, so the walk works on directory
     DESCRIPTORS (the txe/mutate dir_usage pattern):
@@ -684,10 +689,14 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open
     - Each (st_dev, st_ino) is counted once across ALL roots, so hard links and overlapping paths never count twice.
     - Bounds: a shared wall-clock bound, a per-root entry bound, and WALK_MAX_DEPTH levels. Exceeding any of them
       fails that root. One descriptor is open per level.
-    Limit, and no protection is claimed for it: O_NOFOLLOW applies to the final component only. The path components
-    ABOVE the root are resolved normally (following symlinks), so an ancestor changed before the walk redirects the
-    whole walk undetected. The inventory only checks that the path NAMES its reservation; the root directory's identity
-    is not bound. Its parent directories must not be writable by the reservation."""
+    - The opened root's fstat (st_dev, st_ino) must equal root_id BEFORE anything is walked (root_id_mismatch).
+      O_NOFOLLOW protects only the final component, and the path components ABOVE the root are resolved normally. A
+      replaced root, or an ancestor redirected before the walk, opens a DIFFERENT object, which this detects.
+      Nothing is credited, and the full remaining cap is charged. No replacement root is enrolled, and root_id is
+      never re-read or regenerated here.
+    What root_id is NOT: dev/ino detects a different opened object at walk time. It is not a permanent identity: an
+    inode number reused after the recorded directory is deleted, or a filesystem or namespace change, can defeat it.
+    It is only as good as the coordinator's grant-time observation of the INTENDED, coordinator-owned root."""
     seen, out = set(), {}
     start = monotonic()
 
@@ -695,7 +704,7 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open
         f = os.fstat(fd)
         return (f.st_dev, f.st_ino) == (st.st_dev, st.st_ino) and _stat.S_ISDIR(f.st_mode)
 
-    for rid, path in sorted(roots):
+    for rid, path, root_id in sorted(roots):
         flags, tally = [], {"used": 0, "entries": 0}
         try:
             st = os.lstat(path)
@@ -758,6 +767,11 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open
         try:
             if not same(st, top):
                 raise _WalkStop("identity_changed")
+            # The opened root must be the directory the coordinator recorded at grant time (root_id). A replaced root
+            # or a redirected ancestor opens a different object: nothing is credited; the full remaining cap is charged.
+            f = os.fstat(top)
+            if root_id is None or (f.st_dev, f.st_ino) != tuple(root_id):
+                raise _WalkStop("root_id_mismatch")
             count(st)
             walk(top, 0)
         except _WalkStop as stop:
@@ -810,10 +824,10 @@ def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
         return {"devices": [], "other_device_claims": []}, failures
     run = [r for r in inv.reservations if r.state == "running"]
     pend = [r for r in inv.reservations if r.state == "pending" and r.id != budget.reservation_id]
-    roots = [(r.id, p) for r in run for p, _ in r.disk]
+    roots = [(r.id, p, ri) for r in run for p, _, ri in r.disk]
     walked = walker(roots, policy["disk_walk_max_s"], policy["disk_walk_max_entries"], monotonic) if roots else {}
     for r in run:
-        for p, cap in r.disk:
+        for p, cap, ri in r.disk:
             used, flags = walked.get((r.id, p), (None, ["lookup_failed"]))
             dev = nearest_device(p, stat_fn)
             targets = [dev] if dev in devices else ([] if dev is not None else list(devices))
@@ -824,11 +838,12 @@ def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
                 other.append({"reservation": r.id, "path": p, "state": "running", "left": left})
             for t in targets:
                 devices[t]["left"][f"{r.id}:{p}"] = left
-                devices[t]["walks"].append({"reservation": r.id, "path": p, "cap": cap, "used": used,
+                devices[t]["walks"].append({"reservation": r.id, "path": p, "root_id": list(ri), "cap": cap,
+                                            "used": used,
                                             "status": "ok" if used is not None else "fallback_full_remaining_cap",
                                             "flags": flags})
     for r in pend:
-        for p, cap in r.disk:
+        for p, cap, ri in r.disk:
             dev = nearest_device(p, stat_fn)
             targets = [dev] if dev in devices else ([] if dev is not None else list(devices))
             if not targets:

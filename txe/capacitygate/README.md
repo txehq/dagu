@@ -138,8 +138,7 @@ charged_disk(d) = N_disk(d) + Σ_{r running, p on d} left(r, p) + Σ_{p ∈ Pend
 
 **The walk** (D1). `used(r, p)` comes from a bounded `lstat` walk of the claim's path:
 - **The path NAMES its reservation:** one of its components is the reservation id, or the inventory refuses (78,
-  N14). This is a name check only. **The root directory's identity is NOT bound:** nothing records which directory
-  the coordinator meant.
+  N14). That is a name check only; the root's IDENTITY is bound separately, by `root_id` (below).
 - **The walk works on directory descriptors, because the claim tree may be written while it is walked** (the
   `txe/mutate` `dir_usage` pattern). The root, and each directory below it, is opened with `O_NOFOLLOW`, each child
   relative to its parent's descriptor. Each opened directory's `(st_dev, st_ino)` must equal the `lstat` taken when it
@@ -148,8 +147,16 @@ charged_disk(d) = N_disk(d) + Σ_{r running, p on d} left(r, p) + Σ_{p ∈ Pend
   - Every component ABOVE the root is resolved normally, following symlinks, by both the `lstat` and the `open`.
   - An ancestor changed before the walk starts redirects both calls consistently. The walk then measures whatever
     tree the path now names, undetected; a swap between the `lstat` and the `open` is caught as `identity_changed`.
-  - So no protection is claimed for the path prefix. Its parent directories must not be writable by the reservation,
-    and binding the root's `(st_dev, st_ino)` in the inventory is a pending contract decision.
+  - `O_NOFOLLOW` by itself therefore protects nothing in the path prefix.
+- **`root_id` binds the root's identity.** Each claim carries the `[st_dev, st_ino]` the coordinator observed for the
+  intended root at grant time (N17 if missing or malformed). The opened root's `fstat` must equal it before anything is
+  walked. A root replaced after the grant, or an ancestor redirected before the walk, opens a DIFFERENT object:
+  `root_id_mismatch`, nothing credited, the full remaining cap charged. No replacement root is enrolled, and
+  `root_id` is never re-read or regenerated during the measurement.
+- **What `root_id` is NOT.** It detects a different opened object at walk time. `(st_dev, st_ino)` is not a
+  permanent identity: an inode number reused after the recorded directory is deleted, or a filesystem or namespace
+  change, can defeat it. It is only as good as the coordinator's grant-time observation of the INTENDED,
+  coordinator-owned root.
 - **The root must be a real directory, not a symlink.**
   - Symlinks below the root are never followed or counted.
   - A FIFO, socket or device file fails the walk.
@@ -243,12 +250,17 @@ The budget is `txe.runbudget/v1`, a separate data contract with no import betwee
  "reservations": [{"id": "r1-running", "state": "running",
    "owner": {"ticket": "TXE-<n>", "session": "cc<n>-<ws>", "grant": "msg_<12 hex>"},
    "cpus_milli": 2000, "memory_bytes": 2147483648,
-   "disk": [{"path": "/w/r1-running", "cap_bytes": 17179869184}],
+   "disk": [{"path": "/w/r1-running", "cap_bytes": 17179869184, "root_id": [16777232, 81723456]}],
    "match": {"kind": "ids", "ids": ["<64 hex>"]}, "deadline": "2026-11-21T09:00:00Z"}]}
 ```
 
 **Who writes it.** Only the coordinator that owns Mac admission.
 - It increments `generation` on every change.
+- **At grant time it records each claim's `root_id`:** it creates (or confirms) the intended, coordinator-owned
+  claim root, then `lstat`s THAT directory and writes its `[st_dev, st_ino]`. The root must exist when the reservation
+  is written, pending claims included. The coordinator must not take the identity from a path a reservation can
+  redirect. `root_id` is part of the file, so the inventory sha256 in every decision binding covers it, and a changed
+  `root_id` needs a new `generation`.
 - It **refreshes the inventory at every actual admission and ownership change**, not only at checkpoints.
 - It writes by atomic replace.
 - The gate, launchers and workers only read it.
@@ -267,7 +279,7 @@ The budget is `txe.runbudget/v1`, a separate data contract with no import betwee
 | Kind | Cause |
 |---|---|
 | `missing` | the file is absent |
-| `unreadable` | not strict JSON; an unknown or missing key; a bad type or timestamp; a duplicate id; a disk path that does not name its reservation; a policy `milli` < 1 |
+| `unreadable` | not strict JSON; an unknown or missing key (a disk claim without `root_id` included); a bad type or timestamp; a duplicate id; a disk path that does not name its reservation; a `root_id` that is not two non-negative integers (N17); a policy `milli` < 1 |
 | `stale` | `written_at` > now; now ≥ `valid_until`; or a validity window > `inventory_max_validity_s` |
 | `conflict` | the new run is not `pending` with equal owner, caps and disk; one container id under two reservations; a pending reservation with a container; a container of the new run; a policy bound to another generation |
 
