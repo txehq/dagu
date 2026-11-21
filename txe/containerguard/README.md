@@ -41,7 +41,16 @@ launch(argv)
   runtime trees, and read-only unless their target is declared writable;
 - nothing is mounted from or onto a Docker socket;
 - `--network none`, `--pull never`, `--cap-drop ALL`, `--security-opt no-new-privileges` and `--read-only` are fixed;
-- the user is set and is not root;
+- the user is set to a canonical positive decimal uid, with an optional canonical positive decimal gid:
+  `--user 1000:1000`, or a bare uid such as `--user 1000`. Refused (`S13`):
+  - a name, which resolves inside the image, where any name can be uid 0;
+  - uid or gid 0 in any spelling (Docker's `strconv.Atoi` reads `00`, `+0` and `-0` as 0);
+  - a leading zero, a sign or whitespace;
+  - an empty uid or gid (`""`, `":"`, `"1000:"`);
+  - an extra colon component (`1000:1000:1000`).
+
+  This floor governs the REQUESTED container user only, not every privilege transition an image or runtime can
+  make (a setuid binary inside the image, for example);
 - the image is a digest;
 - env and label keys are well formed and unique, with credential-named env keys refused;
 - each policy option has exactly one kind: `--mount`, `--env`, `--label` and `--tmpfs` are repeated; `--network`,
@@ -292,6 +301,10 @@ repository's CI.** A NEW runner revision adopts the guard like this:
 - its packet's pure tests assert two things:
   1. the bytes it loaded hash to the pin;
   2. its launch path calls this module's `violations` on the argv it creates, and raises on any finding.
+
+**A pin is a snapshot.** A consumer pinned to an older `argv_guard.py` digest keeps that version's rules. It is NOT
+upgraded, or validated, by any later change to this module or by the tests that validate it. That includes the
+numeric-user rule (`S13`): a consumer gets it only by moving its pin and re-running its own packet.
 
 ```python
 GUARD_PIN = ("<commit>", "txe/containerguard/argv_guard.py", "<sha256>")

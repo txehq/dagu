@@ -427,6 +427,18 @@ class ClosedPattern(unittest.TestCase):
             "importlib-by-name": (PKG_AS + "import importlib\nimportlib.import_module('m').violations = None\n",
                                   GUARDED),
             "module-name-string": (PKG_AS + "NAME = 'txe.containerguard.argv_guard'\n", GUARDED),
+            # PR 299 security review of 32dc13f1: a dotted target inside the module, and the patching library
+            "mock-patch-decorator-repro": ("import subprocess\nimport unittest.mock\n"
+                                           "from txe.containerguard.argv_guard import violations\n",
+                                           GOOD.replace("\ndef launch(", "\n@unittest.mock.patch("
+                                                        "'txe.containerguard.argv_guard.violations', new=lambda *_: [])"
+                                                        "\ndef launch(")),
+            "mock-patch-context": (HEAD + "from unittest import mock\n"
+                                   "with mock.patch('txe.containerguard.argv_guard.violations'):\n    pass\n", GOOD),
+            "dotted-target-constant": (HEAD + "TARGET = 'txe.containerguard.argv_guard.x'\n", GOOD),
+            "from-unittest-mock-import": (HEAD + "from unittest.mock import patch\n", GOOD),
+            "import-unittest-mock": (HEAD + "import unittest.mock\n", GOOD),
+            "import-mock": (HEAD + "import mock\n", GOOD),
             "dynamic-load": ("import importlib.util\nimport subprocess\n"
                              "spec = importlib.util.spec_from_file_location('argv_guard', 'x/argv_guard.py')\n"
                              "G = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(G)\n",
@@ -437,6 +449,18 @@ class ClosedPattern(unittest.TestCase):
         for label, (head, src) in cases.items():
             with self.subTest(label):
                 self.assertIn("C14", codes(src, head), label)
+
+    def test_strings_that_only_mention_the_guard_stay_clean(self):
+        """W2's boundary: only the module's name, or a dotted target inside it, is access by name. A message or a
+        GUARD_PIN-style path that merely mentions argv_guard is not (the README recipe, executed, is a third)."""
+        cases = {
+            "refusal-message": GOOD.replace('raise SystemExit("refused")',
+                                            'raise SystemExit("argv_guard refused the launch")'),
+            "guard-pin-path": "GUARD_PIN = ('c0ffee', 'txe/containerguard/argv_guard.py', 'ab12')\n" + GOOD,
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertEqual(codes(src), [], label)
 
     def test_the_recognised_guard_bindings_pass(self):
         cases = {

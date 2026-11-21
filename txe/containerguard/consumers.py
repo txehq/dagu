@@ -309,7 +309,9 @@ def _guard_bindings(tree):
     - an unresolved rebinding: a write into globals(), vars() or locals(), or any exec or eval call;
     - ANY occurrence of a guard name other than its import and the root of a check call's callee (the allowlist
       that subsumes the forms above: `g.__dict__.update(…)`, `vars(g)`, `h = g.violations`, `f(violations)`);
-    - the guard module reached by name: a string naming it, sys.modules, importlib or __import__.
+    - the guard module reached by name: a string equal to its name or a dotted target inside it
+      ("txe.containerguard.argv_guard.violations"), sys.modules, importlib, __import__, or any unittest or mock
+      import (the patching library). A path or message that merely mentions argv_guard is not a name.
     An import inside a try, if or def is not module level, so a fallback definition cannot stand in for the guard."""
     if any(isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names) for n in ast.walk(tree)):
         return {}
@@ -353,9 +355,15 @@ def _guard_bindings(tree):
             allowed.add(id(root))
     if any(isinstance(n, ast.Name) and n.id in out and id(n) not in allowed for n in ast.walk(tree)):
         return {}
-    # ... and the guard module may not be reached by NAME: a string naming it, sys.modules, importlib or __import__
+    # ... and the guard module may not be reached by NAME: a string naming it or a dotted target inside it
+    # ("txe.containerguard.argv_guard.violations", the mock.patch and importlib form; PR 299 security review of
+    # 32dc13f1), sys.modules, importlib, __import__, or the patching library (unittest or mock, in any import form).
+    # A path or a message that merely mentions argv_guard ("…/argv_guard.py", "argv_guard refused …") is not a name.
     for n in ast.walk(tree):
-        if (isinstance(n, ast.Constant) and n.value in GUARD_MODULES) or \
+        if (isinstance(n, ast.Constant) and isinstance(n.value, str) and
+                any(n.value == m or n.value.startswith(m + ".") for m in GUARD_MODULES)) or \
+                (isinstance(n, ast.Import) and any(a.name.split(".")[0] in ("unittest", "mock") for a in n.names)) or \
+                (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[0] in ("unittest", "mock")) or \
                 (isinstance(n, ast.Attribute) and n.attr == "modules" and isinstance(n.value, ast.Name) and
                  n.value.id == "sys") or (isinstance(n, ast.Name) and n.id == "__import__") or \
                 (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "importlib" for a in n.names)) or \

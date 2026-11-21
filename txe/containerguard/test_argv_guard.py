@@ -299,6 +299,19 @@ class PolicyFloor(unittest.TestCase):
                 self.assertIn(code, got, (label, got))
                 self.assertNotEqual(G.violations(argv(), s), [], label)
 
+    def test_the_user_must_be_a_canonical_nonzero_numeric_id(self):
+        """PR 299 review of 32dc13f1: `--user 00:0` passed, and Docker reads "00" with strconv.Atoi as uid 0 (root).
+        The user is a canonical nonzero decimal uid, with an optional canonical nonzero decimal gid."""
+        refused = ("00:0", "", ":", "00", "+0", "-0", "0000", "007", "root", "toor", " 1000", "1000 ", "1000:",
+                   "1000:0", "1000:+0", "1000:01", "1000:1000:1000", "0:1000")
+        self.assertEqual(len(refused), 18)
+        for user in refused:
+            with self.subTest(user):
+                self.assertIn("S13", codes(G.check_schema(schema_single(**{"--user": user}))), user)
+        for user in ("1000:1000", "501:20", "1"):        # "1": a bare uid, with no group, is allowed
+            with self.subTest(user):
+                self.assertEqual(G.check_schema(schema_single(**{"--user": user})), [], user)
+
     def test_a_policy_option_in_the_wrong_kind_is_refused(self):
         """PR 299 review (P2): a --mount in `single` skipped every mount rule. Each policy option has one kind."""
         s0 = schema()
