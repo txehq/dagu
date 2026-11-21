@@ -281,9 +281,9 @@ class Refused(unittest.TestCase):
 
     def test_kube_run_runs_bare_with_no_environment_change(self):
         # Connector security review of 7441b7b6: `PATH=/tmp/bin <kube-run>` let the environment choose the
-        # interpreter of kube-run's `env python3` shebang. The class rule: the installed kube-run is accepted only
-        # as a bare command word, in a line that changes no environment (an assignment, export, source, ...) at any
-        # depth and in any order. Variables are not enumerated.
+        # interpreter of kube-run's `env python3` shebang. Root's contract (after two closed-set rounds): the kube-run
+        # exception holds only when the WHOLE command is ONE bare kube-run invocation with literal arguments. Every
+        # case below, from all three review rounds, is another shape, so all are H16.
         for cmd in (f"PATH=/tmp/bin {kr()}", f"PYTHONPATH=/tmp/x {kr()}", f"env PATH=/tmp/bin {kr()}",
                     f"env -i {kr()}", f"timeout 60 {kr()}", f"timeout --preserve-status 60 {kr()}", f"sudo {kr()}",
                     f"nohup {kr()}", f"command {kr()}", f"time {kr()}", f"PATH=/tmp/bin; {kr()}",
@@ -309,6 +309,26 @@ class Refused(unittest.TestCase):
                     f"helm version; {kr()}", f"timeout 5 true; {kr()}", f"command -v kubectl; {kr()}",
                     f"bash x.sh; {kr()}", f"echo x > /tmp/f; {kr()}", f"{kr()} > out.txt"):
             self.deny(cmd, "H16", "kube-run")
+        # Root's single-invocation grammar: arithmetic ++/-- and indirect expansion, the shapes the closed set
+        # allowed (now EXPECTED FALSE REFUSALS, documented in the README), and every non-literal argument.
+        for cmd in (f"(( X++ )); {kr()}", f"echo $((X--)); {kr()}", f"echo ${{!x}}; {kr()}",
+                    f"bash -c '{kr()}'", f"kubectl config current-context; {kr()}", f"cd /tmp && {kr()}",
+                    f"if {kr()}; then echo ok; fi", f"{kr()} | grep Running", f"set -euo pipefail; {kr()}",
+                    f"set -e; {kr()}", f"{kr()} 2>&1", f"{kr()} 2>/dev/null", f"{kr()} < /dev/null", f"{kr()} &",
+                    f"{kr()};", f"{kr()} # note", f"{kr()}\n", f"{kr()} <<< x", f"echo $({kr()})",
+                    kr('txe-onprem-ci -- get pods -n "$NS"'), kr("txe-onprem-ci -- get pods -n ${NS}"),
+                    kr("txe-onprem-ci -- get pods -n $(echo x)"), kr("txe-onprem-ci -- get pods -n `echo x`"),
+                    kr("txe-onprem-ci -- get pods -n $((1))"), kr("txe-onprem-ci -- get pods -o jsonpath={.items}"),
+                    kr("txe-onprem-ci -- get pods/*"), kr("txe-onprem-ci -- get pods a\\ b"),
+                    kr("txe-onprem-ci -- get pods $'x'"), kr("txe-onprem-ci -- get pods !x")):
+            self.deny(cmd, "H16", "kube-run")
+        # literal_word: quote removal alone, with no evaluation.
+        for raw in ("abc", "'a b'", '"x y"', "a'b'c", "app=web", "'jsonpath={.items}'", '"app in (a)"',
+                    "/x/rec.json", "deploy/x", "-n", "--since=1h", "'$X'"):
+            self.assertTrue(GUARD.literal_word(raw), raw)
+        for raw in ("~/x", "$X", '"$X"', "a*", "{a,b}", "\\x", "$'x'", '"a\\b"', "!x", "#x", "'open", '"open',
+                    "x[0]", "`x`", '"`x`"', ""):
+            self.assertFalse(GUARD.literal_word(raw), raw)
         # The widened assignment forms get the H04 check on their value too.
         for cmd in ("X+=kubectl", "a[1]=kubectl", "K[0]+=kubectl true"):
             self.deny(cmd, "H04")
@@ -435,13 +455,12 @@ class Allowed(unittest.TestCase):
         self.assertIsNone(decision, f"{cmd!r} -> {reason}")
 
     def test_the_installed_kube_run(self):
-        # Bare only (H16): a wrapper or an environment change before kube-run is refused; see Refused.
+        # H16's grammar: ONE bare kube-run invocation with literal arguments, quoting decoded without evaluation.
+        # Every other shape is refused; see Refused.test_kube_run_runs_bare_with_no_environment_change.
         for cmd in tuple(kr(rest) for rest in ALLOWED_RESTS) + (
-                f"bash -c '{kr()}'", f"kubectl config current-context; {kr()}",
-                kr('txe-onprem-ci -- get pods -n "$NS"'), f"cd /tmp && {kr()}", f"if {kr()}; then echo ok; fi",
-                f"{kr()} | grep Running", f"set -euo pipefail; {kr()}", f"set -e; {kr()}", f"set +x; {kr()}",
-                f"{kr()} 2>&1 | grep Running", f"{kr()} 2>/dev/null", kr("txe-onprem-ci -- get pods -l app=web"),
-                kr("txe-onprem-ci -- get pods -o jsonpath={.items}")):
+                kr("txe-onprem-ci -- get pods -l app=web"), kr("txe-onprem-ci -- get pods -l 'app in (a,b)'"),
+                kr("txe-onprem-ci -- get pods -o 'jsonpath={.items[*].metadata.name}'"),
+                kr('txe-onprem-ci -- get pods -l "tier=web"'), f"  {kr()}  ", kr("txe-onprem-ci --\tget pods")):
             self.allow(cmd)
 
     def test_local_commands(self):

@@ -60,31 +60,23 @@ a context can be repointed inside its file. This directory holds the source of t
     word, and its attached short form (`-d1`, `-ifoo`) is unsupported: unknown, so refused when a client
     follows. A word consumed as a REQUIRED value never names a client (`watch -n kubectl ...` is H03), so a
     wrong table entry fails closed;
-  - the installed kube-run is accepted only as a BARE command word, with no wrapper before it (`env`, `sudo`,
-    `timeout`, `nohup`, `command`, `time`, ...). It must also sit in a line whose every other command, at any
-    depth, is in a SMALL CLOSED SET of environment-neutral commands, with no assignment of any form (`NAME=`,
-    `NAME+=`, `NAME[i]=`) (H16). The set is:
-    - the data set above, used as data;
-    - `[ ... ]` and `cd`;
-    - `set` with only `-e`, `-u`, `-x` (and `+`, clustered as in `-euo pipefail`) and `-o`/`+o` `pipefail`,
-      `errexit`, `nounset` or `xtrace`;
-    - a kubectl-family client's local forms;
-    - a shell in `-c` mode, whose text is held to this same set;
-    - keyword structure (`if`/`then`/`fi`, `while`/`do`/`done`, `!`, `{ }`, `( )`).
-  - Anything else is refused. That includes:
-    - every other external command or builtin, known or unknown: `export`, `read`, `printf -v`, `mapfile`,
-      `let`, `getopts`, `eval`, `source`, interpreters, `helm`/`flux`/`kustomize` local forms, every wrapper
-      (`command -v` included), `time`, and `set -k`/`-o keyword`/`-a`;
-    - a shell given a script file;
-    - an output redirection to anything but `/dev/null` or an fd duplicate (`2>&1`);
-    - an upper-case assignment-shaped kube-run argument (`PATH=/tmp/bin`), which an inherited keyword mode
-      would move into kube-run's environment.
-  - Syntax H16 does not model is refused in such a line: `${...}` (its `:=` and `=` forms assign), `$((..))`,
-    `((..))`, `$[..]`, `[[ ]]`, a function definition `name()`, and `for`/`select`/`case`/`function`.
-  - It is an allowlist because any environment change could choose the interpreter of kube-run's
-    `#!/usr/bin/env python3`, and the builtins that make one cannot be enumerated safely. It holds the text of
-    the line to this set. It is not proof of a trusted pre-existing environment: that is the installation
-    contract below;
+  - **the kube-run exception has one bounded grammar (H16).** A Bash command in which the installed kube-run
+    is accepted must be EXACTLY one simple command: `<absolute literal path of the installed kube-run>
+    <literal word> ...`, with words separated by spaces or tabs and nothing before the first word or after the
+    last. A word is literal when quote removal alone decodes it:
+    - unquoted characters exclude `` $ ` \ * ? [ ] ~ { } ! # ( ) < > ; & | ``;
+    - `'...'` is literal as is;
+    - `"..."` is literal when it holds no `` $ ` \ `` or `!`.
+    Every other shape is refused, whatever it seems to do:
+    - another command or any separator (`;`, `&&`, `||`, `|`, `&`, a newline);
+    - a keyword, group, subshell or nested shell (`bash -c '<kube-run> ...'`, `$(<kube-run> ...)`);
+    - a wrapper or prefix assignment;
+    - any redirection or here-string (`2>&1`, `> out`, `< /dev/null`), and a comment;
+    - any substitution, parameter, arithmetic, tilde or brace expansion, glob, escape or ANSI-C quote.
+    An upper-case assignment-shaped argument (`PATH=/tmp/bin`) is refused too, as defence in depth against an
+    inherited keyword mode. This is a bounded POSITIVE grammar: the hook does not claim to know which other
+    shell syntax leaves kube-run's environment alone, and it is not proof of a trusted pre-existing
+    environment (see the installation contract below);
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
     always checked as a program;
   - local version, help, config-read and kustomize commands pass.
@@ -181,18 +173,26 @@ name at run time. Its classification also ASSUMES things it cannot see:
 These are deployment prerequisites, not things the hook proves. It does not guard every way a shell can execute a
 command: it refuses the ones it can see that it does not understand.
 
-H16 also refuses legitimate lines. Examples are setting a variable for a kube-run call (`NS=arc-runners;
-kube-run ... -n "$NS"`), wrapping it (`timeout 60 kube-run ...`), combining it with any command outside the
-neutral set (`date; kube-run ...`), writing its output to a file (`kube-run ... > out.txt`), and `"${NS}"`. Pass
-values literally, use kube-run's own `--timeout`, pipe to `grep`, and run other commands in a separate tool call.
+**H16's expected false refusals, documented:** every kube-run use that is not a single bare literal
+invocation. That includes:
+- `cd /tmp && kube-run ...`, `if kube-run ...; then ...`, `kube-run ... | grep Running`;
+- `set -euo pipefail; kube-run ...` and `kubectl config current-context; kube-run ...`;
+- `bash -c 'kube-run ...'`;
+- `kube-run ... 2>&1` and `kube-run ... > out.txt`;
+- `kube-run ... -n "$NS"`, and `-o jsonpath={.items}` unquoted (quote it: `-o 'jsonpath={.items}'`);
+- `timeout 60 kube-run ...` (use kube-run's own `--timeout`);
+- a path written with `~`.
+Run kube-run alone, by its absolute path, with literal arguments, in its own tool call. Filter or combine its
+output in a later call. The Bash tool already returns both stdout and stderr.
+
 
 **Installation contract for kube-run (a prerequisite of any install; nothing here installs it):** the installed
 kube-run must start through an ABSOLUTE, pinned interpreter in isolated mode. For example, it can be a small
 launcher at the installed path that execs `<absolute python3.13> -I -B <absolute kube_run.py> "$@"`. The
 `#!/usr/bin/env python3` shebang is for running it from source. Through `env`, it lets the caller's `PATH` choose
 the interpreter, and a program posing as Python would receive kube-run's full argv before any check. H16 keeps
-the hook from accepting a line that changes that environment. But the hook cannot see an environment the agent's
-shell already inherited, which is why the pinned interpreter is the install's job. Relative entries in an inherited
+the hook from accepting any line other than one bare literal kube-run invocation. But the hook cannot see an
+environment the agent's shell already inherited, which is why the pinned interpreter is the install's job. Relative entries in an inherited
 `PATH` (which `cd` would then change) are excluded by the same contract.
 
 ## Platform and syscall constraints
