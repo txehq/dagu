@@ -289,6 +289,26 @@ class Refused(unittest.TestCase):
                     "sort --compress-program=kubectl f", "less kubectl.txt kubectl"):
             self.deny(cmd, "H15")
 
+    def test_only_the_small_closed_data_set_with_its_listed_options_is_data(self):
+        # Root's review of fc6bc93b: a SMALL closed set of inert forms, not command grammars. man (its pager) and
+        # git (configured hooks, pagers, diff drivers, textconv) are not accepted, whatever their flags; unknown,
+        # program-carrying, attached and option=value forms refuse when a client is named.
+        for cmd in ("man -P 'kubectl get secrets' ls", "man --pager='kubectl get ns' ls", "man -P'kubectl get ns' ls",
+                    "man -Pkubectl ls", "man kubectl", "man -k kubectl",
+                    "git grep -O'kubectl get ns' x", "git grep -Okubectl x",
+                    "git grep --open-files-in-pager='kubectl get ns' x", "git grep --open-files-in-pager=kubectl x",
+                    "git log --grep kubectl", "git show HEAD:kubectl.yaml kubectl", "git diff kubectl",
+                    "git commit -m 'kubectl notes'", "echo -x kubectl", "grep --pre=x kubectl f", "cat -n kubectl",
+                    "grep -A 3 kubectl f", "printf -v x kubectl", "which -s kubectl"):
+            self.deny(cmd, "H15")
+        # Inherited pagers: a prefix assignment that names a client is refused (H04) before the command.
+        for cmd in ("MANPAGER='kubectl get ns' man ls", "PAGER=kubectl man ls", "GIT_PAGER='kubectl get ns' git log"):
+            self.deny(cmd, "H04")
+        for cmd in ("grep -rn kubectl ops", "grep -c -e kubectl f", "grep -rnE 'kube(ctl|-run)' docs",
+                    "echo -n kubectl", "printf 'kubectl %s' x", "cat <<'EOF'\nkubectl get pods\nEOF",
+                    "which -a kubectl", "test -n kubectl", "[ -x kubectl ]", ": kubectl"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
+
     def test_a_command_the_hook_cannot_parse_is_refused(self):
         # Connector review of a338d882: `kube\ctl get secrets <<\EOF ...` hid the client from a raw-text match.
         # Any parse failure is now refused (H05); quoted and escaped here-document delimiters parse as bash
@@ -373,11 +393,9 @@ class Allowed(unittest.TestCase):
             self.allow(cmd)
 
     def test_data_only_commands_and_pipes_without_a_client(self):
-        for cmd in ("echo kubectl get pods | tee notes.txt", "git log --grep kubectl", "printf x | python3 -",
-                    "cat f | bash", "watch -n 5 date",
+        for cmd in ("echo kubectl get pods | tee notes.txt", "printf x | python3 -", "cat f | bash", "watch -n 5 date",
                     "jq '.items' pods.json", "sort f | uniq -c", "cat <(echo hello)", "echo kubectl > notes.txt",
-                    "git commit -m 'kubectl notes'", "grep -c kubectl README.md", "source ./env.sh",
-                    "git show HEAD:kubectl-notes.md"):
+                    "grep -c kubectl README.md", "source ./env.sh", "git log --oneline", "man ls"):
             self.allow(cmd)
 
     def test_help_and_client_side_template(self):
@@ -392,8 +410,7 @@ class Allowed(unittest.TestCase):
     def test_text_that_only_mentions_a_client(self):
         for cmd in ("command -v kubectl", "which kubectl helm flux", "grep -rn kubectl ops", "echo kubectl get pods",
                     "cat ops/flux/prod.sh", "python3 ops/flux/classify-diff.py x", "bash ops/flux/staging.sh --help",
-                    "cat > notes.md <<'EOF'\nkubectl get pods\nEOF", "git commit -m 'kubectl guard notes'",
-                    "man kubectl"):
+                    "cat > notes.md <<'EOF'\nkubectl get pods\nEOF"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):

@@ -51,8 +51,8 @@ a context can be repointed inside its file. This directory holds the source of t
   - direct kubectl API calls are refused (H01), and so are helm, flux, k9s and stern API calls (H07);
   - anything it cannot read fails closed (H02 to H05, H12 to H14);
   - a client's name is allowed only in a position the hook understands: a client's own argv (classified), the
-    installed kube-run's argv (H09 to H11), or an argument or input of a DATA-ONLY command (`echo`, `grep`,
-    `cat`, `git`, `orca`, ...). Anywhere else it is refused (H15). An interpreter's code, arguments or input
+    installed kube-run's argv (H09 to H11), or an argument or input of the small closed data set (`echo`,
+    `printf`, `cat`, `grep`, `which`, `test`) with its listed options only. Anywhere else it is refused (H15). An interpreter's code, arguments or input
     naming a client, and a shell or interpreter reading a pipe while the command names a client, are refused
     as H03. `watch` without `--exec` runs its words as shell text, and they are checked as such;
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
@@ -114,14 +114,22 @@ refused:
 |---|---|
 | A client's own argv (kubectl, oc, kubecolor, helm, flux, k9s, stern) | It is a LOCAL form whose options are fully understood (`version --client`, help, `config` reads without `--raw`/`--flatten`, kustomize, helm template without `--validate` or `--dry-run=server`, ...). Any other form is H01 or H07 |
 | The installed kube-run's argv | H09 to H11 hold, and kube-run repeats every check at run time |
-| A data-only command: `echo`, `printf`, `grep`/`egrep`/`fgrep`, `cat`, `head`, `tail`, `wc`, `uniq`, `cut`, `tr`, `tee`, `ls`, `diff`, `jq`, `which`, `type`, `man`, `whatis`, `apropos`, `test`/`[`, `true`, `false`, `:` | Any argument or input is data, but only while that output does not reach code. A shell or interpreter reading its pipe is refused, as is an output process substitution `>(...)` (checked as a pipe receiver) or a redirection into a process substitution |
-| `git` | Only with `commit`, `log`, `show`, `grep`, `diff`, `status` or `blame` as its FIRST argument, so no `-c` or other option comes before the subcommand |
+| The SMALL closed data set (`DATA_OPTIONS`) | `echo` with `-n` `-e` `-E` only; `printf` and `cat` with NO options; `grep` with `-r` `-R` `-n` `-i` `-l` `-c` `-v` `-w` `-x` `-E` `-F` `-o` and `-e <pattern>` (`egrep`/`fgrep` the same, without `-E`/`-F`); `which` with `-a`; `test`/`[`, `true`, `false` and `:` with any token. Operands and input are then data, but only while that output does not reach code: a shell or interpreter reading its pipe is refused, and so is an output process substitution `>(...)` (checked as a pipe receiver) or a redirection into a process substitution |
 | `command -v` / `command -V` | A lookup, not a run |
 | The inner text of `$(...)`, backticks and `<(...)` | It is classified recursively by these same rules |
 
-**Unsupported, and refused when a client is named:** every other command, including `rg`, `ag`, `sort`,
-`less`, `more`, `gh`, `orca`, `awk`, `sed`, `make` and scripts. Also:
-- `git` with a global option or any other subcommand;
+Why no operand of the data set carries execution: `echo`, `printf` and `cat` print text or file contents;
+`grep` matches a pattern over files (this set has no pager, preprocessor or exec option); `which` prints paths;
+`test`/`[` evaluate an expression; `true`/`false`/`:` ignore their arguments. Rejected forms: any option not
+listed, any attached or clustered short form outside the listed letters, `--long=value` for an unlisted name, and
+every other command.
+
+**Unsupported, and refused when a client is named:** every other command, including `man` (it runs a pager:
+`man -P`, `--pager`, `MANPAGER`), `git` (configured hooks, pagers, diff drivers and textconv helpers run without any
+flag in the command, and `grep -O`/`--open-files-in-pager`, `--ext-diff` and `--textconv` run programs), `head`,
+`tail`, `tee`, `rg`, `ag`, `sort`, `less`, `more`, `gh`, `orca`, `awk`, `sed`, `make` and scripts. A prefix
+assignment whose value names a client (`MANPAGER='kubectl ...' man ls`, `GIT_PAGER=...`) is refused as H04.
+Also:
 - `source` or `.` of generated text;
 - an interpreter whose code, arguments or input name a client;
 - `watch` (its words are shell text unless `--exec` is given);
@@ -130,13 +138,18 @@ refused:
 
 **Expected false refusals, documented:** text that only QUOTES a client name, inside a command that is not a data
 context, is refused too. Examples: an orchestration message (`orca orchestration ask --question 'run kubectl get
-pods?'`), a `gh` comment, and an `rg` search. Write such text with a data-only command (`echo`, `cat` to a
-file), or without the client's name.
+pods?'`), a `gh` comment, an `rg` search, a `git commit -m` message, `git log --grep` and `man kubectl`. Write such
+text with a data command (`echo`, `cat` to a file), or without the client's name.
 
-**Scope:** this is not containment of arbitrary scripts or interpreters. The hook cannot infer commands that are
-absent from the command text: a script file's contents, a program that builds a client's name at run time, or
-an alias or function defined earlier in the shell. It does not guard every way a shell can execute a command.
-It refuses the ones it can see that it does not understand.
+**Scope and prerequisites:** this is not containment of arbitrary scripts or interpreters. The hook cannot infer
+commands that are absent from the command text: a script file's contents, or a program that builds a client's
+name at run time. Its classification also ASSUMES things it cannot see:
+- that the command words resolve to the standard programs, so no shell alias or function and no `PATH` entry
+  shadows `echo`, `cat`, `grep` and the rest;
+- that no external configuration turns them into launchers (an alias file, a `BASH_ENV`, a pager or driver
+  setting).
+These are deployment prerequisites, not things the hook proves. It does not guard every way a shell can execute a
+command: it refuses the ones it can see that it does not understand.
 
 ## Platform and syscall constraints
 

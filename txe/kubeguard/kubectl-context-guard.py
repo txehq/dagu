@@ -36,9 +36,9 @@ the hook does not know may take a value, so it cannot tell which word is the com
 follows it, the command is refused (H03).
 
 POSITIVE CLASSIFICATION (H15): a client's name is accepted only in a context the hook understands. Those are a
-client's own classified argv, the installed kube-run's argv, a data-only command (DATA_ONLY, git with a text
-subcommand) whose output does not reach a shell or interpreter, `command -v`, and substitutions classified
-recursively. Anywhere else it is refused. This is not containment of arbitrary scripts or interpreters: commands
+client's own classified argv, the installed kube-run's argv, a command of the SMALL closed data set (DATA_OPTIONS:
+echo, printf, cat, grep, which, test) with only its listed options and whose output does not reach a shell or
+interpreter, `command -v`, and substitutions classified recursively. man and git are not accepted. Anywhere else it is refused. This is not containment of arbitrary scripts or interpreters: commands
 absent from the text (script files, run-time names, earlier aliases) cannot be seen.
 
 Diagnostics are value-free. They give the client and the subcommand only when each is in the hook's fixed
@@ -181,17 +181,50 @@ RULES = {
     "H15": "a cluster client is named in a position the hook does not understand (only data-only commands may "
            "carry its name as text)",
 }
-# ACCEPTED DATA CONTEXTS. A client's name may appear as data only here, and only under these syntax conditions:
-# - DATA_ONLY commands: any argument or input. Each of these only reads or prints, and has no option that runs a
-#   program (rg --pre, sort --compress-program, less's ! commands and orca/gh text sent onward are why those are
-#   not listed);
-# - git, only with a GIT_TEXT_SUBCOMMANDS subcommand and no option before it (git -c alias.x='!cmd' runs code);
-# - and in every case only while the output does not reach code: a shell or interpreter reading the pipe, or an
-#   output process substitution >(...) (checked as a pipe receiver), is refused when the command names a client.
-# Anything else naming a client is refused (H15). A shell, interpreter or wrapper is never a data context.
-DATA_ONLY = {"echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "uniq", "cut", "tr", "tee",
-             "ls", "diff", "jq", "which", "type", "man", "whatis", "apropos", "test", "[", "true", "false", ":"}
-GIT_TEXT_SUBCOMMANDS = {"commit", "log", "show", "grep", "diff", "status", "blame"}
+# ACCEPTED DATA CONTEXTS: a SMALL CLOSED SET of inert forms. A client's name may appear as data only in these
+# commands, only with the options listed (no-value short letters, value-taking short letters, long options), and
+# only while the output does not reach code. A shell, eval, source or interpreter reading the pipe, or an output
+# process substitution >(...) (checked as a pipe receiver), is refused when the command names a client.
+# None of these runs a program named by an operand or an option: they print, read files or match text. Any other
+# command (man, git, less, sort, rg, gh, orca, ...), any option not listed, and any attached or clustered form
+# outside the table make the command unclassified, which is H15 when it names a client. man (its pager) and git
+# (configured hooks, pagers, diff drivers and textconv helpers that no flag reveals) are deliberately NOT
+# accepted: their full semantics are not modelled here. In a short cluster, a value letter ends it (the rest, or
+# the next word, is its value). "any" takes any token (test, [: they evaluate an expression and run nothing).
+DATA_OPTIONS = {
+    "echo": ("neE", "", set()),
+    "printf": ("", "", set()),
+    "cat": ("", "", set()),
+    "grep": ("rRnilcvwxEFo", "e", set()), "egrep": ("rRnilcvwxo", "e", set()), "fgrep": ("rRnilcvwxo", "e", set()),
+    "which": ("a", "", set()),
+    "test": "any", "[": "any", "true": "any", "false": "any", ":": "any",
+}
+DATA_ONLY = set(DATA_OPTIONS)
+
+
+def options_in_table(args, spec):
+    """True when every option in args is in `spec` (see DATA_OPTIONS); operands are free text."""
+    if spec == "any":
+        return True
+    bools, values, longs = spec
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return True
+        if a.startswith("--"):
+            if a.partition("=")[0] not in longs:
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in values:
+                    if k == len(a) - 1:
+                        i += 1          # the value is the next word
+                    break
+                if ch not in bools:
+                    return False
+        i += 1
+    return True
 
 class ParseError(Exception):
     pass
@@ -413,6 +446,11 @@ def simple_commands(s):
             continue
         cur["words"].append((t[1], t[2], t[3], t[4]))
     cmds.append(cur)
+    for c in cmds:
+        # The command's own source text, quotes included: a client named inside an attached option value
+        # (`-O'kubectl get ns'`) has no word boundary in the unquoted word, but does in the source.
+        ws = c["words"]
+        c["raw"] = s[ws[0][2]:ws[-1][3]] if ws else ""
     return [c for c in cmds if c["words"] or c["stdin"]]
 
 
@@ -601,11 +639,11 @@ class Guard:
             # Any other command. A data-only command (echo, grep, cat, git, ...) may carry a client's name as text.
             # Every other command naming a client, in an argument, a redirect target or its input, is a position
             # the hook does not understand, so it is refused (H15): only understood positions are allowed.
-            data = base in DATA_ONLY or (base == "git" and bool(args) and args[0] in GIT_TEXT_SUBCOMMANDS)
+            data = base in DATA_OPTIONS and options_in_table(args, DATA_OPTIONS[base])
             targets = cmd.get("redirect_targets", [])
             if any(t.startswith((">(", "<(")) for t in targets):
                 data = False     # a redirection into a process substitution feeds another program
-            if not data and any(mentions(t) for t in args + targets + cmd["stdin"]):
+            if not data and (any(mentions(t) for t in args + targets + cmd["stdin"]) or mentions(cmd.get("raw", ""))):
                 raise Refusal("H15")
             return
         p = parse_flags(args, VALUE_FLAGS[fam])
