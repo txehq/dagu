@@ -18,7 +18,8 @@ a context can be repointed inside its file. This directory holds the source of t
   Only then does it make the request, under B5 host custody. Diagnostics are stable codes with values
   withheld. The full contract is in its docstring.
   Authorization covers every part of a request that selects scope:
-  - every resource operand (`get pods/a secrets/b` is pods and secrets);
+  - every resource operand (`get pods/a secrets/b` is pods and secrets), including those after `--`;
+  - an attached or clustered `-s` (`-sURL`, `-its`) is a server override, refused like `--server`;
   - every true spelling of `--all-namespaces` and `-A`;
   - a `cp` operand that names its own namespace is refused;
   - `auth` and `rollout` are authorized with their subcommand (`auth can-i`, `rollout restart`), from an

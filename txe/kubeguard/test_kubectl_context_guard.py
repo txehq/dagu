@@ -110,7 +110,8 @@ H10_RESTS = ("txe-onprem-ci get pods", "txe-onprem-ci --", "Bad_Id -- get pods",
              "--registry /x txe-onprem-ci -- get pods", "$C -- get pods", "--bogus txe-onprem-ci -- get",
              "--timeout x txe-onprem-ci -- get pods", "--timeout txe-onprem-ci -- get pods")
 H11_EXTRAS = ("--context txe-prod", "--kubeconfig=/x", "--server https://x", "-s x", "--token=t",
-              "--as admin", "--insecure-skip-tls-verify", "--certificate-authority /x", "--kuberc=/x")
+              "--as admin", "--insecure-skip-tls-verify", "--certificate-authority /x", "--kuberc=/x",
+              "-shttps://x", "-its")
 
 
 class Refused(unittest.TestCase):
@@ -162,6 +163,11 @@ class Refused(unittest.TestCase):
     def test_hidden_command_words(self):
         for cmd in ("$K get pods", '"$KUBECTL" get pods', "${K} get pods", "$(which kubectl) get pods",
                     "`which kubectl` get pods", "$'\\x6bubectl' get pods"):
+            self.deny(cmd, "H02")
+        # A run-time command word followed by a cluster-only flag, or by a verb after leading options
+        # (connector review of 1e1e974c).
+        for cmd in ("$(printf kube%s ctl) --context production get secrets -A", '"$K" --kubeconfig /x get pods',
+                    "$K -n kube-system get pods", "$K --namespace=x describe pod y", "$K -A get pods"):
             self.deny(cmd, "H02")
         for cmd in ("K=kubectl; $K get pods", "K=/opt/homebrew/bin/kubectl", 'X="kubectl"; $X get ns'):
             self.deny(cmd, "H04")
@@ -280,6 +286,10 @@ class Allowed(unittest.TestCase):
                     "kustomize build kubernetes/x", "kustomize build --enable-helm kubernetes/x", "helm version",
                     "helm template x ./chart", "helm lint ./chart", "helm repo list", "flux version --client",
                     "flux install --export", "flux build artifact --path ./k", "oc version --client"):
+            self.allow(cmd)
+
+    def test_run_time_command_words_without_cluster_signs(self):
+        for cmd in ('"$PY" -m pip list', '"$PY" -c "print(1)"', "$EDITOR notes.md", '"$GO" test ./...'):
             self.allow(cmd)
 
     def test_unknown_wrapper_options_without_a_client(self):

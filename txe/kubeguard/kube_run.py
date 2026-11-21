@@ -156,8 +156,26 @@ FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
 KEY_VALUE_VERBS = {"label", "annotate"}
 
 
+# kubectl's short options that take a value. In a pflag shorthand cluster (`-it`, `-ojson`), every letter up to
+# the first of these is a boolean, and everything after it is that option's value.
+SHORT_VALUE_LETTERS = set("olfcnpkLvs")
+
+
+def short_cluster_has(arg, letter):
+    """True when the single-dash token `arg` sets the short option `letter` (`-sURL`, `-its`, `-s=URL`)."""
+    if not arg.startswith("-") or arg.startswith("--") or len(arg) < 2:
+        return False
+    for ch in arg[1:]:
+        if ch == letter:
+            return True
+        if ch in SHORT_VALUE_LETTERS or not ch.isalpha():
+            return False
+    return False
+
+
 def is_override(arg):
-    return any(arg == f or arg.startswith(f + "=") for f in OVERRIDE_FLAGS)
+    return (any(arg == f or arg.startswith(f + "=") for f in OVERRIDE_FLAGS)
+            or short_cluster_has(arg, "s"))
 
 
 def _types(operand):
@@ -181,6 +199,10 @@ def parse_request(args, default_namespace):
     while i < len(args):
         a = args[i]
         if a == "--":
+            # kubectl reads what follows `--` as operands. For a verb whose operands are resources, those are
+            # authorized too. For exec and the other fixed-resource verbs, they are the command run in the pod.
+            if pos and isinstance(VERBS.get(pos[0]), int):
+                pos.extend(args[i + 1:])
             break
         if a in NAMESPACE_FLAGS:
             if i + 1 >= len(args):

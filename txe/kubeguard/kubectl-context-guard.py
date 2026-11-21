@@ -495,9 +495,11 @@ class Guard:
         while words:
             w, fl = words[0]
             if "ansi" in fl or DYNAMIC.search(w):
-                first_arg = words[1][0] if len(words) > 1 else ""
-                if self.whole_mentions or first_arg in CLUSTER_VERBS:
-                    raise Refusal("H02", None, safe_sub(first_arg))
+                args = [x[0] for x in words[1:]]
+                operand = first_operand(args)
+                if (self.whole_mentions or operand in CLUSTER_VERBS
+                        or any(a in CLUSTER_FLAGS or a.split("=", 1)[0] in CLUSTER_FLAGS for a in args)):
+                    raise Refusal("H02", None, safe_sub(operand))
                 return
             base = os.path.basename(w)
             if base in WRAPPERS:
@@ -583,7 +585,7 @@ class Guard:
             raise Refusal("H10", "kube-run")
         kargs = args[i + 2:]
         verb = next((a for a in kargs if not a.startswith("-")), "")
-        if any(a == f or a.startswith(f + "=") for a in kargs for f in KUBE_RUN_OVERRIDES):
+        if any(a == f or a.startswith(f + "=") or short_cluster_has(a, "s") for a in kargs for f in KUBE_RUN_OVERRIDES):
             raise Refusal("H11", "kube-run", safe_sub(verb))
 
     def _take_assignments(self, words, env):
@@ -743,6 +745,39 @@ def deny(r, kube_run):
            "coordinator; do not rephrase the command to get past it.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": msg}}))
+
+
+# Long flags only a cluster client takes. A run-time command word followed by one of them is refused (H02), even
+# when the verb comes later (`$(printf kube%s ctl) --context prod get secrets`).
+CLUSTER_FLAGS = {"--context", "--kubeconfig", "--namespace", "--server", "--cluster", "--user", "--token", "--as",
+                 "--as-group", "--as-uid", "--certificate-authority", "--client-certificate", "--client-key",
+                 "--tls-server-name", "--insecure-skip-tls-verify", "--kuberc", "--all-namespaces",
+                 "--request-timeout", "--kube-context", "--kube-apiserver", "--kube-token", "--kube-as-user",
+                 "--kube-as-group", "--kube-ca-file", "--kube-tls-server-name"}
+# The same shorthand rule as kube_run.short_cluster_has: letters before the first value-taking option are
+# booleans, and the rest is its value.
+SHORT_VALUE_LETTERS = set("olfcnpkLvs")
+# Short options of a cluster client that take a separate value, skipped to find the first operand.
+SHORT_VALUED = {"-n", "-s", "-o", "-l", "-c", "-f", "-v", "-L", "-p", "-k"}
+
+
+def short_cluster_has(arg, letter):
+    if not arg.startswith("-") or arg.startswith("--") or len(arg) < 2:
+        return False
+    for ch in arg[1:]:
+        if ch == letter:
+            return True
+        if ch in SHORT_VALUE_LETTERS or not ch.isalpha():
+            return False
+    return False
+
+
+def first_operand(args):
+    """The first argument that is not an option or a short option's value (the would-be verb)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        i += 2 if args[i] in SHORT_VALUED or args[i] in CLUSTER_FLAGS else 1
+    return args[i] if i < len(args) else ""
 
 
 def command_texts(tool_input):

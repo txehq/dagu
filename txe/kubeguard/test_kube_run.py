@@ -478,6 +478,23 @@ class RequestScope(Base):
             self.refused_by_parser(["get", "pods", a])
         self.refused(["txe-onprem-ci", "--", "get", "pods", "--all-namespaces=TRUE"], "KR08")
 
+    def test_operands_after_the_terminator_are_authorized(self):
+        # kubectl reads operands after `--` too (connector review of 1e1e974c).
+        self.assertEqual(self.scope(["get", "pods/a", "--", "secrets/b"])["resources"], ["pods", "secrets"])
+        self.refused_by_parser(["get", "pods", "--", "secrets/b"])
+        self.refused_by_parser(["--", "get", "pods"])
+        r = self.scope(["exec", "pod-a", "--", "get", "secrets/b"])      # exec: the pod's own command
+        self.assertEqual((r["verb"], r["resources"]), ("exec", ["pods"]))
+        self.refused(["txe-onprem-ci", "--", "get", "pods/a", "-n", "arc-runners", "--", "secrets/b"], "KR08")
+
+    def test_an_attached_or_clustered_short_server_override_is_refused(self):
+        # pflag reads `-sURL` and the cluster `-its` (= -i -t -s) as --server (connector review of 1e1e974c).
+        for a in ("-shttps://other.example", "-s=https://x", "-its", "-ts"):
+            self.assertTrue(kr.is_override(a), a)
+        for a in ("-ojson", "-it", "-ojsonpath={.items[*].status}", "-v=5", "-lapp=s", "-A", "-w"):
+            self.assertFalse(kr.is_override(a), a)
+        self.refused(["txe-onprem-ci", "--", "get", "pods", "-shttps://other.example"], "KR04")
+
     def test_auth_and_rollout_carry_their_subcommand(self):
         r = self.scope(["auth", "can-i", "get", "pods"])
         self.assertEqual((r["verb"], r["resources"]), ("auth can-i", ["selfsubjectaccessreviews"]))
