@@ -74,6 +74,7 @@ FINDINGS = {
     "C12": "the checked argv escapes the function (returned or stored); its launch is not analysed",
     "C13": "the checked argv is never passed to a call after the check",
     "C14": "violations() is called but argv_guard is not imported in this file",
+    "C15": "the abort conditional has an else or elif branch (it runs after a passing check, unanalysed)",
 }
 EXEMPT_PROBLEMS = {
     "E01": "the row does not have exactly the registry's columns, or a column is empty or padded",
@@ -139,7 +140,13 @@ def _is_abort(stmt):
 
 
 def _mutates(node, name):
+    """True when node changes, or may change, the argv bound to `name`: rebinding, item assignment, deletion, an
+    in-place method, a loop or with target, or an ALIAS (`x = argv`, which a later `x.append` would change unseen).
+    A callee that mutates its argument is not visible to this heuristic (README)."""
     for n in ast.walk(node):
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and isinstance(n.value, ast.Name) and \
+                n.value.id == name:
+            return True
         if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
             for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
                 for x in ast.walk(t):
@@ -272,6 +279,8 @@ def _check_site(rel, assign, name, where, imports_guard, tree):
     if not (isinstance(u, ast.If) and isinstance(u.test, ast.Name) and u.test.id == result and u.body and
             _is_abort(u.body[0])):
         return out + [Finding(rel, t.lineno, "C05")]
+    if u.orelse:      # an else/elif runs after a PASSING check, outside the analysed path: refused, whatever it holds
+        out.append(Finding(rel, u.lineno, "C15"))
     after = rest[first + 2:]
     if any(_mutates(st, name) for st in after):
         out.append(Finding(rel, u.lineno, "C06"))

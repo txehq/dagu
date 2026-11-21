@@ -102,7 +102,7 @@ class Refused(unittest.TestCase):
     def test_every_mutation_after_the_check_fails(self):
         for change in ('argv.append("--privileged")', 'argv += ["-v", "/:/h"]', 'argv[1] = "run"',
                        'argv = argv + ["x"]', "del argv[2]", 'argv.insert(1, "-v")', "argv.extend([])",
-                       "for argv in [[]]: pass"):
+                       "for argv in [[]]: pass", 'alias = argv\n    alias.append("--privileged")'):
             with self.subTest(change):
                 src = GOOD.replace("    subprocess.run(argv, check=True)", f"    {change}\n    subprocess.run(argv, check=True)")
                 self.assertIn("C06", codes(src), change)
@@ -113,6 +113,15 @@ class Refused(unittest.TestCase):
                 self.assertIn("C05", codes(GOOD.replace('raise SystemExit("refused")', body)))
         self.assertIn("C05", codes(GOOD.replace("if bad:", "if not bad:")))
         self.assertIn("C05", codes(GOOD.replace("    if bad:\n        raise SystemExit(\"refused\")\n", "")))
+
+    def test_an_else_or_elif_on_the_abort_fails(self):
+        """PR 299 review (P2): an else branch runs after a PASSING check and was not inspected."""
+        tail = '        raise SystemExit("refused")\n'
+        for label, branch in (("else-mutation", '    else:\n        argv.insert(1, "--privileged")\n'),
+                              ("else-harmless", "    else:\n        pass\n"),
+                              ("elif", "    elif schema:\n        pass\n")):
+            with self.subTest(label):
+                self.assertIn("C15", codes(GOOD.replace(tail, tail + branch)), label)
 
     def test_using_the_argv_before_its_check_fails(self):
         src = f"""

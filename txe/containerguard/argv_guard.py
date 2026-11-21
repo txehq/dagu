@@ -53,6 +53,10 @@ DENIED_OPTIONS = frozenset({
 })
 FLOOR_SINGLE = {"--network": "none", "--pull": "never", "--cap-drop": "ALL", "--security-opt": "no-new-privileges"}
 FLOOR_FLAGS = frozenset({"--read-only"})
+# The kind each policy-bearing option MUST have, so the floor's checks cannot be skipped by declaring an option in
+# another kind (a --mount in `single` would bypass every mount rule). An option outside these sets may be any one kind.
+REPEATED_KIND = frozenset({"--mount", "--env", "--label", "--tmpfs"})
+SINGLE_KIND = frozenset(FLOOR_SINGLE) | frozenset({"--user"})
 # Runtime and kernel trees that no mount may come from or go onto.
 SYSTEM_TREES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/etc", "/boot")
 SOCKET_NAMES = ("docker.sock", "containerd.sock", "podman.sock")
@@ -69,7 +73,7 @@ CODES = {
     "S01": "the work dir is not an absolute, normalised path strictly inside scratch",
     "S02": "a floor option is missing from the schema or has another value",
     "S03": "a floor flag is missing from the schema",
-    "S04": "the schema names a denied option, or an option in two kinds",
+    "S04": "the schema names a denied option, an option in two kinds, or a policy option in the wrong kind",
     "S05": "a mount in the schema is not a canonical bind mount",
     "S06": "a mount source is not strictly inside the work dir",
     "S07": "a mount target is not absolute and normalised, is the root, or lies in a system tree",
@@ -195,8 +199,11 @@ def check_schema(s):
     kinds = [set(s.flags), set(s.single), set(s.repeated)]
     for opt in sorted(set().union(*kinds)):
         if opt.split("=", 1)[0] in DENIED_OPTIONS or opt in DENIED_OPTIONS or "=" in opt or \
-                sum(opt in k for k in kinds) != 1 or not opt.startswith("-"):
-            bad.append(Violation("S04", _say(opt, set(DENIED_OPTIONS) | set(FLOOR_SINGLE))))
+                sum(opt in k for k in kinds) != 1 or not opt.startswith("-") or \
+                (opt in REPEATED_KIND and opt not in s.repeated) or (opt in SINGLE_KIND and opt not in s.single) or \
+                (opt in FLOOR_FLAGS and opt not in s.flags):
+            bad.append(Violation("S04", _say(opt, set(DENIED_OPTIONS) | set(FLOOR_SINGLE) | REPEATED_KIND |
+                                             SINGLE_KIND | FLOOR_FLAGS)))
     if "--user" not in s.single or s.single["--user"].split(":", 1)[0] in ROOT_USERS + ("",):
         bad.append(Violation("S13", "--user"))     # absent means the image's user, root for most images
     if not IMMUTABLE_IMAGE.fullmatch(s.image):

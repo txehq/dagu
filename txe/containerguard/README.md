@@ -40,7 +40,10 @@ launch(argv)
 - `--network none`, `--pull never`, `--cap-drop ALL`, `--security-opt no-new-privileges` and `--read-only` are fixed;
 - the user is set and is not root;
 - the image is a digest;
-- env and label keys are well formed and unique, with credential-named env keys refused.
+- env and label keys are well formed and unique, with credential-named env keys refused;
+- each policy option has exactly one kind: `--mount`, `--env`, `--label` and `--tmpfs` are repeated; `--network`,
+  `--pull`, `--cap-drop`, `--security-opt` and `--user` are single; `--read-only` is a flag. Declaring one in another
+  kind would skip its rules, so it is refused.
 
 **A value's text does not prove it holds no secret.** What makes the env safe is that it must equal the reviewed
 schema, which is source.
@@ -73,15 +76,16 @@ the same file whose result is assigned.
 ```python
 argv = …                       # the docker list, or builder(...)
 bad = violations(argv, schema) # argv_guard's, on the SAME name, result kept
-if bad:
+if bad:                         # no else or elif
     raise … / return … / sys.exit(…)
-… launch(argv) …               # argv never reassigned, extended, item-set or deleted after the check
+… launch(argv) …               # argv never reassigned, extended, item-set, deleted or aliased after the check
 ```
 
-**Everything else is a finding** (codes `C01`–`C14`), and ambiguity fails for review. That includes:
+**Everything else is a finding** (codes `C01`–`C15`), and ambiguity fails for review. That includes:
 - an ignored result;
 - a different argv checked;
-- use before the check, or a change after it;
+- use before the check, or a change after it, including an alias (`x = argv`);
+- an `else` or `elif` on the abort (it runs after a passing check);
 - an inline or dynamic list;
 - a builder used inline, or never called in its file (cross-module use is not analysed);
 - a check inside a branch;
@@ -90,7 +94,9 @@ if bad:
 - a shell `docker run/create`;
 - an unparsable file.
 
-Importing `violations` and calling it somewhere is NOT accepted as proof that the launched argv was validated.
+Importing `violations` and calling it somewhere is NOT accepted as proof that the launched argv was validated. The
+heuristic also cannot see a callee that changes its argument in place (for example `extend_args(argv)` after the
+check). Reviewers still read the launch path.
 
 ### Launchers that do not use the guard (`UNGUARDED.tsv`)
 

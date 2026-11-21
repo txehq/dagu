@@ -286,6 +286,46 @@ class PolicyFloor(unittest.TestCase):
                 self.assertIn(code, got, (label, got))
                 self.assertNotEqual(G.violations(argv(), s), [], label)
 
+    def test_a_policy_option_in_the_wrong_kind_is_refused(self):
+        """PR 299 review (P2): a --mount in `single` skipped every mount rule. Each policy option has one kind."""
+        s0 = schema()
+
+        def moved(opt, to, value):
+            rep = {k: v for k, v in s0.repeated.items() if k != opt}
+            single = {k: v for k, v in s0.single.items() if k != opt}
+            flags = set(s0.flags) - {opt}
+            if to == "single":
+                single[opt] = value
+            elif to == "repeated":
+                rep[opt] = (value,)
+            else:
+                flags.add(opt)
+            return dataclasses.replace(s0, single=single, repeated=rep, flags=frozenset(flags))
+        cases = [
+            ("mount-in-single", moved("--mount", "single", "type=bind,source=/,target=/host")),
+            ("env-in-single", moved("--env", "single", "GH_TOKEN=x")),
+            ("label-in-single", moved("--label", "single", "txe.run=x")),
+            ("tmpfs-in-single", moved("--tmpfs", "single", "/proc:rw")),
+            ("mount-in-flags", moved("--mount", "flags", None)),
+            ("user-in-repeated", moved("--user", "repeated", "0:0")),
+            ("network-in-repeated", moved("--network", "repeated", "host")),
+            ("read-only-in-single", moved("--read-only", "single", "true")),
+        ]
+        for label, s in cases:
+            with self.subTest(label):
+                self.assertIn("S04", codes(G.check_schema(s)), label)
+
+    def test_the_review_repro_mount_in_single_is_refused_by_schema_and_argv(self):
+        s0 = schema()
+        s = dataclasses.replace(s0, repeated={k: v for k, v in s0.repeated.items() if k != "--mount"},
+                                single={**s0.single, "--mount": "type=bind,source=/,target=/host"})
+        a = [x for x in argv() if not x.startswith("type=bind,")]
+        a = [x for i, x in enumerate(a) if not (x == "--mount")]
+        j = a.index("--entrypoint")
+        a[j:j] = ["--mount", "type=bind,source=/,target=/host"]
+        self.assertIn("S04", codes(G.check_schema(s)))
+        self.assertNotEqual(G.violations(a, s), [])
+
     def test_a_writable_mount_is_allowed_only_at_a_declared_target(self):
         s = schema_mount(f"type=bind,source={W}/cache,target=/cache")
         self.assertIn("S09", codes(G.check_schema(s)))
