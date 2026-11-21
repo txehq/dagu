@@ -684,8 +684,10 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open
     - Each (st_dev, st_ino) is counted once across ALL roots, so hard links and overlapping paths never count twice.
     - Bounds: a shared wall-clock bound, a per-root entry bound, and WALK_MAX_DEPTH levels. Exceeding any of them
       fails that root. One descriptor is open per level.
-    Limit: the path components ABOVE the root are resolved normally. The claim path is bound to its reservation id,
-    but its parent directories must not be writable by the reservation."""
+    Limit, and no protection is claimed for it: O_NOFOLLOW applies to the final component only. The path components
+    ABOVE the root are resolved normally (following symlinks), so an ancestor changed before the walk redirects the
+    whole walk undetected. The inventory only checks that the path NAMES its reservation; the root directory's identity
+    is not bound. Its parent directories must not be writable by the reservation."""
     seen, out = set(), {}
     start = monotonic()
 
@@ -769,27 +771,39 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open
 
 
 def _statfs(path):
-    """(st_dev, free bytes for an unprivileged writer) of a path or its nearest existing ancestor."""
+    """(st_dev, free bytes for an unprivileged writer, filesystem id) of a path or its nearest existing ancestor. The
+    filesystem id (statvfs f_fsid) lets the second sample detect a filesystem change behind an unchanged st_dev."""
     p = path
     while not os.path.exists(p) and p != "/":
         p = os.path.dirname(p)
     vfs = os.statvfs(p)
-    return os.stat(p).st_dev, vfs.f_bavail * vfs.f_frsize
+    return os.stat(p).st_dev, vfs.f_bavail * vfs.f_frsize, getattr(vfs, "f_fsid", None)
 
 
 def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
     """Per device the new run uses: N_disk + sum of running reservations' remaining claims + pending claims + floor,
     against free space. Returns ({"devices": [...], "other_device_claims": [...]}, failures). A claim on a device the
-    new run does not use is recorded in other_device_claims and not charged."""
-    failures, devices, other = [], {}, []
+    new run does not use is recorded in other_device_claims and not charged.
+
+    Free space is sampled TWICE per budget path: before the walks and again after them. A device's free(d) is the
+    smaller of the two. A block a running reservation allocates during its walk is counted in used(r), and it is
+    also out of the second sample, so it is never both deducted from that reservation's remaining claim and still
+    counted as free. A block freed during the walk only lowers used(r), which is conservative, and the min() never
+    credits it. A failed second sample (D03), or a path whose device or filesystem id changed between the samples
+    (D04), fails that disk check closed.
+    What the two samples do NOT do: they reserve no capacity, and a writer may still allocate after the second
+    sample. This is not an atomic admission snapshot; the inventory and concurrent-writer limits still apply."""
+    failures, devices, other, first_dev = [], {}, [], {}
     for d in budget.disk:
         try:
-            dev, free = statfs(d.path)
+            dev, free, fsid = statfs(d.path)
         except OSError:
             failures.append(Failure("disk", "missing", "D01", "statvfs failed for a budget path"))
             continue
-        e = devices.setdefault(dev, {"st_dev": dev, "paths": [], "free": free, "N_disk": 0, "left": {}, "P_disk": {},
-                                     "walks": []})
+        first_dev[d.path] = (dev, fsid)
+        e = devices.setdefault(dev, {"st_dev": dev, "paths": [], "free_before": free, "N_disk": 0, "left": {},
+                                     "P_disk": {}, "walks": []})
+        e["free_before"] = min(e["free_before"], free)
         e["paths"].append(d.path)
         e["N_disk"] += d.need_bytes
     if failures:
@@ -821,9 +835,25 @@ def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
                 other.append({"reservation": r.id, "path": p, "state": "pending", "cap": cap})
             for t in targets:
                 devices[t]["P_disk"][f"{r.id}:{p}"] = cap
+    # The second free-space sample, AFTER every walk (see the docstring).
+    for d in budget.disk:
+        try:
+            dev2, free2, fsid2 = statfs(d.path)
+        except OSError:
+            failures.append(Failure("disk", "missing", "D03", "the second statvfs, after the walks, failed"))
+            continue
+        if (dev2, fsid2) != first_dev[d.path]:
+            failures.append(Failure("disk", "unreadable", "D04",
+                                    "a budget path changed device or filesystem between the samples"))
+            continue
+        e = devices[dev2]
+        e["free_after"] = min(e.get("free_after", free2), free2)
+    if failures:
+        return {"devices": [], "other_device_claims": other}, failures
     out = []
     for dev in sorted(devices):
         e = devices[dev]
+        e["free"] = min(e["free_before"], e["free_after"])
         e["F_disk"] = policy["disk_floor_bytes"]
         e["charged"] = e["N_disk"] + sum(e["left"].values()) + sum(e["P_disk"].values()) + e["F_disk"]
         e["headroom"] = e["free"] - e["charged"]

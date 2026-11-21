@@ -155,7 +155,7 @@ class World:
         return rc, text.encode("utf-8") if isinstance(text, str) else text, b""
 
     def statfs(self, path):
-        return 7, self.free[7]
+        return 7, self.free[7], 1
 
     def stat_fn(self, path):
         return SimpleNamespace(st_dev=7)
@@ -769,6 +769,73 @@ class Walk(unittest.TestCase):
             os.makedirs(claim)
         out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("claim", swap))
         self.assertEqual(out[("c", claim)], (None, ["identity_changed"]))
+
+
+class DiskSampling(unittest.TestCase):
+    """Free space is sampled before AND after the walks, and the smaller sample is used (review finding on 6d7e229f)."""
+
+    def world(self, before, after):
+        w = World(self)
+        calls = []
+
+        def statfs(path):
+            calls.append(path)
+            return 7, (before if len(calls) <= len(w.budget["disk"]) else after), 1
+        w.statfs = statfs
+        return w, calls
+
+    def test_blocks_written_during_the_walk_are_not_counted_as_free(self):
+        # The reviewer's example: 50 GiB free before; r1's 16 GiB claim fills during the walk, so the walk sees
+        # used = 16 GiB (left 0) and only 34 GiB is free after. 19 + 0 + 16 + 2 = 37 GiB fits 50 but not 34.
+        w, calls = self.world(50 * GIB, 34 * GIB)
+        w.walk = {("r1-running", "/w/r1-running"): (16 * GIB, [])}
+        v = w.go()
+        self.assertEqual(v.exit_code, 75)
+        self.assertEqual(len(calls), 4)                                  # 2 budget paths x 2 samples
+        self.assertIn(("disk", "insufficient"), w.kinds())
+        dev = w.receipt()["accounting"]["disk"]["devices"][0]
+        self.assertEqual((dev["free_before"], dev["free_after"], dev["free"], dev["charged"]),
+                         (50 * GIB, 34 * GIB, 34 * GIB, 37 * GIB))
+
+    def test_the_smaller_sample_is_used_and_both_are_recorded(self):
+        w, _ = self.world(50 * GIB, 60 * GIB)                            # space freed during the walk is not credited
+        self.assertTrue(w.go().admit)
+        dev = w.receipt()["accounting"]["disk"]["devices"][0]
+        self.assertEqual((dev["free_before"], dev["free_after"], dev["free"]), (50 * GIB, 60 * GIB, 50 * GIB))
+
+    def test_a_failed_or_moved_second_sample_fails_closed(self):
+        w = World(self)
+        calls = []
+
+        def fails_second(path):
+            calls.append(path)
+            if len(calls) > 2:
+                raise OSError("gone")
+            return 7, FREE_S, 1
+        w.statfs = fails_second
+        v = w.go()
+        self.assertEqual(v.exit_code, 75)
+        self.assertEqual({f.code for f in v.failures if f.reading == "disk"}, {"D03"})
+        w = World(self)
+        calls2 = []
+
+        def moves(path):
+            calls2.append(path)
+            return (7 if len(calls2) <= 2 else 8), FREE_S, 1
+        w.statfs = moves
+        v = w.go()
+        self.assertEqual(v.exit_code, 75)
+        self.assertEqual({f.code for f in v.failures if f.reading == "disk"}, {"D04"})
+        w = World(self)
+        calls3 = []
+
+        def remounted(path):                                     # same st_dev, a different filesystem id
+            calls3.append(path)
+            return 7, FREE_S, (1 if len(calls3) <= 2 else 2)
+        w.statfs = remounted
+        v = w.go()
+        self.assertEqual(v.exit_code, 75)
+        self.assertEqual({f.code for f in v.failures if f.reading == "disk"}, {"D04"})
 
 
 class ReservedId(unittest.TestCase):

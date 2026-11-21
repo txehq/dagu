@@ -46,7 +46,11 @@ converted with exact decimal arithmetic and **rounded up**.
 - **The snapshot must agree:** ContainersRunning = #ps = #stats, with the ps id set equal to the stats id set (else
   exit 74, `inconsistent`), and the inspect id set equal to the ps id set (else exit 79, `inconsistent`).
 - `free(d)`: `statvfs` free space for an unprivileged writer, on each device `d` the run's paths use (or their nearest
-  existing ancestor's device).
+  existing ancestor's device). It is sampled before AND after the walks, and `free(d)` is the smaller sample. A block a
+  running reservation writes during its walk is then never both deducted from its remaining claim and counted as
+  free. A failed second sample (D03), or a path whose device or filesystem id changed (D04), fails the disk check
+  closed (75). **The two samples reserve no capacity:** a writer may still allocate after the second sample, so this
+  is not an atomic admission snapshot, and the inventory and concurrent-writer limits still apply.
 
 **Inventory** (§4.2). A running or pending reservation `r` has:
 - its total caps `cap_mem(r)` and `cap_cpu(r)`;
@@ -133,13 +137,19 @@ charged_disk(d) = N_disk(d) + Σ_{r running, p on d} left(r, p) + Σ_{p ∈ Pend
 ```
 
 **The walk** (D1). `used(r, p)` comes from a bounded `lstat` walk of the claim's path:
-- **The path is bound to the reservation's identity:** one of its components is the reservation id. Otherwise the
-  inventory refuses (78, N14).
+- **The path NAMES its reservation:** one of its components is the reservation id, or the inventory refuses (78,
+  N14). This is a name check only. **The root directory's identity is NOT bound:** nothing records which directory
+  the coordinator meant.
 - **The walk works on directory descriptors, because the claim tree may be written while it is walked** (the
   `txe/mutate` `dir_usage` pattern). The root, and each directory below it, is opened with `O_NOFOLLOW`, each child
   relative to its parent's descriptor. Each opened directory's `(st_dev, st_ino)` must equal the `lstat` taken when it
-  was listed. A directory swapped for a symlink (`open_refused`) or replaced (`identity_changed`) fails closed. The
-  path components above the root are resolved normally, so they must not be writable by the reservation.
+  was listed. A directory swapped for a symlink (`open_refused`) or replaced (`identity_changed`) fails closed.
+- **What `O_NOFOLLOW` does NOT give.** It applies to the final component only.
+  - Every component ABOVE the root is resolved normally, following symlinks, by both the `lstat` and the `open`.
+  - An ancestor changed before the walk starts redirects both calls consistently. The walk then measures whatever
+    tree the path now names, undetected; a swap between the `lstat` and the `open` is caught as `identity_changed`.
+  - So no protection is claimed for the path prefix. Its parent directories must not be writable by the reservation,
+    and binding the root's `(st_dev, st_ino)` in the inventory is a pending contract decision.
 - **The root must be a real directory, not a symlink.**
   - Symlinks below the root are never followed or counted.
   - A FIFO, socket or device file fails the walk.
