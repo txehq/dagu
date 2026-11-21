@@ -298,6 +298,17 @@ class Refused(unittest.TestCase):
                     f"mapfile -t PATH < f; {kr()}", f"let X=1; {kr()}", f"getopts ab PATH; {kr()}", f"foo; {kr()}",
                     f"python3 x.py; {kr()}", f"eval true; {kr()}", f"bash -c 'read PATH'; {kr()}"):
             self.deny(cmd, "H16", "kube-run")
+        # cc3's review of ec45aaa5 and root's narrowing: `set` is neutral only with a closed option list;
+        # assignment expansions and unsupported syntax are refused; no external command, wrapper or non-kubectl
+        # local form is neutral; neither is a shell given a script, nor an output redirection to a file.
+        for cmd in (f"set -k; {kr('txe-onprem-ci -- get pods PATH=/tmp/bin')}", f"set -o keyword; {kr()}",
+                    f"set -a; {kr()}", kr("txe-onprem-ci -- get pods PATH=/tmp/bin"),
+                    f"echo ${{PYTHONPATH:=/tmp/x}}; {kr()}", f"echo ${{X=1}}; {kr()}", f"echo $((PATH=5)); {kr()}",
+                    f"((X=1)); {kr()}", f'echo "${{NS}}"; {kr()}', f"[[ -n x ]] && {kr()}", f"f() {{ true; }}; {kr()}",
+                    f"for i in 1; do true; done; {kr()}", f"date; {kr()}", f"kustomize build x; {kr()}",
+                    f"helm version; {kr()}", f"timeout 5 true; {kr()}", f"command -v kubectl; {kr()}",
+                    f"bash x.sh; {kr()}", f"echo x > /tmp/f; {kr()}", f"{kr()} > out.txt"):
+            self.deny(cmd, "H16", "kube-run")
         # The widened assignment forms get the H04 check on their value too.
         for cmd in ("X+=kubectl", "a[1]=kubectl", "K[0]+=kubectl true"):
             self.deny(cmd, "H04")
@@ -428,7 +439,9 @@ class Allowed(unittest.TestCase):
         for cmd in tuple(kr(rest) for rest in ALLOWED_RESTS) + (
                 f"bash -c '{kr()}'", f"kubectl config current-context; {kr()}",
                 kr('txe-onprem-ci -- get pods -n "$NS"'), f"cd /tmp && {kr()}", f"if {kr()}; then echo ok; fi",
-                f"{kr()} | grep Running", f"set -euo pipefail; {kr()}"):
+                f"{kr()} | grep Running", f"set -euo pipefail; {kr()}", f"set -e; {kr()}", f"set +x; {kr()}",
+                f"{kr()} 2>&1 | grep Running", f"{kr()} 2>/dev/null", kr("txe-onprem-ci -- get pods -l app=web"),
+                kr("txe-onprem-ci -- get pods -o jsonpath={.items}")):
             self.allow(cmd)
 
     def test_local_commands(self):

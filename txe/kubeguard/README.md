@@ -65,14 +65,26 @@ a context can be repointed inside its file. This directory holds the source of t
     depth, is in a SMALL CLOSED SET of environment-neutral commands, with no assignment of any form (`NAME=`,
     `NAME+=`, `NAME[i]=`) (H16). The set is:
     - the data set above, used as data;
-    - `[ ... ]`, `cd` and `set`;
-    - a client's local forms and `kustomize`;
-    - `command -v`;
-    - a shell running checked text in a child process.
-    Anything else is refused. That includes `export`, `read`, `printf -v`, `mapfile`, `let`, `getopts`, `eval`,
-    `source`, interpreters and unknown commands. It is an allowlist, because any environment change could choose
-    the interpreter of kube-run's `#!/usr/bin/env python3`, and the builtins that make one cannot be enumerated
-    safely;
+    - `[ ... ]` and `cd`;
+    - `set` with only `-e`, `-u`, `-x` (and `+`, clustered as in `-euo pipefail`) and `-o`/`+o` `pipefail`,
+      `errexit`, `nounset` or `xtrace`;
+    - a kubectl-family client's local forms;
+    - a shell in `-c` mode, whose text is held to this same set;
+    - keyword structure (`if`/`then`/`fi`, `while`/`do`/`done`, `!`, `{ }`, `( )`).
+  - Anything else is refused. That includes:
+    - every other external command or builtin, known or unknown: `export`, `read`, `printf -v`, `mapfile`,
+      `let`, `getopts`, `eval`, `source`, interpreters, `helm`/`flux`/`kustomize` local forms, every wrapper
+      (`command -v` included), `time`, and `set -k`/`-o keyword`/`-a`;
+    - a shell given a script file;
+    - an output redirection to anything but `/dev/null` or an fd duplicate (`2>&1`);
+    - an upper-case assignment-shaped kube-run argument (`PATH=/tmp/bin`), which an inherited keyword mode
+      would move into kube-run's environment.
+  - Syntax H16 does not model is refused in such a line: `${...}` (its `:=` and `=` forms assign), `$((..))`,
+    `((..))`, `$[..]`, `[[ ]]`, a function definition `name()`, and `for`/`select`/`case`/`function`.
+  - It is an allowlist because any environment change could choose the interpreter of kube-run's
+    `#!/usr/bin/env python3`, and the builtins that make one cannot be enumerated safely. It holds the text of
+    the line to this set. It is not proof of a trusted pre-existing environment: that is the installation
+    contract below;
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
     always checked as a program;
   - local version, help, config-read and kustomize commands pass.
@@ -170,9 +182,9 @@ These are deployment prerequisites, not things the hook proves. It does not guar
 command: it refuses the ones it can see that it does not understand.
 
 H16 also refuses legitimate lines. Examples are setting a variable for a kube-run call (`NS=arc-runners;
-kube-run ... -n "$NS"`), wrapping it (`timeout 60 kube-run ...`), and combining it with any command outside the
-neutral set (`date; kube-run ...`). Pass values literally, use kube-run's own `--timeout`, and run other commands
-in a separate tool call.
+kube-run ... -n "$NS"`), wrapping it (`timeout 60 kube-run ...`), combining it with any command outside the
+neutral set (`date; kube-run ...`), writing its output to a file (`kube-run ... > out.txt`), and `"${NS}"`. Pass
+values literally, use kube-run's own `--timeout`, pipe to `grep`, and run other commands in a separate tool call.
 
 **Installation contract for kube-run (a prerequisite of any install; nothing here installs it):** the installed
 kube-run must start through an ABSOLUTE, pinned interpreter in isolated mode. For example, it can be a small

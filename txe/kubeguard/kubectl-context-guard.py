@@ -18,9 +18,10 @@ and checks the kube-system UID at contact. This hook only makes sure that kube-r
     when kube-run is the installed path (H09), its own arguments are well formed (H10), and the kubectl
     arguments carry no target, identity or TLS override (H11). It must be the BARE command word, not wrapped
     (`env`, `sudo`, `timeout`, `time`, ...), in a line whose every other command, at any depth, is in a small
-    closed set of environment-neutral commands, with no assignment (H16; see ENV_NEUTRAL). Anything else
-    (`export`, `read`, `printf -v`, `mapfile`, `let`, an unknown command) could choose the interpreter of its
-    `env python3` shebang.
+    closed set of environment-neutral commands, with no assignment and no syntax H16 does not model (H16; see
+    ENV_NEUTRAL and UNSUPPORTED_WITH_KUBE_RUN). Anything else (`export`, `read`, `printf -v`, `mapfile`, `let`,
+    `set -k`, `${X:=v}`, an unknown command) could choose the interpreter of its `env python3` shebang. The hook
+    holds the line's TEXT to that set; it is not proof of a trusted pre-existing environment.
     An install starts kube-run through an absolute pinned interpreter in isolated mode; the shebang is for running
     it from source (see the README's installation contract). kube-run repeats every check at run time,
     on the arguments it actually receives. kube-run is read-only, and refuses every mutating, interactive or
@@ -174,20 +175,65 @@ OPTIONAL_VALUE = {
     "xargs": {"-i", "--replace", "-e", "--eof", "-l", "--max-lines"},
 }
 DURATION_WRAPPERS = {"timeout", "gtimeout"}
-# H16 is an ALLOWLIST, not a denylist. kube-run's `#!/usr/bin/env python3` lets the environment choose its
+# H16 is a NARROW ALLOWLIST, not a denylist. kube-run's `#!/usr/bin/env python3` lets the environment choose its
 # interpreter, and many builtins change it (export, read, printf -v, mapfile, let, getopts, ...). So a line holding
-# an installed kube-run may contain, at any depth, ONLY environment-neutral commands. Those are:
-# - the small closed data set, run as data (DATA_OPTIONS with its listed options; `printf -v` is not);
-# - `[ ... ]`;
-# - a client's local forms; kustomize;
-# - `command -v`/`-V`;
-# - the wrappers' and keywords' structure;
-# - a shell running checked text in a CHILD process, which cannot change this shell's environment;
-# - and the commands in ENV_NEUTRAL below.
-# Any assignment, any other command (unknown ones included), a run-time command word, eval, source, an
-# interpreter or an opaque executor makes the line unsafe, and its kube-run is refused.
-# `set` is neutral: `set -a` only exports later assignments, and every assignment makes the line unsafe anyway.
+# an installed kube-run may contain, at any depth, ONLY these environment-neutral commands:
+#   1. the small closed data set, run as data (DATA_OPTIONS with its listed options only; `printf -v` is not);
+#   2. `[ ... ]` with its closing `]`;
+#   3. `cd`, and `set` with ONLY the options in SET_NEUTRAL (`set -k`/`-o keyword` moves an assignment word
+#      anywhere in a later command into its environment, and `set -a` exports: both are refused);
+#   4. a kubectl-family client's LOCAL forms as classify() models them (version --client, help, config reads...);
+#   5. `bash -c '<text>'` (any shell in -c mode), whose text is checked recursively and held to this same set;
+#   6. keyword structure: if/then/else/elif/fi, while/until/do/done, `!`, `{ }` and `( )` grouping;
+#   7. the installed kube-run itself, bare.
+# Everything else marks the line, and its kube-run is refused. That covers:
+# - any assignment of any form (NAME=, NAME+=, NAME[i]=), at any depth, including inside $(..), backticks and
+#   ( ) subshells;
+# - every other command, external or builtin, known or unknown, including helm/flux/kustomize local forms,
+#   kubectl config writes, wrappers (env, sudo, timeout, command, watch, xargs, nohup, ...) and time/coproc;
+# - eval, source and `.`, interpreters and opaque executors;
+# - a run-time command word;
+# - a shell given a script file or only standard input;
+# - an output redirection to anything but /dev/null or an fd duplicate (`2>&1`).
+# Syntax the hook does not model is refused in such a line too: see UNSUPPORTED_WITH_KUBE_RUN.
 ENV_NEUTRAL = {"cd", "set"}
+# `set` is neutral only with these: a cluster of e/u/x after - or +, or -o/+o with one of the named options.
+SET_NEUTRAL_LETTERS = set("eux")
+SET_NEUTRAL_NAMED = {"pipefail", "errexit", "nounset", "xtrace"}
+
+
+def set_is_neutral(args):
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-o", "+o"):
+            if i + 1 >= len(args) or args[i + 1] not in SET_NEUTRAL_NAMED:
+                return False
+            i += 2
+            continue
+        if len(a) < 2 or a[0] not in "-+" or not set(a[1:]) <= SET_NEUTRAL_LETTERS:
+            # `-euo pipefail`: a cluster ending in o takes the next word as its option name
+            if len(a) > 2 and a[0] in "-+" and a[-1] == "o" and set(a[1:-1]) <= SET_NEUTRAL_LETTERS:
+                if i + 1 >= len(args) or args[i + 1] not in SET_NEUTRAL_NAMED:
+                    return False
+                i += 2
+                continue
+            return False
+        i += 1
+    return True
+
+
+WRITE_REDIRECTS = {">", ">>", ">|", "&>", ">&", "<>"}
+# An assignment-shaped kube-run argument with a shell-environment-style (upper-case) name. Under an inherited
+# keyword mode (`set -k` via an exported SHELLOPTS) bash would move it into kube-run's environment.
+ENV_STYLE_ASSIGN = re.compile(r"^[A-Z_][A-Z0-9_]*(?:\[[^\]]*\])?\+?=")
+# Syntax H16 does not model, refused anywhere in a line holding an installed kube-run:
+# - parameter expansion `${...}` (its `${X:=v}` and `${X=v}` forms assign);
+# - arithmetic `$((..))`, `((..))` and `$[..]` (they can assign);
+# - `[[ ]]`;
+# - a function definition `name()`;
+# - for/select/case/function (a loop variable is an assignment).
+UNSUPPORTED_WITH_KUBE_RUN = re.compile(r"\$\{|\$\(\(|\(\(|\$\[|\[\[|\(\s*\)|(?:^|[\s;&|(])(?:for|select|case|function)(?=\s)")
 # An assignment word: NAME=v, NAME+=v, NAME[i]=v and NAME[i]+=v.
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=(.*)$", re.S)
 DYNAMIC = re.compile(r"[$`*?\[]")
@@ -463,7 +509,7 @@ def simple_commands(s):
                 # A pipe edge is kept: the next command READS what the previous one writes.
                 cur = {"words": [], "stdin": [], "piped": op in ("|", "|&")}
             elif op in REDIRECTS:
-                skip_next = True
+                skip_next = op            # the next word is this redirection's target
             elif op == "<<<":
                 herestr = True
             continue
@@ -471,8 +517,9 @@ def simple_commands(s):
             cur["stdin"].append(bodies[t[1]])
             continue
         if skip_next:
-            skip_next = False
             cur.setdefault("redirect_targets", []).append(t[1])
+            cur.setdefault("redirects", []).append((skip_next, t[1]))     # (operator, target), for H16
+            skip_next = False
             continue
         if herestr:
             herestr = False
@@ -574,7 +621,7 @@ class Guard:
                 span = (ws[0][2], ws[-1][3]) if ws else (0, 0)
                 r.where = (k, len(cmds), span)
                 raise
-        if self.kube_run_at is not None and self.env_changed:
+        if self.kube_run_at is not None and (self.env_changed or UNSUPPORTED_WITH_KUBE_RUN.search(text)):
             # One Bash event is one shell: an assignment or export anywhere in it (`PATH=/tmp/bin; kube-run ...`,
             # `export PATH=...`) reaches kube-run's `env python3` lookup, in whichever order the hook saw them.
             r = Refusal("H16", "kube-run")
@@ -628,8 +675,13 @@ class Guard:
         words = [(w[0], w[1]) for w in cmd["words"]]
         env = {}
         wrapped = False           # H16: kube-run must be the bare command word, not run through a wrapper
+        # H16: an output redirection to anything but /dev/null or an fd duplicate (`2>&1`) is not neutral.
+        if any(op in WRITE_REDIRECTS and not (t == "/dev/null" or (op == ">&" and (t.isdigit() or t == "-")))
+               for op, t in cmd.get("redirects", [])):
+            self.env_changed = True
         while words and words[0][0] in KEYWORDS:
-            wrapped = wrapped or words[0][0] in ("time", "coproc")
+            if words[0][0] in ("time", "coproc"):
+                wrapped = self.env_changed = True        # H16: time/coproc are not neutral structure
             words.pop(0)
         words = self._take_assignments(words, env)
         while words:
@@ -653,12 +705,13 @@ class Guard:
                 return
             base = os.path.basename(w)
             if base in WRAPPERS:
-                wrapped = True
+                wrapped = self.env_changed = True        # H16: no wrapper is neutral (command -v included)
                 words = self._unwrap(base, words[1:], env, depth)
                 if words is None:
                     return
                 continue
             if base in VENDOR_WRAPPERS and len(words) > 1 and os.path.basename(words[1][0]) == "kubectl":
+                self.env_changed = True                  # H16: a vendor wrapper is an external command
                 rest = words[2:]
                 words = [("kubectl", set())] + (rest[1:] if rest and rest[0][0] == "--" else rest)
                 continue
@@ -701,6 +754,7 @@ class Guard:
         if base == "gcloud" and {"container", "clusters", "get-credentials"} <= set(args):
             raise Refusal("H06", "gcloud")
         if base in LOCAL_ONLY:
+            self.env_changed = True           # H16: an external command, not in the neutral set
             return
         if base in KUBE_RUN_NAMES:
             return self._kube_run(w, args, prefixed=bool(env) or wrapped)
@@ -713,7 +767,7 @@ class Guard:
             targets = cmd.get("redirect_targets", [])
             if any(t.startswith((">(", "<(")) for t in targets):
                 data = False     # a redirection into a process substitution feeds another program
-            if not data and base not in ENV_NEUTRAL:
+            if not data and not (base == "cd" or (base == "set" and set_is_neutral(args))):
                 self.env_changed = True       # H16: any other command, unknown ones included, is not neutral
             if not data and (any(mentions(t) for t in args + targets + cmd["stdin"]) or mentions(cmd.get("raw", ""))):
                 raise Refusal("H15")
@@ -721,6 +775,8 @@ class Guard:
         p = parse_flags(args, VALUE_FLAGS[fam])
         kind = classify(fam, p)
         sub = safe_sub(p["pos"][0]) if p["pos"] else "-"
+        if not (fam == "kubectl" and kind == "local"):
+            self.env_changed = True           # H16: only a kubectl-family LOCAL form is neutral
         if kind == "local":
             return
         if kind == "secret-print":
@@ -746,6 +802,9 @@ class Guard:
         if prefixed:
             # An assignment prefix or a wrapper (`PATH=/tmp/bin kube-run`, `env PATH=... kube-run`, `timeout 60
             # kube-run`) can choose the interpreter kube-run's `env python3` shebang runs: refused, not enumerated.
+            raise Refusal("H16", "kube-run")
+        if any(ENV_STYLE_ASSIGN.match(a) for a in args):
+            # Defence in depth against an inherited keyword mode: `kube-run c -- get pods PATH=/tmp/bin`.
             raise Refusal("H16", "kube-run")
         if self.kube_run_at is None:
             self.kube_run_at = self._top_k
@@ -848,6 +907,8 @@ class Guard:
             break
         if c_mode and i < len(args):
             self.check_text(args[i], depth + 1)
+        else:
+            self.env_changed = True           # H16: a shell given a script file or only stdin is not neutral
         for text in cmd["stdin"]:
             self.check_text(text, depth + 1)
 
