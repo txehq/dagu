@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "txe.runbudget/v1",
+  "title": "txe.runbudget/v1: one container run's declared caps (TXE-8043)",
+  "description": "Documentation and a test oracle. runbudget.py is the reference validator; it additionally refuses duplicate JSON keys, NaN/Infinity, and integers given as floats or bools. Frozen once merged: any change is a new schema string.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "reservation_id", "owner", "containers", "time", "disk", "policy"],
+  "properties": {
+    "schema": {"const": "txe.runbudget/v1"},
+    "reservation_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$"},
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ticket", "session", "grant"],
+      "properties": {
+        "ticket": {"type": "string", "pattern": "^TXE-[1-9][0-9]*$"},
+        "session": {"type": "string", "pattern": "^cc[0-9]*-[a-z0-9][a-z0-9._-]{0,63}$"},
+        "grant": {"type": "string", "pattern": "^msg_[0-9a-f]{12}$"}
+      }
+    },
+    "containers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["concurrent", "cpus_milli", "memory_bytes"],
+      "properties": {
+        "concurrent": {"type": "integer", "minimum": 1},
+        "cpus_milli": {"type": "integer", "minimum": 1, "description": "per container; docker --cpus 1.5 is 1500"},
+        "memory_bytes": {"type": "integer", "minimum": 1, "description": "per container; docker --memory 4g is 4294967296"}
+      }
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_bound_s", "kill_after_s", "cleanup_reserve_s"],
+      "properties": {
+        "run_bound_s": {"type": "integer", "minimum": 1},
+        "kill_after_s": {"type": "integer", "minimum": 0},
+        "cleanup_reserve_s": {"type": "integer", "minimum": 0}
+      }
+    },
+    "disk": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "need_bytes"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^/", "description": "absolute and normalised; unique in the list"},
+          "need_bytes": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host_pressure_free_min_pct": {"type": "integer", "minimum": 0, "maximum": 100},
+        "vm_reserve_bytes": {"type": "integer", "minimum": 0},
+        "vm_cpu_reserve_milli": {"type": "integer", "minimum": 0},
+        "disk_floor_bytes": {"type": "integer", "minimum": 0},
+        "inventory_max_validity_s": {"type": "integer", "minimum": 1},
+        "disk_walk_max_s": {"type": "integer", "minimum": 1},
+        "disk_walk_max_entries": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}
