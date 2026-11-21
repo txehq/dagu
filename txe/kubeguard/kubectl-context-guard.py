@@ -29,7 +29,9 @@ It fails closed. A client reached through something the hook cannot see into is 
 at run time (H02); a client inside python -c, ssh, find -exec, docker and the like (H03); an assignment or
 alias whose value is a client (H04); text it cannot read that names a client (H05); nesting too deep (H12).
 sh/bash/zsh -c, eval, here-documents and here-strings fed to a shell, $(...), backticks and <(...) are parsed
-recursively, and wrappers (timeout, env, xargs, watch, sudo, nice, nohup, ...) are unwrapped.
+recursively, and wrappers (timeout, env, xargs, watch, sudo, nice, nohup, ...) are unwrapped. A wrapper option
+the hook does not know may take a value, so it cannot tell which word is the command: when a cluster client
+follows it, the command is refused (H03).
 
 Diagnostics are value-free. They give the client and the subcommand only when each is in the hook's fixed
 lists, a stable rule id, and the location as a simple-command index with a character span. The span is
@@ -119,14 +121,33 @@ OPAQUE = {"ssh", "find", "parallel", "su", "script", "expect", "tmux", "screen",
           "chroot", "flock", "rsudo", "osascript", "alias", "trap", "nix-shell", "devbox", "make", "just",
           "launchctl", "at", "crontab", "open"}
 INTERPRETERS = re.compile(r"^(python[\d.]*|node|nodejs|deno|bun|perl|ruby|php|lua|tclsh|Rscript|osascript)$")
+# wrapper -> its options that take a separate value.
 WRAPPERS = {
     "env": {"-u", "--unset", "-C", "--chdir", "-P", "-S", "--split-string"},
     "command": set(), "exec": {"-a"}, "builtin": set(), "nohup": set(), "time": set(),
     "nice": {"-n", "--adjustment"}, "caffeinate": {"-t", "-w"}, "stdbuf": {"-i", "-o", "-e"},
-    "unbuffer": set(), "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t", "-T", "--user", "--group"},
+    "unbuffer": set(),
+    "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t", "-T", "--user", "--group", "--prompt",
+             "--close-from", "--chdir", "--role", "--type", "--other-user", "--host", "--command-timeout"},
     "doas": {"-u", "-C"}, "watch": {"-n", "--interval", "-d"},
-    "xargs": {"-I", "-i", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-procs"},
+    "xargs": {"-I", "-i", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-procs", "--max-args", "--max-lines",
+              "--delimiter", "--arg-file", "--replace", "--max-chars"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"}, "gtimeout": {"-s", "--signal", "-k", "--kill-after"},
+}
+# wrapper -> its options known to take NO value. Any option in neither set may take one, so the word after it
+# cannot be placed: if what follows names a cluster client, the command is refused (H03), never guessed.
+WRAPPER_FLAGS = {
+    "env": {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"},
+    "command": {"-p"}, "exec": {"-c", "-l"},
+    "sudo": {"-A", "-B", "-b", "-E", "-e", "-H", "-i", "-K", "-k", "-l", "-n", "-P", "-S", "-s", "-V", "-v",
+             "--askpass", "--background", "--preserve-env", "--set-home", "--login", "--remove-timestamp",
+             "--reset-timestamp", "--non-interactive", "--preserve-groups", "--stdin", "--shell"},
+    "doas": {"-n", "-s"}, "caffeinate": {"-d", "-i", "-m", "-s", "-u"}, "unbuffer": {"-p"},
+    "watch": {"-t", "--no-title", "-e", "--errexit", "-g", "--chgexit", "-b", "--beep", "-c", "--color", "-x",
+              "--exec", "-p", "--precise"},
+    "xargs": {"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-p", "--interactive", "-x", "--exit"},
+    "timeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
+    "gtimeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
 }
 DURATION_WRAPPERS = {"timeout", "gtimeout"}
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
@@ -589,7 +610,16 @@ class Guard:
                 return None
             if not a.startswith("-") or a == "-":
                 break
-            rest = rest[2:] if a in valued else rest[1:]
+            if a in valued:
+                rest = rest[2:]
+            elif (a.startswith("--") and "=" in a) or a in WRAPPER_FLAGS.get(base, set()):
+                rest = rest[1:]
+            else:
+                # An option this hook does not know may take the next word as its value, so the command word
+                # cannot be placed. Fail closed when a cluster client follows anywhere in the rest.
+                if any(mentions(w[0]) for w in rest[1:]):
+                    raise Refusal("H03")
+                rest = rest[1:]
         if base in DURATION_WRAPPERS and rest:
             rest = rest[1:]
         if base in ("env", "sudo", "doas"):

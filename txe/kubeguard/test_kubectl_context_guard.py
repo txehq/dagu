@@ -149,6 +149,16 @@ class Refused(unittest.TestCase):
                     "kubectl version --client # note\nkubectl get pods", "echo '#'; kubectl get pods"):
             self.deny(cmd, "H01", "kubectl")
 
+    def test_wrapper_options_that_take_a_value_or_are_unknown(self):
+        # Connector review of PR 298: `sudo --prompt password kubectl ...` was read as running `password`.
+        for cmd in ("sudo --prompt password kubectl get pods", "sudo --prompt=x kubectl get pods",
+                    "sudo -E kubectl get pods", "sudo --user root kubectl get pods",
+                    "xargs --max-args 1 kubectl get < f", "timeout --preserve-status 30 kubectl get pods"):
+            self.deny(cmd, "H01", "kubectl")
+        for cmd in ("sudo --frobnicate x kubectl get pods", "env --frob kubectl get pods",
+                    "timeout --frob 30 kubectl get pods", "xargs --frob kubectl get", "nice -z kubectl get pods"):
+            self.deny(cmd, "H03")
+
     def test_hidden_command_words(self):
         for cmd in ("$K get pods", '"$KUBECTL" get pods', "${K} get pods", "$(which kubectl) get pods",
                     "`which kubectl` get pods", "$'\\x6bubectl' get pods"):
@@ -270,6 +280,10 @@ class Allowed(unittest.TestCase):
                     "kustomize build kubernetes/x", "kustomize build --enable-helm kubernetes/x", "helm version",
                     "helm template x ./chart", "helm lint ./chart", "helm repo list", "flux version --client",
                     "flux install --export", "flux build artifact --path ./k", "oc version --client"):
+            self.allow(cmd)
+
+    def test_unknown_wrapper_options_without_a_client(self):
+        for cmd in ("sudo --frobnicate ls", "env --frob true", f"timeout --preserve-status 60 {kr()}"):
             self.allow(cmd)
 
     def test_text_that_only_mentions_a_client(self):

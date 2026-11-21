@@ -16,7 +16,10 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     or change the target, the identity or TLS (--kubeconfig, --context, --server/-s, --cluster, --user,
     --token, --as*, --username, --password, --certificate-authority, --client-*, --tls-server-name,
     --insecure-skip-tls-verify, --kuberc) are refused. The verb, resources and namespace are read from the
-    arguments. A plugin, an unknown verb or an ambiguous flag is refused.
+    arguments. A plugin, an unknown verb or an ambiguous flag is refused. Every resource operand counts
+    (`get pods/a secrets/b` is pods AND secrets), every true spelling of --all-namespaces/-A means all
+    namespaces, a `cp` operand naming its own namespace is refused, and auth and rollout carry their
+    subcommand ("auth can-i", "rollout restart") so a record grants exactly the operation it names.
  2. REGISTRY. The entry for the id gives the pinned kubeconfig path, context, server URL, CA SHA-256 and
     kube-system Namespace UID. The registry path is fixed (~/.coding_global/kube-clusters.json); the CLI
     cannot point it elsewhere.
@@ -135,14 +138,37 @@ VERBS = {
     "get": 1, "describe": 1, "delete": 1, "edit": None, "patch": 1, "label": 1, "annotate": 1, "scale": 1,
     "wait": 1, "apply": "<files>", "create": "<files>", "replace": "<files>", "diff": "<files>",
     "rollout": 2, "top": 1, "logs": "pods", "exec": "pods", "cp": "pods", "attach": "pods",
-    "port-forward": "pods", "events": "events", "auth": "selfsubjectaccessreviews",
+    "port-forward": "pods", "events": "events", "auth": "<subcommand>",
     "api-resources": "<discovery>", "api-versions": "<discovery>", "explain": "<discovery>",
     "version": "<discovery>", "cluster-info": "<discovery>",
 }
+# Verbs whose subcommand is part of the operation. The request's verb is "<verb> <subcommand>", so an
+# authorization record grants exactly the operations it names ("auth can-i" never grants "auth reconcile", and
+# "rollout status" never grants "rollout restart"). A subcommand not listed here is refused.
+SUBCOMMANDS = {
+    "auth": {"can-i": ["selfsubjectaccessreviews"], "whoami": ["selfsubjectreviews"]},
+    "rollout": {s: None for s in ("status", "history", "restart", "undo", "pause", "resume")},
+}
+# pflag's boolean spellings (strconv.ParseBool), for --all-namespaces=<value> and -A=<value>.
+TRUE_WORDS = {"1", "t", "T", "TRUE", "true", "True"}
+FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
+# Operands of these verbs that are labels or annotations (key=value, key-), not resources.
+KEY_VALUE_VERBS = {"label", "annotate"}
 
 
 def is_override(arg):
     return any(arg == f or arg.startswith(f + "=") for f in OVERRIDE_FLAGS)
+
+
+def _types(operand):
+    """The resource types in one operand: `pods`, `pods,secrets`, `pods/a` or `deploy/x`, lower-cased."""
+    types = []
+    for part in operand.split(","):
+        r = part.split("/", 1)[0].strip().lower()
+        if not r:
+            raise Refused("KR05", "an empty resource name")
+        types.append(r)
+    return types
 
 
 def parse_request(args, default_namespace):
@@ -166,8 +192,14 @@ def parse_request(args, default_namespace):
             namespaces.append(a.partition("=")[2])
         elif a.startswith("-n") and a != "-n" and not a.startswith("--"):
             raise Refused("KR05", "an attached short namespace flag is not accepted; use -n <namespace>")
-        elif a in ALL_NS_FLAGS or a in ("--all-namespaces=true",):
+        elif a in ALL_NS_FLAGS:
             all_ns = True
+        elif a.startswith("--all-namespaces=") or a.startswith("-A="):
+            value = a.partition("=")[2]
+            if value in TRUE_WORDS:
+                all_ns = True
+            elif value not in FALSE_WORDS:
+                raise Refused("KR05", "an all-namespaces flag has a value that is not a boolean")
         elif a in VALUE_FLAGS:
             i += 1
         elif a.startswith("--") and "=" in a:
@@ -188,17 +220,43 @@ def parse_request(args, default_namespace):
     how = VERBS[verb]
     if how is None:
         raise Refused("KR05", "interactive verbs are not supported")
+    resources = None   # never a default: an empty list would pass every scope check
+    if verb in SUBCOMMANDS:
+        if len(pos) < 2 or (unknown_at is not None and unknown_at <= 1) or pos[1] not in SUBCOMMANDS[verb]:
+            raise Refused("KR05", "the subcommand is missing or is not one kube-run supports for this verb")
+        fixed = SUBCOMMANDS[verb][pos[1]]
+        verb = f"{verb} {pos[1]}"
+        if fixed is not None:
+            how = None
+            resources = list(fixed)
     if isinstance(how, int):
         if len(pos) <= how or (unknown_at is not None and unknown_at <= how):
             raise Refused("KR05", "the resource cannot be read from the arguments unambiguously")
-        resources = []
-        for part in pos[how].split(","):
-            r = part.split("/", 1)[0].strip().lower()
-            if not r:
-                raise Refused("KR05", "an empty resource name")
-            resources.append(r)
-    else:
+        resources = _types(pos[how])
+        # Every further operand is authorized too. After TYPE/NAME, each one must be TYPE/NAME as well (kubectl
+        # accepts `get pods/a secrets/b`). After a bare type, each one is a NAME, and an operand carrying a type
+        # cannot be placed, so it is refused.
+        typed = "/" in pos[how]
+        for extra in pos[how + 1:]:
+            if verb in KEY_VALUE_VERBS and ("=" in extra or extra.endswith("-")):
+                continue
+            if typed:
+                if "/" not in extra:
+                    raise Refused("KR05", "a TYPE/NAME list contains an operand without a type")
+                resources += [r for r in _types(extra) if r not in resources]
+            elif "/" in extra:
+                raise Refused("KR05", "an operand names a resource type after a bare type; name every operand as "
+                                      "TYPE/NAME, or one type and its names")
+    elif isinstance(how, str):
         resources = [how]
+    if not resources:
+        raise Refused("KR05", "the request's resources could not be determined")
+    if verb == "cp":
+        # kubectl cp takes [<namespace>/]<pod>:<path>; a namespace there bypasses -n, so it is refused.
+        for operand in pos[1:]:
+            head, sep, _ = operand.partition(":")
+            if sep and "/" in head:
+                raise Refused("KR05", "a cp operand names its own namespace; use -n <namespace> instead")
     if len(set(namespaces)) > 1:
         raise Refused("KR05", "more than one namespace is named")
     if all_ns and namespaces:

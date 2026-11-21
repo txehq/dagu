@@ -432,6 +432,71 @@ class Arguments(Base):
         self.assertIn("[KR19 ", e)
 
 
+class RequestScope(Base):
+    """Every part of a request that selects a resource, a namespace or an operation is authorized (connector
+    review of PR 298: multi-resource operands, cp's embedded namespace, all-namespaces spellings, auth and
+    rollout subcommands)."""
+
+    def scope(self, args, default="ctx-ns"):
+        return kr.parse_request(args, default)
+
+    def refused_by_parser(self, args):
+        with self.assertRaises(kr.Refused) as cm:
+            self.scope(args)
+        self.assertEqual(cm.exception.code, "KR05", args)
+
+    def test_every_resource_operand_is_authorized(self):
+        self.assertEqual(self.scope(["get", "pods/a", "secrets/b"])["resources"], ["pods", "secrets"])
+        self.assertEqual(self.scope(["get", "rc/web", "service/frontend", "pods/web-1"])["resources"],
+                         ["rc", "service", "pods"])
+        self.assertEqual(self.scope(["get", "pods", "a", "b"])["resources"], ["pods"])
+        self.refused_by_parser(["get", "pods", "a", "secrets/b"])     # a typed operand after a bare type
+        self.refused_by_parser(["get", "pods/a", "b"])                # a bare name inside a TYPE/NAME list
+        # End to end: a record for pods does not cover a secrets operand, and nothing is contacted.
+        self.refused(["txe-onprem-ci", "--", "get", "pods/a", "secrets/b", "-n", "arc-runners"], "KR08")
+        rc, _, e, t = call(["txe-onprem-ci", "--", "get", "pods/a", "pods/b", "-n", "arc-runners"])
+        self.assertEqual((rc, len(t.calls)), (0, 2), e)
+
+    def test_label_and_annotation_values_are_not_resources(self):
+        self.assertEqual(self.scope(["label", "pods", "a", "app.kubernetes.io/name=x", "team-"])["resources"],
+                         ["pods"])
+        self.assertEqual(self.scope(["annotate", "pods/a", "pods/b", "note=a/b"])["resources"], ["pods"])
+
+    def test_a_cp_operand_naming_its_own_namespace_is_refused(self):
+        self.refused_by_parser(["cp", "kube-system/pod-a:/etc/private", "/tmp/local-copy"])
+        self.refused_by_parser(["cp", "/tmp/local", "kube-system/pod-a:/tmp/x"])
+        r = self.scope(["cp", "pod-a:/etc/x", "/tmp/y", "-n", "arc-runners"])
+        self.assertEqual((r["resources"], r["namespace"]), (["pods"], "arc-runners"))
+
+    def test_every_true_spelling_of_all_namespaces(self):
+        for a in ("-A", "--all-namespaces", "--all-namespaces=true", "--all-namespaces=TRUE", "--all-namespaces=True",
+                  "--all-namespaces=1", "--all-namespaces=t", "--all-namespaces=T", "-A=true", "-A=1"):
+            self.assertEqual(self.scope(["get", "pods", a])["namespace"], "*", a)
+        for a in ("--all-namespaces=false", "--all-namespaces=0", "--all-namespaces=F", "-A=False"):
+            self.assertEqual(self.scope(["get", "pods", a])["namespace"], "ctx-ns", a)
+        for a in ("--all-namespaces=yes", "--all-namespaces=", "-A=on"):
+            self.refused_by_parser(["get", "pods", a])
+        self.refused(["txe-onprem-ci", "--", "get", "pods", "--all-namespaces=TRUE"], "KR08")
+
+    def test_auth_and_rollout_carry_their_subcommand(self):
+        r = self.scope(["auth", "can-i", "get", "pods"])
+        self.assertEqual((r["verb"], r["resources"]), ("auth can-i", ["selfsubjectaccessreviews"]))
+        r = self.scope(["auth", "whoami"])
+        self.assertEqual((r["verb"], r["resources"]), ("auth whoami", ["selfsubjectreviews"]))
+        r = self.scope(["rollout", "restart", "deploy/x"])
+        self.assertEqual((r["verb"], r["resources"]), ("rollout restart", ["deploy"]))
+        for args in (["auth", "reconcile", "-f", "rbac.yaml"], ["auth"], ["auth", "--bogus", "can-i"],
+                     ["rollout", "frobnicate", "deploy/x"], ["rollout"]):
+            self.refused_by_parser(args)
+        # End to end: a record granting "auth can-i" covers it, and never "auth reconcile".
+        F.write_record(verbs=["auth can-i"], resources=["selfsubjectaccessreviews"])
+        rc, _, e, t = call(["txe-onprem-ci", "--", "auth", "can-i", "get", "pods"])
+        self.assertEqual((rc, len(t.calls)), (0, 2), e)
+        self.refused(["txe-onprem-ci", "--", "auth", "reconcile", "-f", "rbac.yaml"], "KR05")
+        F.write_record(verbs=["rollout status"], resources=["deploy"])
+        self.refused(["txe-onprem-ci", "--", "rollout", "restart", "deploy/x"], "KR08")
+
+
 class ValueFreeDiagnostics(Base):
     def test_no_value_from_the_command_or_files_appears_in_a_refusal(self):
         S = "SENTINELVALUE7d1"
