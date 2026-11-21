@@ -55,6 +55,17 @@ a context can be repointed inside its file. This directory holds the source of t
     `printf`, `cat`, `grep`, `which`, `test`) with its listed options only. Anywhere else it is refused (H15). An interpreter's code, arguments or input
     naming a client, and a shell or interpreter reading a pipe while the command names a client, are refused
     as H03. `watch` without `--exec` runs its words as shell text, and they are checked as such;
+  - wrapper options follow per-wrapper arity tables. An option whose value is optional and attached only
+    (`watch -d`/`--differences`, GNU `xargs -i`/`--replace`, `-e`/`--eof`, `-l`/`--max-lines`) consumes no
+    word, and its attached short form (`-d1`, `-ifoo`) is unsupported: unknown, so refused when a client
+    follows. A word consumed as a REQUIRED value never names a client (`watch -n kubectl ...` is H03), so a
+    wrong table entry fails closed;
+  - the installed kube-run is accepted only as a BARE command word, in a line that changes no environment
+    (H16). Any assignment (`PATH=/tmp/bin kube-run ...`, `PATH=...; kube-run ...`), `export`, `declare`,
+    `typeset`, `local`, `readonly`, `unset`, `alias`, `hash`, `enable`, `shopt`, `source` or `.`,
+    anywhere in the line and at any depth, and any wrapper before kube-run (`env`, `sudo`, `timeout`, `nohup`,
+    `command`, `time`, ...), is refused. Variables are not enumerated: any change could choose the interpreter
+    of kube-run's `#!/usr/bin/env python3`;
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
     always checked as a program;
   - local version, help, config-read and kustomize commands pass.
@@ -150,6 +161,18 @@ name at run time. Its classification also ASSUMES things it cannot see:
   setting).
 These are deployment prerequisites, not things the hook proves. It does not guard every way a shell can execute a
 command: it refuses the ones it can see that it does not understand.
+
+H16 also refuses legitimate lines that set a variable for a kube-run call (`NS=arc-runners; kube-run ... -n
+"$NS"`) or wrap it (`timeout 60 kube-run ...`). Pass values literally, and use kube-run's own `--timeout`.
+
+**Installation contract for kube-run (a prerequisite of any install; nothing here installs it):** the installed
+kube-run must start through an ABSOLUTE, pinned interpreter in isolated mode. For example, it can be a small
+launcher at the installed path that execs `<absolute python3.13> -I -B <absolute kube_run.py> "$@"`. The
+`#!/usr/bin/env python3` shebang is for running it from source. Through `env`, it lets the caller's `PATH` choose
+the interpreter, and a program posing as Python would receive kube-run's full argv before any check. H16 keeps
+the hook from accepting a line that changes that environment. But the hook cannot see an environment the agent's
+shell already inherited, which is why the pinned interpreter is the install's job. Relative entries in an inherited
+`PATH` (which `cd` would then change) are excluded by the same contract.
 
 ## Platform and syscall constraints
 

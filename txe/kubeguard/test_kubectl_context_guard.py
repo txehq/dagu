@@ -260,6 +260,38 @@ class Refused(unittest.TestCase):
                     "echo 'kubectl get ns' | xargs -I{} sh -c '{}'", "printf 'kubectl' | python3 -"):
             self.deny(cmd, "H03")
 
+    def test_wrapper_options_with_an_optional_value_and_consumed_values(self):
+        # Connector review of 7441b7b6: `watch -d` was read as taking the next word, so the whole command was
+        # dropped before watch's sh -c check. GNU getopt `x::` options (watch -d/--differences, xargs -i/--replace,
+        # -e/--eof, -l) take an OPTIONAL value that can only be attached: the bare form consumes nothing.
+        for cmd in ("watch -d 'kubectl get secrets'", "watch --differences 'kubectl get ns'",
+                    "watch --differences=1 'kubectl get ns'", "watch -d -n 5 'kubectl get ns'"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+        for cmd in ("echo ns | xargs -i kubectl get", "echo ns | xargs --replace kubectl get {}",
+                    "xargs -l kubectl get < f", "xargs --max-lines kubectl get < f", "xargs -e kubectl get < f"):
+            self.deny(cmd, "H01", "kubectl")
+        # An attached optional value is not modelled: unknown, so it fails closed when a client follows.
+        for cmd in ("watch -d1 kubectl get ns", "xargs -ifoo kubectl get foo"):
+            self.deny(cmd, "H03")
+        # A word consumed as a REQUIRED value never names a client: refused, not skipped (a wrong arity entry
+        # then fails closed).
+        for cmd in ("watch -n kubectl ls", "timeout -s kubectl 5 ls", "xargs -I kubectl echo x", "sudo -u kubectl ls"):
+            self.deny(cmd, "H03")
+
+    def test_kube_run_runs_bare_with_no_environment_change(self):
+        # Connector security review of 7441b7b6: `PATH=/tmp/bin <kube-run>` let the environment choose the
+        # interpreter of kube-run's `env python3` shebang. The class rule: the installed kube-run is accepted only
+        # as a bare command word, in a line that changes no environment (an assignment, export, source, ...) at any
+        # depth and in any order. Variables are not enumerated.
+        for cmd in (f"PATH=/tmp/bin {kr()}", f"PYTHONPATH=/tmp/x {kr()}", f"env PATH=/tmp/bin {kr()}",
+                    f"env -i {kr()}", f"timeout 60 {kr()}", f"timeout --preserve-status 60 {kr()}", f"sudo {kr()}",
+                    f"nohup {kr()}", f"command {kr()}", f"time {kr()}", f"PATH=/tmp/bin; {kr()}",
+                    f"export PATH=/tmp/bin; {kr()}", f"{kr()}; export X=1", f"source ./env.sh && {kr()}",
+                    f"PATH=/tmp/bin bash -c '{kr()}'", f"bash -c 'X=1; {kr()}'", f"declare -x PATH=/tmp/bin; {kr()}",
+                    f"set -a; X=1; {kr()}", f"hash -p /tmp/py python3; {kr()}", f"unset PATH; {kr()}"):
+            self.deny(cmd, "H16", "kube-run")
+
     def test_a_client_named_where_the_hook_does_not_understand_it_is_refused(self):
         # Class rule (H15): outside the positions the hook classifies (a client's own argv, kube-run, local
         # forms) and outside data-only commands, a client's name is refused rather than guessed about.
@@ -382,9 +414,11 @@ class Allowed(unittest.TestCase):
         self.assertIsNone(decision, f"{cmd!r} -> {reason}")
 
     def test_the_installed_kube_run(self):
+        # Bare only (H16): a wrapper or an environment change before kube-run is refused; see Refused.
         for cmd in tuple(kr(rest) for rest in ALLOWED_RESTS) + (
-                f"timeout 60 {kr()}", f"bash -c '{kr()}'", f"kubectl config current-context; {kr()}",
-                kr('txe-onprem-ci -- get pods -n "$NS"')):
+                f"bash -c '{kr()}'", f"kubectl config current-context; {kr()}",
+                kr('txe-onprem-ci -- get pods -n "$NS"'), f"cd /tmp && {kr()}", f"if {kr()}; then echo ok; fi",
+                f"{kr()} | grep Running", f"set -euo pipefail; {kr()}"):
             self.allow(cmd)
 
     def test_local_commands(self):
@@ -419,7 +453,9 @@ class Allowed(unittest.TestCase):
             self.allow(cmd)
 
     def test_unknown_wrapper_options_without_a_client(self):
-        for cmd in ("sudo --frobnicate ls", "env --frob true", f"timeout --preserve-status 60 {kr()}"):
+        for cmd in ("sudo --frobnicate ls", "env --frob true", "timeout --preserve-status 60 date",
+                    "watch -d date", "watch --differences=1 date", "watch -d -n 5 date", "echo a | xargs -i echo {}",
+                    "echo a | xargs --replace echo {}"):
             self.allow(cmd)
 
     def test_text_that_only_mentions_a_client(self):

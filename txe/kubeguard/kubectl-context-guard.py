@@ -16,7 +16,11 @@ and checks the kube-system UID at contact. This hook only makes sure that kube-r
     another rule, is a decision for any install plan.
   - `<installed kube-run> [--authorization F] [--timeout N] <cluster-id> -- <kubectl args>` is let through
     when kube-run is the installed path (H09), its own arguments are well formed (H10), and the kubectl
-    arguments carry no target, identity or TLS override (H11). kube-run repeats every check at run time,
+    arguments carry no target, identity or TLS override (H11). It must be the BARE command word, in a line that
+    changes no environment at any depth (H16): an assignment, `export`/`declare`/`unset`/`source`/`hash`/..., or a
+    wrapper (`env`, `sudo`, `timeout`, `time`, ...) could choose the interpreter of its `env python3` shebang.
+    An install starts kube-run through an absolute pinned interpreter in isolated mode; the shebang is for running
+    it from source (see the README's installation contract). kube-run repeats every check at run time,
     on the arguments it actually receives. kube-run is read-only, and refuses every mutating, interactive or
     tunnelling verb itself.
   - Local commands need nothing: kubectl version --client, help/--help/-h, completion, options, plugin list,
@@ -139,9 +143,9 @@ WRAPPERS = {
     "unbuffer": set(),
     "sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-U", "-r", "-t", "-T", "--user", "--group", "--prompt",
              "--close-from", "--chdir", "--role", "--type", "--other-user", "--host", "--command-timeout"},
-    "doas": {"-u", "-C"}, "watch": {"-n", "--interval", "-d"},
-    "xargs": {"-I", "-i", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-procs", "--max-args", "--max-lines",
-              "--delimiter", "--arg-file", "--replace", "--max-chars"},
+    "doas": {"-u", "-C"}, "watch": {"-n", "--interval"},
+    "xargs": {"-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a", "--max-procs", "--max-args",
+              "--delimiter", "--arg-file", "--max-chars"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"}, "gtimeout": {"-s", "--signal", "-k", "--kill-after"},
 }
 # wrapper -> its options known to take NO value. Any option in neither set may take one, so the word after it
@@ -159,7 +163,21 @@ WRAPPER_FLAGS = {
     "timeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
     "gtimeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
 }
+# wrapper -> its options whose value is OPTIONAL and can only be attached (GNU getopt `x::`): the bare form takes
+# NO value, so the next word is never consumed (`watch -d 'kubectl get secrets'` runs the quoted command). An
+# attached short form (`-d1`, `-ifoo`) is not modelled and is treated as unknown (fail closed); `--long=value`
+# takes nothing from the next word.
+OPTIONAL_VALUE = {
+    "watch": {"-d", "--differences"},
+    "xargs": {"-i", "--replace", "-e", "--eof", "-l", "--max-lines"},
+}
 DURATION_WRAPPERS = {"timeout", "gtimeout"}
+# Shell builtins that change the environment or the command lookup of the rest of the line. kube-run's
+# `#!/usr/bin/env python3` lets the environment choose its interpreter, so with one of these (or any assignment)
+# anywhere in the line, an installed kube-run invocation is refused (H16).
+# `set` is not listed: `set -a` only exports later assignments, and every assignment is already counted.
+ENV_BUILTINS = {"export", "declare", "typeset", "local", "readonly", "unset", "alias", "unalias", "hash",
+                "enable", "shopt", "source", "."}
 ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
 DYNAMIC = re.compile(r"[$`*?\[]")
 
@@ -180,6 +198,8 @@ RULES = {
     "H14": "this tool or event shape is not one the hook guards, and its command names a cluster client",
     "H15": "a cluster client is named in a position the hook does not understand (only data-only commands may "
            "carry its name as text)",
+    "H16": "kube-run is started through a wrapper, or the line changes the environment (an assignment, export, "
+           "source, ...), which could choose its interpreter; run the installed kube-run as a bare command",
 }
 # ACCEPTED DATA CONTEXTS: a SMALL CLOSED SET of inert forms. A client's name may appear as data only in these
 # commands, only with the options listed (no-value short letters, value-taking short letters, long options), and
@@ -518,6 +538,11 @@ class Guard:
         self.kube_run = kube_run
         self.cwd = cwd
         self.whole_mentions = mentions(whole)
+        # H16: whether any command of the line (at any depth) changes the environment, and the top-level command
+        # index of the first installed kube-run invocation the hook accepted.
+        self.env_changed = False
+        self.kube_run_at = None
+        self._top_k = 0
 
     # Top level: locate a refusal by simple-command index and character span.
     def check_top(self, text):
@@ -528,6 +553,7 @@ class Guard:
             # because bash may unquote what the text hides (`kube\ctl ... <<\EOF`).
             raise Refusal("H05")
         for k, cmd in enumerate(cmds, 1):
+            self._top_k = k
             try:
                 self.check_cmd(cmd, 0)
             except Refusal as r:
@@ -535,6 +561,13 @@ class Guard:
                 span = (ws[0][2], ws[-1][3]) if ws else (0, 0)
                 r.where = (k, len(cmds), span)
                 raise
+        if self.kube_run_at is not None and self.env_changed:
+            # One Bash event is one shell: an assignment or export anywhere in it (`PATH=/tmp/bin; kube-run ...`,
+            # `export PATH=...`) reaches kube-run's `env python3` lookup, in whichever order the hook saw them.
+            r = Refusal("H16", "kube-run")
+            ws = cmds[self.kube_run_at - 1]["words"]
+            r.where = (self.kube_run_at, len(cmds), (ws[0][2], ws[-1][3]) if ws else (0, 0))
+            raise r
 
     def check_text(self, text, depth, piped=False):
         """A nested text: a -c string, eval's arguments, a here-document fed to a shell, a substitution.
@@ -581,7 +614,9 @@ class Guard:
     def _command(self, cmd, depth):
         words = [(w[0], w[1]) for w in cmd["words"]]
         env = {}
+        wrapped = False           # H16: kube-run must be the bare command word, not run through a wrapper
         while words and words[0][0] in KEYWORDS:
+            wrapped = wrapped or words[0][0] in ("time", "coproc")
             words.pop(0)
         words = self._take_assignments(words, env)
         while words:
@@ -604,6 +639,7 @@ class Guard:
                 return
             base = os.path.basename(w)
             if base in WRAPPERS:
+                wrapped = True
                 words = self._unwrap(base, words[1:], env, depth)
                 if words is None:
                     return
@@ -621,6 +657,8 @@ class Guard:
         w = words[0][0]
         base = os.path.basename(w)
         args = [x[0] for x in words[1:]]
+        if base in ENV_BUILTINS:
+            self.env_changed = True
         runs_text = base in SHELLS or base in ("eval", "source", ".") or bool(INTERPRETERS.match(base))
         if runs_text and self.whole_mentions and (
                 cmd.get("piped") or any(a.startswith(("<(", ">(")) or "$(" in a or "`" in a for a in args)):
@@ -651,7 +689,7 @@ class Guard:
         if base in LOCAL_ONLY:
             return
         if base in KUBE_RUN_NAMES:
-            return self._kube_run(w, args)
+            return self._kube_run(w, args, prefixed=bool(env) or wrapped)
         fam = FAMILY.get(base)
         if fam is None:
             # Any other command. A data-only command (echo, grep, cat, git, ...) may carry a client's name as text.
@@ -685,10 +723,16 @@ class Guard:
             return
         raise Refusal("H01" if fam == "kubectl" else "H07", base, sub)
 
-    def _kube_run(self, w, args):
+    def _kube_run(self, w, args, prefixed):
         path = os.path.expanduser(w)
         if not os.path.isabs(path) or os.path.realpath(path) != self.kube_run:
             raise Refusal("H09", "kube-run")
+        if prefixed:
+            # An assignment prefix or a wrapper (`PATH=/tmp/bin kube-run`, `env PATH=... kube-run`, `timeout 60
+            # kube-run`) can choose the interpreter kube-run's `env python3` shebang runs: refused, not enumerated.
+            raise Refusal("H16", "kube-run")
+        if self.kube_run_at is None:
+            self.kube_run_at = self._top_k
         i = 0
         while i < len(args) and args[i].startswith("--") and args[i] != "--":
             # The same option grammar as kube_run.parse_cli: --timeout takes digits only.
@@ -712,6 +756,7 @@ class Guard:
             if mentions(value):
                 raise Refusal("H04")
             env[name] = value
+            self.env_changed = True      # H16: an assignment reaches kube-run's interpreter lookup
             words = words[1:]
         return words
 
@@ -738,7 +783,14 @@ class Guard:
             if base == "watch" and a in ("-x", "--exec"):
                 watch_exec = True
             if a in valued:
+                # The word an option consumes as its value is never a command: if it names a cluster client, the
+                # option table is wrong for this use or the value hides the command (`watch -n kubectl ...`), so
+                # it is refused rather than skipped. A wrong arity entry then fails closed, not open.
+                if len(rest) > 1 and mentions(rest[1][0]):
+                    raise Refusal("H03")
                 rest = rest[2:]
+            elif a in OPTIONAL_VALUE.get(base, set()):
+                rest = rest[1:]           # bare: no value, so the next word is the command (or another option)
             elif (a.startswith("--") and "=" in a) or a in WRAPPER_FLAGS.get(base, set()):
                 rest = rest[1:]
             else:
