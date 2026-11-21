@@ -84,6 +84,9 @@ EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_S
 # A completed --diagnostic run, whatever the command's own status: never 0, so no `&&` chain and no
 # gate that reads exit 0 as "done, no finding" proceeds on a diagnostic (TXE-8053).
 EXIT_DIAGNOSTIC = 7
+# The end-of-run read-only mount check's own allowance under --deadline (it must still run on a stop
+# path whose run deadline has passed); past it the check is incomplete, exit 6, never a pass.
+FINAL_CHECK_S = 60.0
 # The only container paths a --ro-mount may target. /work/src/.git is the one path under /work/src
 # the tree copy can never hold (.git is excluded at every depth), so the mount shadows no tree
 # content, and git finds it with no environment change.
@@ -270,7 +273,7 @@ def parse_ro_mounts(specs: list[str]) -> list[RoMount]:
         src, dst, digest = parts
         if dst not in RO_MOUNT_DESTS:
             raise Refused(f"--ro-mount {spec!r}: destination {dst!r} is not one of {', '.join(RO_MOUNT_DESTS)}")
-        if not SHA256_HEX.match(digest):
+        if not SHA256_HEX.fullmatch(digest):
             raise Refused(f"--ro-mount {spec!r}: SHA256 must be 64 lowercase hex digits (the --ro-manifest digest)")
         # Exactly its own realpath: absolute, no '.', '..' or trailing slash, no symlink on the path.
         if not os.path.isabs(src) or os.path.realpath(src) != src:
@@ -306,13 +309,15 @@ RO_DIR_MODE, RO_FILE_MODE = 0o755, 0o644
 DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
-def ro_walk(root: Path, limits: RoLimits):
+def ro_walk(root: Path, limits: RoLimits, deadline: float | None = None):
     """(relative path, lstat, parent directory fd, name) for every entry below root, never following
     a link. Each directory is opened relative to its parent's descriptor with O_NOFOLLOW, the root
     included, so a directory replaced by a link mid-walk cannot steer the walk off the tree. Refused:
     a root that is not a plain directory, any entry that is not a directory or a regular file, a
     name outside RO_NAME or equal to another in the same directory ignoring case, and a bound
-    passed. The descriptor yielded is valid only until the next step."""
+    passed. Entries are counted while a directory is listed, so a huge directory is refused at
+    limits.files + 1, never listed whole. The deadline is checked per entry (Stopped). The
+    descriptor yielded is valid only until the next step."""
     try:
         top = os.open(root, DIR_FLAGS)
     except OSError as e:
@@ -320,19 +325,24 @@ def ro_walk(root: Path, limits: RoLimits):
     count = [0]
 
     def walk(fd: int, prefix: str, depth: int):
+        names: list[str] = []
         with os.scandir(fd) as it:
-            names = sorted(e.name for e in it)
+            for e in it:
+                count[0] += 1
+                if count[0] > limits.files:
+                    raise Refused(f"{root} holds over {limits.files} entries")
+                check_deadline(deadline, f"walking {root}")
+                names.append(e.name)
+        names.sort()
         folded: set[str] = set()
         for name in names:
+            check_deadline(deadline, f"walking {root}")
             rel = prefix + name
-            if not RO_NAME.match(name) or name in (".", ".."):
+            if not RO_NAME.fullmatch(name) or name in (".", ".."):
                 raise Refused(f"{rel!r} in {root}: names must use only A-Z a-z 0-9 . _ -")
             if name.casefold() in folded:
                 raise Refused(f"{rel!r} in {root}: another name in its directory differs only in case")
             folded.add(name.casefold())
-            count[0] += 1
-            if count[0] > limits.files:
-                raise Refused(f"{root} holds over {limits.files} entries")
             st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             if stat.S_ISDIR(st.st_mode):
                 if depth >= limits.depth:
@@ -372,14 +382,17 @@ def open_regular_at(fd: int, name: str) -> int:
     return rfd
 
 
-def read_bounded(rfd: int, limits: RoLimits, used: list[int], rel: str, sink) -> int:
+def read_bounded(rfd: int, limits: RoLimits, used: list[int], rel: str, sink,
+                 deadline: float | None = None) -> int:
     """Read rfd to its end into sink, refusing once the file passes limits.file_bytes or all files
     together (used[0]) pass limits.total_bytes. Bytes are counted as read, not as stat says, so a
-    file that grows during the copy is still bounded. Returns the file's size."""
+    file that grows during the copy is still bounded. The deadline is checked per MiB (Stopped).
+    Returns the file's size."""
     n = 0
     try:
         with os.fdopen(rfd, "rb") as f:
             while chunk := f.read(1 << 20):
+                check_deadline(deadline, f"reading {rel}")
                 n += len(chunk)
                 used[0] += len(chunk)
                 if n > limits.file_bytes:
@@ -392,7 +405,7 @@ def read_bounded(rfd: int, limits: RoLimits, used: list[int], rel: str, sink) ->
     return n
 
 
-def ro_manifest_sha256(root: Path, limits: RoLimits | None = None) -> str:
+def ro_manifest_sha256(root: Path, limits: RoLimits | None = None, deadline: float | None = None) -> str:
     """The manifest digest of a directory: every entry below root, sorted by its relative path as
     bytes, '/'-separated, one line each, "D <rel>\\n" for a directory (empty ones included) and
     "F <size> <sha256 hex> <rel>\\n" for a regular file; the sha256 of the lines joined. Names,
@@ -401,12 +414,12 @@ def ro_manifest_sha256(root: Path, limits: RoLimits | None = None) -> str:
     limits = limits or RoLimits()
     used = [0]
     lines: list[str] = []
-    for rel, st, fd, name in ro_walk(root, limits):
+    for rel, st, fd, name in ro_walk(root, limits, deadline):
         if stat.S_ISDIR(st.st_mode):
             lines.append(f"D {rel}\n")
             continue
         h = hashlib.sha256()
-        size = read_bounded(open_regular_at(fd, name), limits, used, rel, h.update)
+        size = read_bounded(open_regular_at(fd, name), limits, used, rel, h.update, deadline)
         lines.append(f"F {size} {h.hexdigest()} {rel}\n")
     lines.sort(key=lambda line: line.split(" ")[-1].encode())
     return hashlib.sha256("".join(lines).encode()).hexdigest()
@@ -430,10 +443,10 @@ GIT_VIEW_PATHS = [
 ]
 
 
-def check_git_view(copy: Path, limits: RoLimits) -> None:
+def check_git_view(copy: Path, limits: RoLimits, deadline: float | None = None) -> None:
     """Refuse a git directory outside the TXE-8047 view contract (see GIT_VIEW_TOP)."""
     seen: dict[str, bool] = {}
-    for rel, st, fd, name in ro_walk(copy, limits):
+    for rel, st, fd, name in ro_walk(copy, limits, deadline):
         is_dir = stat.S_ISDIR(st.st_mode)
         seen[rel] = is_dir
         if "/" not in rel:
@@ -445,7 +458,7 @@ def check_git_view(copy: Path, limits: RoLimits) -> None:
             raise Refused(f"git view: {rel}: the view holds no refs")
         if rel.startswith("objects/info/"):
             raise Refused(f"git view: {rel}: objects/info holds nothing (no alternates)")
-        if not any(p.match(rel) for p in GIT_VIEW_PATHS):
+        if not any(p.fullmatch(rel) for p in GIT_VIEW_PATHS):
             raise Refused(f"git view: {rel} is not part of the view")
         if is_dir != (rel.count("/") == 1 or rel.startswith("refs/")):
             raise Refused(f"git view: {rel} has the wrong type")
@@ -486,7 +499,7 @@ def check_git_view(copy: Path, limits: RoLimits) -> None:
                           "with a plain value is allowed")
 
 
-def check_ro_source(m: RoMount, forbidden: dict[str, Path], limits: RoLimits) -> None:
+def check_ro_source(m: RoMount, forbidden: dict[str, Path], limits: RoLimits, deadline: float | None = None) -> None:
     """Before anything runs: the source is a plain directory within the bounds, holding only
     directories and regular files, and is not, does not contain and does not lie inside protected
     state. Lying inside HOME is allowed (it is only read on the host); containing HOME is not."""
@@ -495,21 +508,21 @@ def check_ro_source(m: RoMount, forbidden: dict[str, Path], limits: RoLimits) ->
         fr = real(f)
         if within(fr, src) or (name != "HOME" and within(src, fr)):
             raise Refused(f"--ro-mount source {src} overlaps {name} ({fr})")
-    for _entry in ro_walk(m.src, limits):
+    for _entry in ro_walk(m.src, limits, deadline):
         pass
 
 
-def verify_ro_copy(m: RoMount, limits: RoLimits) -> None:
+def verify_ro_copy(m: RoMount, limits: RoLimits, deadline: float | None = None) -> None:
     """The runner's copy is still what was checked: its manifest, one link per file, owned by this
     process's uid (the uid the container runs as, so git's ownership check holds), and, for the git
     view, the view's shape. Called after the copy, immediately before every mount and after every
     run; a failure after the first check is the read-only boundary failing."""
     if m.copy is None:
         raise Refused(f"read-only mount {m.dst} is not prepared")
-    got = ro_manifest_sha256(m.copy, limits)
+    got = ro_manifest_sha256(m.copy, limits, deadline)
     if got != m.sha256:
         raise Refused(f"--ro-mount {m.dst}: the copy's manifest is {got}, expected {m.sha256}")
-    entries = [("", os.lstat(m.copy))] + [(rel, st) for rel, st, _fd, _name in ro_walk(m.copy, limits)]
+    entries = [("", os.lstat(m.copy))] + [(rel, st) for rel, st, _fd, _name in ro_walk(m.copy, limits, deadline)]
     for rel, st in entries:
         what = rel or "(root)"
         if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
@@ -520,7 +533,7 @@ def verify_ro_copy(m: RoMount, limits: RoLimits) -> None:
         if stat.S_IMODE(st.st_mode) != want:
             raise Refused(f"--ro-mount copy {what} has mode {oct(stat.S_IMODE(st.st_mode))}, not {oct(want)}")
     if m.dst == "/work/src/.git":
-        check_git_view(m.copy, limits)
+        check_git_view(m.copy, limits, deadline)
 
 
 def prepare_ro_mount(m: RoMount, work: Path, index: int, forbidden: dict[str, Path], limits: RoLimits,
@@ -529,7 +542,7 @@ def prepare_ro_mount(m: RoMount, work: Path, index: int, forbidden: dict[str, Pa
     directories, 0755: no inode is shared with anything), through the same descriptor-anchored walk,
     with every byte bounded as read; then verify_ro_copy. Hashing the copy, not the source, means
     what is mounted is what was checked: a writer racing on the source can only cause a refusal."""
-    check_ro_source(m, forbidden, limits)
+    check_ro_source(m, forbidden, limits, deadline)
     src, w = real(m.src), real(work)
     if within(w, src) or within(src, w):
         raise Refused(f"--ro-mount source {src} overlaps this run's work directory {w}")
@@ -540,7 +553,7 @@ def prepare_ro_mount(m: RoMount, work: Path, index: int, forbidden: dict[str, Pa
     used = [0]
     try:
         os.chmod(copy, RO_DIR_MODE)  # modes are set explicitly, whatever the umask (Linux or macOS)
-        for rel, st, fd, name in ro_walk(m.src, limits):
+        for rel, st, fd, name in ro_walk(m.src, limits, deadline):
             check_deadline(deadline, "copying a --ro-mount source")
             target = copy / rel
             if stat.S_ISDIR(st.st_mode):
@@ -550,11 +563,11 @@ def prepare_ro_mount(m: RoMount, work: Path, index: int, forbidden: dict[str, Pa
             out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), RO_FILE_MODE)
             os.fchmod(out, RO_FILE_MODE)
             with os.fdopen(out, "wb") as fout:
-                read_bounded(open_regular_at(fd, name), limits, used, rel, fout.write)
+                read_bounded(open_regular_at(fd, name), limits, used, rel, fout.write, deadline)
     except OSError as e:
         raise Refused(f"--ro-mount source {m.src}: copy failed: {e}") from e
     m.copy = copy
-    verify_ro_copy(m, limits)
+    verify_ro_copy(m, limits, deadline)
 
 
 # ---------------------------------------------------------------- mutants
@@ -935,13 +948,15 @@ class Runner:
         self.err_log = None  # the open stderr file of the run in progress, in diagnostic mode
         self.err_path: Path | None = None  # the last run's stderr file, in diagnostic mode
 
-    def verify_ro_mounts(self, when: str) -> None:
+    def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
         """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
-        mount and after every run: once the copy was verified, a failure means the read-only
-        boundary failed, so it is exit 3 with no verdict, never a refusal."""
+        mount and after every run (inside the run deadline), and at the end of the run (inside the
+        final check's own allowance): once the copy was verified, a failure means the read-only
+        boundary failed, so it is exit 3 with no verdict, never a refusal. A deadline passed during
+        the check raises Stopped: the check did not complete, which is never a pass."""
         for m in self.ro_mounts:
             try:
-                verify_ro_copy(m, self.ro_limits)
+                verify_ro_copy(m, self.ro_limits, deadline if deadline is not None else self.deadline)
             except (Refused, OSError) as e:
                 raise SharedStateChanged(f"{when}: the read-only mount {m.dst} (copy {m.copy}) changed: {e}") from e
 
@@ -1496,14 +1511,15 @@ def main(argv: list[str]) -> int:
     report["identity_before"] = initial
     work = None
     runner = None
-    code = EXIT_OK
+    # Undecided until a path below sets it: a path that sets nothing is never reported as a pass.
+    code = EXIT_FINDINGS
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop_on_signal)
     try:
         check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
         for m in ro_mounts:  # refused before anything is created or run
-            check_ro_source(m, forbidden, ro_limits(args))
-        left =args.deadline_at - time.monotonic() if args.deadline_at else 60.0
+            check_ro_source(m, forbidden, ro_limits(args), args.deadline_at)
+        left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
         if left <= 0:
             raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
         try:
@@ -1549,6 +1565,11 @@ def main(argv: list[str]) -> int:
         report["stopped"] = str(e)
         code = EXIT_STOPPED
         args.keep = True  # evidence
+    except Exception as e:  # anything unexpected (an OSError from a host-side step, say) is a finding
+        report["error"] = f"{type(e).__name__}: {e}"
+        print(f"mutate-sandboxed: error: {type(e).__name__}: {e}", file=sys.stderr)
+        code = EXIT_FINDINGS
+        args.keep = True  # evidence
     finally:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
@@ -1560,8 +1581,6 @@ def main(argv: list[str]) -> int:
                       "after checking their owner label", file=sys.stderr)
                 if code in (EXIT_OK, EXIT_DIAGNOSTIC):
                     code = EXIT_FINDINGS
-                    if isinstance(report.get("diagnostic"), dict):
-                        report["diagnostic"]["status"] = "not-completed: containers not confirmed removed"
                 args.keep = True  # never delete a directory a container may still have mounted
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
@@ -1575,7 +1594,10 @@ def main(argv: list[str]) -> int:
                     for f, digest in runner.live.items():
                         if file_digest(args.tree / f) != digest:
                             raise SharedStateChanged(f"at the end of the run: the live tree's {f} changed")
-                    runner.verify_ro_mounts("at the end of the run")
+                    # Its own allowance when a --deadline was given: the run's deadline may already
+                    # have passed on a stop path, and this check must still run (overrun <= FINAL_CHECK_S).
+                    final_by = time.monotonic() + FINAL_CHECK_S if args.deadline_at else None
+                    runner.verify_ro_mounts("at the end of the run", final_by)
             except SharedStateChanged as e:
                 loud(str(e))
                 report["shared_state_changed"] = str(e)
@@ -1586,13 +1608,24 @@ def main(argv: list[str]) -> int:
                 report["shared_state_changed"] = f"final check unreadable: {e}"
                 code = EXIT_SHARED_CHANGED
                 args.keep = True
-        if code == EXIT_SHARED_CHANGED and isinstance(report.get("diagnostic"), dict):
-            # A recorded diagnostic is void once the boundary failed: no command status stands.
+            except Stopped as e:  # the final check did not complete: never a pass, never 7
+                print(f"mutate-sandboxed: the final read-only mount check did not complete: {e}", file=sys.stderr)
+                report["final_check"] = f"incomplete: {e}"
+                code = EXIT_STOPPED
+                args.keep = True
+        if isinstance(report.get("diagnostic"), dict) and code != EXIT_DIAGNOSTIC:
+            # A diagnostic stands only with exit 7. On any other exit no command status stands; the
+            # raw value, if one was recorded, is kept as raw_exit.
             d = report["diagnostic"]
             if d.get("command_exit") is not None:
                 d["raw_exit"] = d["command_exit"]
             d["command_exit"] = None
-            d["status"] = "invalid: shared state changed"
+            if code == EXIT_SHARED_CHANGED:
+                d["status"] = "invalid: shared state changed"
+            elif "containers_left" in report:
+                d["status"] = "not-completed: container not confirmed removed"
+            elif not str(d.get("status", "")).startswith("not-completed"):
+                d["status"] = f"not-completed: runner exit {code}"
         try:
             report["identity_after"] = watch.snapshot()
         except OSError as e:
@@ -1612,8 +1645,14 @@ def main(argv: list[str]) -> int:
             else:
                 try:
                     work.remove()
-                except Refused as e:
-                    print(f"mutate-sandboxed: {e}", file=sys.stderr)
+                except (Refused, OSError) as e:
+                    print(f"mutate-sandboxed: cleanup error: {e}", file=sys.stderr)
+                    if code == EXIT_OK:  # a pass whose cleanup failed is a finding, and says so
+                        code = EXIT_FINDINGS
+                        report["exit"] = code
+                        report["cleanup_error"] = f"{type(e).__name__}: {e}"
+                        if args.report:
+                            args.report.write_text(json.dumps(report, indent=2, default=str))
     return code
 
 

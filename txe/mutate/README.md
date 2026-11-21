@@ -101,7 +101,17 @@ is always kept.
   5 with `status: not-completed: ...` and no `command_exit`. A shared-state or read-only-mount
   change is exit 3: during the run no result is recorded, and after it (in cleanup or the final
   check) the recorded diagnostic is marked `status: invalid: shared state changed` with its
-  `command_exit` cleared. Refusals are 2 and the deadline or a signal 6, as in any run.
+  `command_exit` cleared. Refusals are 2 and the deadline or a signal 6, as in any run. On every
+  exit but 7 the report carries no `command_exit` (a recorded value is kept as `raw_exit`).
+- **Trade-off: a command's own 125, 126 or 127 is read as docker's.** docker run reports its own
+  failures with those codes, and the client cannot tell them from the command's, so a shell's
+  "command not found" (127) is exit 5, `not-completed`, with no `command_exit`, never a recorded
+  diagnostic.
+- **Anything unexpected is a finding.** An exception the runner does not expect (a host-side step
+  failing, such as removing a run directory the command made unremovable) is exit 5 with
+  `report["error"]`; the report's `exit` always equals the process's exit status. The end-of-run
+  read-only mount check has its own 60 s allowance under `--deadline`; past it the check is
+  incomplete, exit 6.
 
 **`--ro-mount SRC:DST:SHA256`** gives the container a read-only view of a directory, in either
 mode. SRC is only read on the host and never mounted: the runner copies it into

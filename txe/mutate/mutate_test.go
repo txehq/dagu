@@ -2011,6 +2011,13 @@ func TestRoMountShapesRefused(t *testing.T) {
 			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "café"), 0o755))
 			return spec(view, git, sum)
 		}, "names must use only"},
+		"name with a trailing newline": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "x\n"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"hash with a trailing newline": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, sum+"\n")
+		}, "64 lowercase hex"},
 		"name with a space": {func(t *testing.T, f fixture, view, sum string) []string {
 			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "a b"), 0o755))
 			return spec(view, git, sum)
@@ -2271,7 +2278,7 @@ func TestRoCopyRevalidatedBeforeMount(t *testing.T) {
 	tree := filepath.Join(root, "tree")
 	require.NoError(t, os.Mkdir(tree, 0o755))
 	prog := `
-import importlib.util, sys, os
+import importlib.util, sys, os, time
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
 ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
@@ -2279,6 +2286,8 @@ root, view, digest, tree = Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv
 def verdict(f):
     try:
         f(); return "ok"
+    except ms.Stopped:
+        return "stopped"
     except ms.SharedStateChanged:
         return "alarm"
     except ms.Refused:
@@ -2300,6 +2309,9 @@ os.chmod(m.copy / "config", 0o600)
 print(verdict(lambda: runner.docker_argv(d, "n", cid)))
 os.chmod(m.copy / "config", 0o644)
 print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+past = time.monotonic() - 1
+print(verdict(lambda: ms.verify_ro_copy(m, runner.ro_limits, past)))
+print(verdict(lambda: runner.verify_ro_mounts("late", past)))
 shadow = work.path / "pristine-with-git"; (shadow / ".git").mkdir(parents=True); (shadow / ".git" / "x").write_text("x")
 print(verdict(lambda: runner.prepare("shadow", shadow, None)))
 (m.copy / "HEAD").write_text("tampered\n")
@@ -2314,9 +2326,10 @@ print(verdict(lambda: ms.check_mounts([(w, "/work", False), (s, "/work/src/.git"
 	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root, view,
 		goManifest(t, view), tree).CombinedOutput()
 	require.NoError(t, err, string(out))
-	// ok; non-empty mountpoint; a mode changed (alarm); restored (ok); a tree copy holding .git
-	// (refused: source data would be shadowed); content changed (alarm); then the check_mounts rules.
-	assert.Equal(t, "ok\nrefused\nalarm\nok\nrefused\nalarm\nrefused\nrefused\nrefused\nok\n", string(out))
+	// ok; non-empty mountpoint; a mode changed (alarm); restored (ok); a deadline already passed
+	// stops the re-hash, directly and through the runner (stopped, never ok); a tree copy holding
+	// .git (refused: source data would be shadowed); content changed (alarm); the check_mounts rules.
+	assert.Equal(t, "ok\nrefused\nalarm\nok\nstopped\nstopped\nrefused\nalarm\nrefused\nrefused\nrefused\nok\n", string(out))
 }
 
 // A diagnostic whose command exits non-zero is recorded as evidence and is not a pass: the runner
@@ -2467,4 +2480,39 @@ func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
 	assert.EqualValues(t, 0, diag["raw_exit"])
 	assert.EqualValues(t, 3, o.report["exit"])
 	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// An exception the runner does not expect is a finding, never a pass: the sandboxed command leaves
+// a directory the host cannot empty (0500 with a file in it, readable, so the disk bound still
+// measures it), and the runner's discard of the run directory raises. The run exits 5, the report
+// says exit 5 and names the error, and a diagnostic carries no command status.
+func TestUnexpectedErrorIsFinding(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root removes through permissions")
+	}
+	check := "#!/bin/sh\n: CLEANUP\nmkdir -p ../x && touch ../x/f && chmod 500 ../x\nexit 0\n"
+	for name, diagnostic := range map[string]bool{"diagnostic": true, "mutation": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, check)
+			t.Cleanup(func() {
+				_ = filepath.Walk(f.root, func(p string, _ os.FileInfo, _ error) error { _ = os.Chmod(p, 0o755); return nil })
+			})
+			var o outcome
+			if diagnostic {
+				o = f.diag(t)
+			} else {
+				o = f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+			}
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			assert.EqualValues(t, 5, o.report["exit"], "the report's exit is the process's")
+			assert.Contains(t, o.report["error"], "Error")
+			assert.Contains(t, o.stderr, "mutate-sandboxed: error:")
+			if diagnostic {
+				d := o.report["diagnostic"].(map[string]any)
+				assert.Nil(t, d["command_exit"])
+				assert.True(t, strings.HasPrefix(d["status"].(string), "not-completed"), d["status"])
+				assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+			}
+		})
+	}
 }
