@@ -1,0 +1,14 @@
+# Planted leak (inert fake data): the pre-TXE-8035 shape, the token signing key
+# rendered into dagu.yaml in a ConfigMap. The render check must fail on it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-planted-token
+data:
+  dagu.yaml: |
+    auth:
+      mode: "builtin"
+      builtin:
+        token:
+          secret: "fake-planted-value-token"
+          ttl: "24h"

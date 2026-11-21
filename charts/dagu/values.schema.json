@@ -542,15 +542,27 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
+                "existingSecret": {
+                  "type": "string",
+                  "description": "Optional Secret holding the JWT signing key; empty keeps the key Dagu generates on the data volume.",
+                  "maxLength": 253,
+                  "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                },
+                "secretKey": {
+                  "type": "string",
+                  "maxLength": 253,
+                  "pattern": "^$|^[-._a-zA-Z0-9]+$"
+                },
                 "secret": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Removed: it rendered the key into a ConfigMap. Must stay empty; use existingSecret."
                 },
                 "ttl": {
                   "type": "string",
                   "minLength": 1
                 }
               },
-              "required": ["secret", "ttl"]
+              "required": ["existingSecret", "secretKey", "secret", "ttl"]
             }
           },
           "required": ["token"]

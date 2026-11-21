@@ -1,0 +1,31 @@
+# Every Secret reference the chart takes, set to a REFERENCE canary (fake-ref-*),
+# in distributed mode. extraEnv carries a SECRET-VALUE canary: it belongs in the
+# Deployment spec and must never reach a ConfigMap.
+deploymentMode: distributed
+persistence:
+  accessMode: ReadWriteMany
+imagePullSecrets:
+  - name: fake-ref-pull
+license:
+  existingSecret: fake-ref-license
+extraEnv:
+  - name: EXAMPLE_PLAIN_SETTING
+    value: FAKE-SECRET-VALUE-extra-env
+ingress:
+  enabled: true
+  tls:
+    enabled: true
+    secretName: fake-ref-tls
+auth:
+  builtin:
+    token:
+      existingSecret: fake-ref-token
+      secretKey: fake-ref-token-key
+  oidc:
+    enabled: true
+    clientId: ci-client
+    clientUrl: https://dagu.example.com
+    issuer: https://idp.example.com
+    clientSecret:
+      existingSecret: fake-ref-oidc
+      secretKey: fake-ref-oidc-key

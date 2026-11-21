@@ -1,0 +1,8 @@
+# Planted leak (inert fake data): a ConfigMap meant for envFrom that carries a
+# Dagu credential environment variable.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-planted-env
+data:
+  DAGU_AUTH_BASIC_PASSWORD: "fake-planted-value-env"

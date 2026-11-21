@@ -1,0 +1,13 @@
+license:
+  existingSecret: fake-ref-license
+auth:
+  oidc:
+    enabled: true
+    clientId: ci-client
+    clientUrl: https://dagu.example.com
+    issuer: https://idp.example.com
+    clientSecret:
+      existingSecret: fake-ref-oidc
+    roleMapping:
+      groupMappings:
+        engineering: developer

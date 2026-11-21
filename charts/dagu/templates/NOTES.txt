@@ -58,7 +58,7 @@ OIDC authentication is configured.
   OIDC/SSO requires an active Dagu license.
 
 {{- end }}
-{{- if or (eq .Values.auth.mode "basic") .Values.license.existingSecret .Values.auth.oidc.enabled }}
+{{- if or (eq .Values.auth.mode "basic") .Values.license.existingSecret .Values.auth.oidc.enabled .Values.auth.builtin.token.existingSecret }}
 
 Chart-managed authentication and license Secret values are read when the UI pod starts.
   After changing a referenced Secret value, restart the UI deployment:

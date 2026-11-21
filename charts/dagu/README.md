@@ -370,9 +370,31 @@ auth:
   mode: "builtin"  # Options: "none", "basic", "builtin" (default)
   builtin:
     token:
-      secret: ""               # optional: auto-generated at {data_dir}/auth/token_secret
+      existingSecret: ""       # optional: Secret holding the token signing key
+      secretKey: token-secret
       ttl: "24h"
 ```
+
+Dagu signs session tokens with a key it generates on first start at `{data_dir}/auth/token_secret` on the data volume. To supply the key yourself, store it in a Secret in the release namespace and reference it:
+
+```bash
+kubectl --namespace dagu create secret generic dagu-auth-token \
+  --from-literal=token-secret='<strong-random-value>'
+```
+
+```yaml
+auth:
+  builtin:
+    token:
+      existingSecret: dagu-auth-token
+      secretKey: token-secret
+```
+
+The chart exposes the key only to the server container, as `DAGU_AUTH_TOKEN_SECRET`; it is never written to the chart-managed ConfigMap. Restart the UI Deployment after rotating the Secret. A new key invalidates every existing session.
+
+##### Migrating from `auth.builtin.token.secret`
+
+Chart 2.0.6 and earlier rendered `auth.builtin.token.secret` into the config ConfigMap. Chart 2.0.7 refuses to render while that value is non-empty and prints these steps. Create a Secret holding the same value you had set, set `auth.builtin.token.existingSecret` to its name, and remove `auth.builtin.token.secret` from your values. With the same value, existing sessions stay valid. A release that never set the value needs no change.
 
 #### Basic
 

@@ -23,6 +23,19 @@
 {{- end }}
 {{- end }}
 {{- end }}
+{{- if .Values.auth.builtin.token.secret }}
+{{- fail "auth.builtin.token.secret is no longer supported because it rendered the token signing key into the config ConfigMap. Put the same value in a Secret in the release namespace (for example: kubectl create secret generic dagu-auth-token --from-literal=token-secret=<the current value>) and set auth.builtin.token.existingSecret=dagu-auth-token with auth.builtin.token.secret empty. Keeping the same value keeps existing sessions valid; see the chart README, Authentication." }}
+{{- end }}
+{{- if .Values.auth.builtin.token.existingSecret }}
+{{- if empty .Values.auth.builtin.token.secretKey }}
+{{- fail "auth.builtin.token.secretKey is required when auth.builtin.token.existingSecret is set" }}
+{{- end }}
+{{- range .Values.extraEnv }}
+{{- if has .name (list "DAGU_AUTH_TOKEN_SECRET" "DAGU_AUTH_TOKEN_SECRET_FILE") }}
+{{- fail (printf "extraEnv entry %q conflicts with auth.builtin.token.existingSecret; use the configured Secret key" .name) }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- if .Values.auth.oidc.enabled }}
 {{- if ne .Values.auth.mode "builtin" }}
 {{- fail "auth.oidc.enabled requires auth.mode=builtin" }}
@@ -173,7 +186,9 @@ data:
       mode: {{ .Values.auth.mode | quote }}
       builtin:
         token:
-          secret: {{ .Values.auth.builtin.token.secret | quote }}
+{{- /* The signing key never goes in this ConfigMap (TXE-8035): it comes
+       from auth.builtin.token.existingSecret through the server container's
+       environment, or Dagu generates one on the data volume. */}}
           ttl: {{ .Values.auth.builtin.token.ttl | quote }}
 {{- if .Values.auth.oidc.enabled }}
       oidc:
