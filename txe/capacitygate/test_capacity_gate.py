@@ -645,12 +645,38 @@ class Decision(unittest.TestCase):
         w = World(self)
         self.assertTrue(w.go().admit)
         inv_path = os.path.join(w.dir, "inventory.json")
-        self.assertEqual(G.check_decision(w.receipt_path, inv_path), 0)
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=lambda: NOW), 0)
         w.inventory["generation"] = 42
         w.inventory["foreign_cpu_policy"]["generation"] = 42
         with open(inv_path, "w") as f:
             f.write(json.dumps(w.inventory))
-        self.assertEqual(G.check_decision(w.receipt_path, inv_path), 78)
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=lambda: NOW), 78)
+
+    def test_an_inventory_that_expired_after_the_preflight_is_rejected_with_unchanged_bytes(self):
+        w = World(self)
+        self.assertTrue(w.go().admit)                                  # preflight at 06:02:00; valid_until 06:10:00
+        inv_path = os.path.join(w.dir, "inventory.json")
+        before = Path(inv_path).read_bytes()
+        at = lambda h, m, s: (lambda: dt.datetime(2026, 11, 21, h, m, s, tzinfo=dt.timezone.utc))  # noqa: E731
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=at(6, 9, 59)), 0)
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=at(6, 10, 0)), 78)   # now >= valid_until
+        self.assertEqual(G.check_decision(w.receipt_path, inv_path, clock=at(5, 59, 59)), 78)  # written_at in future
+        self.assertEqual(Path(inv_path).read_bytes(), before)          # the same bytes throughout
+
+    def test_a_receipt_without_a_usable_validity_policy_is_rejected(self):
+        w = World(self)
+        self.assertTrue(w.go().admit)
+        inv_path = os.path.join(w.dir, "inventory.json")
+        rec = w.receipt()
+        rec["policy"]["inventory_max_validity_s"]["value"] = "900"
+        bad = os.path.join(w.dir, "receipt-bad.json")
+        with open(bad, "w") as f:
+            json.dump(rec, f)
+        self.assertEqual(G.check_decision(bad, inv_path, clock=lambda: NOW), 78)
+        del rec["policy"]
+        with open(bad, "w") as f:
+            json.dump(rec, f)
+        self.assertEqual(G.check_decision(bad, inv_path, clock=lambda: NOW), 78)
 
 
 class Walk(unittest.TestCase):

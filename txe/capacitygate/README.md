@@ -20,8 +20,9 @@ by hand before each START.
 - **Not a lease and not a lock.**
   - Another admission can follow a second later, and the inventory can go stale.
   - **One named coordinator owns the inventory and serializes admissions.** An atomic file replace alone does not.
-  - Each decision is bound to the inventory's `generation` and sha256. A later caller rejects a superseded decision
-    (`check-decision`, §4.4).
+  - Each decision is bound to the inventory's `generation` and sha256. A later caller rejects a superseded decision,
+    or an inventory that has gone stale since the preflight even when its bytes are unchanged (`check-decision`,
+    §4.4).
 - **Not cleanup authority.**
   - An unknown owner stays unknown.
   - Every container's ownership is `UNVERIFIED`: a label or a listed id is a claim.
@@ -295,7 +296,7 @@ launch(argv)
 python3 -I capacity_gate.py preflight --budget B --inventory I --receipt R --docker /abs/docker [--pin COMMIT,BLOB,SHA256]
 python3 -I capacity_gate.py check-budget B                    # 0 or 76
 python3 -I capacity_gate.py check-inventory I [--budget B]    # 0 or 78: the coordinator's own check before a grant
-python3 -I capacity_gate.py check-decision R --inventory I    # 0, or 78 when the decision is superseded
+python3 -I capacity_gate.py check-decision R --inventory I    # 0, or 78 when superseded or the inventory is now stale
 ```
 
 **Exit codes:**

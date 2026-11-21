@@ -1050,17 +1050,24 @@ def _containers(ps, stats, cpu, attr, accounting):
     return rows
 
 
-def check_decision(receipt_path, inventory_path):
-    """0 when the receipt admitted and its inventory generation and sha256 are still the inventory's; 78 otherwise.
-    A launcher calls it immediately before its first container, so a superseded decision is rejected. It narrows the
-    window; it is not a lock."""
+def check_decision(receipt_path, inventory_path, clock=_utc_now):
+    """0 when the receipt admitted, its inventory generation and sha256 are still the inventory's, AND the inventory is
+    still fresh at this moment; 78 otherwise. A launcher calls it immediately before its first container.
+    - A superseded decision is rejected.
+    - An inventory that expired after the preflight is rejected (check_inventory's staleness rules, using the
+      inventory_max_validity_s the receipt records), even when its bytes are unchanged.
+    It narrows the window; it is not a lock."""
     try:
         with open(receipt_path, encoding="utf-8") as f:
             rec = json.load(f)
         with open(inventory_path, "rb") as f:
             data = f.read()
         inv = parse_inventory(data)
-    except (OSError, ValueError, Bad):
+        max_validity = rec["policy"]["inventory_max_validity_s"]["value"]
+        if not runbudget.is_int(max_validity) or max_validity < 1:
+            return 78
+        check_inventory(inv, clock(), max_validity)
+    except (OSError, ValueError, KeyError, TypeError, Bad):
         return 78
     b = rec.get("decision_binding", {})
     ok = (rec.get("verdict", {}).get("admit") is True and b.get("inventory_generation") == inv.generation
