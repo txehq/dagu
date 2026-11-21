@@ -10,7 +10,8 @@ The guard checks ONE shape, ["create", <options>, image, <payload tokens>], agai
 spells out one run's exact argv:
 
 - check_schema(schema) is the POLICY FLOOR, which no consumer can loosen. It is STRUCTURAL:
-  - every path is absolute and already normalised;
+  - every path is absolute and already canonical, with ONE leading "/" ("//proc" is refused: Linux resolves it as
+    /proc), including each declared writable target, which must also lie outside the system trees (S19);
   - the work dir lies strictly inside scratch;
   - a mount is the canonical `type=bind,source=..,target=..[,readonly]` with no alias or
     duplicate key, its source strictly inside the work dir, its target outside the kernel and
@@ -111,6 +112,7 @@ CODES = {
     "S16": "a tmpfs is not an absolute normalised path outside the system trees",
     "S17": "the schema is not well formed",
     "S18": "a schema value starts with '-' (docker could read it as an option)",
+    "S19": "a declared writable target is not a canonical absolute path outside the system trees",
     "G01": "the argv is not a list of strings starting with create",
     "G10": "a denied option (parsing stopped)",
     "G11": "an option in --opt=value form (parsing stopped)",
@@ -169,7 +171,14 @@ def _say(name, known):
 
 
 def _normal_abs(p):
-    return isinstance(p, str) and p.startswith("/") and posixpath.normpath(p) == p and "\x00" not in p
+    """A canonical absolute path: ONE leading "/", then non-empty segments that are neither "." nor "..", no NUL.
+    Spelled out rather than taken from posixpath.normpath, which keeps a leading "//" (POSIX leaves its meaning to the
+    implementation) that Linux, and so Docker, resolves as "/": "//proc" is /proc (PR 299 review). Every path policy
+    input (scratch, work dir, mount source and target, tmpfs, writable target) is tested here before any containment
+    or system-tree rule sees it."""
+    if not isinstance(p, str) or "\x00" in p or not p.startswith("/") or p.startswith("//"):
+        return False
+    return p == "/" or all(seg not in ("", ".", "..") for seg in p[1:].split("/"))
 
 
 def _strictly_inside(child, parent):
@@ -211,7 +220,9 @@ def check_schema(s):
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in s.single.items()) or \
             not all(isinstance(k, str) and isinstance(v, tuple) and all(isinstance(x, str) for x in v)
                     for k, v in s.repeated.items()) or not all(isinstance(x, str) for x in s.flags) or \
-            not isinstance(s.last_option, str) or not isinstance(s.image, str):
+            not isinstance(s.last_option, str) or not isinstance(s.image, str) or \
+            not isinstance(s.writable_targets, (frozenset, set)) or not all(isinstance(t, str)
+                                                                          for t in s.writable_targets):
         return [Violation("S17")]
     if not _normal_abs(s.scratch) or not _strictly_inside(s.work_dir, s.scratch):
         bad.append(Violation("S01"))
@@ -255,6 +266,9 @@ def check_schema(s):
         targets.append(dst)
     if len(targets) != len(set(targets)):
         bad.append(Violation("S10", "--mount"))
+    for t in sorted(s.writable_targets):
+        if not _normal_abs(t) or t == "/" or _in_system_tree(t):
+            bad.append(Violation("S19"))
     keys = []
     for kv in s.repeated.get("--env", ()):
         key, sep, _ = kv.partition("=")

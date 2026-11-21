@@ -19,6 +19,12 @@ caller in its file (cross-module use is not analysed), a shell `docker run/creat
 different block, an ignored result, a different argv checked, the argv used before its check, a mutation after it, a
 checked argv that escapes or is never launched: each is a finding. Anything ambiguous fails for review.
 
+In Python, a known process-launch call (subprocess, os or asyncio, through any import alias) that names docker and
+uses a shell (shell=True with a string or a list, os.system, os.popen, create_subprocess_shell), a shell's -c list, a
+string command, or an exec/spawn call is C16, an unsupported launch: it fails for review, never passes. NOT covered:
+a command that does not contain the word docker, an obfuscated or data-flow-built command, **kwargs, and launch
+calls this recogniser does not know.
+
 The scan covers *.py, *.sh and *.bash under txe/, except testdata/ directories and txe/containerguard/ itself (whose
 test fixtures build inert argv that is never launched).
 
@@ -75,7 +81,22 @@ FINDINGS = {
     "C13": "the checked argv is never passed to a call after the check",
     "C14": "violations() is called but argv_guard is not imported in this file",
     "C15": "the abort conditional has an else or elif branch (it runs after a passing check, unanalysed)",
+    "C16": "a Python process launch that names docker uses a shell, a shell's -c, a string command, or an exec/spawn "
+           "call: an unsupported launch form, not analysed",
 }
+# C16: the process-launch calls the recogniser knows, by their canonical dotted name. Import aliases resolve to these
+# (`import subprocess as sp`, `from os import system as sh`), and a bare `subprocess`, `os` or `asyncio` stands for
+# itself. A call outside these names (exec(), importlib, a wrapper defined elsewhere) is not recognised (README).
+SHELL_APIS = frozenset({"os.system", "os.popen", "subprocess.getoutput", "subprocess.getstatusoutput",
+                        "asyncio.create_subprocess_shell", "asyncio.subprocess.create_subprocess_shell"})
+PROCESS_APIS = frozenset({"subprocess.run", "subprocess.Popen", "subprocess.call", "subprocess.check_call",
+                          "subprocess.check_output"})
+EXEC_APIS = frozenset({"asyncio.create_subprocess_exec", "asyncio.subprocess.create_subprocess_exec",
+                       "os.posix_spawn", "os.posix_spawnp",
+                       *(f"os.{p}{s}" for p in ("exec", "spawn")
+                         for s in ("l", "le", "lp", "lpe", "v", "ve", "vp", "vpe"))})
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+DOCKER_WORD = re.compile(r"\bdocker\b")
 EXEMPT_PROBLEMS = {
     "E01": "the row does not have exactly the registry's columns, or a column is empty or padded",
     "E02": "the difference is shorter than 30 characters, or the ticket is not TXE-<n>",
@@ -195,12 +216,106 @@ def _blocks(tree):
     return out
 
 
+def _import_names(tree):
+    """Local name -> the dotted module or module.function it stands for, from this file's imports."""
+    names = {m: m for m in ("subprocess", "os", "asyncio")}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                top = a.name.split(".")[0]
+                names[a.asname or top] = a.name if a.asname else top
+        elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+            for a in n.names:
+                names[a.asname or a.name] = f"{n.module}.{a.name}"
+    return names
+
+
+def _dotted(node, names):
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name) or node.id not in names:
+        return None
+    return ".".join([names[node.id]] + parts[::-1])
+
+
+def _bindings(tree):
+    """Name -> every value assigned to it anywhere in the file. One level, no data flow."""
+    out = {}
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and n.value is not None:
+            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]):
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name):
+                        out.setdefault(x.id, []).append(n.value)
+    return out
+
+
+def _consts(node):
+    return [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+
+
+def _stringish(node, binds, depth=1):
+    """True when node builds a command STRING: a str constant, an f-string, a %-format or a concatenation with a
+    string, .format()/.join()/str(), or a name bound in this file to one of those."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Mod) or (isinstance(node.op, ast.Add) and
+                                                 (_stringish(node.left, binds, 0) or _stringish(node.right, binds, 0)))
+    if isinstance(node, ast.Call):
+        f = node.func
+        return (isinstance(f, ast.Attribute) and f.attr in ("format", "join")) or (isinstance(f, ast.Name) and
+                                                                                   f.id == "str")
+    if isinstance(node, ast.Name) and depth:
+        return any(_stringish(v, binds, 0) for v in binds.get(node.id, ()))
+    return False
+
+
+def _shell_list(node):
+    """A list or tuple literal that runs a shell's -c: ["sh", "-c", ...], ["/bin/bash", "-c", ...]."""
+    if not isinstance(node, (ast.List, ast.Tuple)) or not node.elts:
+        return False
+    first = node.elts[0]
+    return isinstance(first, ast.Constant) and isinstance(first.value, str) and \
+        first.value.rsplit("/", 1)[-1] in SHELLS and any(isinstance(e, ast.Constant) and e.value == "-c"
+                                                          for e in node.elts)
+
+
+def _unsupported_launches(rel, tree):
+    """C16. A recognised launch call whose arguments (or the file's values for the names in them) name docker, in a
+    form the argv pattern cannot analyse: a shell API, shell= anything but a constant False/None (a list argv
+    included), a shell's -c list, a string command, or an exec/spawn call. Not covered, and so not claimed: a command
+    that names no docker word, an obfuscated or data-flow-built one ("dock" + "er"), **kwargs, and calls this
+    recogniser does not know (README)."""
+    names, binds, out = _import_names(tree), _bindings(tree), []
+    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+        api = _dotted(call.func, names)
+        if api not in SHELL_APIS | PROCESS_APIS | EXEC_APIS:
+            continue
+        texts = _consts(call) + [s for n in ast.walk(call) if isinstance(n, ast.Name)
+                                 for v in binds.get(n.id, ()) for s in _consts(v)]
+        if not any(DOCKER_WORD.search(t) for t in texts):
+            continue
+        cmds = list(call.args[:1]) + [k.value for k in call.keywords if k.arg == "args"]
+        shell = any(k.arg == "shell" and not (isinstance(k.value, ast.Constant) and k.value.value in (False, None))
+                    for k in call.keywords)
+        shell_c = any(_shell_list(c) or (isinstance(c, ast.Name) and any(_shell_list(v) for v in binds.get(c.id, ())))
+                      for c in cmds)
+        if api in SHELL_APIS or api in EXEC_APIS or shell or shell_c or any(_stringish(c, binds) for c in cmds):
+            out.append(Finding(rel, call.lineno, "C16"))
+    return out
+
+
 def scan_python(rel, text):
     try:
         tree = ast.parse(text)
     except SyntaxError as e:
         return [Finding(rel, e.lineno or 0, "C10")]
-    found = []
+    found = _unsupported_launches(rel, tree)
     imports_guard = any(
         (isinstance(n, ast.ImportFrom) and (n.module or "").split(".")[-1] == "argv_guard") or
         (isinstance(n, ast.Import) and any(a.name.split(".")[-1] == "argv_guard" for a in n.names)) or

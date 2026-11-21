@@ -33,7 +33,10 @@ launch(argv)
 - the payload tokens.
 
 **`check_schema` is a floor that no schema can loosen.** It is structural:
-- paths are absolute and normalised, and the work dir lies strictly inside scratch;
+- paths are absolute and canonical with ONE leading `/`, and the work dir lies strictly inside scratch. A leading
+  `//` is refused in every path input (scratch, work dir, mount source and target, tmpfs, writable target): POSIX
+  `normpath` keeps it, but Linux resolves `//proc` as `/proc`, so the guard spells the rule out instead of relying on
+  `normpath`. A declared writable target must also lie outside the system trees (`S19`);
 - mounts are canonical bind mounts, sourced strictly inside the work dir, with unique targets outside the kernel and
   runtime trees, and read-only unless their target is declared writable;
 - nothing is mounted from or onto a Docker socket;
@@ -88,7 +91,7 @@ if bad:                         # no else or elif
 … launch(argv) …               # argv never reassigned, extended, item-set, deleted or aliased after the check
 ```
 
-**Everything else is a finding** (codes `C01`–`C15`), and ambiguity fails for review. That includes:
+**Everything else is a finding** (codes `C01`–`C16`), and ambiguity fails for review. That includes:
 - an ignored result;
 - a different argv checked;
 - use before the check, or a change after it, including an alias (`x = argv`);
@@ -98,12 +101,29 @@ if bad:                         # no else or elif
 - a check inside a branch;
 - a checked argv that escapes or is never launched;
 - a missing `argv_guard` import;
-- a shell `docker run/create`;
+- a shell `docker run/create` in a `.sh` or `.bash` file;
+- in Python, a process launch that names `docker` in an unsupported form (`C16`). The launch is a call to a known
+  `subprocess`, `os` or `asyncio` function, through any import alias (`import subprocess as sp`,
+  `from os import system as sh`). The forms are:
+  - a shell: `shell=True`, with a string or a list; `os.system`; `os.popen`; `create_subprocess_shell`;
+  - a shell's `-c` list (`["sh", "-c", …]`);
+  - a string command, including one built from an f-string, a concatenation or `.format`, directly or through a name
+    bound in the file;
+  - an `exec*`, `spawn*` or `create_subprocess_exec` call.
 - an unparsable file.
 
 Importing `violations` and calling it somewhere is NOT accepted as proof that the launched argv was validated. The
 heuristic also cannot see a callee that changes its argument in place (for example `extend_args(argv)` after the
 check). Reviewers still read the launch path.
+
+**What `C16` does not cover, and does not claim to.** It detects the literal word `docker` in a launch call's
+arguments, or in values the file assigns to names used there. It does not cover:
+- a shell or string command that does not contain that word (non-Docker strings are out of scope);
+- an obfuscated or data-flow-built command (`"dock" + "er"`, a value read from a file or another module);
+- arguments passed through `**kwargs`;
+- a launch through a function the recogniser does not know (`exec()`, `importlib`, a wrapper in another module).
+
+A list argv without a shell is the list rule's, above.
 
 ### Launchers that do not use the guard (`UNGUARDED.tsv`)
 

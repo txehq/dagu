@@ -163,6 +163,54 @@ class Refused(unittest.TestCase):
         self.assertEqual([f.code for f in C.scan_shell("txe/x/a.sh", "docker run --rm img\n")], ["C08"])
         self.assertEqual(C.scan_shell("txe/x/a.sh", "# docker run is described here\necho ok\n"), [])
 
+    def test_a_python_shell_or_string_docker_launch_fails(self):
+        """PR 299 review (P2): subprocess.run("docker run …", shell=True) produced no finding. Every recognised
+        shell, string, -c or exec/spawn launch that names docker is C16, through any import alias."""
+        cases = {
+            "run-shell-string": 'import subprocess\n'
+                                'subprocess.run("docker run --privileged alpine true", shell=True)\n',
+            "run-shell-list": 'import subprocess\nsubprocess.run(["docker", "run", "alpine"], shell=True)\n',
+            "run-args-keyword": 'import subprocess\nsubprocess.run(args="docker run x", shell=True)\n',
+            "dynamic-shell-flag": 'import subprocess\n\ndef f(flag):\n'
+                                  '    subprocess.run(["docker", "ps"], shell=flag)\n',
+            "os-system": 'import os\nos.system("docker run alpine")\n',
+            "os-popen-fstring": 'import os\nx = "a"\nos.popen(f"docker run {x}")\n',
+            "module-alias": 'import subprocess as sp\nsp.call("docker create x", shell=True)\n',
+            "from-import": 'from subprocess import check_output\ncheck_output("docker run x", shell=True)\n',
+            "from-import-as": 'from os import system as sh\nsh("docker run x")\n',
+            "asyncio-shell": 'import asyncio\n\nasync def f():\n'
+                             '    await asyncio.create_subprocess_shell("docker run x")\n',
+            "asyncio-subprocess-alias": 'from asyncio import subprocess as asp\n\nasync def f():\n'
+                                        '    await asp.create_subprocess_shell("docker run x")\n',
+            "asyncio-exec": 'import asyncio\n\nasync def f():\n'
+                            '    await asyncio.create_subprocess_exec("docker", "run", "x")\n',
+            "os-exec": 'import os\nos.execvp("docker", ["docker", "run", "x"])\n',
+            "sh-dash-c-list": 'import subprocess\nsubprocess.run(["sh", "-c", "docker run x"])\n',
+            "bash-path-dash-c-list": 'import subprocess\nsubprocess.run(["/bin/bash", "-c", "docker run x"])\n',
+            "string-no-shell": 'import subprocess\nsubprocess.Popen("docker")\n',
+            "dynamic-name-shell": 'import subprocess\ncmd = "docker run " + "x"\nsubprocess.run(cmd, shell=True)\n',
+            "dynamic-fstring-no-shell": 'import subprocess\n\ndef f(y):\n    cmd = f"docker run {y}"\n'
+                                        '    subprocess.run(cmd)\n',
+        }
+        self.assertEqual(len(cases), 18)
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertIn("C16", codes(src, head=""), label)
+
+    def test_forms_outside_c16_stay_clean(self):
+        """C16's stated scope: a shell string with no docker word, and a docker list without a shell, are not C16;
+        a guarded argv whose PAYLOAD runs `/bin/sh -c` (as the runners' does) is not a shell launch."""
+        payload_argv = '["docker", "create", "--name", "n", "--network", "none", "img", "/bin/sh", "-c", "true"]'
+        cases = {
+            "non-docker-shell": 'import subprocess\nsubprocess.run("ls -l", shell=True)\n',
+            "docker-list-no-shell": 'import subprocess\nsubprocess.run(["docker", "ps"])\n',
+            "docker-list-shell-false": 'import subprocess\nsubprocess.run(["docker", "ps"], shell=False)\n',
+            "guarded-argv-with-sh-c-payload": HEAD + textwrap.dedent(GOOD.replace(ARGV, payload_argv)),
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertEqual(codes(src, head=""), [], label)
+
     def test_a_list_without_a_launch_verb_or_mark_is_not_a_launcher(self):
         self.assertEqual(codes('def f():\n    a = ["--mount", "x"]\n    b = ["run", "fast"]\n    return a, b\n'), [])
 

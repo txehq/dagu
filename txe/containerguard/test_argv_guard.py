@@ -429,6 +429,34 @@ class PolicyFloor(unittest.TestCase):
                                  repeated={**s.repeated, "--ulimit": ("nofile=65536:65536",)})
         self.assertEqual(G.check_schema(s2), [])
 
+    def test_a_double_leading_slash_is_refused_in_every_path_input(self):
+        """PR 299 review (P2): posixpath.normpath keeps a leading "//", which Linux resolves as "/", so a mount onto
+        //proc passed both validators. Each path policy input, and each alias of an allowed path, is refused."""
+        s0 = schema()
+        ro = ",readonly"
+        cases = [
+            ("mount-target-//proc", schema_mount(f"type=bind,source={W}/a,target=//proc{ro}"), "S07"),
+            ("mount-target-//", schema_mount(f"type=bind,source={W}/a,target=//{ro}"), "S07"),
+            ("mount-target-///proc", schema_mount(f"type=bind,source={W}/a,target=///proc{ro}"), "S07"),
+            ("mount-source-//", schema_mount(f"type=bind,source=/{W}/a,target=/a{ro}"), "S06"),
+            ("tmpfs-//proc", dataclasses.replace(s0, repeated={**s0.repeated, "--tmpfs": ("//proc:rw",)}), "S16"),
+            ("writable-target-//proc", dataclasses.replace(s0, writable_targets=frozenset({"/w", "//proc"})), "S19"),
+            ("writable-target-system", dataclasses.replace(s0, writable_targets=frozenset({"/w", "/proc"})), "S19"),
+            ("work-dir-//", dataclasses.replace(s0, work_dir="/" + W), "S01"),
+            ("scratch-//", dataclasses.replace(s0, scratch="/" + SCRATCH), "S01"),
+            # duplicate aliases: the second spelling of an allowed path is refused, never treated as another path
+            ("target-/w-and-//w", schema_mount(f"type=bind,source={W}/b,target=//w"), "S07"),
+            ("target-/src-and-//src", schema_mount(f"type=bind,source={W}/b,target=//src{ro}"), "S07"),
+            ("writable-/w-and-//w", dataclasses.replace(s0, writable_targets=frozenset({"/w", "//w"})), "S19"),
+        ]
+        for label, s, code in cases:
+            with self.subTest(label):
+                self.assertIn(code, codes(G.check_schema(s)), label)
+        for p in ("/", "/w", "/s/runs/kg-1/src"):
+            self.assertTrue(G._normal_abs(p), p)
+        for p in ("//", "//proc", "///proc", "/a//b", "/a/", "/./a", "/a/../b", "a", "", "/a\x00"):
+            self.assertFalse(G._normal_abs(p), p)
+
     def test_a_writable_mount_is_allowed_only_at_a_declared_target(self):
         s = schema_mount(f"type=bind,source={W}/cache,target=/cache")
         self.assertIn("S09", codes(G.check_schema(s)))
@@ -500,7 +528,7 @@ class Static(unittest.TestCase):
 
     def test_the_codes_are_stable(self):
         self.assertEqual(sorted(G.CODES), sorted(
-            [f"S{n:02d}" for n in range(1, 19)] + ["G01", "G10", "G11", "G12", "G13", "G20", "G21", "G22", "G23",
+            [f"S{n:02d}" for n in range(1, 20)] + ["G01", "G10", "G11", "G12", "G13", "G20", "G21", "G22", "G23",
                                                     "G30", "G31", "G32"]))
 
 
