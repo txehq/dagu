@@ -449,6 +449,74 @@ class ClosedPattern(unittest.TestCase):
             with self.subTest(label):
                 self.assertIn("C21", codes(src), label)
 
+    def test_the_launch_argument_contexts(self):
+        """PR 299 CG-r7: each context the argv can take as the launch's argument, as an inert parsed fixture. Only a
+        positional argument or the API's command keyword (`args=` on the subprocess launch APIs) of a call that is an
+        Expr or Assign statement directly after the check is accepted; every other context is C21."""
+        launch = "    subprocess.run(argv, check=True)\n"
+        cases = {
+            "positional": ("    subprocess.run(argv, check=True)\n", None),
+            "command-keyword": ("    subprocess.run(args=argv, check=True)\n", None),
+            "command-keyword-popen": ("    subprocess.Popen(args=argv)\n", None),
+            "assigned-result": ("    proc = subprocess.run(argv)\n", None),
+            "env-keyword": ("    subprocess.run(['true'], env=argv)\n", "C21"),
+            "stdout-keyword": ("    subprocess.run(['true'], stdout=argv)\n", "C21"),
+            "cwd-keyword": ("    subprocess.run(['true'], cwd=argv)\n", "C21"),
+            "input-keyword": ("    subprocess.run(['true'], input=argv)\n", "C21"),
+            "args-keyword-unknown-api": ("    runner(args=argv)\n", "C21"),
+            "starred": ("    subprocess.run(*argv)\n", "C21"),
+            "double-star": ("    subprocess.run(**argv)\n", "C21"),
+            "attribute": ("    subprocess.run(argv.copy())\n", "C21"),
+            "alias": ("    cmd = argv\n    subprocess.run(cmd)\n", "C21"),
+            "lambda-command-keyword": ("    go = lambda: subprocess.run(args=argv)\n    go()\n", "C21"),
+            "nested-def": ("    def later():\n        subprocess.run(argv)\n    later()\n", "C21"),
+            "with-item": ("    with subprocess.Popen(argv) as proc:\n        proc.wait()\n", "C21"),
+            "conditional-expression": ("    subprocess.run(argv) if schema else None\n", "C21"),
+            "return": ("    return subprocess.run(argv)\n", "C21"),
+            "comprehension": ("    [subprocess.run(argv) for _ in range(1)]\n", "C21"),
+            "await": ("    await runner(argv)\n", "C21"),
+        }
+        self.assertEqual(len(cases), 20)
+        for label, (block, code) in cases.items():
+            with self.subTest(label):
+                src = GOOD.replace(launch, block)
+                if label == "await":
+                    src = src.replace("def launch(schema):", "async def launch(schema):")
+                if code is None:
+                    self.assertEqual(codes(src), [], label)
+                else:
+                    self.assertIn(code, codes(src), label)
+
+    def test_the_recorded_ast_chains_hold(self):
+        """The parent chains C21 relies on, from the argv Name up to its function, asserted on Python's own parser
+        rather than a hand trace (PR 299 CG-r7: a keyword value's parent is ast.keyword, not the Call)."""
+        def chain(body, is_async=False):
+            tree = ast.parse(("async def" if is_async else "def") + " f():\n    " + body + "\n")
+            parent = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+            node = next(n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "argv")
+            out = []
+            while not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                node = parent[node]
+                out.append(type(node).__name__)
+            return out
+        cases = {
+            "positional": ("run(argv)", False, ["Call", "Expr", "FunctionDef"]),
+            "command-keyword": ("run(args=argv)", False, ["keyword", "Call", "Expr", "FunctionDef"]),
+            "assigned": ("p = run(argv)", False, ["Call", "Assign", "FunctionDef"]),
+            "starred": ("run(*argv)", False, ["Starred", "Call", "Expr", "FunctionDef"]),
+            "double-star": ("run(**argv)", False, ["keyword", "Call", "Expr", "FunctionDef"]),
+            "attribute": ("run(argv.copy())", False, ["Attribute", "Call", "Call", "Expr", "FunctionDef"]),
+            "await": ("await run(argv)", True, ["Call", "Await", "Expr", "AsyncFunctionDef"]),
+            "lambda": ("go = lambda: run(argv)", False, ["Call", "Lambda", "Assign", "FunctionDef"]),
+            "comprehension": ("[run(argv) for _ in x]", False, ["Call", "ListComp", "Expr", "FunctionDef"]),
+            "with-item": ("with run(argv) as p:\n        pass", False, ["Call", "withitem", "With", "FunctionDef"]),
+            "return": ("return run(argv)", False, ["Call", "Return", "FunctionDef"]),
+            "conditional": ("run(argv) if c else None", False, ["Call", "IfExp", "Expr", "FunctionDef"]),
+        }
+        for label, (body, is_async, want) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(chain(body, is_async), want, label)
+
     def test_the_documented_recipe_passes(self):
         """The supported recipe, as the README documents it, and its accepted variants are clean. The README's own
         block is read from the file, so the documentation cannot drift from what the check accepts."""

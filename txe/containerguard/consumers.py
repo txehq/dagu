@@ -559,20 +559,39 @@ DEFERRED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast
             ast.GeneratorExp)
 
 
-def _one_launch(rel, assign, check, after, name, fn, parent):
+# C21: the keyword that IS a launch API's command argument. Only these qualify as a keyword launch; the argv passed as
+# env=, stdout=, cwd=, input= or any other keyword, or to an API not listed here by keyword, is not a launch of it.
+COMMAND_KEYWORDS = {api: frozenset({"args"}) for api in PROCESS_APIS}
+
+
+def _one_launch(rel, assign, check, after, name, fn, parent, names):
     """C21: within its function, the argv's name occurs exactly three times: as the site's target, as the check's
-    argument, and as an argument of ONE call after the check (the launch). That call is not inside a nested def,
-    lambda, class or comprehension, whose code may run later, twice or never. Any other occurrence (a use before the
-    site, a second launch, a mutation, an alias, an escape, a closure) is outside the recognised sequence."""
+    argument, and as the command argument of ONE launch call after the check. Any other occurrence (a use before the
+    site, a second launch, a mutation, an alias, an escape, a closure) is outside the recognised sequence.
+    The supported contexts, with their AST chains (test_consumers.py asserts each chain on parsed source):
+    - positional: Name -> Call (in Call.args) -> Expr | Assign -> the function;
+    - command keyword: Name -> keyword (arg in COMMAND_KEYWORDS for the resolved API) -> Call -> Expr | Assign -> the
+      function. ast.keyword sits between the value and the Call (PR 299 CG-r7);
+    and the launch statement (that Expr, or that Assign whose value is the Call) is one of the statements after the
+    check, directly in the function body. So nothing deferred can enclose the call. Refused, as not analysed:
+    Starred (*argv), a **argv keyword (arg None), any other keyword, an attribute or call on argv, Await, IfExp,
+    BoolOp, a with item, return, and a lambda, def, class or comprehension."""
     occ = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
     later = [n for st in after for n in ast.walk(st) if isinstance(n, ast.Name) and n.id == name]
     known = {id(assign.targets[0]), id(check.args[0])}
     ok = len(later) == 1 and len(occ) == 3 and {id(n) for n in occ} == known | {id(later[0])}
     if ok:
         use, p = later[0], parent.get(later[0])
-        ok = isinstance(p, ast.Call) and (use in p.args or any(k.value is use for k in p.keywords))
-        node = p
-        while ok and node is not None and node is not fn:
+        if isinstance(p, ast.keyword):
+            call = parent.get(p)
+            ok = isinstance(call, ast.Call) and p.arg in COMMAND_KEYWORDS.get(_dotted(call.func, names), ())
+        else:
+            call = p
+            ok = isinstance(call, ast.Call) and use in call.args
+        stmt = parent.get(call)
+        ok = ok and isinstance(stmt, (ast.Expr, ast.Assign)) and stmt.value is call and stmt in after
+        node = call
+        while ok and node is not None and node is not fn:      # kept as a second line: no deferred ancestor
             ok = not isinstance(node, DEFERRED)
             node = parent.get(node)
     return [] if ok else [Finding(rel, (later[0] if later else assign).lineno, "C21")]
@@ -615,7 +634,7 @@ def _check_site(rel, assign, name, where, guard, tree, parent):
     if not launched:
         out.append(Finding(rel, u.lineno, "C13"))
     if fn is not None:
-        out += _one_launch(rel, assign, t.value, after, name, fn, parent)
+        out += _one_launch(rel, assign, t.value, after, name, fn, parent, _import_names(tree))
     return out
 
 

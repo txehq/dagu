@@ -105,7 +105,9 @@ from the check. Accepted variants:
 - the list built by a builder function in the same file, which only constructs and returns it, and whose result is
   assigned (`argv = build(...)`);
 - `import txe.containerguard.argv_guard as guard` with `guard.violations(...)`;
-- the launch taking the argv as a keyword argument (`subprocess.run(args=argv)`).
+- the launch taking the argv as the API's own command keyword: `args=` on `subprocess.run`, `Popen`, `call`,
+  `check_call` or `check_output` (`subprocess.run(args=argv)`), through any import alias of `subprocess`;
+- the launch's result assigned (`proc = subprocess.run(argv)`).
 
 ### 1. Recognised and validated
 
@@ -121,9 +123,13 @@ It is ACCEPTED only in the recipe's shape:
   module-level import. The name is bound once in the file and the module is never patched;
 - the next statement is `if bad:` whose first statement is `raise …` or `return …`, with no call (other than an
   exception class), await, yield or walrus in it;
-- after that, the argv's name appears in exactly ONE call argument, the launch. In the whole function it appears
-  only as the site's target, the check's argument and that launch argument, and the launch is not inside a nested
-  def, lambda, class or comprehension.
+- after that, the argv's name appears exactly ONCE, as the launch's command argument: a positional argument, or the
+  API's command keyword above. In the whole function it appears only as the site's target, the check's argument and
+  that one argument. The launch call is an expression statement, or the value of an assignment, directly in the
+  function body after the check. `test_consumers.py` asserts the AST chain of each supported and refused context on
+  parsed source:
+  - `f(argv)`: Name → Call → Expr / Assign;
+  - `f(args=argv)`: Name → keyword → Call → Expr / Assign.
 
 ### 2. Unsupported, so refused (a finding, codes `C01`–`C21`)
 
@@ -134,6 +140,9 @@ A recognised launch in any other form fails for review. These forms include:
   - a second launch;
   - an alias;
   - a launch inside a nested def, lambda or comprehension;
+  - the argv as any other keyword (`env=`, `stdout=`, `cwd=`, `input=`, or `args=` on an API not listed);
+  - `*argv`, `**argv`, or an attribute or call on it (`argv.copy()`);
+  - a launch that is awaited, conditional (`… if … else …`), a `with` item or returned;
 - an ignored result, or a different argv checked;
 - use before the check, or a change after it, including an alias (`x = argv`);
 - an `else` or `elif` on the abort (`C15`);
