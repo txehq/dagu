@@ -12,6 +12,9 @@ the findings were enforced. So the check demands this exact shape, in one functi
         bad = violations(argv, <schema>)           # txe.containerguard.argv_guard's: one module-level import (C14)
         if bad:
             raise ... | return ...                 # first statement of the branch, NO call or other side effect (C05)
+        fs = check_mount_sources(<schema>)         # argv_guard's, the SAME schema, right after the abort (C22)
+        if fs:
+            raise ... | return ...                 # the same fail-closed abort, no else (C22)
         ... launch(argv) ...                       # argv's ONLY other occurrence in the function: one launch (C21)
 
 A docker argv is a list literal with a launch verb and a launch mark, or a mark and a dynamic element, or a constant
@@ -98,12 +101,18 @@ FINDINGS = {
            "try, if or loop, is not analysed)",
     "C21": "the argv's name occurs in its function other than as the site's target, the check's argument and ONE "
            "launch-call argument after the check (outside any nested def, lambda, class or comprehension)",
+    "C22": "the argv check's abort is not followed at once by the filesystem check: `fs = check_mount_sources(<the "
+           "check's schema>)`, bound to argv_guard's, then `if fs:` with a fail-closed abort and no else",
 }
 # C14: the only modules whose violations() counts, by import name. A module path suffix is not provenance: neither
 # `evil.argv_guard` nor a file path ending argv_guard.py is trusted, and a dynamic load (importlib) is refused.
 GUARD_MODULES = ("txe.containerguard.argv_guard",)   # package-qualified only: a bare `argv_guard` can resolve to a
                                                      # planted sibling argv_guard.py (PR 299 security review, fa2183f1)
 GUARD_CALLS = frozenset(f"{m}.violations" for m in GUARD_MODULES)
+# C22: the filesystem floor's call (PR 299 security review of cdb78d1d: a symlinked bind source passed the string
+# floor). It is bound exactly as violations is, and is the only other guard name a launcher may use.
+FS_CALLS = frozenset(f"{m}.check_mount_sources" for m in GUARD_MODULES)
+GUARD_FUNCTIONS = ("violations", "check_mount_sources")
 CONSTRUCTORS = frozenset({"append", "extend", "insert"})
 # C16: the process-launch calls the recogniser knows, by their canonical dotted name. Import aliases resolve to these
 # (`import subprocess as sp`, `from os import system as sh`), and a bare `subprocess`, `os` or `asyncio` stands for
@@ -298,8 +307,9 @@ def _written_bases(target):
 
 
 def _guard_bindings(tree):
-    """{local name: what it stands for} for argv_guard's violations, from MODULE-LEVEL `import M [as g]` and
-    `from M import violations [as v]` (M in GUARD_MODULES) only, each local name bound exactly once in the file.
+    """{local name: what it stands for} for argv_guard's violations and check_mount_sources, from MODULE-LEVEL
+    `import M [as g]` and `from M import violations | check_mount_sources [as v]` (M in GUARD_MODULES) only, each local
+    name bound exactly once in the file.
     Empty when any of these appears in the file:
     - a star import, which could shadow anything;
     - a write to the guard module or the guard function through ANY assignment target (plain, unpacked, nested,
@@ -323,8 +333,8 @@ def _guard_bindings(tree):
                     out[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
         elif isinstance(st, ast.ImportFrom) and not st.level and st.module in GUARD_MODULES:
             for a in st.names:
-                if a.name == "violations":
-                    out[a.asname or a.name] = f"{st.module}.violations"
+                if a.name in GUARD_FUNCTIONS:
+                    out[a.asname or a.name] = f"{st.module}.{a.name}"
     counts = _binding_counts(tree)
     out = {k: v for k, v in out.items() if counts.get(k) == 1}
     for n in ast.walk(tree):
@@ -344,11 +354,11 @@ def _guard_bindings(tree):
             return {}
     # PR 299 security review of 166b76cc (`g.__dict__.update(...)`): an ALLOWLIST rather than another blocked form.
     # A guard name may occur only in its import (an ast.alias, not a Name) and as the root of a check call's callee
-    # (`violations(...)`, `g.violations(...)`). Any other occurrence (a read, an alias, an argument, a namespace or
-    # function mutation through any API) voids the bindings.
+    # (`violations(...)`, `g.violations(...)`, `check_mount_sources(...)`). Any other occurrence (a read, an alias, an
+    # argument, a namespace or function mutation through any API) voids the bindings.
     allowed = set()
     for n in ast.walk(tree):
-        if isinstance(n, ast.Call) and _dotted(n.func, out) in GUARD_CALLS:
+        if isinstance(n, ast.Call) and _dotted(n.func, out) in GUARD_CALLS | FS_CALLS:
             root = n.func
             while isinstance(root, ast.Attribute):
                 root = root.value
@@ -670,6 +680,26 @@ def _one_launch(rel, assign, check, after, name, fn, parent, names):
     return [] if ok else [Finding(rel, (later[0] if later else assign).lineno, "C21")]
 
 
+def _fs_checked(after, check, guard):
+    """C22 (PR 299 security review of cdb78d1d): the two statements right after the argv check's abort are the
+    filesystem floor and its abort, so nothing runs between the host read and the launch:
+        fs = check_mount_sources(<schema>)    # bound to argv_guard's (FS_CALLS); one positional argument, pure, and
+                                              # the SAME expression as the argv check's schema argument
+        if fs:                                # its first statement a fail-closed abort (_is_abort); no else or elif
+    Refused (C22): the check omitted, its result ignored, called after the launch or anywhere else, on another schema,
+    not bound to argv_guard's, or without a fail-closed abort."""
+    if len(after) < 2 or len(check.args) < 2:
+        return False
+    a, b = after[0], after[1]
+    if not (isinstance(a, ast.Assign) and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name) and
+            isinstance(a.value, ast.Call) and _dotted(a.value.func, guard) in FS_CALLS and
+            len(a.value.args) == 1 and not a.value.keywords and _pure(a.value.args[0]) and
+            ast.dump(a.value.args[0]) == ast.dump(check.args[1])):
+        return False
+    return isinstance(b, ast.If) and isinstance(b.test, ast.Name) and b.test.id == a.targets[0].id and \
+        bool(b.body) and _is_abort(b.body[0]) and not b.orelse
+
+
 def _check_site(rel, assign, name, where, guard, tree, parent):
     block, i, fn = where[id(assign)]
     rest = block[i + 1:]
@@ -697,6 +727,10 @@ def _check_site(rel, assign, name, where, guard, tree, parent):
     if u.orelse:      # an else/elif runs after a PASSING check, outside the analysed path: refused, whatever it holds
         out.append(Finding(rel, u.lineno, "C15"))
     after = rest[first + 2:]
+    if _fs_checked(after, t.value, guard):
+        after = after[2:]
+    else:
+        out.append(Finding(rel, u.lineno, "C22"))
     if any(_mutates(st, name) for st in after):
         out.append(Finding(rel, u.lineno, "C06"))
     if any(_escapes(st, name) for st in after):

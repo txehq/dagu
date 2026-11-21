@@ -2,13 +2,18 @@
 """Tests for argv_guard.py (TXE-8041). containerguard_test.go runs this file; directly:
     python3 -I -B test_argv_guard.py -v
 
-Pure: no process, no file, no network. The argv and schema below model a real run (TXE-8039's KG-r3 kubeguard run),
-written out here independently of any runner. Every credential-looking value is a FAKE sentinel.
+No process, no network. Only FilesystemFloor touches files: its own fixtures (directories, regular files, symbolic
+links, a FIFO), in a fresh directory it makes with tempfile.mkdtemp and removes; a link it makes is only lstat'd,
+never followed, and no live path is read through it. The argv and schema below model a real run (TXE-8039's KG-r3
+kubeguard run), written out here independently of any runner. Every credential-looking value is a FAKE sentinel.
 """
 import dataclasses
 import importlib.util
 import inspect
+import os
 import random
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -516,6 +521,92 @@ class Redaction(unittest.TestCase):
                 self.assertNotEqual(vs, [])
                 self.assertFalse(self.leaks(vs), [str(v) for v in vs])
 
+    def test_sentinel_keys_in_every_schema_kind_never_reach_a_diagnostic(self):
+        """PR 299 review of cdb78d1d: a schema KEY reached a runtime diagnostic (`G22 --x=sekrit-7f3a91`). A sentinel
+        key in flags, single and repeated, through check_schema, violations (with the reviewed argv and with the key
+        inserted into it) and check_mount_sources: in no field of any Violation, nor in its str or repr."""
+        s0 = schema()
+        for key in (f"--x={SENT}", f"--{SENT}", SENT):
+            for kind in ("flags", "single", "repeated"):
+                with self.subTest(f"{kind}:{key}"):
+                    if kind == "flags":
+                        s = dataclasses.replace(s0, flags=s0.flags | {key})
+                    elif kind == "single":
+                        s = dataclasses.replace(s0, single={**s0.single, key: "x"})
+                    else:
+                        s = dataclasses.replace(s0, repeated={**s0.repeated, key: ("x",)})
+                    with_key = argv()
+                    ins(key, "x")(with_key)
+                    vs = G.check_schema(s) + G.violations(argv(), s) + G.violations(with_key, s) + \
+                        G.check_mount_sources(s)
+                    self.assertIn("S04", codes(vs))
+                    self.assertFalse(self.leaks(vs), [str(v) for v in vs])
+                    for v in vs:
+                        self.assertFalse(any(SENT in str(x) for x in dataclasses.astuple(v)), v)
+
+    def test_the_review_repro_reports_the_schema_and_parses_nothing(self):
+        """The reviewer's exact repro: single['--x=sekrit-7f3a91'] = 'x'. violations returns check_schema's findings
+        and nothing from parsing the argv (no G code): an invalid schema has nothing to compare against."""
+        s = schema_single(**{f"--x={SENT}": "x"})
+        vs = G.violations(argv(), s)
+        self.assertEqual(vs, G.check_schema(s))
+        self.assertEqual(codes(vs), ["S04"])
+        self.assertEqual(vs[0].option, G.UNRECOGNISED)
+        self.assertFalse(self.leaks(vs))
+        self.assertEqual(G.violations(["create", "--privileged", SENT], s), G.check_schema(s))
+
+    def test_a_violation_stores_only_constants_whatever_it_is_given(self):
+        """Redaction is the Violation type's invariant (a direct construction), so no call site can leak."""
+        v = G.Violation("G22", f"--x={SENT}", 3, f"{SENT} given")
+        self.assertEqual((v.option, v.position, v.detail), (G.UNRECOGNISED, 3, G.REDACTED))
+        self.assertFalse(self.leaks([v]))
+        cases = [
+            ("option-not-str", G.Violation("G22", 5).option, G.UNRECOGNISED),
+            ("option-sentinel-alone", G.Violation("G22", SENT).option, G.UNRECOGNISED),
+            ("option-constant-kept", G.Violation("G22", "--network").option, "--network"),
+            ("option-denied-kept", G.Violation("G10", "-v").option, "-v"),
+            ("detail-not-str", G.Violation("G23", detail=7).detail, G.REDACTED),
+            ("detail-count-kept", G.Violation("G23", detail="1 unexpected, 0 missing, 4 given for 3").detail,
+             "1 unexpected, 0 missing, 4 given for 3"),
+            ("detail-count-with-text", G.Violation("G32", detail=f"2 tokens given for 1 {SENT}").detail, G.REDACTED),
+            ("detail-phrase-kept", G.Violation("G10", detail="parsing stopped").detail, "parsing stopped"),
+            ("position-not-int", G.Violation("G20", position="7").position, -1),
+            ("position-bool", G.Violation("G20", position=True).position, -1),
+        ]
+        for label, got, want in cases:
+            with self.subTest(label):
+                self.assertEqual(got, want)
+        with self.subTest("unknown-code"):
+            with self.assertRaises(ValueError):
+                G.Violation(SENT)
+        with self.subTest("fields"):      # a new field must be added here, and redacted, deliberately
+            self.assertEqual([f.name for f in dataclasses.fields(G.Violation)], ["code", "option", "position",
+                                                                                  "detail"])
+
+    def test_random_sentinel_keys_never_echo(self):
+        rng = random.Random(80411)
+        keys = [f"--x={SENT}", f"--{SENT}", SENT, f"-{SENT}", f"--network={SENT}", f"--mount{SENT}", "--" + SENT * 2]
+        s0 = schema()
+        for _ in range(300):
+            flags, single, repeated = set(s0.flags), dict(s0.single), dict(s0.repeated)
+            for _ in range(rng.randint(1, 3)):
+                key = rng.choice(keys)
+                kind = rng.choice(("flags", "single", "repeated"))
+                if kind == "flags":
+                    flags.add(key)
+                elif kind == "single":
+                    single[key] = rng.choice(("x", SENT, "-x"))
+                else:
+                    repeated[key] = (rng.choice(("x", SENT)),)
+            s = dataclasses.replace(s0, flags=frozenset(flags), single=single, repeated=repeated)
+            a = argv()
+            if rng.random() < 0.5:
+                ins(rng.choice(keys), SENT)(a)
+            vs = G.check_schema(s) + G.violations(a, s) + G.check_mount_sources(s)
+            self.assertNotEqual(vs, [])
+            self.assertFalse(self.leaks(vs), [str(v) for v in vs])
+            self.assertTrue(all(v.code in G.CODES for v in vs))
+
     def test_malformed_argv_never_raises_and_never_echoes(self):
         for a in (None, [], ["run"], "create --x", [b"create"], ["create", 1, SENT], ["create", None],
                   ["create", "--name"], ["create", "--" + SENT]):
@@ -534,7 +625,213 @@ class Redaction(unittest.TestCase):
             self.assertTrue(all(v.code in G.CODES for v in vs))
 
 
+class FilesystemFloor(unittest.TestCase):
+    """check_mount_sources (PR 299 security review of cdb78d1d: a bind source linked to the Docker socket passed the
+    string floor). Each fixture is built in its own fresh directory from tempfile.mkdtemp, removed afterwards; its
+    schema passes check_schema, so only the filesystem differs. Every path a fixture makes, and every link TARGET it
+    names, is under that root: no live resource is named. A link is only lstat'd, never followed."""
+
+    def fresh(self):
+        root = os.path.realpath(tempfile.mkdtemp(prefix="cg-fs-"))     # realpath: the tmp dir's own ancestors
+        self.assertFalse(os.path.islink(root))       # rmtree also refuses a link root rather than following it
+        self.addCleanup(shutil.rmtree, root)
+        work = root + "/s/w"
+        for d in ("src", "goproxy", "w"):
+            os.makedirs(f"{work}/{d}")
+        return root, work
+
+    def floor(self, work, extra=(), cidfile=None):
+        s = schema(w=work)
+        single = s.single if cidfile is None else {**s.single, "--cidfile": cidfile}
+        s = dataclasses.replace(s, scratch=work.rsplit("/", 1)[0], single=single,
+                                repeated={**s.repeated, "--mount": s.repeated["--mount"] + tuple(extra)})
+        self.assertEqual(G.check_schema(s), [])
+        return G.check_mount_sources(s)
+
+    @staticmethod
+    def file(path):
+        with open(path, "w") as f:
+            f.write("x")
+
+    def test_each_fixture_gets_its_code(self):
+        ro = "type=bind,source={},target=/extra,readonly"
+
+        def plain(root, w):
+            return w, ()
+
+        def file_source(root, w):
+            os.rmdir(f"{w}/src")
+            self.file(f"{w}/src")
+            return w, ()
+
+        def review_repro(root, w):           # the reviewer's shape, aimed at an OWNED name: ANY link refuses unfollowed
+            os.symlink(f"{root}/sock-target", f"{w}/innocent")
+            return w, (ro.format(f"{w}/innocent"),)
+
+        def leaf_link(root, w):
+            os.rmdir(f"{w}/src")
+            os.mkdir(f"{root}/elsewhere")
+            os.symlink(f"{root}/elsewhere", f"{w}/src")
+            return w, ()
+
+        def intermediate_link(root, w):
+            os.makedirs(f"{root}/real-d/in")
+            os.symlink(f"{root}/real-d", f"{w}/d")
+            return w, (ro.format(f"{w}/d/in"),)
+
+        def dangling_link(root, w):
+            os.rmdir(f"{w}/src")
+            os.symlink(f"{root}/nowhere", f"{w}/src")
+            return w, ()
+
+        def readonly_fifo(root, w):
+            os.rmdir(f"{w}/goproxy")
+            os.mkfifo(f"{w}/goproxy")
+            return w, ()
+
+        def writable_fifo(root, w):
+            os.rmdir(f"{w}/w")
+            os.mkfifo(f"{w}/w")
+            return w, ()
+
+        def missing_source(root, w):
+            os.rmdir(f"{w}/src")
+            return w, ()
+
+        def file_as_directory(root, w):        # an inspection error: ENOTDIR
+            self.file(f"{w}/f")
+            return w, (ro.format(f"{w}/f/x"),)
+
+        def name_too_long(root, w):            # an inspection error: ENAMETOOLONG
+            return w, (ro.format(f"{w}/" + "n" * 300),)
+
+        def work_dir_link(root, w):
+            os.rename(w, f"{root}/s/real-w")
+            os.symlink(f"{root}/s/real-w", f"{root}/s/lw")
+            return f"{root}/s/lw", ()
+
+        def ancestor_link(root, w):
+            os.rename(f"{root}/s", f"{root}/real")
+            os.symlink(f"{root}/real", f"{root}/a")
+            return f"{root}/a/w", ()
+
+        def work_dir_missing(root, w):
+            return f"{root}/s/none", ()
+
+        def work_dir_a_file(root, w):
+            self.file(f"{root}/s/wf")
+            return f"{root}/s/wf", ()
+
+        cases = [
+            ("clean", plain, []), ("regular-file-source", file_source, []),
+            ("review-repro-link", review_repro, ["F01"]), ("leaf-link", leaf_link, ["F01"]),
+            ("intermediate-link", intermediate_link, ["F01"]), ("dangling-link", dangling_link, ["F01"]),
+            ("readonly-source-fifo", readonly_fifo, ["F02"]), ("writable-source-fifo", writable_fifo, ["F02"]),
+            ("missing-source", missing_source, ["F03"]), ("file-as-directory", file_as_directory, ["F03"]),
+            ("name-too-long", name_too_long, ["F03"]),
+            # the work dir's own finding, then the cidfile's ({work}/cid: its parent IS the work dir), then each source
+            ("work-dir-link", work_dir_link, ["F01"] * 5), ("ancestor-link", ancestor_link, ["F01"] * 5),
+            ("work-dir-missing", work_dir_missing, ["F03"] * 5),
+            ("work-dir-a-file", work_dir_a_file, ["F02", "F02", "F03", "F03", "F03"]),
+        ]
+        self.assertEqual(len(cases), 15)
+        for label, make, want in cases:
+            with self.subTest(label):
+                root, w = self.fresh()
+                work, extra = make(root, w)
+                vs = self.floor(work, extra)
+                self.assertEqual(codes(vs), want, label)
+                self.assertFalse(any(root in str(v) or root in repr(v) for v in vs), label)    # no path is echoed
+                work_level = len(want) == 5
+                if work_level:
+                    self.assertEqual((vs[0].option, vs[0].detail), ("", "the work dir"), label)
+                    self.assertEqual(vs[1].option, "--cidfile", label)
+                self.assertTrue(all(v.option == "--mount" for v in vs[2 if work_level else 0:]), label)
+
+    def test_the_cidfile_preflight(self):
+        """Root's ruling on PR 299 (the --cidfile is the same host-path class): the parent chain from "/" has no link,
+        is present and readable and ends in a directory, and the leaf is ABSENT. An existing leaf, a dangling link
+        included, refuses without being followed. Docker's O_EXCL create stays a second check at create time."""
+        def absent(root, w):
+            return f"{w}/cid"
+
+        def linked_parent(root, w):
+            os.mkdir(f"{root}/real-p")
+            os.symlink(f"{root}/real-p", f"{root}/lp")
+            return f"{root}/lp/cid"
+
+        def existing_regular(root, w):
+            self.file(f"{w}/cid")
+            return f"{w}/cid"
+
+        def existing_directory(root, w):
+            os.mkdir(f"{w}/cid")
+            return f"{w}/cid"
+
+        def dangling_leaf(root, w):
+            os.symlink(f"{root}/nowhere", f"{w}/cid")
+            return f"{w}/cid"
+
+        def leaf_link_to_owned_file(root, w):
+            self.file(f"{root}/target")
+            os.symlink(f"{root}/target", f"{w}/cid")
+            return f"{w}/cid"
+
+        def non_directory_parent(root, w):
+            self.file(f"{w}/f")
+            return f"{w}/f/cid"
+
+        def missing_parent(root, w):
+            return f"{w}/none/cid"
+
+        def parent_name_too_long(root, w):     # an inspection error in the parent chain: ENAMETOOLONG
+            return f"{w}/" + "n" * 300 + "/cid"
+
+        def leaf_name_too_long(root, w):       # an inspection error on the leaf itself: ENAMETOOLONG, not ENOENT
+            return f"{w}/" + "n" * 300
+
+        def relative(root, w):
+            return "cid"
+
+        def dot_dot(root, w):
+            return f"{w}/../cid"
+
+        cases = [
+            ("clean-absent-leaf", absent, []), ("linked-parent", linked_parent, ["F01"]),
+            ("existing-regular-leaf", existing_regular, ["F04"]),
+            ("existing-directory-leaf", existing_directory, ["F04"]),
+            ("dangling-leaf", dangling_leaf, ["F04"]), ("leaf-link-to-owned-file", leaf_link_to_owned_file, ["F04"]),
+            ("non-directory-parent", non_directory_parent, ["F02"]), ("missing-parent", missing_parent, ["F03"]),
+            ("parent-name-too-long", parent_name_too_long, ["F03"]),
+            ("leaf-name-too-long", leaf_name_too_long, ["F03"]),
+            ("relative", relative, ["F05"]), ("dot-dot", dot_dot, ["F05"]),
+        ]
+        self.assertEqual(len(cases), 12)
+        for label, make, want in cases:
+            with self.subTest(label):
+                root, w = self.fresh()
+                vs = self.floor(w, cidfile=make(root, w))
+                self.assertEqual(codes(vs), want, label)
+                self.assertTrue(all(v.option == "--cidfile" for v in vs), label)
+                self.assertFalse(any(root in str(v) or root in repr(v) for v in vs), label)
+                if want == ["F04"] and label == "dangling-leaf":
+                    self.assertFalse(os.path.exists(f"{root}/nowhere"), label)     # the link was never followed
+
+    def test_an_invalid_schema_is_reported_and_nothing_is_read(self):
+        s = schema_single(**{"--network": "host"})     # work dir /s/runs/kg-1 does not exist here: nothing is read
+        self.assertEqual(G.check_mount_sources(s), G.check_schema(s))
+        self.assertEqual(codes(G.check_mount_sources(s)), ["S02"])
+
+
 class Static(unittest.TestCase):
+    def test_the_filesystem_floor_reads_with_lstat_only(self):
+        """It never follows a link: no stat, realpath, open, listdir or walk; lstat is its only read."""
+        src = inspect.getsource(G._lstat_walk) + inspect.getsource(G._cidfile_code) + \
+            inspect.getsource(G.check_mount_sources)
+        for bad in ("os.stat(", "realpath", "open(", "listdir", "os.walk", "scandir", "readlink", "Path("):
+            self.assertNotIn(bad, src, bad)
+        self.assertIn("os.lstat(", src)
+
     def test_the_guard_never_joins_the_argv_or_splits_the_payload(self):
         src = inspect.getsource(G)
         for bad in ('" ".join', "' '.join", "join(argv", "shlex", "payload.split", "argv[-1].split", "print("):
@@ -543,7 +840,7 @@ class Static(unittest.TestCase):
     def test_the_codes_are_stable(self):
         self.assertEqual(sorted(G.CODES), sorted(
             [f"S{n:02d}" for n in range(1, 20)] + ["G01", "G10", "G11", "G12", "G13", "G20", "G21", "G22", "G23",
-                                                    "G30", "G31", "G32"]))
+                                                    "G30", "G31", "G32", "F01", "F02", "F03", "F04", "F05"]))
 
 
 if __name__ == "__main__":

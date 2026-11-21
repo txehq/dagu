@@ -13,7 +13,7 @@ payload whole. `consumers.py` checks that the launchers in this tree use it, or 
 ## The guard (`argv_guard.py`)
 
 ```python
-from argv_guard import Schema, violations
+from argv_guard import Schema, check_mount_sources, violations
 
 schema = Schema(image="sha256:…", work_dir=W, scratch=SCRATCH, flags=frozenset({"--read-only", "--init"}),
                 single={…}, repeated={"--label": (…), "--env": (…), "--mount": (…)},
@@ -22,6 +22,9 @@ argv = build_argv()
 bad = violations(argv, schema)
 if bad:
     raise Refused(f"argv: {[str(v) for v in bad]}")    # redacted codes only; never print argv
+fs = check_mount_sources(schema)                       # the filesystem floor, immediately before the create
+if fs:
+    raise Refused(f"mounts: {[str(v) for v in fs]}")
 launch(argv)
 ```
 
@@ -69,19 +72,58 @@ launch(argv)
 schema, which is source.
 
 **`violations` reads the argv by position:**
+- a schema that fails `check_schema` is reported as such, and the argv is NOT parsed against it;
 - options as tokens up to the image, each in the schema, with its exact value, once;
 - a denied option, an `--opt=value` form or an unknown option refuses, and parsing STOPS;
 - the image must follow the schema's last option;
 - the payload must equal the schema's, compared whole and never parsed;
 - the argv is never joined.
 
-**Diagnostics are redacted.** A `Violation` is a stable code (see `CODES`), plus:
-- an option name, only when it is a schema option or a denied one;
-- a position;
-- counts.
+**`check_mount_sources` is the filesystem floor**, a preflight the launcher runs immediately before `docker create`
+(the consumer check requires it, `C22`). `check_schema` and `violations` compare canonical path STRINGS, but Docker
+resolves a bind source on the host and follows links: `work/innocent -> /var/run/docker.sock` passed both. This
+function reads the host with `lstat` only and never follows a link:
+- the work dir, every component from `/` down: a symbolic link anywhere (`F01`), a missing component or any other
+  inspection error (`F03`), or a work dir that is not a directory (`F02`) refuses;
+- EVERY bind source, readonly and writable, every component from `/` down: a symbolic link anywhere (`F01`), a
+  missing component or any other inspection error (`F03`), or a source that is neither a directory nor a regular file,
+  such as a socket, device or FIFO (`F02`), refuses;
+- it adds no root of its own. `check_schema` already holds every source, readonly or writable, strictly inside the
+  work dir (`S06`); this check narrows nothing further;
+- the `--cidfile`, when the schema has one. The docker CLI creates and writes it on this host, so it is the same
+  host-path class: it must be a canonical absolute path (`F05`); every component from `/` through its PARENT must be
+  a directory chain with no symbolic link (`F01`), present and readable (`F03`), ending in a directory (`F02`); and
+  the leaf must NOT exist in any form, a dangling link included, which is read with `lstat` and never followed
+  (`F04`). Only "no such file" on the leaf is clean. Docker's own exclusive create of the cidfile (`O_EXCL`) remains
+  a second, independent check at create time;
+- a schema that fails `check_schema` is reported as such, and nothing is read.
 
-It never contains a value or an unknown token from the argv or the schema. This is a validator for a fixed, reviewed
-argv. **It is not a safe logger of arbitrary argv**, and a caller must not print the argv it refuses.
+Its limits, stated plainly:
+- **This PR is source-only delivery. It is NOT an adoption or platform-compatibility approval.**
+- **It is a preflight on the filesystem this process sees.** It establishes nothing about what a Docker daemon
+  elsewhere mounts. A remote daemon (`DOCKER_HOST` over TCP or SSH) or a daemon in a different mount namespace is
+  NOT supported.
+- **VM-backed daemons are UNVERIFIED: Docker Desktop, OrbStack and any other daemon that runs in a VM.** Their bind
+  sources are host paths served into the VM by the runtime's file sharing. That this preflight's view matches what
+  such a daemon actually mounts is NOT measured (this PR runs no Docker probe), and the same path spelling on both
+  sides does NOT establish that the same object is mounted. Adoption on these runtimes is unsupported until that
+  equivalence is measured.
+- **It is a point-in-time read, not proof against concurrent change.** Owning the work dir alone does not remove the
+  race: the caller must ensure that no untrusted writer can create, replace or rename any source path, the cidfile's
+  parent, or any of their ancestors from this check until `docker create` returns.
+- **A hard link is not detected.** A hard link to a regular file elsewhere on the same filesystem is itself a regular
+  file. (A hard-linked socket is still a socket, and is refused by `F02`.)
+- **It governs the host side of a bind mount only.** Links INSIDE a mounted directory resolve in the container's own
+  view at run time, and the requested-user limits above still apply.
+
+**Diagnostics are redacted, by the `Violation` type itself.** A `Violation` is a stable code (see `CODES`), plus:
+- an option name, only when it is in `NAMEABLE`: the listed create options and the denied ones, all module
+  constants. Anything else is stored as `<unrecognised option>`, whatever the call site passes;
+- a fixed detail phrase or a count template; anything else is stored as `<redacted>`;
+- a position.
+
+It never contains a value, a path, an unknown token from the argv, or a schema key. This is a validator for a fixed,
+reviewed argv. **It is not a safe logger of arbitrary argv**, and a caller must not print the argv it refuses.
 
 ## The consumer check (`consumers.py`): an AST HEURISTIC, not a data-flow proof
 
@@ -99,7 +141,7 @@ A launcher in this repository that wants the check to accept it is written exact
 # The supported recipe (consumers.py accepts exactly this shape; anything else fails for review).
 import subprocess
 
-from txe.containerguard.argv_guard import Schema, violations   # package-qualified, module level, bound once
+from txe.containerguard.argv_guard import Schema, check_mount_sources, violations   # package-qualified, module level
 
 
 def launch(schema: Schema) -> None:
@@ -111,6 +153,9 @@ def launch(schema: Schema) -> None:
     bad = violations(argv, schema)                     # the SAME name, the result kept
     if bad:                                            # no else or elif
         raise SystemExit("argv_guard refused the launch")   # raise or return, with no call in it
+    fs = check_mount_sources(schema)                   # the SAME schema, at once: the host filesystem floor
+    if fs:                                             # no else or elif
+        raise SystemExit("argv_guard refused the mounts")
     subprocess.run(["docker"] + argv, check=True)      # ONE launch: the docker binary, then the validated argv
 ```
 
@@ -120,7 +165,9 @@ def launch(schema: Schema) -> None:
   process:
   - for the matching schema, `check_schema` and `violations` return `[]`, and `launch` calls `subprocess.run` exactly
     once, with `["docker"] + argv`;
-  - for a schema the argv does not match, `launch` raises `SystemExit` and calls nothing.
+  - for a schema the argv does not match, `launch` raises `SystemExit` and calls nothing;
+  - its `check_mount_sources` runs for real, against a fresh work dir the test makes; for a work dir reached through
+    a symbolic link, `launch` raises `SystemExit` and calls nothing.
 
 **A separate prerequisite: the executable.** `"docker"` is resolved by the launcher's `PATH`, or the absolute path
 given in the prefix. Neither this check nor the guard verifies which binary that is: making it the reviewed Docker
@@ -152,6 +199,9 @@ It is ACCEPTED only in the recipe's shape:
   ONLY in that import and as the check call's callee;
 - the next statement is `if bad:` whose first statement is `raise …` or `return …`, with no call (other than an
   exception class), await, yield or walrus in it;
+- the two statements right after that abort are `fs = check_mount_sources(<the check's schema>)`, bound to
+  `txe.containerguard.argv_guard` exactly as `violations` is, and `if fs:` with the same kind of abort and no `else`
+  (`C22`). Nothing runs between the host read and the launch;
 - after that, the argv's name appears exactly ONCE, as the launch's command argument. That is a positional argument
   or the API's command keyword above, either as `argv` itself or with the docker binary in front (`["docker"] + argv`,
   a one-element list naming docker). In the whole function it appears only as the site's target, the check's
@@ -162,7 +212,7 @@ It is ACCEPTED only in the recipe's shape:
   - `f(args=argv)`: Name → keyword → Call → Expr / Assign;
   - `f(["docker"] + argv)`: Name → BinOp → Call (or → keyword → Call) → Expr / Assign.
 
-### 2. Unsupported, so refused (a finding, codes `C01`–`C21`)
+### 2. Unsupported, so refused (a finding, codes `C01`–`C22`)
 
 A recognised launch in any other form fails for review. These forms include:
 - a site not directly in a function body: module-level, or nested in a `with`, `try`, `if` or loop (`C20`);
@@ -176,6 +226,9 @@ A recognised launch in any other form fails for review. These forms include:
     one-element list naming docker (`["podman"] + argv`, `argv + […]`, `[DOCKER] + argv`);
   - a launch that is awaited, conditional (`… if … else …`), a `with` item or returned;
 - an ignored result, or a different argv checked;
+- the filesystem check omitted, its result ignored, run anywhere but right after the argv check's abort (after the
+  launch, before the argv check, or with a statement between), on another schema or by keyword, not bound to
+  argv_guard's, or without a fail-closed abort, or with an `else` (`C22`);
 - use before the check, or a change after it, including an alias (`x = argv`);
 - an `else` or `elif` on the abort (`C15`);
 - an abort with a side effect (`return subprocess.run(argv)`) (`C05`);
@@ -301,11 +354,14 @@ repository's CI.** A NEW runner revision adopts the guard like this:
   pattern), and never vendors a copy;
 - its packet's pure tests assert two things:
   1. the bytes it loaded hash to the pin;
-  2. its launch path calls this module's `violations` on the argv it creates, and raises on any finding.
+  2. its launch path calls this module's `violations` on the argv it creates, then `check_mount_sources` on the same
+     schema immediately before the create, and raises on any finding of either.
 
 **A pin is a snapshot.** A consumer pinned to an older `argv_guard.py` digest keeps that version's rules. It is NOT
 upgraded, or validated, by any later change to this module or by the tests that validate it. That includes the
-numeric-user rule (`S13`): a consumer gets it only by moving its pin and re-running its own packet.
+numeric-user rule (`S13`): a consumer gets it only by moving its pin and re-running its own packet. It also includes
+the filesystem floor: an older consumer gets neither `check_mount_sources` nor its rules until it moves its pin AND
+adds the call to its launch path, and it is not protected against a symlinked bind source until then.
 
 ```python
 GUARD_PIN = ("<commit>", "txe/containerguard/argv_guard.py", "<sha256>")

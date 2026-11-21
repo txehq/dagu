@@ -36,18 +36,36 @@ spells out one run's exact argv:
   denied option, an --opt=value form or any option outside the schema refuses and stops parsing,
   failing closed. The image must be the schema's, right after the schema's last option. The
   PAYLOAD tokens must equal the schema's exactly: they are compared whole, never parsed. The argv
-  is never joined.
+  is never joined. When check_schema fails, violations returns its findings and does NOT parse the
+  argv: an invalid schema has nothing to compare against.
+- check_mount_sources(schema) is the FILESYSTEM floor, a preflight the launcher runs immediately
+  before `docker create`. check_schema and violations compare canonical path STRINGS, but Docker
+  resolves a bind source on the host, following links (PR 299 security review of cdb78d1d:
+  work/innocent -> /var/run/docker.sock passed both). It reads the host with lstat only, never
+  following a link: every component of the work dir and of every bind source, readonly or
+  writable, from "/" down. A symbolic link anywhere on that path (F01), a final object that is
+  neither a directory nor a regular file, such as a socket, device or FIFO (F02; the work dir must
+  be a directory), and a missing component or any other inspection error (F03) refuse. It adds no
+  root of its own: every source is already strictly inside the work dir (S06). The --cidfile, when
+  given, needs a canonical path (F05), a link-free directory parent chain (F01, F02, F03) and an
+  ABSENT leaf: an existing one, a dangling link included, refuses without being followed (F04).
+  It is a POINT-IN-TIME read of THIS host's filesystem: it proves nothing against a concurrent
+  writer, and nothing about a remote, namespaced or VM-backed daemon (README: UNVERIFIED).
 
-Diagnostics are REDACTED. A Violation holds a stable code, an option name only when it is a KNOWN
-constant (a schema option or a denied one), a position, and counts. It never holds a value or an
-unknown token from the argv or the schema, so an unexpected `--env NAME=<credential>` or
-`--x=<credential>` is reported without it.
+Diagnostics are REDACTED, and the Violation type enforces it, so no call site can leak (PR 299
+review of cdb78d1d: a schema KEY reached a diagnostic). A Violation's option is a name in
+NAMEABLE (the listed create options and the denied ones, all module constants) or
+"<unrecognised option>"; its detail is a fixed phrase or a count template, else "<redacted>";
+its position is an int. It never holds a value or an unknown token from the argv or the schema, so
+an unexpected `--env NAME=<credential>`, `--x=<credential>` or schema key is reported without it.
 
 This is a validator of a fixed, reviewed argv. It is NOT a safe logger of arbitrary argv, and its
 callers must not print the argv they refuse.
 """
+import os
 import posixpath
 import re
+import stat
 from dataclasses import dataclass, field
 
 DENIED_OPTIONS = frozenset({
@@ -81,6 +99,14 @@ CREATE_OPTIONS = {
 # The schema kinds each arity allows: a flag only as a flag, a single-value option only in `single`, a list option in
 # `single` (exactly one occurrence) or `repeated`. The policy kinds above narrow the list options further.
 ARITY_KINDS = {"flag": ("flags",), "single": ("single",), "list": ("single", "repeated")}
+# The ONLY option names, and detail texts, a Violation may hold: module constants, never a schema key or an argv token.
+# Violation.__post_init__ enforces both (PR 299 review of cdb78d1d), so a call site cannot leak whatever it passes.
+NAMEABLE = frozenset(CREATE_OPTIONS) | DENIED_OPTIONS | frozenset(FLOOR_SINGLE) | FLOOR_FLAGS | REPEATED_KIND | \
+    SINGLE_KIND
+UNRECOGNISED = "<unrecognised option>"
+DETAILS = frozenset({"", "parsing stopped", "a repeated value is listed twice", "a key is given twice", "the work dir"})
+COUNT_DETAIL = re.compile(r"[0-9]+ unexpected, [0-9]+ missing, [0-9]+ given for [0-9]+|[0-9]+ tokens given for [0-9]+")
+REDACTED = "<redacted>"
 # Runtime and kernel trees that no mount may come from or go onto.
 SYSTEM_TREES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/etc", "/boot")
 SOCKET_NAMES = ("docker.sock", "containerd.sock", "podman.sock")
@@ -115,6 +141,14 @@ CODES = {
     "S17": "the schema is not well formed",
     "S18": "a schema value starts with '-' (docker could read it as an option)",
     "S19": "a declared writable target is not a canonical absolute path outside the system trees",
+    "F01": "a component of the work dir, of a bind source or of the cidfile's parent, from the root down, is a "
+           "symbolic link",
+    "F02": "a bind source is neither a directory nor a regular file (a socket, device or FIFO), or the work dir or "
+           "the cidfile's parent is not a directory",
+    "F03": "a component of the work dir, of a bind source or of the cidfile's parent is missing, or a path could not "
+           "be inspected",
+    "F04": "the cidfile already exists, in any form (a dangling symbolic link included)",
+    "F05": "the cidfile is not a canonical absolute path",
     "G01": "the argv is not a list of strings starting with create",
     "G10": "a denied option (parsing stopped)",
     "G11": "an option in --opt=value form (parsing stopped)",
@@ -146,30 +180,28 @@ class Schema:
 
 @dataclass(frozen=True)
 class Violation:
-    """A redacted finding: a CODES key, a known option name or "", a position or -1, and counts."""
+    """A redacted finding: a CODES key, a NAMEABLE option name or "", a position or -1, and a fixed detail or counts.
+    Redaction is the type's invariant, not each caller's duty: whatever a caller passes, an option outside NAMEABLE is
+    stored as UNRECOGNISED, a detail outside DETAILS and COUNT_DETAIL as REDACTED, and a non-int position as -1."""
     code: str
     option: str = ""
     position: int = -1
     detail: str = ""
 
+    def __post_init__(self):
+        if self.code not in CODES:
+            raise ValueError("Violation: not a CODES key")        # a literal at every call site: a programming error
+        if not isinstance(self.option, str) or (self.option and self.option not in NAMEABLE):
+            object.__setattr__(self, "option", UNRECOGNISED)
+        if not isinstance(self.detail, str) or (self.detail not in DETAILS and not COUNT_DETAIL.fullmatch(self.detail)):
+            object.__setattr__(self, "detail", REDACTED)
+        if not isinstance(self.position, int) or isinstance(self.position, bool):
+            object.__setattr__(self, "position", -1)
+
     def __str__(self):
         where = f" at position {self.position}" if self.position >= 0 else ""
         opt = f" {self.option}" if self.option else ""
         return f"{self.code}{opt}{where}{(': ' + self.detail) if self.detail else ''}"
-
-
-def _known(s):
-    """The option names a Violation may name: the schema's own and the denied ones (constants)."""
-    names = set(DENIED_OPTIONS) | set(FLOOR_SINGLE) | set(FLOOR_FLAGS)
-    if isinstance(s, Schema):
-        for part in (s.flags, s.single, s.repeated):
-            if isinstance(part, (dict, frozenset, set)):
-                names |= {x for x in part if isinstance(x, str)}
-    return names
-
-
-def _say(name, known):
-    return name if name in known else "<unrecognised option>"
 
 
 def _normal_abs(p):
@@ -218,7 +250,7 @@ def check_schema(s):
     if not isinstance(s, Schema) or not all(isinstance(x, (dict, frozenset, set)) for x in (s.single, s.repeated,
                                                                                           s.flags)):
         return [Violation("S17")]
-    bad, known = [], _known(s)
+    bad = []
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in s.single.items()) or \
             not all(isinstance(k, str) and isinstance(v, tuple) and all(isinstance(x, str) for x in v)
                     for k, v in s.repeated.items()) or not all(isinstance(x, str) for x in s.flags) or \
@@ -241,8 +273,7 @@ def check_schema(s):
                 (opt in FLOOR_FLAGS and opt not in s.flags) or opt not in CREATE_OPTIONS or \
                 not any(opt in {"flags": s.flags, "single": s.single, "repeated": s.repeated}[k]
                         for k in ARITY_KINDS[CREATE_OPTIONS[opt]]):
-            bad.append(Violation("S04", _say(opt, set(DENIED_OPTIONS) | set(FLOOR_SINGLE) | REPEATED_KIND |
-                                             SINGLE_KIND | FLOOR_FLAGS | set(CREATE_OPTIONS))))
+            bad.append(Violation("S04", opt))
     # absent means the image's user, root for most images. Docker reads a numeric id with strconv.Atoi, so "00", "+0"
     # and "-0" are uid 0, and a NAME resolves inside the image, where any name can be uid 0 (PR 299 review of
     # 32dc13f1: `--user 00:0` ran as root). So the user is EXACTLY uid:gid, both canonical nonzero decimals. A bare
@@ -298,30 +329,31 @@ def check_schema(s):
             bad.append(Violation("S16", "--tmpfs"))
     for opt, vals in s.repeated.items():
         if len(vals) != len(set(vals)):
-            bad.append(Violation("S04", _say(opt, known), detail="a repeated value is listed twice"))
+            bad.append(Violation("S04", opt, detail="a repeated value is listed twice"))
     for opt, vals in list((k, (v,)) for k, v in s.single.items()) + list(s.repeated.items()):
         if any(v.startswith("-") for v in vals):   # docker could read such a value as an option
-            bad.append(Violation("S18", _say(opt, known)))
+            bad.append(Violation("S18", opt))
     return bad
 
 
 def violations(argv, schema):
     """[] when argv is exactly the schema's (and the schema passes the floor); else redacted Violations.
-    Never raises on any argv: a malformed one is G01."""
+    Never raises on any argv: a malformed one is G01. A schema that fails check_schema is reported as such and the argv
+    is NOT parsed against it (PR 299 review of cdb78d1d): an invalid schema has nothing to compare against."""
     bad = check_schema(schema)
-    if bad and bad[0].code == "S17":
+    if bad:
         return bad
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv) or argv[0] != "create":
         return bad + [Violation("G01")]
-    s, known = schema, _known(schema)
+    s = schema
     seen, seen_flags, seen_rep, last, i = set(), set(), {k: [] for k in s.repeated}, None, 1
     while i < len(argv) and argv[i].startswith("-"):
         tok = argv[i]
         base = tok.split("=", 1)[0]
         if base in DENIED_OPTIONS or tok in DENIED_OPTIONS:
-            return bad + [Violation("G10", _say(base, known), i, "parsing stopped")]
+            return bad + [Violation("G10", base, i, "parsing stopped")]
         if "=" in tok:
-            return bad + [Violation("G11", _say(base, known), i, "parsing stopped")]
+            return bad + [Violation("G11", base, i, "parsing stopped")]
         if tok in s.flags:
             if tok in seen_flags:
                 bad.append(Violation("G21", tok, i))
@@ -329,7 +361,7 @@ def violations(argv, schema):
             last, i = tok, i + 1
             continue
         if tok not in s.single and tok not in s.repeated:
-            return bad + [Violation("G12", _say(tok, known), i, "parsing stopped")]
+            return bad + [Violation("G12", tok, i, "parsing stopped")]
         if i + 1 >= len(argv):
             return bad + [Violation("G13", tok, i)]
         val = argv[i + 1]
@@ -354,9 +386,92 @@ def violations(argv, schema):
             bad.append(Violation("G23", tok, detail=f"{extra} unexpected, {missing} missing, {len(got)} given for "
                                                     f"{len(want)}"))
     if last != s.last_option:
-        bad.append(Violation("G30", _say(s.last_option, known)))
+        bad.append(Violation("G30", s.last_option))
     if argv[i:i + 1] != [s.image]:
         bad.append(Violation("G31", position=i))
     elif tuple(argv[i + 1:]) != s.payload:
         bad.append(Violation("G32", position=i + 1, detail=f"{len(argv) - i - 1} tokens given for {len(s.payload)}"))
+    return bad
+
+
+def _lstat_walk(path):
+    """lstat every component of a canonical absolute path from "/" down, following NO link. (None, mode of the final
+    object) when no component is a link and every one could be read; else (code, None): F01 for a symbolic link
+    anywhere on the path, F03 for a missing component or any other inspection error (a file used as a directory, a
+    name too long, a permission refused). The walk never resolves a link, so nothing outside the path is read."""
+    segs = path[1:].split("/") if path != "/" else []
+    mode = None
+    for cur in ["/"] + ["/" + "/".join(segs[:k]) for k in range(1, len(segs) + 1)]:
+        try:
+            mode = os.lstat(cur).st_mode
+        except OSError:
+            return "F03", None
+        if stat.S_ISLNK(mode):
+            return "F01", None
+    return None, mode
+
+
+def _cidfile_code(path):
+    """None when the cidfile can be created fresh: a canonical absolute path (F05) whose parent chain, from "/", has
+    no link (F01), is all present and readable (F03) and ends in a directory (F02), and whose LEAF does not exist in
+    any form (F04: a regular file, a directory, a FIFO, or a symbolic link, dangling or not, which lstat reports
+    without following). FileNotFoundError on the leaf is the only clean result; any other error there is F03."""
+    if not _normal_abs(path) or path == "/":
+        return "F05"
+    code, mode = _lstat_walk(posixpath.dirname(path))
+    if code:
+        return code
+    if not stat.S_ISDIR(mode):
+        return "F02"
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "F03"
+    return "F04"
+
+
+def check_mount_sources(schema):
+    """The FILESYSTEM floor (PR 299 security review of cdb78d1d): [] when it holds, else redacted Violations. The
+    launcher calls it immediately before `docker create`, after violations() passed; consumers.py requires that (C22).
+
+    check_schema and violations compare path STRINGS, while Docker resolves a bind source on the host, following
+    links: `work/innocent -> /var/run/docker.sock` passed both. So this reads the host, with lstat only:
+    - the work dir, every component from "/" down: no link (F01), all present and readable (F03), a directory (F02);
+    - EVERY bind source, readonly and writable, every component from "/" down: no link (F01), all present and
+      readable (F03), and the source a directory or a regular file (F02: a socket, device or FIFO refuses). It adds no
+      root of its own: check_schema already holds every source strictly inside the work dir (S06), readonly or not.
+    - the --cidfile, when the schema has one (the docker CLI creates and writes it on this host): a canonical absolute
+      path (F05); every component from "/" through its PARENT: no link (F01), all present and readable (F03), the
+      parent a directory (F02); and the LEAF must NOT exist in any form, a dangling link included, read with lstat and
+      never followed (F04). Only "no such file" on the leaf is clean; any other error on it is F03. Docker's own
+      O_EXCL create of the cidfile remains a second, independent check at create time.
+    A schema that fails check_schema is reported as such and nothing is read.
+
+    It is a POINT-IN-TIME read of the filesystem this process sees. It proves nothing against a writer that replaces
+    a component between this check and the create: the caller must ensure no concurrent untrusted writer to the
+    sources, the cidfile's parent or their ancestors until the create returns. It establishes nothing about a remote
+    Docker daemon, a daemon in another mount namespace, or a VM-backed daemon (Docker Desktop, OrbStack): filesystem
+    equivalence with what such a daemon mounts is UNVERIFIED (README). A hard link to a regular file elsewhere on the
+    same filesystem is a regular file here and is NOT detected (a hard-linked socket is still a socket: F02)."""
+    bad = check_schema(schema)
+    if bad:
+        return bad
+    code, mode = _lstat_walk(schema.work_dir)
+    if code is None and not stat.S_ISDIR(mode):
+        code = "F02"
+    if code:
+        bad.append(Violation(code, detail="the work dir"))
+    if "--cidfile" in schema.single:
+        code = _cidfile_code(schema.single["--cidfile"])
+        if code:
+            bad.append(Violation(code, "--cidfile"))
+    for spec in schema.repeated.get("--mount", ()):
+        src = _mount_fields(spec)[0]["source"]   # check_schema passed: each mount is canonical, inside the work dir
+        code, mode = _lstat_walk(src)
+        if code is None and not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            code = "F02"
+        if code:
+            bad.append(Violation(code, "--mount"))
     return bad

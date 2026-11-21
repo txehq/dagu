@@ -5,13 +5,16 @@
 The fixtures are Python and shell SOURCE TEXT, parsed and never run. Temporary trees hold only that text. The last
 class scans this repository's real txe/ tree (reads only). One exception: the README's supported recipe is executed
 against the real argv_guard, with a fake `subprocess` that records its call (no process is ever started) and an
-import hook that resolves only the recipe's two imports.
+import hook that resolves only the recipe's two imports. Its filesystem check reads a fresh work dir the test makes
+with tempfile.mkdtemp (and a symbolic link to it, only lstat'd), removed afterwards.
 """
 import ast
 import builtins
 import dataclasses
 import hashlib
 import importlib.util
+import os
+import shutil
 import types
 import tempfile
 import textwrap
@@ -24,7 +27,7 @@ spec = importlib.util.spec_from_file_location("consumers", HERE / "consumers.py"
 C = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(C)
 
-HEAD = "import subprocess\nimport sys\nfrom txe.containerguard.argv_guard import violations\n"
+HEAD = "import subprocess\nimport sys\nfrom txe.containerguard.argv_guard import check_mount_sources, violations\n"
 PKG_AS = "import subprocess\nimport txe.containerguard.argv_guard as argv_guard\n"
 ARGV = '["docker", "create", "--name", "n", "--network", "none", "img", "true"]'
 
@@ -33,15 +36,26 @@ def codes(src, head=HEAD):
     return [f.code for f in C.scan_python("txe/x/launch.py", head + textwrap.dedent(src))]
 
 
+# C22: the filesystem floor, right after the argv check's abort. Its abort's text differs from the argv check's, so a
+# test that replaces `raise SystemExit("refused")` changes the argv check's abort only.
+FS = '    fs = check_mount_sources(schema)\n    if fs:\n        raise SystemExit("mounts refused")\n'
 GOOD = f"""
 def launch(schema):
     argv = {ARGV}
     bad = violations(argv, schema)
     if bad:
         raise SystemExit("refused")
-    subprocess.run(argv, check=True)
+{FS}    subprocess.run(argv, check=True)
 """
-GUARDED = GOOD.replace("violations(argv", "argv_guard.violations(argv")    # GOOD through `import … as argv_guard`
+
+
+def qualify(src, prefix):
+    """src with both guard calls spelled through prefix ("g.", "txe.containerguard.argv_guard.", or "")."""
+    return src.replace("violations(argv", prefix + "violations(argv").replace(
+        "check_mount_sources(schema)", prefix + "check_mount_sources(schema)")
+
+
+GUARDED = qualify(GOOD, "argv_guard.")    # GOOD through `import … as argv_guard`
 
 
 def readme_recipe():
@@ -70,6 +84,9 @@ class Recognised(unittest.TestCase):
             bad = violations(argv, schema)
             if bad:
                 raise RuntimeError("refused")
+            fs = check_mount_sources(schema)
+            if fs:
+                raise RuntimeError("mounts refused")
             subprocess.Popen(argv)
         """
         self.assertEqual(codes(src), [])
@@ -86,12 +103,15 @@ class Recognised(unittest.TestCase):
             bad = violations(argv, schema)
             if bad:
                 raise RuntimeError("refused")
+            fs = check_mount_sources(schema)
+            if fs:
+                raise RuntimeError("mounts refused")
             subprocess.Popen(argv)
         """
         self.assertEqual(codes(src), [])
 
     def test_an_attribute_qualified_check_passes(self):
-        src = GOOD.replace("violations(argv", "argv_guard.violations(argv")
+        src = GUARDED
         self.assertEqual(codes(src, "import subprocess\nimport txe.containerguard.argv_guard as argv_guard\n"), [])
 
 
@@ -236,6 +256,53 @@ class Refused(unittest.TestCase):
         self.assertEqual(codes('def f():\n    a = ["--mount", "x"]\n    b = ["run", "fast"]\n    return a, b\n'), [])
 
 
+class FilesystemRule(unittest.TestCase):
+    """C22 (PR 299 security review of cdb78d1d): a launcher must run argv_guard's check_mount_sources on the check's
+    schema, with a fail-closed abort, right after the argv check's abort. An optional helper would leave the symlinked
+    bind source accepted for every new consumer that omits it. Inert source, parsed only."""
+
+    def test_the_filesystem_check_must_follow_the_argv_check(self):
+        launch = "    subprocess.run(argv, check=True)\n"
+        cases = {
+            "omitted": GOOD.replace(FS, ""),
+            "result-ignored": GOOD.replace(FS, "    check_mount_sources(schema)\n"),
+            "after-the-launch": GOOD.replace(FS, "").replace(launch, launch + FS),
+            "before-the-argv-check": GOOD.replace(FS, "").replace("    bad = violations", FS + "    bad = violations"),
+            "statement-between": GOOD.replace(FS, '    log("checked")\n' + FS),
+            "other-schema": GOOD.replace("def launch(schema):", "def launch(schema, other):").replace(
+                "check_mount_sources(schema)", "check_mount_sources(other)"),
+            "keyword-schema": GOOD.replace("check_mount_sources(schema)", "check_mount_sources(schema=schema)"),
+            "no-abort": GOOD.replace('raise SystemExit("mounts refused")', "print(fs)"),
+            "abort-with-a-call": GOOD.replace('raise SystemExit("mounts refused")',
+                                              "raise SystemExit(subprocess.run(argv))"),
+            "inverted-test": GOOD.replace("    if fs:", "    if not fs:"),
+            "else-branch": GOOD.replace('        raise SystemExit("mounts refused")\n',
+                                        '        raise SystemExit("mounts refused")\n    else:\n        pass\n'),
+            "result-reassigned-test": GOOD.replace("    if fs:", "    if bad:"),
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertIn("C22", codes(src), label)
+
+    def test_a_filesystem_check_not_bound_to_argv_guard_fails(self):
+        local = "import subprocess\nfrom txe.containerguard.argv_guard import violations\n\n" \
+                "def check_mount_sources(s):\n    return []\n"
+        cases = {
+            "local-definition": (local, GOOD, "C22"),
+            "other-module": ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n"
+                             "from fake_guard import check_mount_sources\n", GOOD, "C22"),
+            "passed-as-argument": (HEAD + "register(check_mount_sources)\n", GOOD, "C14"),
+            "patched": (PKG_AS + "argv_guard.check_mount_sources = lambda s: []\n", GUARDED, "C14"),
+        }
+        for label, (head, src, code) in cases.items():
+            with self.subTest(label):
+                self.assertIn(code, codes(src, head), label)
+
+    def test_the_complete_pattern_passes(self):
+        self.assertEqual(codes(GOOD), [])
+        self.assertEqual(codes(GUARDED, PKG_AS), [])
+
+
 BUILDER = """
 def build(x, log, CACHE):
     argv = {argv}
@@ -246,6 +313,9 @@ def launch(schema):
     argv = build(1, print, {{}})
     bad = violations(argv, schema)
     if bad:
+        raise SystemExit(1)
+    fs = check_mount_sources(schema)
+    if fs:
         raise SystemExit(1)
     subprocess.run(argv)
 """
@@ -464,15 +534,15 @@ class ClosedPattern(unittest.TestCase):
 
     def test_the_recognised_guard_bindings_pass(self):
         cases = {
-            "import-as": ("import subprocess\nimport txe.containerguard.argv_guard as g\n", "g.violations(argv"),
-            "package-from-import": ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n",
-                                    "violations(argv"),
+            "import-as": ("import subprocess\nimport txe.containerguard.argv_guard as g\n", "g."),
+            "package-from-import": ("import subprocess\nfrom txe.containerguard.argv_guard import "
+                                    "check_mount_sources, violations\n", ""),
             "package-import": ("import subprocess\nimport txe.containerguard.argv_guard\n",
-                               "txe.containerguard.argv_guard.violations(argv"),
+                               "txe.containerguard.argv_guard."),
         }
-        for label, (head, call) in cases.items():
+        for label, (head, prefix) in cases.items():
             with self.subTest(label):
-                self.assertEqual(codes(GOOD.replace("violations(argv", call), head), [], label)
+                self.assertEqual(codes(qualify(GOOD, prefix), head), [], label)
 
     def test_a_use_outside_the_checked_block_fails(self):
         """PR 299 review of 8f848049: a block does not scope a Python name, so a later use is the same argv."""
@@ -622,7 +692,10 @@ class ClosedPattern(unittest.TestCase):
         records its call and never runs a process:
         - its argv starts with "create" and passes check_schema and violations for its schema;
         - launch(schema) calls subprocess.run exactly once, with ["docker"] + argv;
-        - for a schema the argv does not match, launch raises SystemExit and never calls the fake."""
+        - for a schema the argv does not match, launch raises SystemExit and never calls the fake;
+        - PR 299 security review of cdb78d1d: the recipe's check_mount_sources runs for real against a fresh work dir
+          made here; for a work dir reached through a symbolic link (only lstat'd), launch raises SystemExit and never
+          calls the fake."""
         spec_g = importlib.util.spec_from_file_location("argv_guard_for_recipe", HERE / "argv_guard.py")
         G = importlib.util.module_from_spec(spec_g)
         spec_g.loader.exec_module(G)
@@ -631,7 +704,11 @@ class ClosedPattern(unittest.TestCase):
         argv = ast.literal_eval(next(st.value for st in launch.body if isinstance(st, ast.Assign) and
                                      isinstance(st.targets[0], ast.Name) and st.targets[0].id == "argv"))
         self.assertEqual(argv[0], "create")
-        schema = G.Schema(image=argv[-2], work_dir="/s/runs/example", scratch="/s/runs",
+        scratch = os.path.realpath(tempfile.mkdtemp(prefix="cg-recipe-"))
+        self.addCleanup(shutil.rmtree, scratch)
+        os.mkdir(scratch + "/example")
+        os.symlink(scratch + "/example", scratch + "/linked")
+        schema = G.Schema(image=argv[-2], work_dir=scratch + "/example", scratch=scratch,
                           flags=frozenset({"--read-only"}),
                           single={"--name": "txe-example", "--pull": "never", "--network": "none", "--cap-drop": "ALL",
                                   "--security-opt": "no-new-privileges", "--user": "1000:1000",
@@ -639,6 +716,9 @@ class ClosedPattern(unittest.TestCase):
                           repeated={}, last_option="--entrypoint", payload=(argv[-1],))
         self.assertEqual(G.check_schema(schema), [])
         self.assertEqual(G.violations(argv, schema), [])
+        self.assertEqual(G.check_mount_sources(schema), [])
+        linked = dataclasses.replace(schema, work_dir=scratch + "/linked")
+        self.assertEqual((G.check_schema(linked), [v.code for v in G.check_mount_sources(linked)]), ([], ["F01"]))
 
         calls = []
         fake_subprocess = types.SimpleNamespace(run=lambda *a, **kw: calls.append((a, kw)))
@@ -656,16 +736,19 @@ class ClosedPattern(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ns["launch"](dataclasses.replace(schema, single={**schema.single, "--user": "1001:1001"}))
         self.assertEqual(calls, [])
+        with self.assertRaises(SystemExit):
+            ns["launch"](linked)
+        self.assertEqual(calls, [])
 
     def test_the_documented_recipe_passes(self):
         """The supported recipe, as the README documents it, and its accepted variants are clean. The README's own
         block is read from the file, so the documentation cannot drift from what the check accepts."""
         recipe = readme_recipe()
-        builder = ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n\n\ndef build(extra):\n"
-                   f"    argv = {ARGV}\n    argv += extra\n    return argv\n\n\ndef launch(schema):\n"
-                   "    argv = build([])\n    bad = violations(argv, schema)\n    if bad:\n"
-                   '        raise SystemExit("argv_guard refused the launch")\n    subprocess.Popen(argv)\n')
-        alias = GOOD.replace("violations(argv", "guard.violations(argv").replace(
+        builder = ("import subprocess\nfrom txe.containerguard.argv_guard import check_mount_sources, violations\n\n\n"
+                   f"def build(extra):\n    argv = {ARGV}\n    argv += extra\n    return argv\n\n\n"
+                   "def launch(schema):\n    argv = build([])\n    bad = violations(argv, schema)\n    if bad:\n"
+                   '        raise SystemExit("argv_guard refused the launch")\n' + FS + "    subprocess.Popen(argv)\n")
+        alias = qualify(GOOD, "guard.").replace(
             "subprocess.run(argv, check=True)", "subprocess.run(args=argv, check=True)")
         cases = {
             "readme-recipe": (recipe, ""),
