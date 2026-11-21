@@ -22,7 +22,10 @@ spells out one run's exact argv:
   - the image is an immutable digest;
   - env and label keys are well formed and unique, and env names that carry credentials by
     convention, or point at a Docker daemon or an SSH agent, are refused;
-  - an option belongs to exactly one kind (flag, single or repeated).
+  - an option belongs to exactly one kind (flag, single or repeated);
+  - every option is a canonical long docker create option listed in CREATE_OPTIONS, in the kind its docker arity
+    requires (a boolean is a flag; a single-value option is single; a list option is single or repeated), and no
+    value starts with "-".
 
   A value is not proven secret-free by its text: the env set must equal the reviewed schema, and
   the schema is reviewed source.
@@ -57,6 +60,25 @@ FLOOR_FLAGS = frozenset({"--read-only"})
 # another kind (a --mount in `single` would bypass every mount rule). An option outside these sets may be any one kind.
 REPEATED_KIND = frozenset({"--mount", "--env", "--label", "--tmpfs"})
 SINGLE_KIND = frozenset(FLOOR_SINGLE) | frozenset({"--user"})
+# The ONLY docker create options a schema may name, by canonical LONG name, each with docker's own arity. A schema
+# option outside this table (a short alias such as -u, or any other option) is refused, and its kind must match its
+# arity: a docker boolean declared as taking a value would let the guard read the next token as its value while docker
+# applies that token as an option (`--init --privileged`). The table is the union of what this repository's and the
+# evidence runners' launchers use (TXE-8041 PR 299 security review); widening it is a reviewed change.
+# Arity as docker/cli v29.7.1 registers each flag (cli/command/container/opts.go addFlags, create.go; the citation table
+# is ARITY-v29.7.1.md in the TXE-8041 evidence): "flag" a BoolVar; "single" a StringVar, IntVar, Int64Var or a single-value
+# Var (MemBytes, MemSwapBytes, NanoCPUs), where a repeat overrides; "list" a Var whose type accumulates (ListOpts,
+# MountOpt, NetworkOpt, UlimitOpt).
+CREATE_OPTIONS = {
+    **{o: "flag" for o in ("--read-only", "--init", "--rm")},
+    **{o: "single" for o in ("--name", "--pull", "--cidfile", "--user", "--cpus", "--memory", "--memory-swap",
+                             "--pids-limit", "--stop-timeout", "--hostname", "--workdir", "--entrypoint", "--log-driver")},
+    **{o: "list" for o in ("--network", "--cap-drop", "--security-opt", "--ulimit", "--label", "--env", "--mount",
+                           "--tmpfs")},
+}
+# The schema kinds each arity allows: a flag only as a flag, a single-value option only in `single`, a list option in
+# `single` (exactly one occurrence) or `repeated`. The policy kinds above narrow the list options further.
+ARITY_KINDS = {"flag": ("flags",), "single": ("single",), "list": ("single", "repeated")}
 # Runtime and kernel trees that no mount may come from or go onto.
 SYSTEM_TREES = ("/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/etc", "/boot")
 SOCKET_NAMES = ("docker.sock", "containerd.sock", "podman.sock")
@@ -73,7 +95,8 @@ CODES = {
     "S01": "the work dir is not an absolute, normalised path strictly inside scratch",
     "S02": "a floor option is missing from the schema or has another value",
     "S03": "a floor flag is missing from the schema",
-    "S04": "the schema names a denied option, an option in two kinds, or a policy option in the wrong kind",
+    "S04": "the schema names a denied or unlisted option (a short alias included), an option in two kinds, a policy "
+           "option in the wrong kind, or an option whose kind does not match docker's arity",
     "S05": "a mount in the schema is not a canonical bind mount",
     "S06": "a mount source is not strictly inside the work dir",
     "S07": "a mount target is not absolute and normalised, is the root, or lies in a system tree",
@@ -87,6 +110,7 @@ CODES = {
     "S15": "the payload is not a non-empty tuple of strings",
     "S16": "a tmpfs is not an absolute normalised path outside the system trees",
     "S17": "the schema is not well formed",
+    "S18": "a schema value starts with '-' (docker could read it as an option)",
     "G01": "the argv is not a list of strings starting with create",
     "G10": "a denied option (parsing stopped)",
     "G11": "an option in --opt=value form (parsing stopped)",
@@ -201,9 +225,11 @@ def check_schema(s):
         if opt.split("=", 1)[0] in DENIED_OPTIONS or opt in DENIED_OPTIONS or "=" in opt or \
                 sum(opt in k for k in kinds) != 1 or not opt.startswith("-") or \
                 (opt in REPEATED_KIND and opt not in s.repeated) or (opt in SINGLE_KIND and opt not in s.single) or \
-                (opt in FLOOR_FLAGS and opt not in s.flags):
+                (opt in FLOOR_FLAGS and opt not in s.flags) or opt not in CREATE_OPTIONS or \
+                not any(opt in {"flags": s.flags, "single": s.single, "repeated": s.repeated}[k]
+                        for k in ARITY_KINDS[CREATE_OPTIONS[opt]]):
             bad.append(Violation("S04", _say(opt, set(DENIED_OPTIONS) | set(FLOOR_SINGLE) | REPEATED_KIND |
-                                             SINGLE_KIND | FLOOR_FLAGS)))
+                                             SINGLE_KIND | FLOOR_FLAGS | set(CREATE_OPTIONS))))
     if "--user" not in s.single or s.single["--user"].split(":", 1)[0] in ROOT_USERS + ("",):
         bad.append(Violation("S13", "--user"))     # absent means the image's user, root for most images
     if not IMMUTABLE_IMAGE.fullmatch(s.image):
@@ -252,6 +278,9 @@ def check_schema(s):
     for opt, vals in s.repeated.items():
         if len(vals) != len(set(vals)):
             bad.append(Violation("S04", _say(opt, known), detail="a repeated value is listed twice"))
+    for opt, vals in list((k, (v,)) for k, v in s.single.items()) + list(s.repeated.items()):
+        if any(v.startswith("-") for v in vals):   # docker could read such a value as an option
+            bad.append(Violation("S18", _say(opt, known)))
     return bad
 
 

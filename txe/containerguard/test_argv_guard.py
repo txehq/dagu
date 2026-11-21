@@ -142,6 +142,19 @@ KG_NEGATIVES = [
 
 # runner-final's joined-substring list (txe-evidence runner-final.py c7c97084, argv_violations), and the rule here
 # that refuses each as a real Docker argv or schema.
+# docker/cli v29.7.1's own arity for each allowed option, written out here from the source (cli/command/container/
+# opts.go addFlags and create.go; TXE-8041 evidence ARITY-v29.7.1.md cites file and line): BoolVar is "flag";
+# StringVar/IntVar/Int64Var and the single-value Var types MemBytes, MemSwapBytes, NanoCPUs are "single"; the
+# accumulating Var types ListOpts, MountOpt, NetworkOpt, UlimitOpt are "list".
+CITED_ARITY = {
+    "--read-only": "flag", "--init": "flag", "--rm": "flag",
+    "--name": "single", "--pull": "single", "--cidfile": "single", "--user": "single", "--cpus": "single",
+    "--memory": "single", "--memory-swap": "single", "--pids-limit": "single", "--stop-timeout": "single",
+    "--hostname": "single", "--workdir": "single", "--entrypoint": "single", "--log-driver": "single",
+    "--network": "list", "--cap-drop": "list", "--security-opt": "list", "--ulimit": "list", "--label": "list",
+    "--env": "list", "--mount": "list", "--tmpfs": "list",
+}
+
 OLD_SUBSTRINGS = {
     "--privileged": "G10", "docker.sock": "S08", "/var/run": "S08", "--cap-add": "G10", "--network host": "G20",
     "--network=host": "G11", "--env-file": "G10", "--pid host": "G10", "--ipc host": "G10", "--userns host": "G10",
@@ -326,6 +339,96 @@ class PolicyFloor(unittest.TestCase):
         self.assertIn("S04", codes(G.check_schema(s)))
         self.assertNotEqual(G.violations(a, s), [])
 
+    def test_the_security_review_repros_arity_and_alias_are_refused(self):
+        """PR 299 security review: a docker boolean declared as single-valued (`--init` taking "--privileged"), and a
+        short alias beside its long form (`-u 0` beside `--user 501:20`), each passed the floor."""
+        s0 = schema()
+        arity = dataclasses.replace(s0, flags=frozenset({"--read-only"}), single={**s0.single, "--init": "--privileged"})
+        got = codes(G.check_schema(arity))
+        self.assertIn("S04", got)
+        self.assertIn("S18", got)
+        a = argv()
+        j = a.index("--init")
+        a[j:j + 1] = ["--init", "--privileged"]
+        self.assertNotEqual(G.violations(a, arity), [])
+        alias = dataclasses.replace(s0, single={**s0.single, "-u": "0"})
+        self.assertIn("S04", codes(G.check_schema(alias)))
+        b = argv()
+        k = b.index("--entrypoint")
+        b[k:k] = ["-u", "0"]
+        self.assertNotEqual(G.violations(b, alias), [])
+
+    def test_every_option_must_be_listed_canonical_and_match_its_arity(self):
+        """Each option in every schema kind its docker arity forbids, the short-alias class, and an unlisted option."""
+        self.assertEqual(G.CREATE_OPTIONS, CITED_ARITY)
+        s0 = schema()
+
+        def only_in(opt, kind):
+            flags = set(s0.flags) - {opt}
+            single = {k: v for k, v in s0.single.items() if k != opt}
+            rep = {k: v for k, v in s0.repeated.items() if k != opt}
+            if kind == "flags":
+                flags.add(opt)
+            elif kind == "single":
+                single[opt] = "x"
+            else:
+                rep[opt] = ("x",)
+            return dataclasses.replace(s0, flags=frozenset(flags), single=single, repeated=rep)
+        allowed = {"flag": {"flags"}, "single": {"single"}, "list": {"single", "repeated"}}
+        cases = [(f"{ar} {opt} as {kind}", only_in(opt, kind))
+                 for opt, ar in sorted(CITED_ARITY.items())
+                 for kind in ("flags", "single", "repeated") if kind not in allowed[ar]]
+        self.assertEqual(len(cases), 3 * 2 + 13 * 2 + 8 * 1)
+        for alias in ("-u", "-w", "-l", "-m", "-h", "-e", "-v", "-p", "-c", "-i", "-t", "-d"):
+            cases.append((f"alias {alias}", dataclasses.replace(s0, single={**s0.single, alias: "x"})))
+        cases.append(("unlisted --log-opt", dataclasses.replace(s0, single={**s0.single, "--log-opt": "x"})))
+        for label, s in cases:
+            with self.subTest(label):
+                self.assertIn("S04", codes(G.check_schema(s)), label)
+
+    def test_duplicate_and_conflicting_options_are_refused(self):
+        """The 'once' rule and its conflicts: a single option or a flag given twice, a value option repeated where
+        only one is allowed, a short alias beside its long form, an option in two schema kinds."""
+        s0 = schema()
+        cases = [
+            ("hostname-twice", ins("--hostname", "txe-gotest"), "G21"),
+            ("user-twice-different", ins("--user", "0:0"), "G21"),
+            ("read-only-twice", ins("--read-only"), "G21"),
+            ("init-twice", ins("--init"), "G21"),
+            ("alias-beside-long", ins("-u", "0"), "G12"),
+        ]
+        for label, mut, code in cases:
+            with self.subTest(label):
+                a = argv()
+                mut(a)
+                self.assertIn(code, codes(G.violations(a, s0)), label)
+        with self.subTest("single-option-in-single-and-repeated"):
+            both = dataclasses.replace(s0, repeated={**s0.repeated, "--hostname": ("txe-gotest",)})
+            self.assertIn("S04", codes(G.check_schema(both)))
+
+    def test_a_dash_leading_value_is_refused(self):
+        s0 = schema()
+        for label, s in (("single", schema_single(**{"--hostname": "--privileged"})),
+                         ("repeated", dataclasses.replace(s0, repeated={**s0.repeated,
+                                                                        "--label": LABELS + ("--privileged",)}))):
+            with self.subTest(label):
+                self.assertIn("S18", codes(G.check_schema(s)), label)
+
+    def test_every_listed_option_in_its_kind_keeps_a_runner_shaped_schema_clean(self):
+        """The allowlist holds the union of the launchers' options: a KG-shaped schema plus --rm, --log-driver and a
+        --tmpfs (the mutate-style options) is still clean."""
+        s0 = schema()
+        s = dataclasses.replace(s0, flags=frozenset(s0.flags) | {"--rm"},
+                                single={**s0.single, "--log-driver": "none"},
+                                repeated={**s0.repeated, "--tmpfs": ("/tmp:rw,nosuid,nodev,size=1g",)})
+        self.assertEqual(G.check_schema(s), [])
+        used = set(s.flags) | set(s.single) | set(s.repeated)
+        self.assertEqual(used, set(G.CREATE_OPTIONS))
+        # a list option is allowed in either kind its arity permits: --ulimit as repeated is clean too
+        s2 = dataclasses.replace(s, single={k: v for k, v in s.single.items() if k != "--ulimit"},
+                                 repeated={**s.repeated, "--ulimit": ("nofile=65536:65536",)})
+        self.assertEqual(G.check_schema(s2), [])
+
     def test_a_writable_mount_is_allowed_only_at_a_declared_target(self):
         s = schema_mount(f"type=bind,source={W}/cache,target=/cache")
         self.assertIn("S09", codes(G.check_schema(s)))
@@ -397,7 +500,7 @@ class Static(unittest.TestCase):
 
     def test_the_codes_are_stable(self):
         self.assertEqual(sorted(G.CODES), sorted(
-            [f"S{n:02d}" for n in range(1, 18)] + ["G01", "G10", "G11", "G12", "G13", "G20", "G21", "G22", "G23",
+            [f"S{n:02d}" for n in range(1, 19)] + ["G01", "G10", "G11", "G12", "G13", "G20", "G21", "G22", "G23",
                                                     "G30", "G31", "G32"]))
 
 

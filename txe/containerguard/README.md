@@ -43,7 +43,14 @@ launch(argv)
 - env and label keys are well formed and unique, with credential-named env keys refused;
 - each policy option has exactly one kind: `--mount`, `--env`, `--label` and `--tmpfs` are repeated; `--network`,
   `--pull`, `--cap-drop`, `--security-opt` and `--user` are single; `--read-only` is a flag. Declaring one in another
-  kind would skip its rules, so it is refused.
+  kind would skip its rules, so it is refused;
+- every schema option is listed in `CREATE_OPTIONS`: the canonical LONG `docker create` options the launchers use,
+  each with docker/cli's own arity (v29.7.1: a boolean is a flag; a StringVar or single-value option is `single`; an
+  accumulating list option may be `single` or `repeated`). A short alias (`-u`, `-w`, …) or any unlisted option is
+  refused. So is an option in a kind its arity forbids: a docker boolean declared as taking a value would let the guard
+  read the next token as its value while docker applied that token as an option. Widening the table is a reviewed
+  change;
+- no schema value starts with `-` (`S18`), which docker could read as an option.
 
 **A value's text does not prove it holds no secret.** What makes the env safe is that it must equal the reviewed
 schema, which is source.
