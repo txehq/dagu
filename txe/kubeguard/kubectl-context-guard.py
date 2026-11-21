@@ -484,9 +484,16 @@ def output_substitutions(text):
     return out
 
 
+# A client named as the attached value of a short option (`man -Pkubectl`, `git grep -Okubectl`): the option
+# letters leave no word boundary before the name, so MENTION alone would miss it.
+MENTION_ATTACHED = re.compile(r"(?:^|(?<=[\s'\"`(;|&=\[,{!]))-[A-Za-z]{1,4}(?:[\w.~-]*/)*(?:"
+                              + "|".join(map(re.escape, CLIENT_NAMES)) + r")(?=$|[\s'\"`);|&,\]}:@])")
+
+
 def mentions(text):
     # Also on a copy without backslashes: bash removes them (`kube\ctl` runs kubectl).
-    return bool(MENTION.search(text)) or ("\\" in text and bool(MENTION.search(text.replace("\\", ""))))
+    texts = (text, text.replace("\\", "")) if "\\" in text else (text,)
+    return any(MENTION.search(t) or MENTION_ATTACHED.search(t) for t in texts)
 
 
 class Refusal(Exception):
