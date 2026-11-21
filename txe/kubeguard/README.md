@@ -40,6 +40,11 @@ a context can be repointed inside its file. This directory holds the source of t
   refused. An unconfigured kube-run refuses every call too (KR02 with no registry, KR06 with no policy).
   Wiring the hook therefore changes agent behaviour at once. It is a deployment decision with its own plan,
   not part of this change.
+- **An authorization record is a declaration of scope, not tamper-proof authority.** kube-run checks a
+  record's shape, cluster, expiry and scope against the request. It does not check who wrote the record: a
+  caller who can write a file can write one. KR06, the refusal of every call to an entry with no policy
+  configured, is a default-deny, not authentication of a configured record. Who may issue records, and how
+  they are protected, is a decision for any install plan; signing is out of scope here.
 - The rules that need a decision before any install are compatibility proposals, not approved policies:
   static credentials only, the direct-client and helm/flux refusals, which clusters are registered and who
   writes authorization records.

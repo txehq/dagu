@@ -382,5 +382,63 @@ class PairingWithKubeRun(unittest.TestCase):
             self.assertEqual(cm.exception.code, "KR04", extra)
 
 
+class ShortOptionPairing(unittest.TestCase):
+    """The hook and kube-run each keep a copy of the shorthand rule, because the hook must run standalone. This
+    pins the copies to each other for every value-taking letter and every recognised boolean letter, in every
+    form pflag reads: bare, attached (-xVALUE), with = (-x=V), clustered before and after s, and after `--`.
+    The hook's side runs in-process (its Guard class), so that hundreds of forms stay fast; Refused and
+    PairingWithKubeRun cover the subprocess path."""
+
+    BOOLEAN_LETTERS = "AitwRhq"
+
+    def forms(self):
+        for x in sorted(KR.SHORT_VALUE_LETTERS) + list(self.BOOLEAN_LETTERS):
+            yield from (f"-{x}", f"-{x}VALUE", f"-{x}=V", f"-{x}https://h", f"-i{x}s", f"-{x}s", f"-s{x}",
+                        f"-it{x}")
+
+    def hook_refuses_h11(self, kargs):
+        cmd = f"{F.kr} txe-onprem-ci -- {kargs}"
+        try:
+            GUARD.Guard(os.path.realpath(F.kr), None, cmd).check_top(cmd)
+        except GUARD.Refusal as r:
+            self.assertEqual(r.rule, "H11", cmd)   # an allowed kube-run form can only fail as an override
+            return True
+        return False
+
+    def kube_run_refuses_kr04(self, args):
+        try:
+            KR.parse_request(args, "default")
+        except KR.Refused as r:
+            return r.code == "KR04"
+        return False
+
+    def test_the_value_letter_sets_are_the_same_set(self):
+        self.assertEqual(GUARD.SHORT_VALUE_LETTERS, KR.SHORT_VALUE_LETTERS)
+        # The hook's third copy: the short options first_operand skips together with their value.
+        self.assertEqual({o[1] for o in GUARD.SHORT_VALUED}, KR.SHORT_VALUE_LETTERS)
+        self.assertTrue(all(len(o) == 2 and o[0] == "-" for o in GUARD.SHORT_VALUED))
+        self.assertFalse(set(self.BOOLEAN_LETTERS) & KR.SHORT_VALUE_LETTERS)
+
+    def test_every_short_form_gets_the_same_verdict_from_both(self):
+        seen = {True: 0, False: 0}
+        for a in self.forms():
+            override = KR.is_override(a)
+            seen[override] += 1
+            self.assertEqual(GUARD.short_cluster_has(a, "s"), KR.short_cluster_has(a, "s"), a)
+            self.assertEqual(self.hook_refuses_h11(f"get pods {a}"), override, a)
+            self.assertEqual(self.kube_run_refuses_kr04(["get", "pods", a]), override, a)
+            # After the terminator, both still read the token (kube-run scans every argument for overrides).
+            self.assertEqual(self.hook_refuses_h11(f"get pods -- {a}"), override, a)
+            self.assertEqual(self.kube_run_refuses_kr04(["get", "pods", "--", a]), override, a)
+        self.assertTrue(seen[True] and seen[False], seen)   # both verdicts were exercised
+
+    def test_the_value_letters_end_the_cluster(self):
+        for x in sorted(KR.SHORT_VALUE_LETTERS - {"s"}):
+            self.assertFalse(KR.is_override(f"-{x}s"), x)          # the s is the value of -x
+            self.assertTrue(KR.is_override(f"-s{x}"), x)           # -s first takes x as its value
+        for x in self.BOOLEAN_LETTERS:
+            self.assertTrue(KR.is_override(f"-{x}s"), x)           # a boolean, then -s
+
+
 if __name__ == "__main__":
     unittest.main()
