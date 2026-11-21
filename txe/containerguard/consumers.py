@@ -15,7 +15,8 @@ the findings were enforced. So the check demands this exact shape, in one functi
         fs = check_mount_sources(<schema>)         # argv_guard's, the SAME schema, right after the abort (C22)
         if fs:
             raise ... | return ...                 # the same fail-closed abort, no else (C22)
-        ... launch(argv) ...                       # argv's ONLY other occurrence in the function: one launch (C21)
+        ... launch(argv) ...                       # the NEXT statement, pure callee and arguments (C22); argv's
+                                                   # ONLY other occurrence in the function: one launch (C21)
 
 A docker argv is a list literal with a launch verb and a launch mark, or a mark and a dynamic element, or a constant
 "docker" followed by a dynamic verb (is_docker_list). A builder is a function in the same file that returns such a list
@@ -101,8 +102,10 @@ FINDINGS = {
            "try, if or loop, is not analysed)",
     "C21": "the argv's name occurs in its function other than as the site's target, the check's argument and ONE "
            "launch-call argument after the check (outside any nested def, lambda, class or comprehension)",
-    "C22": "the argv check's abort is not followed at once by the filesystem check: `fs = check_mount_sources(<the "
-           "check's schema>)`, bound to argv_guard's, then `if fs:` with a fail-closed abort and no else",
+    "C22": "the argv check's abort is not followed at once by the filesystem check (`fs = check_mount_sources(<the "
+           "check's schema>)`, bound to argv_guard's, then `if fs:` with a fail-closed abort and no else), or the "
+           "launch is not the statement right after that abort, or its callee or an argument has a call, await, yield "
+           "or walrus",
 }
 # C14: the only modules whose violations() counts, by import name. A module path suffix is not provenance: neither
 # `evil.argv_guard` nor a file path ending argv_guard.py is trusted, and a dynamic load (importlib) is refused.
@@ -682,12 +685,18 @@ def _one_launch(rel, assign, check, after, name, fn, parent, names):
 
 def _fs_checked(after, check, guard):
     """C22 (PR 299 security review of cdb78d1d): the two statements right after the argv check's abort are the
-    filesystem floor and its abort, so nothing runs between the host read and the launch:
+    filesystem floor and its abort:
         fs = check_mount_sources(<schema>)    # bound to argv_guard's (FS_CALLS); one positional argument, pure, and
                                               # the SAME expression as the argv check's schema argument
         if fs:                                # its first statement a fail-closed abort (_is_abort); no else or elif
+    and _check_site then requires the launch to be the very NEXT statement, with a pure callee and pure arguments
+    (_pure_call). So no STATEMENT, and no call, await, yield or walrus this check can see, sits between the host read
+    and the launch. That is not a proof that evaluating the launch's callee and arguments has no effect: an attribute
+    read can run a property or __getattr__, which the AST does not show. The caller must keep that evaluation free of
+    filesystem changes (README).
     Refused (C22): the check omitted, its result ignored, called after the launch or anywhere else, on another schema,
-    not bound to argv_guard's, or without a fail-closed abort."""
+    not bound to argv_guard's, or without a fail-closed abort; any statement between its abort and the launch; a
+    launch whose callee or arguments contain a call, await, yield or walrus."""
     if len(after) < 2 or len(check.args) < 2:
         return False
     a, b = after[0], after[1]
@@ -727,8 +736,19 @@ def _check_site(rel, assign, name, where, guard, tree, parent):
     if u.orelse:      # an else/elif runs after a PASSING check, outside the analysed path: refused, whatever it holds
         out.append(Finding(rel, u.lineno, "C15"))
     after = rest[first + 2:]
+    launch_window = after
     if _fs_checked(after, t.value, guard):
         after = after[2:]
+        # PR 299 root review of 332681f4: the launch is the statement IMMEDIATELY after the filesystem abort. Not
+        # "some later statement": a helper call between the two (replace_source(), log(...), an assignment) would run
+        # after the host read and before the create. So only that next statement may hold the launch (C21 is checked
+        # against this one-statement window), and it must hold the argv and a launch call whose callee and arguments
+        # are pure (no call, await, yield or walrus; _pure_call).
+        launch_window = after[:1]
+        nxt = after[0] if after else None
+        call = nxt.value if isinstance(nxt, (ast.Expr, ast.Assign)) and isinstance(nxt.value, ast.Call) else None
+        if call is None or not _uses(nxt, name) or not _pure_call(call):
+            out.append(Finding(rel, u.lineno, "C22"))
     else:
         out.append(Finding(rel, u.lineno, "C22"))
     if any(_mutates(st, name) for st in after):
@@ -742,7 +762,7 @@ def _check_site(rel, assign, name, where, guard, tree, parent):
     if not launched:
         out.append(Finding(rel, u.lineno, "C13"))
     if fn is not None:
-        out += _one_launch(rel, assign, t.value, after, name, fn, parent, _import_names(tree))
+        out += _one_launch(rel, assign, t.value, launch_window, name, fn, parent, _import_names(tree))
     return out
 
 

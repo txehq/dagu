@@ -156,7 +156,7 @@ def launch(schema: Schema) -> None:
     fs = check_mount_sources(schema)                   # the SAME schema, at once: the host filesystem floor
     if fs:                                             # no else or elif
         raise SystemExit("argv_guard refused the mounts")
-    subprocess.run(["docker"] + argv, check=True)      # ONE launch: the docker binary, then the validated argv
+    subprocess.run(["docker"] + argv, check=True)      # the NEXT statement, ONE launch: docker, then the argv
 ```
 
 `test_consumers.py` reads this block from the README and checks it, so the recipe cannot drift:
@@ -201,7 +201,11 @@ It is ACCEPTED only in the recipe's shape:
   exception class), await, yield or walrus in it;
 - the two statements right after that abort are `fs = check_mount_sources(<the check's schema>)`, bound to
   `txe.containerguard.argv_guard` exactly as `violations` is, and `if fs:` with the same kind of abort and no `else`
-  (`C22`). Nothing runs between the host read and the launch;
+  (`C22`);
+- the launch is the statement IMMEDIATELY after that `if fs:` abort, with no statement between them (`C22`), and
+  its callee and arguments contain no call, await, yield or walrus (`C22`). That bounds what the check can see. It
+  does not prove that evaluating the launch's callee and arguments has no effect: an attribute read can run a
+  property or `__getattr__`. The caller must keep that evaluation free of filesystem changes;
 - after that, the argv's name appears exactly ONCE, as the launch's command argument. That is a positional argument
   or the API's command keyword above, either as `argv` itself or with the docker binary in front (`["docker"] + argv`,
   a one-element list naming docker). In the whole function it appears only as the site's target, the check's
@@ -228,7 +232,9 @@ A recognised launch in any other form fails for review. These forms include:
 - an ignored result, or a different argv checked;
 - the filesystem check omitted, its result ignored, run anywhere but right after the argv check's abort (after the
   launch, before the argv check, or with a statement between), on another schema or by keyword, not bound to
-  argv_guard's, or without a fail-closed abort, or with an `else` (`C22`);
+  argv_guard's, or without a fail-closed abort, or with an `else`; ANY statement between its abort and the launch
+  (a helper such as `replace_source()`, a `log(…)` call, an assignment); or a launch whose callee or arguments call
+  something (`subprocess.run(argv, stdout=open(…))`, `factory().run(argv)`) (`C22`);
 - use before the check, or a change after it, including an alias (`x = argv`);
 - an `else` or `elif` on the abort (`C15`);
 - an abort with a side effect (`return subprocess.run(argv)`) (`C05`);

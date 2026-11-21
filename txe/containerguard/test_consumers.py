@@ -298,6 +298,25 @@ class FilesystemRule(unittest.TestCase):
             with self.subTest(label):
                 self.assertIn(code, codes(src, head), label)
 
+    def test_the_launch_must_be_the_next_statement_with_a_pure_call(self):
+        """PR 299 root review of 332681f4: C22 took the two statements after the argv abort, then accepted the launch
+        as ANY later statement, so a filesystem-mutating helper between the host read and the create passed. The
+        launch must be the statement right after the `if fs:` abort, and its callee and arguments may not call.
+        Inert parsed source: nothing here is executed."""
+        launch = "    subprocess.run(argv, check=True)\n"
+        cases = {
+            "intervening-filesystem-helper": GOOD.replace(FS, FS + "    replace_source(schema)\n"),
+            "intervening-benign-call": GOOD.replace(FS, FS + '    log("x")\n'),
+            "intervening-assignment": GOOD.replace(FS, FS + "    x = 1\n"),
+            "launch-argument-calls": GOOD.replace(launch, '    subprocess.run(argv, stdout=open("log", "w"))\n'),
+            "launch-callee-calls": GOOD.replace(launch, "    factory().run(argv)\n"),
+            "launch-keyword-calls": GOOD.replace(launch, "    subprocess.run(args=argv, env=prepare())\n"),
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertNotEqual(src, GOOD, label)
+                self.assertIn("C22", codes(src), label)
+
     def test_the_complete_pattern_passes(self):
         self.assertEqual(codes(GOOD), [])
         self.assertEqual(codes(GUARDED, PKG_AS), [])
