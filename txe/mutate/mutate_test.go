@@ -13,12 +13,15 @@ package mutate_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -103,6 +106,9 @@ if args[:1] == ["inspect"]:
         print("/%s %s" % tuple(r[args[-1]]))
     sys.exit(0)
 if args[:2] == ["rm", "-f"]:
+    if os.path.exists(LOG + ".rmtamper"):  # the stand-in for a boundary failing during cleanup
+        with open(open(LOG + ".rmtamper").read().strip(), "a") as fh:
+            fh.write("tampered during rm\n")
     if os.path.exists(LOG + ".rmfail"):
         print("Error response from daemon: removal failed", file=sys.stderr)
         sys.exit(1)
@@ -292,11 +298,23 @@ type outcome struct {
 
 func (f fixture) run(t *testing.T, mutants string, extra ...string) outcome {
 	t.Helper()
+	return f.invoke(t, []string{"--mutants", mutants}, extra...)
+}
+
+// diag runs the fixture in --diagnostic mode: no mutant list.
+func (f fixture) diag(t *testing.T, extra ...string) outcome {
+	t.Helper()
+	return f.invoke(t, []string{"--diagnostic"}, extra...)
+}
+
+func (f fixture) invoke(t *testing.T, mode []string, extra ...string) outcome {
+	t.Helper()
 	report := filepath.Join(f.root, "report.json")
 	_ = os.Remove(report)
-	args := append([]string{"-I", script(t, "mutate-sandboxed.py"), "--mutants", mutants, "--tree", f.tree,
+	args := append([]string{"-I", script(t, "mutate-sandboxed.py")}, mode...)
+	args = append(append(args, "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
-		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"}, extra...)
+		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"), extra...)
 	args = append(args, "--", "sh", "check.sh")
 	cmd := exec.Command(python(t), args...)
 	cmd.Env = append(os.Environ(), "MUTATE_TEST_CANARY=host-only-value")
@@ -1844,4 +1862,609 @@ func TestTreeCheckedBeforeFirstCopy(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(g.tree, ".git", "pack"), make([]byte, 2<<20), 0o644))
 	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1", "--no-warm-gocache")
 	assert.Equal(t, 0, o.code, "an excluded .git is not counted: %s", o.stdout+o.stderr)
+}
+
+// ---------------------------------------------------------------- TXE-8053: --diagnostic and --ro-mount
+
+const viewOID = "0123456789abcdef0123456789abcdef01234567"
+
+// gitView writes a directory in the TXE-8047 view shape (commit objects, shallow, a detached HEAD,
+// an index, a core-only config, empty refs) under parent and returns its real path.
+func gitView(t *testing.T, parent string) string {
+	t.Helper()
+	dir := filepath.Join(parent, "view")
+	for _, d := range []string{"objects/pack", "objects/info", "objects/01", "refs/heads", "refs/tags"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
+	}
+	for rel, body := range map[string]string{
+		"HEAD":                                   viewOID + "\n",
+		"shallow":                                viewOID + "\n",
+		"config":                                 "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n",
+		"index":                                  "DIRC\x00\x00\x00\x02\x00\x00\x00\x00",
+		"objects/pack/pack-" + viewOID + ".pack": "PACK\x00\x00\x00\x02",
+		"objects/pack/pack-" + viewOID + ".idx":  "\xfftOc",
+		"objects/01/" + viewOID[2:]:              "loose object",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, rel), []byte(body), 0o644))
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	require.NoError(t, err)
+	return real
+}
+
+// goManifest is the --ro-manifest rule written independently: "D <rel>" per directory and
+// "F <size> <sha256> <rel>" per file, sorted by rel as bytes, hashed together.
+func goManifest(t *testing.T, root string) string {
+	t.Helper()
+	var lines []string
+	require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		if p == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		require.NoError(t, err)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			lines = append(lines, "D "+rel+"\n")
+			return nil
+		}
+		raw, err := os.ReadFile(p)
+		require.NoError(t, err)
+		lines = append(lines, fmt.Sprintf("F %d %x %s\n", len(raw), sha256.Sum256(raw), rel))
+		return nil
+	}))
+	last := func(s string) string { f := strings.Fields(s); return f[len(f)-1] }
+	sort.Slice(lines, func(i, j int) bool { return last(lines[i]) < last(lines[j]) })
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(lines, ""))))
+}
+
+func roManifest(t *testing.T, dir string) (int, string, string) {
+	t.Helper()
+	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", dir)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode(), out.String(), errb.String()
+	}
+	require.NoError(t, err)
+	return 0, strings.TrimSpace(out.String()), errb.String()
+}
+
+// The runner's manifest equals the rule computed independently, includes empty directories, and
+// changes when one file's content, one name or one empty directory changes.
+func TestRoManifest(t *testing.T) {
+	view := gitView(t, t.TempDir())
+	code, got, stderr := roManifest(t, view)
+	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, goManifest(t, view), got)
+	seen := map[string]bool{got: true}
+	for name, change := range map[string]func(){
+		"content":   func() { require.NoError(t, os.WriteFile(filepath.Join(view, "index"), []byte("DIRC-other"), 0o644)) },
+		"name":      func() { require.NoError(t, os.Rename(filepath.Join(view, "shallow"), filepath.Join(view, "shallow2"))) },
+		"empty dir": func() { require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "remotes"), 0o755)) },
+	} {
+		change()
+		code, next, stderr := roManifest(t, view)
+		require.Equal(t, 0, code, stderr)
+		assert.False(t, seen[next], "%s: the manifest did not change", name)
+		assert.Equal(t, goManifest(t, view), next, name)
+		seen[next] = true
+	}
+}
+
+// Every --ro-mount shape outside the contract is refused (exit 2) before any container runs:
+// source shapes, protected-state overlap, destinations, the hash, a writable form, the git view's
+// contents, and the bounds. Nothing here needs privileged host access.
+func TestRoMountShapesRefused(t *testing.T) {
+	home, err := filepath.EvalSymlinks(os.Getenv("HOME"))
+	require.NoError(t, err)
+	type setup func(t *testing.T, f fixture, view, sum string) []string
+	spec := func(src, dst, sum string) []string { return []string{"--ro-mount", src + ":" + dst + ":" + sum} }
+	git := "/work/src/.git"
+	write := func(t *testing.T, p, body string) {
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
+	}
+	realDir := func(t *testing.T, p string) string {
+		require.NoError(t, os.MkdirAll(p, 0o755))
+		r, err := filepath.EvalSymlinks(p)
+		require.NoError(t, err)
+		return r
+	}
+	cases := map[string]struct {
+		setup setup
+		want  string
+	}{
+		"relative source": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec("view", git, sum)
+		}, "absolute path equal to its own realpath"},
+		"dot-dot source": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view+"/../view", git, sum)
+		}, "own realpath"},
+		"trailing slash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view+"/", git, sum)
+		}, "own realpath"},
+		"symlinked parent": {func(t *testing.T, f fixture, view, sum string) []string {
+			link := filepath.Join(filepath.Dir(filepath.Dir(view)), "linked-parent")
+			require.NoError(t, os.Symlink(filepath.Dir(view), link))
+			return spec(link+"/view", git, sum)
+		}, "own realpath"},
+		"source is a symlink": {func(t *testing.T, f fixture, view, sum string) []string {
+			link := filepath.Join(filepath.Dir(view), "view-link")
+			require.NoError(t, os.Symlink(view, link))
+			return spec(link, git, sum)
+		}, "own realpath"},
+		"source is a file": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(filepath.Join(view, "HEAD"), git, sum)
+		}, "not a plain directory"},
+		"symlink inside": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Symlink(f.modcache, filepath.Join(view, "refs", "heads", "main")))
+			return spec(view, git, sum)
+		}, "is a symlink"},
+		"fifo inside": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, syscall.Mkfifo(filepath.Join(view, "objects", "info", "pipe"), 0o644))
+			return spec(view, git, sum)
+		}, "special file"},
+		"name outside the portable set": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "café"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"name with a space": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "a b"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"source is the live tree": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, f.tree), git, sum)
+		}, "overlaps live tree"},
+		"source inside the live tree": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.tree, "sub")), git, sum)
+		}, "overlaps live tree"},
+		"source contains the shared module cache": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.root, "fake-gopath")), git, sum)
+		}, "overlaps shared GOMODCACHE"},
+		"source inside the shared build cache": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.gocache, "sub")), git, sum)
+		}, "overlaps shared GOCACHE"},
+		"source contains HOME": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(filepath.Dir(home), git, sum)
+		}, "overlaps"}, // GOPATH (under HOME) may be named first: the order is the forbidden map's
+		"destination /":           {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/", sum) }, "is not one of"},
+		"destination /etc":        {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/etc", sum) }, "is not one of"},
+		"destination /work":       {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work", sum) }, "is not one of"},
+		"destination /work/src":   {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work/src", sum) }, "is not one of"},
+		"destination in the tree": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work/src/x", sum) }, "is not one of"},
+		"destination in sandbox": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, "/work/sandbox/gocache", sum)
+		}, "is not one of"},
+		"destination /goproxy": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/goproxy", sum) }, "is not one of"},
+		"destination /tmp":     {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/tmp", sum) }, "is not one of"},
+		"destination with dot-dot": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, "/work/src/../src/.git", sum)
+		}, "is not one of"},
+		"relative destination":       {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "work/src/.git", sum) }, "is not one of"},
+		"destination trailing slash": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, git+"/", sum) }, "is not one of"},
+		"destination twice": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), spec(view, git, sum)...)
+		}, "given twice"},
+		"wrong hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, strings.Repeat("0", 64))
+		}, "the copy's manifest is"},
+		"uppercase hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, strings.ToUpper(sum))
+		}, "64 lowercase hex"},
+		"missing hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return []string{"--ro-mount", view + ":" + git}
+		}, "expected SRC:DST:SHA256"},
+		"writable option": {func(t *testing.T, f fixture, view, sum string) []string {
+			return []string{"--ro-mount", view + ":" + git + ":rw:" + sum}
+		}, "is not one of"},
+		"hooks": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "hooks", "post-checkout"), "#!/bin/sh\n")
+			return spec(view, git, goManifest(t, view))
+		}, "git view: hooks is not part of the view"},
+		"alternates": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "objects", "info", "alternates"), "/elsewhere/objects\n")
+			return spec(view, git, goManifest(t, view))
+		}, "no alternates"},
+		"a ref": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "refs", "heads", "main"), viewOID+"\n")
+			return spec(view, git, goManifest(t, view))
+		}, "holds no refs"},
+		"packed refs": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "packed-refs"), viewOID+" refs/remotes/origin/main\n")
+			return spec(view, git, goManifest(t, view))
+		}, "packed-refs is not part of the view"},
+		"reflog": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "logs", "HEAD"), "x\n")
+			return spec(view, git, goManifest(t, view))
+		}, "logs is not part of the view"},
+		"remote in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://example.invalid/x\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"credential helper in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[credential]\n\thelper = store\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"hooksPath in core": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[core]\n\thooksPath = /elsewhere\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only core."},
+		"include in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[include]\n\tpath = /elsewhere/config\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"symbolic HEAD": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "HEAD"), "ref: refs/heads/main\n")
+			return spec(view, git, goManifest(t, view))
+		}, "HEAD must be a detached object id"},
+		"no HEAD": {func(t *testing.T, f fixture, view, _ string) []string {
+			require.NoError(t, os.Remove(filepath.Join(view, "HEAD")))
+			return spec(view, git, goManifest(t, view))
+		}, "HEAD is missing"},
+		"worktree link": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "commondir"), "/elsewhere/.git\n")
+			return spec(view, git, goManifest(t, view))
+		}, "commondir is not part of the view"},
+		"file count bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-files", "3")
+		}, "holds over 3 entries"},
+		"depth bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-depth", "1")
+		}, "nested over 1 levels"},
+		"file size bound": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "index"), strings.Repeat("x", 1<<20+1))
+			return append(spec(view, git, goManifest(t, view)), "--ro-max-file-mib", "1")
+		}, "over 1048576 bytes"},
+		"total size bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-mib", "0")
+		}, "pass 0 bytes"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			view := gitView(t, f.root)
+			o := f.diag(t, c.setup(t, f, view, goManifest(t, view))...)
+			assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "refused")
+			assert.Contains(t, o.stderr, c.want)
+			if _, err := os.Stat(f.log); err == nil {
+				assert.Empty(t, dockerRuns(t, f.log), "no container runs on a refused mount")
+			}
+		})
+	}
+	// Two names that differ only in case, where the file system keeps both.
+	t.Run("names differing in case", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		view := gitView(t, f.root)
+		require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "A"), 0o755))
+		if err := os.Mkdir(filepath.Join(view, "refs", "heads", "a"), 0o755); err != nil {
+			t.Skip("this file system folds case, so the two names cannot coexist")
+		}
+		o := f.diag(t, spec(view, git, goManifest(t, view))...)
+		assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+		assert.Contains(t, o.stderr, "differs only in case")
+	})
+}
+
+func mountArgs(argv []string) []string {
+	var out []string
+	for i, a := range argv {
+		if a == "--mount" {
+			out = append(out, argv[i+1])
+		}
+	}
+	return out
+}
+
+// An accepted view is copied, never mounted itself: the one extra mount is a read-only bind of
+// the runner's copy inside its work directory, outside the run's read-write directory, at
+// /work/src/.git, with GIT_OPTIONAL_LOCKS=0. The copy has the manifest, and no file in it has a
+// second link. Without --ro-mount the argv carries no extra mount and no git variable.
+func TestRoMountArgv(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	view := gitView(t, f.root)
+	// The live tree's own .git is never copied (excluded at every depth), so the mount at
+	// /work/src/.git shadows no source data.
+	require.NoError(t, os.MkdirAll(filepath.Join(f.tree, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, ".git", "config"), []byte("[remote \"live\"]\n"), 0o644))
+	// Restrictive source modes and umask: the copy's modes are set by the runner, not inherited.
+	require.NoError(t, filepath.WalkDir(view, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		if d.IsDir() {
+			return os.Chmod(p, 0o700)
+		}
+		return os.Chmod(p, 0o600)
+	}))
+	old := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(old) })
+	sum := goManifest(t, view)
+	o := f.diag(t, "--ro-mount", view+":/work/src/.git:"+sum)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	runs := dockerRuns(t, f.log)
+	require.Len(t, runs, 1)
+	mounts := mountArgs(runs[0])
+	require.Len(t, mounts, 2, "the run's directory and the read-only copy (no seed)")
+	work := o.report["workdir"].(string)
+	realWork, err := filepath.EvalSymlinks(work)
+	require.NoError(t, err)
+	var rw, ro string
+	for _, m := range mounts {
+		if strings.HasSuffix(m, ",target=/work/src/.git,readonly") {
+			ro = strings.TrimSuffix(strings.TrimPrefix(m, "type=bind,source="), ",target=/work/src/.git,readonly")
+		} else {
+			require.True(t, strings.HasSuffix(m, ",target=/work"), m)
+			rw = strings.TrimSuffix(strings.TrimPrefix(m, "type=bind,source="), ",target=/work")
+		}
+	}
+	require.NotEmpty(t, ro, "the read-only mount: %v", mounts)
+	assert.Equal(t, filepath.Join(realWork, "ro", "00"), ro, "the runner's copy, never the caller's directory")
+	assert.NotEqual(t, view, ro)
+	assert.False(t, strings.HasPrefix(ro+"/", rw+"/") || strings.HasPrefix(rw+"/", ro+"/"), "no writable alias: %s vs %s", ro, rw)
+	assert.Contains(t, strings.Join(runs[0], " "), "--env GIT_OPTIONAL_LOCKS=0")
+	assert.Equal(t, sum, goManifest(t, ro))
+	require.NoError(t, filepath.WalkDir(ro, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		fi, err := os.Lstat(p)
+		require.NoError(t, err)
+		st := fi.Sys().(*syscall.Stat_t)
+		assert.EqualValues(t, os.Getuid(), st.Uid, "owned by the runner's uid, the container's --user: %s", p)
+		if d.IsDir() {
+			assert.Equal(t, os.FileMode(0o755), fi.Mode().Perm(), "directory modes are normalised: %s", p)
+			return nil
+		}
+		assert.EqualValues(t, 1, st.Nlink, p)
+		assert.Equal(t, os.FileMode(0o644), fi.Mode().Perm(), "file modes are normalised: %s", p)
+		return nil
+	}))
+	assert.NoDirExists(t, filepath.Join(work, "pristine", ".git"), "the tree copy holds no .git to shadow")
+	mountsReport := o.report["ro_mounts"].([]any)
+	require.Len(t, mountsReport, 1)
+	assert.Equal(t, filepath.Join(work, "ro", "00"), mountsReport[0].(map[string]any)["copy"])
+
+	t.Run("without --ro-mount", func(t *testing.T) {
+		g := newFixture(t, passingCheck)
+		o := g.run(t, g.mutants(t, []map[string]any{cleanupMutant}))
+		require.Equal(t, 0, o.code, o.stderr)
+		for _, argv := range dockerRuns(t, g.log) {
+			assert.Len(t, mountArgs(argv), 1)
+			assert.NotContains(t, strings.Join(argv, " "), "GIT_")
+		}
+	})
+}
+
+// The read-only boundary failing (the fake docker writing into the mounted copy, or giving one of
+// its files a second link from the writable run directory) is exit 3 with no verdict: never a
+// refusal, never a recorded diagnostic.
+func TestRoMountChangeAlarms(t *testing.T) {
+	cases := map[string]struct{ effect, want string }{
+		"content written": {`open(os.path.join(mounts["/work/src/.git"], "HEAD"), "w").write("tampered\n")`, "manifest is"},
+		"file added":      {`open(os.path.join(mounts["/work/src/.git"], "objects", "info", "x"), "w").close()`, "manifest is"},
+		"writable alias":  {`os.link(os.path.join(mounts["/work/src/.git"], "index"), os.path.join(mounts["/work"], "alias"))`, "links: a writable alias"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			f.docker = fakeDocker(t, f.root, f.log, c.effect)
+			view := gitView(t, f.root)
+			o := f.diag(t, "--ro-mount", view+":/work/src/.git:"+goManifest(t, view))
+			require.Equal(t, 3, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+			assert.Contains(t, o.stderr, "the read-only mount /work/src/.git")
+			assert.Contains(t, o.stderr, c.want)
+			assert.Empty(t, o.outcomes(), "a run whose read-only mount changed has no verdict")
+			assert.NotContains(t, o.report, "diagnostic")
+			assert.DirExists(t, o.report["workdir"].(string))
+		})
+	}
+}
+
+// The copy is checked again immediately before every mount: a change made on the host between
+// runs is the boundary failing (SharedStateChanged), and a mountpoint that is not an empty plain
+// directory is refused. check_mounts refuses a read-only source that a read-write mount reaches,
+// and two mounts on one target.
+func TestRoCopyRevalidatedBeforeMount(t *testing.T) {
+	root := t.TempDir()
+	view := gitView(t, root)
+	tree := filepath.Join(root, "tree")
+	require.NoError(t, os.Mkdir(tree, 0o755))
+	prog := `
+import importlib.util, sys, os
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root, view, digest, tree = Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+def verdict(f):
+    try:
+        f(); return "ok"
+    except ms.SharedStateChanged:
+        return "alarm"
+    except ms.Refused:
+        return "refused"
+args = ms.parse(["--diagnostic", "--image", "img", "--tree", tree, "--", "true"])
+work = ms.WorkDir(root)
+runner = ms.Runner(args, ms.Watch({}), {}, work, "docker", [])
+m = ms.parse_ro_mounts([view + ":/work/src/.git:" + digest])[0]
+ms.prepare_ro_mount(m, work.path, 0, {}, runner.ro_limits)
+runner.ro_mounts = [m]
+d = work.path / "001-x"
+(d / "src" / ".git").mkdir(parents=True)
+cid = work.path / "c.cid"
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+(d / "src" / ".git" / "stray").write_text("x")
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+os.remove(d / "src" / ".git" / "stray")
+os.chmod(m.copy / "config", 0o600)
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+os.chmod(m.copy / "config", 0o644)
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+shadow = work.path / "pristine-with-git"; (shadow / ".git").mkdir(parents=True); (shadow / ".git" / "x").write_text("x")
+print(verdict(lambda: runner.prepare("shadow", shadow, None)))
+(m.copy / "HEAD").write_text("tampered\n")
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+w = work.path / "rw"; w.mkdir(); (w / "inner").mkdir()
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (w / "inner", "/work/src/.git", True)], work.path, {})))
+print(verdict(lambda: ms.check_mounts([(w / "inner", "/work", False), (w, "/work/src/.git", True)], work.path, {})))
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (w / "inner", "/work", True)], work.path, {})))
+s = work.path / "sib"; s.mkdir()
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (s, "/work/src/.git", True)], work.path, {})))
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root, view,
+		goManifest(t, view), tree).CombinedOutput()
+	require.NoError(t, err, string(out))
+	// ok; non-empty mountpoint; a mode changed (alarm); restored (ok); a tree copy holding .git
+	// (refused: source data would be shadowed); content changed (alarm); then the check_mounts rules.
+	assert.Equal(t, "ok\nrefused\nalarm\nok\nrefused\nalarm\nrefused\nrefused\nrefused\nok\n", string(out))
+}
+
+// A diagnostic whose command exits non-zero is recorded as evidence and is not a pass: the runner
+// exits 7 (never 0), the report says mode diagnostic, gate never and outcome DIAGNOSTIC, the
+// command's status is only in diagnostic.command_exit, and the two raw streams are kept apart in
+// files outside every mount with their exact bytes, sizes and sha256.
+func TestDiagnosticNonzeroNotPass(t *testing.T) {
+	f := newFixture(t, "#!/bin/sh\nprintf 'out-line\\n'\nprintf 'err-line\\n' >&2\nexit 1\n")
+	o := f.diag(t)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stdout, "DIAGNOSTIC: command exit 1 (evidence only, never a pass; runner exit 7)")
+	assert.Equal(t, "diagnostic", o.report["mode"])
+	assert.Equal(t, "never", o.report["gate"])
+	assert.EqualValues(t, 7, o.report["exit"])
+	assert.Equal(t, map[string]string{"diagnostic": "DIAGNOSTIC"}, o.outcomes())
+	diag := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "completed", diag["status"])
+	assert.EqualValues(t, 1, diag["command_exit"])
+	work := o.report["workdir"].(string)
+	for stream, want := range map[string]string{"stdout": "out-line\n", "stderr": "err-line\n"} {
+		ev := diag[stream].(map[string]any)
+		p := ev["path"].(string)
+		assert.Equal(t, filepath.Join(work, "logs", "001."+stream), p, "outside every mount")
+		raw, err := os.ReadFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, want, string(raw), stream)
+		assert.EqualValues(t, len(want), ev["bytes"])
+		assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(want))), ev["sha256"])
+	}
+	raw, err := os.ReadFile(filepath.Join(work, "report.json"))
+	require.NoError(t, err)
+	for _, verdict := range []string{"PASSED", "SURVIVED", "KILLED", "FAILED"} {
+		assert.NotContains(t, string(raw), `"`+verdict+`"`, "a diagnostic carries no mutation verdict")
+	}
+	assert.Len(t, dockerRuns(t, f.log), 1, "one run: no baseline, no mutant")
+}
+
+// A command that exits 0 is still only a recorded diagnostic: exit 7, never 0.
+func TestDiagnosticZeroNotPass(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.diag(t)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 0, o.report["diagnostic"].(map[string]any)["command_exit"])
+	assert.Equal(t, "DIAGNOSTIC", o.outcomes()["diagnostic"])
+}
+
+// --diagnostic takes no mutant list (no dummy mutant, no empty list), and outside diagnostic mode
+// a mutant list is still required.
+func TestDiagnosticRefusesMutants(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.invoke(t, []string{"--diagnostic", "--mutants", f.mutants(t, []map[string]any{cleanupMutant})})
+	assert.Equal(t, 2, o.code)
+	assert.Contains(t, o.stderr, "--mutants is refused with it")
+	o = f.invoke(t, nil)
+	assert.Equal(t, 2, o.code)
+	assert.Contains(t, o.stderr, "--mutants (or --diagnostic)")
+	if _, err := os.Stat(f.log); err == nil {
+		assert.Empty(t, dockerRuns(t, f.log))
+	}
+}
+
+// A diagnostic that did not complete (docker's own exit, a timeout, an output bound) is a finding,
+// exit 5, with no command status: never 7 and never 0.
+func TestDiagnosticNotCompleted(t *testing.T) {
+	cases := map[string]struct {
+		extra   []string
+		outcome string
+	}{
+		"docker 125": {[]string{"--image", "infra-125"}, "ERROR"},
+		"timeout":    {[]string{"--image", "hang", "--timeout", "1"}, "TIMEOUT"},
+		"output":     {[]string{"--image", "flood", "--max-output-mib", "1"}, "ERROR"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			o := f.diag(t, c.extra...)
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			assert.Equal(t, c.outcome, o.outcomes()["diagnostic"])
+			diag := o.report["diagnostic"].(map[string]any)
+			assert.Equal(t, "not-completed: "+c.outcome, diag["status"])
+			assert.Nil(t, diag["command_exit"])
+			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete")
+			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+		})
+	}
+}
+
+// A diagnostic during which shared state changed is exit 3 with no recorded result: an integrity
+// failure is never masked by 7.
+func TestDiagnosticAlarm(t *testing.T) {
+	f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
+	o := f.diag(t)
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Empty(t, o.outcomes())
+	assert.NotContains(t, o.report, "diagnostic")
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A completed diagnostic is evidence only once its container is confirmed gone. The fake
+// "staysup" image exits as a client but leaves its container registered; with removal failing, or
+// the daemon unreachable for the owner check, the diagnostic is not complete: exit 5, never 7,
+// with no command status and the run directory kept. With removal working it is 7.
+func TestDiagnosticUnconfirmedContainerIsFinding(t *testing.T) {
+	cases := map[string]string{"removal fails": ".rmfail", "daemon unreachable": ".daemondown"}
+	for name, flag := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			require.NoError(t, os.WriteFile(f.log+flag, nil, 0o644))
+			o := f.diag(t, "--image", "staysup")
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			diag := o.report["diagnostic"].(map[string]any)
+			assert.Equal(t, "not-completed: container not confirmed removed", diag["status"])
+			assert.Nil(t, diag["command_exit"])
+			assert.EqualValues(t, 0, diag["raw_exit"])
+			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete: container")
+			assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
+			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+			assert.NotEmpty(t, o.report["containers_left"])
+			entries, err := filepath.Glob(filepath.Join(o.report["workdir"].(string), "001-*"))
+			require.NoError(t, err)
+			assert.Len(t, entries, 1, "the run directory a container may still mount is kept")
+		})
+	}
+	t.Run("removal confirmed", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		o := f.diag(t, "--image", "staysup")
+		require.Equal(t, 7, o.code, o.stdout+o.stderr)
+		assert.Len(t, removals(t, f.log), 1, "the lingering container was removed, owner-checked")
+		assert.Empty(t, registry(t, f.log))
+		assert.Contains(t, o.stdout, "DIAGNOSTIC: command exit 0")
+	})
+}
+
+// An integrity failure found after the diagnostic was recorded (here the fake docker changes the
+// fake shared cache's sentinel while removing the container, after the run's own checks) wins:
+// exit 3, the diagnostic marked invalid with no command status, and no DIAGNOSTIC line.
+func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmtamper", []byte(filepath.Join(f.modcache, sentinel)), 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Contains(t, o.stderr, "after the end of the run")
+	diag := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "invalid: shared state changed", diag["status"])
+	assert.Nil(t, diag["command_exit"])
+	assert.EqualValues(t, 0, diag["raw_exit"])
+	assert.EqualValues(t, 3, o.report["exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 }
