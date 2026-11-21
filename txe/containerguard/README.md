@@ -77,7 +77,35 @@ argv. **It is not a safe logger of arbitrary argv**, and a caller must not print
 
 `consumers.py` scans `*.py`, `*.sh` and `*.bash` under `txe/`. It skips `testdata/` and this directory.
 
-It sorts what it sees into three categories. **It does not claim complete coverage.**
+It sorts what it sees into three categories. **It does not claim complete coverage.** The runtime guard
+(`argv_guard.violations`, called by the launcher) is what enforces the policy. This check is a fail-closed gate for
+the forms it recognises, and it is incomplete outside its recogniser.
+
+### The supported recipe
+
+A launcher in this repository that wants the check to accept it is written exactly like this:
+
+```python
+# The supported recipe (consumers.py accepts exactly this shape; anything else fails for review).
+import subprocess
+
+from txe.containerguard.argv_guard import Schema, violations   # package-qualified, module level, bound once
+
+
+def launch(schema: Schema) -> None:
+    argv = ["docker", "create", "--name", "n", "--network", "none", "img", "true"]   # directly in the function body
+    bad = violations(argv, schema)                     # the SAME name, the result kept
+    if bad:                                            # no else or elif
+        raise SystemExit("argv_guard refused the launch")   # raise or return, with no call in it
+    subprocess.run(argv, check=True)                   # ONE launch: argv appears nowhere else in the function
+```
+
+`test_consumers.py` reads this block from the README and requires the check to accept it, so the recipe cannot drift
+from the check. Accepted variants:
+- the list built by a builder function in the same file, which only constructs and returns it, and whose result is
+  assigned (`argv = build(...)`);
+- `import txe.containerguard.argv_guard as guard` with `guard.violations(...)`;
+- the launch taking the argv as a keyword argument (`subprocess.run(args=argv)`).
 
 ### 1. Recognised and validated
 
@@ -87,29 +115,31 @@ A **launch** is a list literal that has:
 - a launch mark and any dynamic element, since the verb may be in a variable; or
 - a constant `docker` followed by a dynamic second element.
 
-The list is assigned directly, or returned by a builder in the same file whose result is assigned. A builder may only
-construct the argv (`append`, `extend`, `insert`, `+=`, item assignment, possibly inside a branch or loop) and return
-it.
+It is ACCEPTED only in the recipe's shape:
+- the site (`argv = <list>` or `argv = build(...)`) is a statement **directly in a function body**;
+- the next use is `bad = violations(argv, …)`, with `violations` bound to `txe.containerguard.argv_guard` by one
+  module-level import. The name is bound once in the file and the module is never patched;
+- the next statement is `if bad:` whose first statement is `raise …` or `return …`, with no call (other than an
+  exception class), await, yield or walrus in it;
+- after that, the argv's name appears in exactly ONE call argument, the launch. In the whole function it appears
+  only as the site's target, the check's argument and that launch argument, and the launch is not inside a nested
+  def, lambda, class or comprehension.
 
-It is ACCEPTED only in exactly this shape, in the same function and block:
-
-```python
-argv = …                       # the docker list, or builder(...)
-bad = violations(argv, schema) # argv_guard's: `from argv_guard import violations` or `import argv_guard [as g]`
-                               # at module level, the name bound once in the file, the module never patched
-if bad:                        # no else or elif
-    raise … / return … / sys.exit(…)   # with NO side effect: no call (other than the exception or exit
-                                       # itself), await, yield or walrus anywhere in it
-… launch(argv) …               # argv never reassigned, extended, item-set, deleted or aliased after the check
-```
-
-### 2. Unsupported, so refused (a finding, codes `C01`–`C17`)
+### 2. Unsupported, so refused (a finding, codes `C01`–`C21`)
 
 A recognised launch in any other form fails for review. These forms include:
+- a site not directly in a function body: module-level, or nested in a `with`, `try`, `if` or loop (`C20`);
+- any other occurrence of the argv's name in its function (`C21`):
+  - a use before the site or after the launch;
+  - a second launch;
+  - an alias;
+  - a launch inside a nested def, lambda or comprehension;
 - an ignored result, or a different argv checked;
 - use before the check, or a change after it, including an alias (`x = argv`);
-- an `else` or `elif` on the abort, or an abort with a side effect (`return subprocess.run(argv)`,
-  `sys.exit(launch(argv))`) (`C05`);
+- an `else` or `elif` on the abort (`C15`);
+- an abort with a side effect (`return subprocess.run(argv)`) (`C05`);
+- a CALL as the abort (`sys.exit(…)`, `exit(…)`, `os._exit(…)`) (`C05`): a callee can be shadowed to return. Use
+  `raise SystemExit(n)`;
 - an inline list;
 - a builder used inline, or never called in its file (cross-module use is not analysed);
 - a builder that launches, passes, aliases, stores or yields its argv before returning it (`C17`);
@@ -121,8 +151,9 @@ A recognised launch in any other form fails for review. These forms include:
   - a name bound twice;
   - a star import;
   - a patched module;
-  - a module other than `argv_guard` or `txe.containerguard.argv_guard` (a path or name suffix is not provenance);
   - a dynamic `importlib` load;
+  - a module other than `txe.containerguard.argv_guard`. That includes the bare `argv_guard`, which can resolve to a
+    sibling `argv_guard.py`. A path or name suffix is not provenance;
 - a shell `docker run/create` in a `.sh` or `.bash` file;
 - in Python, a process launch that names `docker` in an unsupported form (`C16`). The launch is a call to a known
   `subprocess`, `os` or `asyncio` function, through any import alias (`import subprocess as sp`,
@@ -143,11 +174,14 @@ The heuristic does not see these, so the code under it is unchecked, and reviewe
   (`"dock" + "er"`);
 - arguments passed through `**kwargs`, and launch functions the recogniser does not know (`exec()`, `importlib`, a
   wrapper in another module);
-- a callee that changes its argument in place (`extend_args(argv)` after the check), and side effects inside a
-  property or an exception's `__init__`.
+- a callee that changes its argument in place, and side effects inside a property or an exception's `__init__`;
+- **module identity.** The package-qualified import reduces accidental resolution to a sibling module, but it is
+  NOT cryptographic module identity. The check assumes the repository's source root is what Python imports
+  `txe.containerguard.argv_guard` from. It makes no claim about an arbitrary Python path or arbitrary code.
 
 These limits cover forms the AST cannot observe. They do not excuse a recognised shape: an accepted shape that
-launches, aborts with a side effect, or calls a fake guard is a bug in this check.
+launches, aborts with a side effect, or calls a fake guard is a bug in this check, and is fixed rather than
+documented.
 
 ### Launchers that do not use the guard (`UNGUARDED.tsv`)
 

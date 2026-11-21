@@ -7,21 +7,25 @@ THIS IS AN AST HEURISTIC, NOT A PROOF OF DATA FLOW. It recognises one written pa
 recognise. Importing violations() and calling it somewhere does not show that the launched argv was validated or that
 the findings were enforced. So the check demands this exact shape, in one function and one block:
 
-    argv = <a docker argv list literal>        or   argv = <a builder in this file>(...)
-    bad = violations(argv, <schema>)               # argv_guard's: imported once, at module level, never shadowed
-    if bad:
-        raise ... | return ... | sys.exit(...)     # fail closed, first statement of the branch, NO side effect
-    ... launch(argv) ...                           # argv not reassigned, extended, item-set or deleted after the check
+    def launcher(...):                             # the site is a statement DIRECTLY in a function body (C20)
+        argv = <a docker argv list literal>    or   argv = <a builder in this file>(...)
+        bad = violations(argv, <schema>)           # txe.containerguard.argv_guard's: one module-level import (C14)
+        if bad:
+            raise ... | return ...                 # first statement of the branch, NO call or other side effect (C05)
+        ... launch(argv) ...                       # argv's ONLY other occurrence in the function: one launch (C21)
 
 A docker argv is a list literal with a launch verb and a launch mark, or a mark and a dynamic element, or a constant
 "docker" followed by a dynamic verb (is_docker_list). A builder is a function in the same file that returns such a list
-and does nothing else with it but construct it (C17). The abort's expression may not call, await, yield or assign
-(C05). violations() counts only when it resolves to argv_guard through a module-level import bound once in the file;
-a dynamic load, a fallback definition, a shadowing or a patch is C14. A call to a builder outside an assignment, a list
-used inline, a builder with no caller in its file (cross-module use is not analysed), a shell `docker run/create`, an
-unparsable file, a check in a different block, an ignored result, a different argv checked, the argv used before its
-check, a mutation after it, a checked argv that escapes or is never launched: each is a finding. Anything ambiguous
-fails for review. The README lists what is recognised and validated, what is refused, and what is not detected.
+and does nothing else with it but construct it (C17). The abort is a raise or return whose expression may not call,
+await, yield or assign (C05). violations() counts only when it resolves to txe.containerguard.argv_guard (the package
+path; a bare argv_guard can resolve to a sibling file) through a module-level import bound once in the file; a dynamic
+load, a fallback definition, a shadowing or a patch is C14. That is not cryptographic module identity: the runtime
+guard is the enforcer, and this check is fail-closed for the forms it knows. A call to a builder outside an
+assignment, a list used inline, a builder with no caller in its file (cross-module use is not analysed), a shell
+`docker run/create`, an unparsable file, a check in a different block, an ignored result, a different argv checked,
+the argv used before its check, a mutation after it, a checked argv that escapes or is never launched: each is a
+finding. Anything ambiguous fails for review. The README lists what is recognised and validated, what is refused,
+and what is not detected, and documents the supported recipe.
 
 In Python, a known process-launch call (subprocess, os or asyncio, through any import alias) that names docker and
 uses a shell (shell=True with a string or a list, os.system, os.popen, create_subprocess_shell), a shell's -c list, a
@@ -90,10 +94,15 @@ FINDINGS = {
            "call: an unsupported launch form, not analysed",
     "C17": "a builder uses its docker argv other than to construct and return it (a launch, call, alias or escape "
            "before any caller's check)",
+    "C20": "the site is not a statement directly in a function body (a module-level site, or one nested in a with, "
+           "try, if or loop, is not analysed)",
+    "C21": "the argv's name occurs in its function other than as the site's target, the check's argument and ONE "
+           "launch-call argument after the check (outside any nested def, lambda, class or comprehension)",
 }
 # C14: the only modules whose violations() counts, by import name. A module path suffix is not provenance: neither
 # `evil.argv_guard` nor a file path ending argv_guard.py is trusted, and a dynamic load (importlib) is refused.
-GUARD_MODULES = ("argv_guard", "txe.containerguard.argv_guard")
+GUARD_MODULES = ("txe.containerguard.argv_guard",)   # package-qualified only: a bare `argv_guard` can resolve to a
+                                                     # planted sibling argv_guard.py (PR 299 security review, fa2183f1)
 GUARD_CALLS = frozenset(f"{m}.violations" for m in GUARD_MODULES)
 CONSTRUCTORS = frozenset({"append", "extend", "insert"})
 # C16: the process-launch calls the recogniser knows, by their canonical dotted name. Import aliases resolve to these
@@ -189,20 +198,17 @@ def _is_abort(stmt):
     """A fail-closed abort whose evaluation has no side effect (PR 299 security review: `return subprocess.run(argv)`
     launched the refused argv while aborting):
     - `return` with a pure value, or a bare `return`;
-    - `raise`, bare, or of a pure exception, or of an exception class called with pure arguments;
-    - `sys.exit(...)`, `exit(...)` or `os._exit(...)` with pure arguments.
-    Anything else, a nested launch included, is not an abort (C05)."""
+    - `raise`, bare, or of a pure exception, or of an exception class called with pure arguments.
+    A CALL is never an abort (PR 299 security review of fa2183f1: `exit`, `sys.exit` and `os._exit` were accepted by
+    spelling, and a local `def exit(...)` that returns passed). The AST cannot prove a callee terminates, while raise
+    and return transfer control whatever they evaluate (raising a non-exception still raises TypeError). Use
+    `raise SystemExit(n)`. Anything else, a nested launch included, is not an abort (C05)."""
     if isinstance(stmt, ast.Return):
         return _pure(stmt.value)
     if isinstance(stmt, ast.Raise):
         exc = stmt.exc
         ok = exc is None or (_pure_call(exc) if isinstance(exc, ast.Call) else _pure(exc))
         return ok and _pure(stmt.cause)
-    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-        f = stmt.value.func
-        return ((isinstance(f, ast.Name) and f.id == "exit") or (
-            isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and
-            (f.value.id, f.attr) in (("sys", "exit"), ("os", "_exit")))) and _pure_call(stmt.value)
     return False
 
 
@@ -535,11 +541,44 @@ def scan_python(rel, text):
         if fn.name in builders and fn.name not in called:
             found.append(Finding(rel, fn.lineno, "C11"))
     for assign, name in sites:
-        found += _check_site(rel, assign, name, where, guard, tree)
+        found += _site_place(rel, assign, where)
+        found += _check_site(rel, assign, name, where, guard, tree, parent)
     return sorted(set(found), key=lambda f: (f.line, f.code))
 
 
-def _check_site(rel, assign, name, where, guard, tree):
+def _site_place(rel, assign, where):
+    """C20: the accepted site is a statement DIRECTLY in a function body (PR 299 reviews of 8f848049 and fa2183f1).
+    A site nested in a with, try, if or loop has code around it that this check does not read: a use after the block
+    (blocks do not scope Python names), a handler or finally that runs after the abort, or a with that suppresses it.
+    A module-level site has no function to bound its uses. Both fail for review."""
+    block, _, fn = where[id(assign)]
+    return [] if fn is not None and block is fn.body else [Finding(rel, assign.lineno, "C20")]
+
+
+DEFERRED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef, ast.ListComp, ast.SetComp, ast.DictComp,
+            ast.GeneratorExp)
+
+
+def _one_launch(rel, assign, check, after, name, fn, parent):
+    """C21: within its function, the argv's name occurs exactly three times: as the site's target, as the check's
+    argument, and as an argument of ONE call after the check (the launch). That call is not inside a nested def,
+    lambda, class or comprehension, whose code may run later, twice or never. Any other occurrence (a use before the
+    site, a second launch, a mutation, an alias, an escape, a closure) is outside the recognised sequence."""
+    occ = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == name]
+    later = [n for st in after for n in ast.walk(st) if isinstance(n, ast.Name) and n.id == name]
+    known = {id(assign.targets[0]), id(check.args[0])}
+    ok = len(later) == 1 and len(occ) == 3 and {id(n) for n in occ} == known | {id(later[0])}
+    if ok:
+        use, p = later[0], parent.get(later[0])
+        ok = isinstance(p, ast.Call) and (use in p.args or any(k.value is use for k in p.keywords))
+        node = p
+        while ok and node is not None and node is not fn:
+            ok = not isinstance(node, DEFERRED)
+            node = parent.get(node)
+    return [] if ok else [Finding(rel, (later[0] if later else assign).lineno, "C21")]
+
+
+def _check_site(rel, assign, name, where, guard, tree, parent):
     block, i, fn = where[id(assign)]
     rest = block[i + 1:]
     first = next((k for k, st in enumerate(rest) if _uses(st, name)), None)
@@ -571,10 +610,12 @@ def _check_site(rel, assign, name, where, guard, tree):
     if any(_escapes(st, name) for st in after):
         out.append(Finding(rel, u.lineno, "C12"))
     launched = any(isinstance(c, ast.Call) and not _is_violations_call(c) and
-                   any(isinstance(a, ast.Name) and a.id == name for a in c.args)
+                   any(isinstance(a, ast.Name) and a.id == name for a in list(c.args) + [k.value for k in c.keywords])
                    for st in after for c in ast.walk(st))
     if not launched:
         out.append(Finding(rel, u.lineno, "C13"))
+    if fn is not None:
+        out += _one_launch(rel, assign, t.value, after, name, fn, parent)
     return out
 
 

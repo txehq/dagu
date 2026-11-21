@@ -19,7 +19,8 @@ spec = importlib.util.spec_from_file_location("consumers", HERE / "consumers.py"
 C = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(C)
 
-HEAD = "import subprocess\nimport sys\nfrom argv_guard import violations\n"
+HEAD = "import subprocess\nimport sys\nfrom txe.containerguard.argv_guard import violations\n"
+PKG_AS = "import subprocess\nimport txe.containerguard.argv_guard as argv_guard\n"
 ARGV = '["docker", "create", "--name", "n", "--network", "none", "img", "true"]'
 
 
@@ -41,8 +42,8 @@ class Recognised(unittest.TestCase):
     def test_the_fail_closed_pattern_passes(self):
         self.assertEqual(codes(GOOD), [])
 
-    def test_return_and_sys_exit_aborts_pass(self):
-        for abort in ("return None", "sys.exit(2)", "return bad"):
+    def test_return_and_raise_aborts_pass(self):
+        for abort in ("return None", "raise SystemExit(2)", "return bad"):
             with self.subTest(abort):
                 self.assertEqual(codes(GOOD.replace('raise SystemExit("refused")', abort)), [])
 
@@ -78,7 +79,7 @@ class Recognised(unittest.TestCase):
 
     def test_an_attribute_qualified_check_passes(self):
         src = GOOD.replace("violations(argv", "argv_guard.violations(argv")
-        self.assertEqual(codes(src, "import subprocess\nimport argv_guard\n"), [])
+        self.assertEqual(codes(src, "import subprocess\nimport txe.containerguard.argv_guard as argv_guard\n"), [])
 
 
 class Refused(unittest.TestCase):
@@ -309,14 +310,21 @@ class ClosedPattern(unittest.TestCase):
             "return-mutation": 'return argv.append("--privileged")',
             "raise-from-call": "raise SystemExit(1) from launch_anyway()",
             "walrus": "return (n := bad)",
+            # PR 299 security review of fa2183f1: a callable abort is never accepted, shadowable or not
+            "sys-exit": "sys.exit(2)",
+            "bare-exit": "exit(2)",
+            "os-exit": "os._exit(2)",
         }
         for label, abort in cases.items():
             with self.subTest(label):
                 self.assertIn("C05", codes(GOOD.replace('raise SystemExit("refused")', abort)), label)
+        shadowed = HEAD + "\ndef exit(*a):\n    return None\n"     # the reviewer's repro: a local exit that returns
+        self.assertIn("C05", codes(GOOD.replace('raise SystemExit("refused")', "exit(2)"), shadowed))
 
     def test_a_pure_abort_passes(self):
         for label, abort in (("fstring", 'raise SystemExit(f"refused: {bad}")'),
-                             ("from-none", 'raise RuntimeError("refused") from None'), ("bare-return", "return")):
+                             ("from-none", 'raise RuntimeError("refused") from None'), ("bare-return", "return"),
+                             ("raise-systemexit", "raise SystemExit(2)")):
             with self.subTest(label):
                 self.assertEqual(codes(GOOD.replace('raise SystemExit("refused")', abort)), [], label)
 
@@ -344,25 +352,30 @@ class ClosedPattern(unittest.TestCase):
                                                 "def violations(a, s):\n    return []\n", host),
             "shadowed-after-import": (HEAD + "violations = lambda a, s: []\n", GOOD),
             "parameter-shadow": (HEAD, GOOD.replace("def launch(schema):", "def launch(schema, violations):")),
-            "try-fallback": ("import subprocess\ntry:\n    from argv_guard import violations\nexcept ImportError:\n"
-                             "    def violations(a, s):\n        return []\n", GOOD),
+            "try-fallback": ("import subprocess\ntry:\n    from txe.containerguard.argv_guard import violations\n"
+                             "except ImportError:\n    def violations(a, s):\n        return []\n", GOOD),
             "suffix-module": ("import subprocess\nfrom evil.argv_guard import violations\n", GOOD),
             "other-module": ("import subprocess\nfrom fake_guard import violations\n", GOOD),
-            "method-on-other-object": ("import subprocess\nimport argv_guard\n",
+            "method-on-other-object": (PKG_AS,
                                        GOOD.replace("def launch(schema):", "def launch(schema, checker):")
                                        .replace("violations(argv", "checker.violations(argv")),
-            "module-patched": ("import subprocess\nimport argv_guard\nargv_guard.violations = lambda a, s: []\n",
+            "module-patched": (PKG_AS + "argv_guard.violations = lambda a, s: []\n",
                                GOOD.replace("violations(argv", "argv_guard.violations(argv")),
-            "setattr-patch": ("import subprocess\nimport argv_guard\n"
-                              "setattr(argv_guard, 'violations', lambda a, s: [])\n",
+            "setattr-patch": (PKG_AS + "setattr(argv_guard, 'violations', lambda a, s: [])\n",
                               GOOD.replace("violations(argv", "argv_guard.violations(argv")),
-            "star-import": ("import subprocess\nfrom argv_guard import violations\nfrom helpers import *\n", GOOD),
+            "star-import": (HEAD + "from helpers import *\n", GOOD),
+            # PR 299 security review of fa2183f1: a bare `argv_guard` can resolve to a planted sibling argv_guard.py
+            "top-level-from-import": ("import subprocess\nfrom argv_guard import violations\n", GOOD),
+            "top-level-import": ("import subprocess\nimport argv_guard\n",
+                                 GOOD.replace("violations(argv", "argv_guard.violations(argv")),
+            "top-level-import-as": ("import subprocess\nimport argv_guard as g\n",
+                                    GOOD.replace("violations(argv", "g.violations(argv")),
             "dynamic-load": ("import importlib.util\nimport subprocess\n"
                              "spec = importlib.util.spec_from_file_location('argv_guard', 'x/argv_guard.py')\n"
                              "G = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(G)\n",
                              GOOD.replace("violations(argv", "G.violations(argv")),
-            "import-in-function": ("import subprocess\n",
-                                   GOOD.replace("    argv = ", "    from argv_guard import violations\n    argv = ")),
+            "import-in-function": ("import subprocess\n", GOOD.replace(
+                "    argv = ", "    from txe.containerguard.argv_guard import violations\n    argv = ")),
         }
         for label, (head, src) in cases.items():
             with self.subTest(label):
@@ -370,7 +383,7 @@ class ClosedPattern(unittest.TestCase):
 
     def test_the_recognised_guard_bindings_pass(self):
         cases = {
-            "import-as": ("import subprocess\nimport argv_guard as g\n", "g.violations(argv"),
+            "import-as": ("import subprocess\nimport txe.containerguard.argv_guard as g\n", "g.violations(argv"),
             "package-from-import": ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n",
                                     "violations(argv"),
             "package-import": ("import subprocess\nimport txe.containerguard.argv_guard\n",
@@ -379,6 +392,84 @@ class ClosedPattern(unittest.TestCase):
         for label, (head, call) in cases.items():
             with self.subTest(label):
                 self.assertEqual(codes(GOOD.replace("violations(argv", call), head), [], label)
+
+    def test_a_use_outside_the_checked_block_fails(self):
+        """PR 299 review of 8f848049: a block does not scope a Python name, so a later use is the same argv."""
+        template = ("\ndef launch(schema, x, items):\n    {header}\n        argv = {argv}\n"
+                    "        bad = violations(argv, schema)\n        if bad:\n            raise SystemExit(1)\n"
+                    "        subprocess.run(argv)\n    {after}\n")
+        cases = {
+            "after-with-repro": ("with open('x') as f:", 'argv.insert(2, "--privileged")\n    subprocess.run(argv)'),
+            "after-if": ("if x:", "subprocess.run(argv)"),
+            "after-for": ("for _ in items:", 'argv.append("--privileged")'),
+        }
+        for label, (header, after) in cases.items():
+            with self.subTest(label):
+                self.assertIn("C20", codes(template.format(header=header, argv=ARGV, after=after)), label)
+
+    def test_a_check_inside_a_try_fails(self):
+        """PR 299 security review of 8f848049: a handler or finally runs after the abort, with the refused argv."""
+        template = ("\ndef launch(schema):\n    try:\n        argv = {argv}\n        bad = violations(argv, schema)\n"
+                    "        if bad:\n            {abort}\n        subprocess.run(argv)\n    {handler}\n")
+        cases = {
+            "except-relaunch-repro": ('raise RuntimeError("refused")',
+                                      "except RuntimeError:\n        subprocess.run(argv)"),
+            "finally-after-return": ("return", "finally:\n        done = 1"),
+            "harmless-handler": ('raise RuntimeError("refused")', "except ValueError:\n        pass"),
+        }
+        for label, (abort, handler) in cases.items():
+            with self.subTest(label):
+                self.assertIn("C20", codes(template.format(argv=ARGV, abort=abort, handler=handler)), label)
+
+    def test_a_site_not_directly_in_a_function_body_fails(self):
+        cases = {
+            "module-level": (f"\nargv = {ARGV}\nbad = violations(argv, None)\nif bad:\n    raise SystemExit(1)\n"
+                             "subprocess.run(argv)\n"),
+            "in-while": (f"\ndef launch(schema):\n    while True:\n        argv = {ARGV}\n"
+                         "        bad = violations(argv, schema)\n        if bad:\n            raise SystemExit(1)\n"
+                         "        subprocess.run(argv)\n        break\n"),
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertIn("C20", codes(src), label)
+
+    def test_the_argv_outside_the_recognised_sequence_fails(self):
+        """The site's argv occurs exactly as its target, the check's argument and ONE launch argument; nothing else."""
+        launch = "    subprocess.run(argv, check=True)\n"
+        cases = {
+            "second-launch": GOOD.replace(launch, launch + launch),
+            "use-after-launch": GOOD.replace(launch, launch + "    print(argv)\n"),
+            "earlier-binding": GOOD.replace("    argv = [", "    argv = None\n    argv = ["),
+            "launch-in-nested-def": GOOD.replace(launch, "    def later():\n        subprocess.run(argv)\n"
+                                                         "    later()\n"),
+            "launch-in-lambda": GOOD.replace(launch, "    go = lambda: subprocess.run(argv)\n    go()\n"),
+            "launch-in-generator": GOOD.replace(launch, "    list(subprocess.run(a) for a in [argv])\n"),
+        }
+        for label, src in cases.items():
+            with self.subTest(label):
+                self.assertIn("C21", codes(src), label)
+
+    def test_the_documented_recipe_passes(self):
+        """The supported recipe, as the README documents it, and its accepted variants are clean. The README's own
+        block is read from the file, so the documentation cannot drift from what the check accepts."""
+        text = (HERE / "README.md").read_text()
+        start = text.index("```python\n# The supported recipe") + len("```python\n")
+        recipe = text[start:text.index("```", start)]
+        builder = ("import subprocess\nfrom txe.containerguard.argv_guard import violations\n\n\ndef build(extra):\n"
+                   f"    argv = {ARGV}\n    argv += extra\n    return argv\n\n\ndef launch(schema):\n"
+                   "    argv = build([])\n    bad = violations(argv, schema)\n    if bad:\n"
+                   '        raise SystemExit("argv_guard refused the launch")\n    subprocess.Popen(argv)\n')
+        alias = GOOD.replace("violations(argv", "guard.violations(argv").replace(
+            "subprocess.run(argv, check=True)", "subprocess.run(args=argv, check=True)")
+        cases = {
+            "readme-recipe": (recipe, ""),
+            "builder": (builder, ""),
+            "module-alias-keyword-launch": (alias,
+                                            "import subprocess\nimport txe.containerguard.argv_guard as guard\n"),
+        }
+        for label, (src, head) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(codes(src, head), [], label)
 
     def test_a_builder_may_only_construct_its_argv(self):
         cases = {
