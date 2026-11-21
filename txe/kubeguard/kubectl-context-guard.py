@@ -1099,29 +1099,45 @@ def classify(fam, p):
 # An option outside the form, an unknown or ambiguous arity, or a missing or invalid value makes it "api"
 # (refused as H01/H07). Options that name or enable a program (helm --post-renderer/--post-renderer-args,
 # --dependency-update; kustomize --enable-*, --helm-command) are in NO form.
-# Evidence: the reference pages, by tool and documented version:
-# - kubectl v1.37 https://kubernetes.io/docs/reference/kubectl/generated/ (kubectl_version, kubectl_completion,
-#   kubectl_options, kubectl_plugin/kubectl_plugin_list, kubectl_config/kubectl_config_{current-context,
-#   get-contexts,view}, kubectl);
-# - Helm 4.3.1 https://helm.sh/docs/helm/ (helm, helm_template, helm_lint, helm_repo_list, helm_version,
-#   helm_completion, helm_env);
-# - Flux v2.10 https://fluxcd.io/flux/cmd/ (flux, flux_version, flux_completion, flux_build_artifact, flux_install).
+# SUPPORTED VERSIONS are the ones the txehq/txe repository pins, and the evidence is their SOURCE at those tags
+# (the per-option file:line table is in the README):
+# - kubectl v1.34.9: pinned in txe ops/sentry-platform/ci-check.sh and kubernetes/sentry/backups/install_tools.py.
+#   Source: kubernetes/kubernetes@v1.34.9 staging/src/k8s.io/kubectl/pkg/cmd/{version/version.go,
+#   completion/completion.go, options/options.go, plugin/plugin.go, config/{current_context,get_contexts,view}.go,
+#   cmd.go} and staging/src/k8s.io/cli-runtime/pkg/genericclioptions/config_flags.go.
+# - helm v4.2.3: pinned in ops/sentry-platform/ci-check.sh. Source: helm/helm@v4.2.3 pkg/cmd/{template,install,lint,
+#   repo_list,version,completion,env,root,flags,load_plugins}.go and pkg/cli/environment.go.
+# - flux v2.9.4: pinned in .github/workflows/ci.yml and others. The v2.9.5 mention (ops/ci/prod-release.py) is a
+#   measurement note, not a pin, and the v2.9.5 sources of every retained command are byte-identical to v2.9.4.
+#   Source: fluxcd/flux2@v2.9.4 cmd/flux/{version,completion,build,build_artifact,install,version_utils,
+#   plugin,main}.go.
+# - kustomize v5.8.1: pinned in .github/workflows/ci.yml and others. Source:
+#   kubernetes-sigs/kustomize@kustomize/v5.8.1 kustomize/commands/build/build.go.
+# Helm 3 and any other version are NOT modelled. An installed binary of another version is an unsupported
+# install: the hook cannot see which version is installed without executing it, so it does NOT detect or refuse
+# an incompatible binary by version. The install prerequisite is not runtime enforcement.
 # Only the binaries those pages document get forms: `kubectl`, `helm` and `flux`. oc, kubecolor, k9s, stern
 # and microk8s.kubectl have none. Literal client-name detection in values is DEFENCE IN DEPTH only: chart and
 # kustomization contents, inherited configuration and installed plugins can still invoke a client, and they are
 # deployment prerequisites (README), not something this grammar establishes.
 SHELLS_FOR_COMPLETION = {"bash", "zsh", "fish", "powershell"}
+# The commands kubectl v1.34.9 registers (staging/src/k8s.io/kubectl/pkg/cmd/cmd.go:380-492). `alpha` is left
+# out: it is registered only when it has subcommands (cmd.go:470-486). `create` is left out of the HELP
+# built-ins: kubectl dispatches `kubectl create <unknown> ...` to a kubectl-create-* plugin even with --help
+# (cmd.go:144-161, IsSubcommandPluginAllowed at cmd.go:172-175).
 KUBECTL_BUILTINS = {"annotate", "api-resources", "api-versions", "apply", "attach", "auth", "autoscale", "certificate",
                     "cluster-info", "completion", "config", "cordon", "cp", "create", "debug", "delete", "describe",
-                    "diff", "drain", "edit", "events", "exec", "explain", "expose", "get", "kuberc", "kustomize",
+                    "diff", "drain", "edit", "events", "exec", "explain", "expose", "get", "kustomize",
                     "label", "logs", "options", "patch", "plugin", "port-forward", "proxy", "replace", "rollout",
                     "run", "scale", "set", "taint", "top", "uncordon", "version", "wait"}
+KUBECTL_PLUGIN_SUBCOMMAND_PARENTS = {"create"}
 HELM_BUILTINS = {"completion", "create", "dependency", "env", "get", "history", "install", "lint", "list", "package",
                  "plugin", "pull", "push", "registry", "repo", "rollback", "search", "show", "status", "template",
                  "test", "uninstall", "upgrade", "verify", "version"}
-FLUX_BUILTINS = {"bootstrap", "build", "check", "completion", "create", "debug", "delete", "diff", "envsubst", "events",
-                 "export", "get", "install", "list", "logs", "migrate", "plugin", "pull", "push", "reconcile",
-                 "resume", "stats", "suspend", "tag", "trace", "tree", "trigger", "uninstall", "version"}
+# flux v2.9.4 registers plugins as subcommands for every name NOT among its built-ins (cmd/flux/plugin.go:45-60),
+# with DisableFlagParsing, so --help reaches a plugin. Only the built-ins whose source was read at v2.9.4
+# (version.go, completion.go, build.go, install.go) count as help built-ins.
+FLUX_BUILTINS = {"build", "completion", "install", "version"}
 BUILTINS = {"kubectl": KUBECTL_BUILTINS, "helm": HELM_BUILTINS, "flux": FLUX_BUILTINS}
 
 
@@ -1186,7 +1202,7 @@ LOCAL_FORMS = {
          "require": ("--client",)},
         {"path": ("completion",), "ops": (1, 1), "op": lambda o: o in SHELLS_FOR_COMPLETION},
         {"path": ("build", "artifact"), "opts": {"-p": K_PATH, "--path": K_PATH, "-o": K_PATH, "--output": K_PATH,
-                                                 "--ignore-paths": V, "--add-ignore-paths": V, "--resolve-symlinks": B}},
+                                                 "--ignore-paths": V, "--resolve-symlinks": B}},
         {"path": ("install",), "require": ("--export",),
          "opts": {"--export": B, "--components": V, "--components-extra": V, "--cluster-domain": V,
                   "--log-level": choice("debug", "info", "error"), "--network-policy": B, "--watch-all-namespaces": B,
@@ -1261,7 +1277,10 @@ def local_form(base, args, p):
     if any(mentions(a) for a in args):
         raise Refusal("H03")          # defence in depth: a local form whose argument names a client
     if p["help"]:
-        # Help is local only for a documented built-in subcommand: a plugin receives `--help` itself.
+        # Help is local only for a built-in subcommand of the pinned version: a plugin receives `--help` itself.
+        # A kubectl parent that dispatches unknown subcommands to plugins (`create`) is never help-local.
+        if base == "kubectl" and p["pos"] and p["pos"][0] in KUBECTL_PLUGIN_SUBCOMMAND_PARENTS:
+            return False
         return base in BUILTINS and (not p["pos"] or p["pos"][0] in BUILTINS[base])
     for form in LOCAL_FORMS.get(base, ()):
         parsed = parse_local(args, form.get("opts", {}))

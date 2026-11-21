@@ -234,8 +234,14 @@ class Refused(unittest.TestCase):
                 "flux build artifact --path ./k --frob", "flux install --export -v 2.3.0",
                 "flux install --export --registry-creds u:p", "flux create source git x --url y --export",
                 "flux envsubst", "flux build kustomization x --path ./k --dry-run",
-                "flux push artifact oci://example/x --path ./k"):
+                "flux push artifact oci://example/x --path ./k",
+                # Pinned-source review (flux v2.9.4): --add-ignore-paths does not exist; a non-built-in is a plugin.
+                "flux build artifact --path ./k --add-ignore-paths x", "flux trigger --help", "flux get --help"):
             self.deny(cmd, "H07")
+        # Pinned-source review (kubectl v1.34.9 cmd.go:144-175): `create <unknown> --help` runs a kubectl-create-*
+        # plugin, and kuberc is no v1.34.9 command.
+        for cmd in ("kubectl create foo --help", "kubectl create --help", "kubectl kuberc --help"):
+            self.deny(cmd, "H01")
         for cmd in (
                 # kubectl kustomize is no local form (helm, plugins, functions, git URLs).
                 "kubectl kustomize ./o", "kubectl kustomize ./o --enable-helm", "kubectl kustomize ./o --enable-alpha-plugins",
