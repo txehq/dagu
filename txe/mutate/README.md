@@ -93,23 +93,30 @@ is always kept.
   a code N that is not docker's own (125 to 127), every host check held, the run's container was
   confirmed removed or absent by the owner-checked cleanup call (docker's `--rm` is not taken on
   trust), and the end-of-run checks held. Only then is the `DIAGNOSTIC: command exit N` line
-  printed. N, 0 included, is only in `report["diagnostic"]["command_exit"]`; the outcome
-  is `DIAGNOSTIC`, never PASSED, SURVIVED, KILLED or FAILED. A diagnostic never exits 0, so it
-  never passes a gate that reads exit 0. Read the report; do not chain on the exit status.
+  printed. The outcome is `DIAGNOSTIC`, never PASSED, SURVIVED, KILLED or FAILED. A diagnostic
+  never exits 0, so it never passes a gate that reads exit 0. Read the report; do not chain on the
+  exit status, and never treat `command_exit` 0 as a gate success (`gate: never`).
+- **Separate facts, never merged.** `report["diagnostic"]` keeps:
+  - `command_exit`: the docker client's raw exit status, ALWAYS kept as evidence (null only when
+    the client was stopped or died before returning), with `command_exit_attribution`: `command`,
+    `ambiguous: docker-or-command` for 125 to 127, or `none: ...`;
+  - `settlement`: `confirmed` (the container removed or absent), `unconfirmed`, or `not checked`;
+  - `integrity`: `held`, `failed` (exit 3) or `incomplete` (the final check could not finish);
+  - `evidence`: `complete` only with exit 7, else `incomplete`; and `status`, a summary.
+  The overall exit is `report["exit"]`.
 - **7 never masks a failure.** A run that did not complete (docker's 125 to 127, the timeout, an
   output or disk bound, the client killed by a signal, a container not confirmed removed) is exit
-  5 with `status: not-completed: ...` and no `command_exit`. A shared-state or read-only-mount
-  change is exit 3: during the run no result is recorded, and after it (in cleanup or the final
-  check) the recorded diagnostic is marked `status: invalid: shared state changed` with its
-  `command_exit` cleared. Refusals are 2 and the deadline or a signal 6, as in any run. On every
-  exit but 7 the report carries no `command_exit` (a recorded value is kept as `raw_exit`).
-- **Trade-off: a command's own 125, 126 or 127 is read as docker's.** docker run reports its own
-  failures with those codes, and the client cannot tell them from the command's, so a shell's
-  "command not found" (127) is exit 5, `not-completed`, with no `command_exit`, never a recorded
-  diagnostic.
+  5 with `status: not-completed: ...`. A shared-state or read-only-mount change is exit 3: during
+  the run no diagnostic is recorded, and after it (in cleanup or the final check) the recorded one
+  is marked `integrity: failed`, `status: invalid: shared state changed`. Refusals are 2 and the
+  deadline or a signal 6, as in any run.
+- **Ambiguity: 125, 126 and 127 are attributed to neither side.** docker run reports its own
+  failures with those codes and the client cannot tell them from the command's, so the runner
+  does not claim either: such a run is exit 5, `not-completed`, with the value kept in
+  `command_exit` and `command_exit_attribution: ambiguous: docker-or-command`.
 - **Anything unexpected is a finding.** An exception the runner does not expect (a host-side step
   failing, such as removing a run directory the command made unremovable) is exit 5 with
-  `report["error"]`; the report's `exit` always equals the process's exit status. The end-of-run
+  `report["error"]`; whenever a report is written, its `exit` equals the process's exit status. The end-of-run
   read-only mount check has its own 60 s allowance under `--deadline`; past it the check is
   incomplete, exit 6.
 

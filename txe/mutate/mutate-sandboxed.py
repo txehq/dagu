@@ -1434,36 +1434,50 @@ def stream_evidence(path: Path | None) -> dict:
     return {"path": str(path), "bytes": size, "sha256": file_digest(path), "tail": output_tail(path)}
 
 
+def command_attribution(code: int | None) -> str:
+    """What the docker client's exit status says about the command. docker run reports its own
+    failures as 125-127, which a command can also return: those are ambiguous, never attributed."""
+    if code is None:
+        return "none: the docker client was stopped before it returned"
+    if code < 0:
+        return "none: the docker client died by a signal"
+    if code in DOCKER_INFRA_EXITS:
+        return "ambiguous: docker-or-command"
+    return "command"
+
+
 def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
-    """One run of the unmutated tree, recorded as evidence. A completed run exits EXIT_DIAGNOSTIC
-    whatever the command's status, which is only in report["diagnostic"]["command_exit"]; a run
-    that did not complete is a finding. Never EXIT_OK: a diagnostic is never a pass."""
+    """One run of the unmutated tree, recorded as evidence. The report keeps apart the command's
+    raw result (command_exit, always kept, with its attribution), settlement (the container
+    confirmed removed or absent), integrity (the end-of-run checks, set by main) and evidence
+    completeness; the overall exit is report["exit"]. Exit EXIT_DIAGNOSTIC only when the run
+    completed and settled; never EXIT_OK, and command_exit 0 is never a gate success."""
     r = runner.run("diagnostic", pristine, None)
     report["results"].append(r.__dict__)
-    diag = {"stdout": stream_evidence(Path(r.log)), "stderr": stream_evidence(runner.err_path),
-            "stderr_note": DOCKER_STDERR_NOTE}
+    diag = {"command_exit": r.exit_code, "command_exit_attribution": command_attribution(r.exit_code),
+            "run_outcome": r.outcome, "settlement": "not checked", "integrity": "not checked",
+            "evidence": "incomplete", "stdout": stream_evidence(Path(r.log)),
+            "stderr": stream_evidence(runner.err_path), "stderr_note": DOCKER_STDERR_NOTE}
     report["diagnostic"] = diag
-    if r.outcome == "DIAGNOSTIC":
-        # Evidence is complete only once the run's container is confirmed gone: docker's --rm
-        # after the client returned is not taken on trust. Removal or absence must be confirmed,
-        # by the same owner-checked call the cleanup uses, before the run's directory is touched.
-        cidfile, name = runner.containers[r.name]
-        runner.pending[name] = cidfile
-        if not runner.remove_pending():
-            diag.update(status="not-completed: container not confirmed removed", command_exit=None,
-                        raw_exit=r.exit_code)
-            report["findings"] = [f"diagnostic: container {name} not confirmed removed"]
-            print(f"FINDING: diagnostic did not complete: container {name} not confirmed removed",
-                  file=sys.stderr)
-            return EXIT_FINDINGS  # the run's directory is kept: the container may still mount it
-        runner.discard(r)
-        diag.update(status="completed", command_exit=r.exit_code)
-        return EXIT_DIAGNOSTIC  # main prints the DIAGNOSTIC line once the end-of-run checks held
-    # ERROR (docker's own 125-127, a bound, a client signal) or TIMEOUT: no command status exists.
+    # Settlement is positive and bounded: docker's --rm after the client returned is not taken on
+    # trust. The run's container must be confirmed removed or absent by the owner-checked cleanup
+    # call (each docker call under its own timeout) before the run's directory is touched.
+    cidfile, name = runner.containers[r.name]
+    runner.pending[name] = cidfile
+    if not runner.remove_pending():
+        diag.update(settlement="unconfirmed", status="not-completed: container not confirmed removed")
+        report["findings"] = [f"diagnostic: container {name} not confirmed removed"]
+        print(f"FINDING: diagnostic did not complete: container {name} not confirmed removed", file=sys.stderr)
+        return EXIT_FINDINGS  # the run's directory is kept: the container may still mount it
+    diag["settlement"] = "confirmed"
     runner.discard(r)
-    diag.update(status=f"not-completed: {r.outcome}", command_exit=None, raw_exit=r.exit_code)
-    report["findings"] = [f"diagnostic: {r.outcome} (raw exit {r.exit_code}), log {r.log}"]
-    print(f"FINDING: diagnostic did not complete: {r.outcome} (raw exit {r.exit_code})", file=sys.stderr)
+    if r.outcome == "DIAGNOSTIC":
+        diag["status"] = "completed"
+        return EXIT_DIAGNOSTIC  # main prints the DIAGNOSTIC line once the end-of-run checks held
+    # ERROR (docker's own 125-127, a bound, a client signal) or TIMEOUT: the run did not complete.
+    diag["status"] = f"not-completed: {r.outcome}"
+    report["findings"] = [f"diagnostic: {r.outcome} (docker client exit {r.exit_code}), log {r.log}"]
+    print(f"FINDING: diagnostic did not complete: {r.outcome} (docker client exit {r.exit_code})", file=sys.stderr)
     return EXIT_FINDINGS
 
 
@@ -1613,18 +1627,24 @@ def main(argv: list[str]) -> int:
                 report["final_check"] = f"incomplete: {e}"
                 code = EXIT_STOPPED
                 args.keep = True
-        if isinstance(report.get("diagnostic"), dict) and code != EXIT_DIAGNOSTIC:
-            # A diagnostic stands only with exit 7. On any other exit no command status stands; the
-            # raw value, if one was recorded, is kept as raw_exit.
-            d = report["diagnostic"]
-            if d.get("command_exit") is not None:
-                d["raw_exit"] = d["command_exit"]
-            d["command_exit"] = None
+        d = report.get("diagnostic")
+        if isinstance(d, dict):
+            # Separate facts, never merged: the raw command_exit stays as recorded; integrity,
+            # settlement and evidence completeness are set here, after cleanup and the final checks.
+            if code == EXIT_SHARED_CHANGED:
+                d["integrity"] = "failed"
+            elif "final_check" in report:
+                d["integrity"] = "incomplete"
+            else:
+                d["integrity"] = "held"
+            if "containers_left" in report:
+                d["settlement"] = "unconfirmed"
+            d["evidence"] = "complete" if code == EXIT_DIAGNOSTIC else "incomplete"
             if code == EXIT_SHARED_CHANGED:
                 d["status"] = "invalid: shared state changed"
-            elif "containers_left" in report:
+            elif d["settlement"] == "unconfirmed":
                 d["status"] = "not-completed: container not confirmed removed"
-            elif not str(d.get("status", "")).startswith("not-completed"):
+            elif code != EXIT_DIAGNOSTIC and not str(d.get("status", "")).startswith("not-completed"):
                 d["status"] = f"not-completed: runner exit {code}"
         try:
             report["identity_after"] = watch.snapshot()

@@ -2348,6 +2348,10 @@ func TestDiagnosticNonzeroNotPass(t *testing.T) {
 	diag := o.report["diagnostic"].(map[string]any)
 	assert.Equal(t, "completed", diag["status"])
 	assert.EqualValues(t, 1, diag["command_exit"])
+	assert.Equal(t, "command", diag["command_exit_attribution"])
+	assert.Equal(t, "confirmed", diag["settlement"])
+	assert.Equal(t, "held", diag["integrity"])
+	assert.Equal(t, "complete", diag["evidence"])
 	work := o.report["workdir"].(string)
 	for stream, want := range map[string]string{"stdout": "out-line\n", "stderr": "err-line\n"} {
 		ev := diag[stream].(map[string]any)
@@ -2392,15 +2396,18 @@ func TestDiagnosticRefusesMutants(t *testing.T) {
 }
 
 // A diagnostic that did not complete (docker's own exit, a timeout, an output bound) is a finding,
-// exit 5, with no command status: never 7 and never 0.
+// exit 5, evidence incomplete: never 7 and never 0. The raw docker client exit is kept as recorded,
+// and a 125 is attributed to neither side: the API cannot tell docker's from the command's.
 func TestDiagnosticNotCompleted(t *testing.T) {
 	cases := map[string]struct {
-		extra   []string
-		outcome string
+		extra       []string
+		outcome     string
+		exit        any
+		attribution string
 	}{
-		"docker 125": {[]string{"--image", "infra-125"}, "ERROR"},
-		"timeout":    {[]string{"--image", "hang", "--timeout", "1"}, "TIMEOUT"},
-		"output":     {[]string{"--image", "flood", "--max-output-mib", "1"}, "ERROR"},
+		"docker 125": {[]string{"--image", "infra-125"}, "ERROR", float64(125), "ambiguous: docker-or-command"},
+		"timeout":    {[]string{"--image", "hang", "--timeout", "1"}, "TIMEOUT", nil, "none: the docker client was stopped before it returned"},
+		"output":     {[]string{"--image", "flood", "--max-output-mib", "1"}, "ERROR", nil, "none: the docker client was stopped before it returned"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -2410,7 +2417,10 @@ func TestDiagnosticNotCompleted(t *testing.T) {
 			assert.Equal(t, c.outcome, o.outcomes()["diagnostic"])
 			diag := o.report["diagnostic"].(map[string]any)
 			assert.Equal(t, "not-completed: "+c.outcome, diag["status"])
-			assert.Nil(t, diag["command_exit"])
+			assert.Equal(t, c.exit, diag["command_exit"])
+			assert.Equal(t, c.attribution, diag["command_exit_attribution"])
+			assert.Equal(t, "incomplete", diag["evidence"])
+			assert.Equal(t, "confirmed", diag["settlement"])
 			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete")
 			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 		})
@@ -2432,7 +2442,8 @@ func TestDiagnosticAlarm(t *testing.T) {
 // A completed diagnostic is evidence only once its container is confirmed gone. The fake
 // "staysup" image exits as a client but leaves its container registered; with removal failing, or
 // the daemon unreachable for the owner check, the diagnostic is not complete: exit 5, never 7,
-// with no command status and the run directory kept. With removal working it is 7.
+// with the raw command_exit kept, settlement unconfirmed, evidence incomplete and the run directory
+// kept. With removal working it is 7.
 func TestDiagnosticUnconfirmedContainerIsFinding(t *testing.T) {
 	cases := map[string]string{"removal fails": ".rmfail", "daemon unreachable": ".daemondown"}
 	for name, flag := range cases {
@@ -2443,8 +2454,9 @@ func TestDiagnosticUnconfirmedContainerIsFinding(t *testing.T) {
 			require.Equal(t, 5, o.code, o.stdout+o.stderr)
 			diag := o.report["diagnostic"].(map[string]any)
 			assert.Equal(t, "not-completed: container not confirmed removed", diag["status"])
-			assert.Nil(t, diag["command_exit"])
-			assert.EqualValues(t, 0, diag["raw_exit"])
+			assert.EqualValues(t, 0, diag["command_exit"], "the raw command result is kept as evidence")
+			assert.Equal(t, "unconfirmed", diag["settlement"])
+			assert.Equal(t, "incomplete", diag["evidence"])
 			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete: container")
 			assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
 			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
@@ -2466,7 +2478,7 @@ func TestDiagnosticUnconfirmedContainerIsFinding(t *testing.T) {
 
 // An integrity failure found after the diagnostic was recorded (here the fake docker changes the
 // fake shared cache's sentinel while removing the container, after the run's own checks) wins:
-// exit 3, the diagnostic marked invalid with no command status, and no DIAGNOSTIC line.
+// exit 3, the diagnostic marked invalid with integrity failed, its raw command_exit kept, and no DIAGNOSTIC line.
 func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
 	f := newFixture(t, passingCheck)
 	require.NoError(t, os.WriteFile(f.log+".rmtamper", []byte(filepath.Join(f.modcache, sentinel)), 0o644))
@@ -2476,8 +2488,10 @@ func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
 	assert.Contains(t, o.stderr, "after the end of the run")
 	diag := o.report["diagnostic"].(map[string]any)
 	assert.Equal(t, "invalid: shared state changed", diag["status"])
-	assert.Nil(t, diag["command_exit"])
-	assert.EqualValues(t, 0, diag["raw_exit"])
+	assert.EqualValues(t, 0, diag["command_exit"], "the raw command result is kept as evidence")
+	assert.Equal(t, "failed", diag["integrity"])
+	assert.Equal(t, "incomplete", diag["evidence"])
+	assert.Equal(t, "confirmed", diag["settlement"])
 	assert.EqualValues(t, 3, o.report["exit"])
 	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 }
@@ -2485,7 +2499,7 @@ func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
 // An exception the runner does not expect is a finding, never a pass: the sandboxed command leaves
 // a directory the host cannot empty (0500 with a file in it, readable, so the disk bound still
 // measures it), and the runner's discard of the run directory raises. The run exits 5, the report
-// says exit 5 and names the error, and a diagnostic carries no command status.
+// says exit 5 and names the error, and a diagnostic is marked incomplete.
 func TestUnexpectedErrorIsFinding(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("root removes through permissions")
@@ -2509,7 +2523,8 @@ func TestUnexpectedErrorIsFinding(t *testing.T) {
 			assert.Contains(t, o.stderr, "mutate-sandboxed: error:")
 			if diagnostic {
 				d := o.report["diagnostic"].(map[string]any)
-				assert.Nil(t, d["command_exit"])
+				assert.EqualValues(t, 0, d["command_exit"], "the raw command result is kept as evidence")
+				assert.Equal(t, "incomplete", d["evidence"])
 				assert.True(t, strings.HasPrefix(d["status"].(string), "not-completed"), d["status"])
 				assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 			}
