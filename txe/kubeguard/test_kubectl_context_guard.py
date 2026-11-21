@@ -208,6 +208,51 @@ class Refused(unittest.TestCase):
         for cmd in ("helm template demo ./chart --dry-run=server", "helm template demo ./chart --dry-run=bogus"):
             self.deny(cmd, "H07", "helm", "template")
 
+    def test_local_forms_accept_only_their_listed_options(self):
+        # Connector review of 24ac0dca: `helm template ... --post-renderer kubectl` was "local", and Helm execs the
+        # post-renderer. Root's contract: a local verdict stands only for a closed, evidenced per-form grammar
+        # (LOCAL_FORMS); every option occurrence is checked; executable, plugin, function and post-renderer
+        # controls are in no form, whatever they name. All inert strings; nothing is executed.
+        # The exact repro names kubectl, so DEFENCE IN DEPTH refuses it first (H03). Without a client name, the
+        # grammar itself refuses (H07).
+        self.deny("helm template demo ./chart --post-renderer kubectl --post-renderer-args=get "
+                  "--post-renderer-args=secrets", "H03")
+        for cmd in ("kubectl config get-contexts kubectl", "helm template kubectl ./c"):
+            self.deny(cmd, "H03")
+        for cmd in (
+                # helm template: execution, download and unlisted options, in every position and form.
+                "helm template x ./chart --post-renderer ./render.sh", "helm template x ./chart --post-renderer=./x",
+                "helm template x ./chart --post-renderer-args=a", "helm template x ./chart --dependency-update",
+                "helm template x ./chart --repo https://charts.example", "helm template x ./c -f https://x/v.yaml",
+                "helm template x repo/chart", "helm template x ./c --dry-run=none", "helm template x ./c --dry-run client",
+                "helm template x ./c --frob", "helm --debug template x ./c", "helm template x ./c -z",
+                "helm template x ./c -gz", "helm template x ./c -f", "helm template x ./c --set=",
+                # helm: plugin, dependency and repo-mutating forms are not local; help only for a built-in.
+                "helm plugin install https://example.com/p", "helm plugin list", "helm dependency build ./c",
+                "helm repo add x https://charts.example", "helm unknownplugin --help",
+                # flux: only version --client, completion, build artifact and install --export, with listed options.
+                "flux build artifact --path ./k --frob", "flux install --export -v 2.3.0",
+                "flux install --export --registry-creds u:p", "flux create source git x --url y --export",
+                "flux envsubst", "flux build kustomization x --path ./k --dry-run",
+                "flux push artifact oci://example/x --path ./k"):
+            self.deny(cmd, "H07")
+        for cmd in (
+                # kubectl kustomize is no local form (helm, plugins, functions, git URLs).
+                "kubectl kustomize ./o", "kubectl kustomize ./o --enable-helm", "kubectl kustomize ./o --enable-alpha-plugins",
+                "kubectl kustomize ./o --helm-command x",
+                # kubectl: unlisted options, invalid or missing values, and help for a non-built-in (a plugin).
+                "kubectl version --client --frob", "kubectl version --client -o wide", "kubectl version --client -o",
+                "kubectl --frob version --client", "kubectl completion tcsh", "kubectl config view -o jsonpath={x}",
+                "kubectl foo --help", "oc version --client"):
+            self.deny(cmd, "H01")
+        for cmd in (
+                # standalone kustomize: only `kustomize build <local dir>`, with no options.
+                "kustomize build --enable-helm kubernetes/x", "kustomize build ./o --enable-alpha-plugins",
+                "kustomize build --enable-exec ./o", "kustomize build --helm-command x ./o",
+                "kustomize build github.com/x/y", "kustomize build https://github.com/x/y", "kustomize version",
+                "kustomize build"):
+            self.deny(cmd, "H03")
+
     def test_other_clients_are_a_compatibility_decision(self):
         for cmd, client in (("helm list -A", "helm"), ("helm upgrade x ./c --kube-context a", "helm"),
                             ("helm template x ./c --validate", "helm"), ("flux get ks -A", "flux"),
@@ -514,11 +559,20 @@ class Allowed(unittest.TestCase):
         for cmd in ("kubectl version --client", "kubectl version --client=true -o json", "kubectl help", "kubectl",
                     "kubectl --help", "kubectl get pods --help", "kubectl config get-contexts",
                     "kubectl config current-context", "kubectl config view", "kubectl config view --minify",
-                    "kubectl kustomize ./overlay", "kubectl completion zsh", "kubectl plugin list",
+                    "kubectl completion zsh", "kubectl plugin list",
                     f"kubectl --kubeconfig {F.root}/scratch.yaml config set-context x --cluster y",
-                    "kustomize build kubernetes/x", "kustomize build --enable-helm kubernetes/x", "helm version",
+                    "kustomize build kubernetes/x", "helm version",
                     "helm template x ./chart", "helm lint ./chart", "helm repo list", "flux version --client",
-                    "flux install --export", "flux build artifact --path ./k", "oc version --client"):
+                    "flux install --export", "flux build artifact --path ./k",
+                    # Benign supported renders and reads, in the closed per-form grammar (LOCAL_FORMS):
+                    "kubectl version --client -ojson", "kubectl version --client --output=yaml",
+                    "kubectl --kubeconfig ./k.yaml config view --minify -o json", "kubectl config get-contexts -o name",
+                    "kubectl plugin list --name-only", "kubectl help get", "helm help template", "helm version --short",
+                    "helm template x ./chart -n ns -f values.yaml --set a=b --include-crds",
+                    "helm template ./chart -g --dry-run=client", "helm lint ./chart --strict -f v.yaml",
+                    "helm repo list -o json", "helm completion zsh", "helm env", "flux completion zsh",
+                    "flux version --client -o json", "flux build artifact -p ./k -o ./a.tgz",
+                    "flux install --export --components-extra=image-reflector-controller"):
             self.allow(cmd)
 
     def test_run_time_command_words_without_cluster_signs(self):
@@ -538,7 +592,7 @@ class Allowed(unittest.TestCase):
 
     def test_help_and_client_side_template(self):
         for cmd in ("kubectl get pods --help=false --help", "kubectl get pods -h", "helm template x ./c --dry-run",
-                    "helm template x ./c --dry-run=client", "helm template x ./c --dry-run=none"):
+                    "helm template x ./c --dry-run=client"):
             self.allow(cmd)
 
     def test_unknown_wrapper_options_without_a_client(self):

@@ -27,12 +27,15 @@ and checks the kube-system UID at contact. This hook only makes sure that kube-r
     it from source (see the README's installation contract). kube-run repeats every check at run time,
     on the arguments it actually receives. kube-run is read-only, and refuses every mutating, interactive or
     tunnelling verb itself.
-  - Local commands need nothing: kubectl version --client, help/--help/-h, completion, options, plugin list,
-    kustomize, config current-context|get-contexts|get-clusters|get-users|view (not --raw/--flatten, H08);
-    helm version|template (not --validate)|lint|package|repo|show|pull|dependency|...; flux version --client,
-    --export, OCI artifact commands; and the kustomize binary (no cluster client; --enable-helm runs
-    helm template locally). kubectx, kubens, gcloud get-credentials and config writes to the default
-    kubeconfig are refused (H06).
+  - Local commands need nothing, but ONLY the closed, evidenced forms in LOCAL_FORMS, with their listed options:
+    - kubectl: version --client, help on a built-in, completion <shell>, options, plugin list, and config
+      current-context|get-contexts|view (not --raw/--flatten, which is H08);
+    - helm: version, help on a built-in, completion, env, repo list, template <local chart>, lint <local chart>;
+    - flux: version --client, help, completion, build artifact, install --export;
+    - `kustomize build <local dir>` with no options.
+    Anything else (kubectl kustomize, helm plugin/dependency/package/pull, post-renderers, kustomize plugins and
+    Helm integration, flux OCI and other builds, unlisted options) is an API call or H03. kubectx, kubens, gcloud
+    get-credentials and config writes to the default kubeconfig are refused (H06).
 
 It fails closed. A client reached through something the hook cannot see into is refused: a command word built
 at run time (H02); a client inside python -c, ssh, find -exec, docker and the like (H03); an assignment or
@@ -764,6 +767,11 @@ class Guard:
         if base == "gcloud" and {"container", "clusters", "get-credentials"} <= set(args):
             raise Refusal("H06", "gcloud")
         if base in LOCAL_ONLY:
+            # kustomize: ONLY `kustomize build <local dir>` with no options. Its plugin, KRM-function, exec and
+            # Helm integrations (--enable-alpha-plugins, --enable-exec, --enable-helm, --helm-command) and a
+            # git-URL directory can run other programs, and its reference page documents no flags to evidence.
+            if not (len(args) == 2 and args[0] == "build" and kustomize_local_path(args[1])):
+                raise Refusal("H03")
             return
         if base in KUBE_RUN_NAMES:
             return self._kube_run(w, args)
@@ -782,6 +790,8 @@ class Guard:
         p = parse_flags(args, VALUE_FLAGS[fam])
         kind = classify(fam, p)
         sub = safe_sub(p["pos"][0]) if p["pos"] else "-"
+        if kind == "local" and not local_form(base, args, p):
+            kind = "api"      # not one of the closed, evidenced LOCAL_FORMS: an API call (H01/H07)
         if kind == "local":
             return
         if kind == "secret-print":
@@ -1082,6 +1092,199 @@ def classify(fam, p):
     return "api"
 
 
+# ---- LOCAL FORMS: a closed, evidenced option grammar per form (TXE-8039, connector review of 24ac0dca) ----
+# classify() decides whether a client command is local by its subcommand. A local verdict then stands ONLY if the
+# whole argv matches one form below. EVERY option occurrence is checked, before and after the subcommand,
+# including repeated flags, `--name=value`, attached short values (`-ojson`, `-o=json`), short clusters and `--`.
+# An option outside the form, an unknown or ambiguous arity, or a missing or invalid value makes it "api"
+# (refused as H01/H07). Options that name or enable a program (helm --post-renderer/--post-renderer-args,
+# --dependency-update; kustomize --enable-*, --helm-command) are in NO form.
+# Evidence: the reference pages, by tool and documented version:
+# - kubectl v1.37 https://kubernetes.io/docs/reference/kubectl/generated/ (kubectl_version, kubectl_completion,
+#   kubectl_options, kubectl_plugin/kubectl_plugin_list, kubectl_config/kubectl_config_{current-context,
+#   get-contexts,view}, kubectl);
+# - Helm 4.3.1 https://helm.sh/docs/helm/ (helm, helm_template, helm_lint, helm_repo_list, helm_version,
+#   helm_completion, helm_env);
+# - Flux v2.10 https://fluxcd.io/flux/cmd/ (flux, flux_version, flux_completion, flux_build_artifact, flux_install).
+# Only the binaries those pages document get forms: `kubectl`, `helm` and `flux`. oc, kubecolor, k9s, stern
+# and microk8s.kubectl have none. Literal client-name detection in values is DEFENCE IN DEPTH only: chart and
+# kustomization contents, inherited configuration and installed plugins can still invoke a client, and they are
+# deployment prerequisites (README), not something this grammar establishes.
+SHELLS_FOR_COMPLETION = {"bash", "zsh", "fish", "powershell"}
+KUBECTL_BUILTINS = {"annotate", "api-resources", "api-versions", "apply", "attach", "auth", "autoscale", "certificate",
+                    "cluster-info", "completion", "config", "cordon", "cp", "create", "debug", "delete", "describe",
+                    "diff", "drain", "edit", "events", "exec", "explain", "expose", "get", "kuberc", "kustomize",
+                    "label", "logs", "options", "patch", "plugin", "port-forward", "proxy", "replace", "rollout",
+                    "run", "scale", "set", "taint", "top", "uncordon", "version", "wait"}
+HELM_BUILTINS = {"completion", "create", "dependency", "env", "get", "history", "install", "lint", "list", "package",
+                 "plugin", "pull", "push", "registry", "repo", "rollback", "search", "show", "status", "template",
+                 "test", "uninstall", "upgrade", "verify", "version"}
+FLUX_BUILTINS = {"bootstrap", "build", "check", "completion", "create", "debug", "delete", "diff", "envsubst", "events",
+                 "export", "get", "install", "list", "logs", "migrate", "plugin", "pull", "push", "reconcile",
+                 "resume", "stats", "suspend", "tag", "trace", "tree", "trigger", "uninstall", "version"}
+BUILTINS = {"kubectl": KUBECTL_BUILTINS, "helm": HELM_BUILTINS, "flux": FLUX_BUILTINS}
+
+
+def helm_local_path(v):
+    return (v == "." or v.startswith(("./", "../", "/"))) and "://" not in v
+
+
+def kustomize_local_path(v):
+    first = v.split("/", 1)[0]
+    return (bool(v) and "://" not in v and "?" not in v and "@" not in v and not v.startswith("-")
+            and (first in ("", ".", "..") or "." not in first))
+
+
+B = ("B",)
+V = ("V", None)
+NOSCHEME = ("V", lambda v: "://" not in v)
+K_PATH = ("V", kustomize_local_path)
+
+
+def choice(*vals, optional=False):
+    return ("O" if optional else "V", lambda v: v in vals)
+
+
+KCFG = {"--kubeconfig": V, "--context": V}
+HELM_VALUES = {"--set": V, "--set-json": V, "--set-literal": V, "--set-string": V, "-f": NOSCHEME, "--values": NOSCHEME,
+               "--kube-version": V, "--skip-schema-validation": B, "-n": V, "--namespace": V}
+LOCAL_FORMS = {
+    "kubectl": [
+        {"path": ()},
+        {"path": ("help",), "ops": (0, 1), "op": lambda o: o in KUBECTL_BUILTINS},
+        {"path": ("version",), "opts": {"--client": B, "-o": choice("json", "yaml"), "--output": choice("json", "yaml")},
+         "require": ("--client",)},
+        {"path": ("completion",), "ops": (1, 1), "op": lambda o: o in SHELLS_FOR_COMPLETION},
+        {"path": ("options",)},
+        {"path": ("plugin", "list"), "opts": {"--name-only": B}},
+        {"path": ("config", "current-context"), "opts": KCFG},
+        {"path": ("config", "get-contexts"), "opts": {"--no-headers": B, "-o": choice("name"), "--output": choice("name"),
+                                                     **KCFG}, "ops": (0, None)},
+        {"path": ("config", "view"), "opts": {"--minify": B, "-o": choice("json", "yaml"),
+                                             "--output": choice("json", "yaml"), **KCFG}},
+    ],
+    "helm": [
+        {"path": ()},
+        {"path": ("help",), "ops": (0, 1), "op": lambda o: o in HELM_BUILTINS},
+        {"path": ("version",), "opts": {"--short": B, "--template": V}},
+        {"path": ("completion",), "ops": (1, 1), "op": lambda o: o in SHELLS_FOR_COMPLETION},
+        {"path": ("env",)},
+        {"path": ("repo", "list"), "opts": {"--no-headers": B, "-o": choice("table", "json", "yaml"),
+                                           "--output": choice("table", "json", "yaml")}},
+        {"path": ("template",), "ops": (1, 2), "last": helm_local_path,
+         "opts": {"-a": V, "--api-versions": V, "--devel": B, "--disable-openapi-validation": B,
+                  "--dry-run": choice("client", optional=True), "-g": B, "--generate-name": B, "--include-crds": B,
+                  "--is-upgrade": B, "-l": V, "--labels": V, "--name-template": V, "--no-hooks": B, "-s": V,
+                  "--show-only": V, "--skip-crds": B, "--skip-tests": B, **HELM_VALUES}},
+        {"path": ("lint",), "ops": (0, None), "op": helm_local_path,
+         "opts": {"--quiet": B, "--strict": B, "--with-subcharts": B, **HELM_VALUES}},
+    ],
+    "flux": [
+        {"path": ()},
+        {"path": ("help",), "ops": (0, 1), "op": lambda o: o in FLUX_BUILTINS},
+        {"path": ("version",), "opts": {"--client": B, "-o": choice("json", "yaml"), "--output": choice("json", "yaml")},
+         "require": ("--client",)},
+        {"path": ("completion",), "ops": (1, 1), "op": lambda o: o in SHELLS_FOR_COMPLETION},
+        {"path": ("build", "artifact"), "opts": {"-p": K_PATH, "--path": K_PATH, "-o": K_PATH, "--output": K_PATH,
+                                                 "--ignore-paths": V, "--add-ignore-paths": V, "--resolve-symlinks": B}},
+        {"path": ("install",), "require": ("--export",),
+         "opts": {"--export": B, "--components": V, "--components-extra": V, "--cluster-domain": V,
+                  "--log-level": choice("debug", "info", "error"), "--network-policy": B, "--watch-all-namespaces": B,
+                  "--toleration-keys": V, "--registry": V, "--image-pull-secret": V}},
+    ],
+}
+
+
+def _value_ok(spec, v):
+    return bool(v) and not mentions(v) and (spec[1] is None or spec[1](v))
+
+
+def parse_local(args, opts):
+    """(positionals, {option: value}) when EVERY option is in opts with a valid value, else None."""
+    pos, seen, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, v = a.partition("=")
+            spec = opts.get(name)
+            if spec is None:
+                return None
+            if spec[0] == "B":
+                if eq and v.lower() not in ("true", "false"):
+                    return None
+                seen[name] = "false" if eq and v.lower() == "false" else "true"
+            elif not eq and spec[0] == "O":
+                seen[name] = "true"                   # an optional value is never taken from the next word
+            else:
+                if not eq:
+                    if i + 1 >= len(args):
+                        return None
+                    i += 1
+                    v = args[i]
+                if not _value_ok(spec, v):
+                    return None
+                seen[name] = v
+        elif a.startswith("-") and a != "-":
+            k = 1
+            while k < len(a):
+                name = "-" + a[k]
+                spec = opts.get(name)
+                if spec is None:
+                    return None
+                if spec[0] == "B":
+                    seen[name] = "true"
+                    k += 1
+                    continue
+                v = a[k + 1:]
+                if v.startswith("="):
+                    v = v[1:]
+                if not v:
+                    if spec[0] == "O" or i + 1 >= len(args):
+                        return None
+                    i += 1
+                    v = args[i]
+                if not _value_ok(spec, v):
+                    return None
+                seen[name] = v
+                break
+        else:
+            pos.append(a)
+        i += 1
+    return pos, seen
+
+
+def local_form(base, args, p):
+    """True when argv is EXACTLY one evidenced local form of this binary (see LOCAL_FORMS)."""
+    if any(mentions(a) for a in args):
+        raise Refusal("H03")          # defence in depth: a local form whose argument names a client
+    if p["help"]:
+        # Help is local only for a documented built-in subcommand: a plugin receives `--help` itself.
+        return base in BUILTINS and (not p["pos"] or p["pos"][0] in BUILTINS[base])
+    for form in LOCAL_FORMS.get(base, ()):
+        parsed = parse_local(args, form.get("opts", {}))
+        if parsed is None:
+            continue
+        pos, seen = parsed
+        path = form["path"]
+        if tuple(pos[:len(path)]) != path:
+            continue
+        ops = pos[len(path):]
+        lo, hi = form.get("ops", (0, 0))
+        if len(ops) < lo or (hi is not None and len(ops) > hi):
+            continue
+        if "op" in form and not all(form["op"](o) for o in ops):
+            continue
+        if "last" in form and not (ops and form["last"](ops[-1])):
+            continue
+        if any(seen.get(f) != "true" for f in form.get("require", ())):
+            continue
+        return True
+    return False
+
+
 def deny(r, kube_run):
     if r.where:
         k, n, (a, b) = r.where
@@ -1092,7 +1295,7 @@ def deny(r, kube_run):
            f"subcommand={r.sub or '-'} rule={r.rule} ({RULES[r.rule]}). Values are withheld. Cluster API calls "
            f"go through {kube_run} [--authorization <record>] <cluster-id> -- <kubectl arguments>, which checks "
            "the cluster's identity before contact. Local commands (version --client, help, config "
-           "get-contexts/current-context, kustomize) need nothing. Report this refusal verbatim to your "
+           "get-contexts/current-context, kustomize build <local dir>) need nothing. Report this refusal verbatim to your "
            "coordinator; do not rephrase the command to get past it.")
     print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                              "permissionDecisionReason": msg}}))

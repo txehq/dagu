@@ -91,7 +91,36 @@ a context can be repointed inside its file. This directory holds the source of t
     `--noprofile`, `--login`, `--posix`, `--verbose`, `--restricted`, `--noediting`, `--debugger` and
     `--protected`. In a line naming no client, the earlier behaviour applies: the `-c` text and standard input
     are checked. This makes no claim about code hidden elsewhere;
-  - local version, help, config-read and kustomize commands pass.
+  - **local forms are a closed, evidenced grammar** (`LOCAL_FORMS`, `parse_local`, `local_form`). A client
+    command the hook classifies as local stays local only if its WHOLE argv matches one form, with every
+    option checked, before and after the subcommand. That covers repeated flags, `--name=value`, attached short
+    values (`-ojson`), short clusters and `--`. Unknown options, ambiguous arity, and missing, empty or invalid
+    values all make it an API call (H01/H07). The forms:
+
+    | Form | Options and arity | Operands | Execution-, network- or cluster-capable options EXCLUDED | Evidence (documented version) |
+    |---|---|---|---|---|
+    | `kubectl` (bare), `kubectl help <built-in>`, `<built-in> --help`/`-h` | (help only) | a built-in subcommand | help for a non-built-in, which a plugin would receive | kubectl v1.37: kubectl (command list); kubectl-plugins ("not possible to create plugins that overwrite existing kubectl commands") |
+    | `kubectl version --client` | `--client` B (required), `-o`/`--output` json\|yaml | none | `--client` absent (server request) | kubectl v1.37: kubectl_version ("no server required") |
+    | `kubectl completion <shell>` | none | bash\|zsh\|fish\|powershell | n/a | kubectl v1.37: kubectl_completion |
+    | `kubectl options` | none | none | n/a | kubectl v1.37: kubectl_options |
+    | `kubectl plugin list` | `--name-only` B | none | n/a (it lists, it does not run) | kubectl v1.37: kubectl_plugin_list |
+    | `kubectl config current-context` | `--kubeconfig` V, `--context` V | none | n/a | kubectl v1.37: kubectl_config_current-context |
+    | `kubectl config get-contexts` | `--no-headers` B, `-o`/`--output` name, `--kubeconfig` V, `--context` V | context names | n/a | kubectl v1.37: kubectl_config_get-contexts |
+    | `kubectl config view` | `--minify` B, `-o`/`--output` json\|yaml, `--kubeconfig` V, `--context` V | none | `--raw`/`--flatten` (H08), `--template` | kubectl v1.37: kubectl_config_view |
+    | `helm` (bare), `helm help <built-in>`, `--help` | (help only) | a built-in | help for a plugin (helm passes `--help` to it) | Helm 4.3.1: helm (command list); topics/plugins ("name cannot duplicate one of the existing helm top-level commands") |
+    | `helm version` | `--short` B, `--template` V | none | n/a | Helm 4.3.1: helm_version |
+    | `helm completion <shell>`, `helm env` | none | a shell / none | n/a | Helm 4.3.1: helm_completion, helm_env |
+    | `helm repo list` | `--no-headers` B, `-o`/`--output` table\|json\|yaml | none | `repo add/update` (network) | Helm 4.3.1: helm_repo_list |
+    | `helm template [NAME] <./chart>` | `-a`/`--api-versions` V, `--devel`, `--disable-openapi-validation`, `--dry-run[=client]` (optional value, never the next word), `-g`/`--generate-name`, `--include-crds`, `--is-upgrade`, `-l`/`--labels` V, `--name-template` V, `--no-hooks`, `-s`/`--show-only` V, `--skip-crds`, `--skip-tests`, `--set`/`--set-json`/`--set-literal`/`--set-string` V, `-f`/`--values` V (no URL scheme), `--kube-version` V, `--skip-schema-validation`, `-n`/`--namespace` V | 1-2; the chart is a local path (`.`, `./`, `../`, `/`) | `--post-renderer`, `--post-renderer-args` (a plugin it executes), `--dependency-update`, `--repo`, URL values, the download TLS and credential flags, `--enable-dns`, `--output-dir`, `--verify`/`--keyring`, `--dry-run=server`, kube connection flags | Helm 4.3.1: helm_template; topics/plugins (downloader plugins and hooks) |
+    | `helm lint [<./chart>...]` | `--quiet`, `--strict`, `--with-subcharts`, the same value flags as template | local paths | URL values | Helm 4.3.1: helm_lint |
+    | `flux version --client` | `--client` B (required), `-o`/`--output` json\|yaml | none | `--client` absent | Flux v2.10: flux_version |
+    | `flux completion <shell>` | none | a shell | n/a | Flux v2.10: flux_completion |
+    | `flux build artifact` | `-p`/`--path` V, `-o`/`--output` V (local paths), `--ignore-paths` V, `--add-ignore-paths` V, `--resolve-symlinks` B | none | n/a | Flux v2.10: flux_build_artifact |
+    | `flux install --export` | `--export` B (required), `--components`, `--components-extra`, `--cluster-domain`, `--log-level` debug\|info\|error, `--network-policy` B, `--watch-all-namespaces` B, `--toleration-keys`, `--registry`, `--image-pull-secret` | none | `-v`/`--version` (downloads the manifests from GitHub), `--registry-creds`, `--force`, no `--export` (it installs) | Flux v2.10: flux_install |
+    | `kustomize build <local dir>` | NONE | one local directory (no URL, host or `?ref=`) | every option: `--enable-helm` and `--helm-command` (a helm executable), `--enable-alpha-plugins`/`--enable-exec` (plugins, KRM functions), a git-URL directory | kubectl v1.37: kubectl_kustomize; kustomize kustomization/helmcharts and resource (remote resources are git clone URLs). The kustomize build reference page documents no flags |
+
+    The evidence URLs are listed in the source above `LOCAL_FORMS`. NOT local any more (each H01/H07/H03): `kubectl kustomize`, `oc`/`kubecolor`/`microk8s.kubectl` local forms, `helm plugin|dependency|package|create|show|pull|push|registry|search|verify`, `helm repo` other than list, `flux create|envsubst|build kustomization`, flux OCI commands, `k9s` and `stern` local forms, `kubectl config get-clusters|get-users`, `--dry-run=none`, and any standalone `kustomize` use other than `build <local dir>`. A client name in a local form's argument is refused (H03), but only as **defence in depth**: an arbitrary helper can invoke a client without naming it in the command;
+  - **what this grammar cannot establish (source-only prerequisites):** literal option checking does NOT show that chart or kustomization CONTENTS (templates, remote bases, helmCharts), inherited CONFIGURATION (helm repositories, registry and plugin directories, `$HELM_PLUGINS`, kubeconfig exec users, git configuration) or installed PLUGINS are trusted. Those are deployment prerequisites of any install, recorded here, not facts the hook proves. The parser boundary is NOT the only residual risk;
 
 ## What state this is in
 
@@ -152,7 +181,7 @@ refused:
 
 | Accepted context | Exact conditions |
 |---|---|
-| A client's own argv (kubectl, oc, kubecolor, helm, flux, k9s, stern) | It is a LOCAL form whose options are fully understood (`version --client`, help, `config` reads without `--raw`/`--flatten`, kustomize, helm template without `--validate` or `--dry-run=server`, ...). Any other form is H01 or H07 |
+| A client's own argv (`kubectl`, `helm`, `flux`) | It matches one closed, evidenced LOCAL form with only its listed options (see the local-forms table above). oc, kubecolor, microk8s.kubectl, k9s and stern have no local forms. Any other form is H01 or H07 |
 | The installed kube-run's argv | H09 to H11 hold, and kube-run repeats every check at run time |
 | The SMALL closed data set (`DATA_OPTIONS`) | `echo` with `-n` `-e` `-E` only; `printf` and `cat` with NO options; `grep` with `-r` `-R` `-n` `-i` `-l` `-c` `-v` `-w` `-x` `-E` `-F` `-o` and `-e <pattern>` (`egrep`/`fgrep` the same, without `-E`/`-F`); `which` with `-a`; `test`, `true`, `false` and `:` with any token; `[` ... `]`, the EXACT word `[` with `]` as its last argument, classified before the glob check with the rules of `test` (a `[` without its `]` is H05; words merely containing `[`, such as `[a-z]` or `x[`, stay run-time command words, H02). Operands and input are then data, but only while that output does not reach code: a shell or interpreter reading its pipe is refused, and so is an output process substitution `>(...)` (checked as a pipe receiver) or a redirection into a process substitution |
 | `command -v` / `command -V` | A lookup, not a run |
