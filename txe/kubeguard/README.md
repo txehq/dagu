@@ -50,6 +50,11 @@ a context can be repointed inside its file. This directory holds the source of t
   installed kube-run path:
   - direct kubectl API calls are refused (H01), and so are helm, flux, k9s and stern API calls (H07);
   - anything it cannot read fails closed (H02 to H05, H12 to H14);
+  - a client's name is allowed only in a position the hook understands: a client's own argv (classified), the
+    installed kube-run's argv (H09 to H11), or an argument or input of a DATA-ONLY command (`echo`, `grep`,
+    `cat`, `git`, `orca`, ...). Anywhere else it is refused (H15). An interpreter's code, arguments or input
+    naming a client, and a shell or interpreter reading a pipe while the command names a client, are refused
+    as H03. `watch` without `--exec` runs its words as shell text, and they are checked as such;
   - standard input fed to a shell (`bash -s x <<< '...'`, a here-document, a script reading its input) is
     always checked as a program;
   - local version, help, config-read and kustomize commands pass.
@@ -75,7 +80,7 @@ a context can be repointed inside its file. This directory holds the source of t
 
 | Shape | Status |
 |---|---|
-| Claude Code PreToolUse, `tool_name == "Bash"`, `tool_input.command` a string | **Guarded.** Parsed by the hook's lexer and checked by H01 to H13. Tested with synthetic events in Claude Code's documented shape. Not yet observed in a live harness |
+| Claude Code PreToolUse, `tool_name == "Bash"`, `tool_input.command` a string | **Guarded.** Parsed by the hook's lexer and checked by H01 to H13 and H15. Tested with synthetic events in Claude Code's documented shape. Not yet observed in a live harness |
 | Any other tool or harness with a command-like field (`tool_input.command` or `tool_input.cmd`, a string or an argv list), for example a Codex shell call | **Unsupported, NOT guarded.** It is refused (H14) when the text names a cluster client, and allowed otherwise. Nothing in it is parsed, so a kube-run call in this shape passes unchecked by the hook (kube-run still runs its own checks). No Codex payload has been captured or tested; the shapes in the tests are hand-written |
 | Events with no command-like field (Read, Edit, MCP tools, ...) | Allowed, not guarded. MCP cluster tools are out of scope (TXE-7874) |
 | Script files (`bash ops/x.sh` that runs kubectl inside), client-go programs, and interpreter code that builds a client's name at run time (`python3 -c '...execlp("kube"+"ctl", ...)'`) | **Not visible to the hook.** It is a heuristic over command text, and it refuses interpreter payloads only when they name a client. Keeping such calls off a production cluster needs the agent's environment to hold no usable default credential. That is a deployment decision, not something this hook can enforce |
@@ -96,6 +101,42 @@ lexer cannot read would be refused as well, for example a partly quoted here-doc
 other constructs outside the forms above. Such a refusal says H05; the remedy is to write the command in a
 form the lexer reads. The extra raw-text check, which also matches a client name with its backslashes removed
 (`kube\ctl`), is a second line only, never the parser.
+
+## Positive classification: where a client's name is accepted
+
+Every cluster-client name in a guarded command must sit in a context the hook understands. Any other mention is
+refused:
+- H15 in an unclassified command;
+- H03 in an interpreter, or in a shell or interpreter that reads a pipe or generated text;
+- H02 after a run-time command word.
+
+| Accepted context | Exact conditions |
+|---|---|
+| A client's own argv (kubectl, oc, kubecolor, helm, flux, k9s, stern) | It is a LOCAL form whose options are fully understood (`version --client`, help, `config` reads without `--raw`/`--flatten`, kustomize, helm template without `--validate` or `--dry-run=server`, ...). Any other form is H01 or H07 |
+| The installed kube-run's argv | H09 to H11 hold, and kube-run repeats every check at run time |
+| A data-only command: `echo`, `printf`, `grep`/`egrep`/`fgrep`, `cat`, `head`, `tail`, `wc`, `uniq`, `cut`, `tr`, `tee`, `ls`, `diff`, `jq`, `which`, `type`, `man`, `whatis`, `apropos`, `test`/`[`, `true`, `false`, `:` | Any argument or input is data, but only while that output does not reach code. A shell or interpreter reading its pipe is refused, as is an output process substitution `>(...)` (checked as a pipe receiver) or a redirection into a process substitution |
+| `git` | Only with `commit`, `log`, `show`, `grep`, `diff`, `status` or `blame` as its FIRST argument, so no `-c` or other option comes before the subcommand |
+| `command -v` / `command -V` | A lookup, not a run |
+| The inner text of `$(...)`, backticks and `<(...)` | It is classified recursively by these same rules |
+
+**Unsupported, and refused when a client is named:** every other command, including `rg`, `ag`, `sort`,
+`less`, `more`, `gh`, `orca`, `awk`, `sed`, `make` and scripts. Also:
+- `git` with a global option or any other subcommand;
+- `source` or `.` of generated text;
+- an interpreter whose code, arguments or input name a client;
+- `watch` (its words are shell text unless `--exec` is given);
+- a shell or interpreter reading a pipe;
+- the forms the lexer cannot parse (H05).
+
+**Expected false refusals, documented:** text that only QUOTES a client name, inside a command that is not a data
+context, is refused too. Examples: an orchestration message (`orca orchestration ask --question 'run kubectl get
+pods?'`), a `gh` comment, and an `rg` search. Write such text with a data-only command (`echo`, `cat` to a
+file), or without the client's name.
+
+**Scope:** this is not containment of arbitrary scripts or interpreters. The hook cannot infer commands that are
+absent from the command text: a script file's contents, a program that builds a client's name at run time, or
+an alias or function defined earlier in the shell. It does not guard every way a shell can execute a command.
+It refuses the ones it can see that it does not understand.
 
 ## Platform and syscall constraints
 

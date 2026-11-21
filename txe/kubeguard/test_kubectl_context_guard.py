@@ -247,6 +247,48 @@ class Refused(unittest.TestCase):
             r = self.deny(cmd, "H01", "kubectl")
             self.assertIn("nested", r, cmd)
 
+    def test_watch_shell_option_terminator_and_pipes(self):
+        # Connector review of bb40b10c. watch runs its words with `sh -c` unless --exec; a shell's -c string is
+        # the first operand after its options (`bash -c -- 'x'`); a shell reading a pipe runs text the hook
+        # cannot place.
+        for cmd in ("watch 'kubectl get secrets'", "watch -n 5 'kubectl get ns'", "bash -c -- 'kubectl get secrets'",
+                    "sh -ec 'kubectl get ns'", "bash -c -x 'kubectl get ns'"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+        self.deny("watch -x kubectl get ns", "H01", "kubectl")                 # --exec: an argv, not shell text
+        for cmd in ("printf '%s\\n' 'kubectl get secrets -A' | bash", "echo kubectl get ns | sh",
+                    "echo 'kubectl get ns' | xargs -I{} sh -c '{}'", "printf 'kubectl' | python3 -"):
+            self.deny(cmd, "H03")
+
+    def test_a_client_named_where_the_hook_does_not_understand_it_is_refused(self):
+        # Class rule (H15): outside the positions the hook classifies (a client's own argv, kube-run, local
+        # forms) and outside data-only commands, a client's name is refused rather than guessed about.
+        for cmd in ("./deploy.sh kubectl apply -f x", "nohup ./run.sh kubectl get pods",
+                    "awk 'BEGIN{system(\"kubectl get ns\")}'", "sed -n 'e kubectl get ns' f"):
+            self.deny(cmd, "H15")
+        self.deny("tee f <<< x; node x.js kubectl get ns", "H03")              # an interpreter's argument
+
+    def test_data_text_that_reaches_code_is_refused(self):
+        # Root: data exemptions are syntax/context-specific. Substitutions, process substitutions, redirections,
+        # eval and downstream interpreter pipes can turn apparently textual arguments into code.
+        for cmd in ("echo kubectl get ns > >(bash)", "echo kubectl get ns | tee >(sh)", "bash <(echo kubectl get ns)",
+                    "source <(echo kubectl get ns)", 'eval "$(echo kubectl get ns)"', "echo kubectl get ns | python3",
+                    "cat notes.txt <<< 'kubectl get ns' | bash"):
+            self.deny(cmd, "H03")
+        for cmd in ("echo $(kubectl get ns)", "echo `kubectl get ns`", "cat <(kubectl get ns)",
+                    "grep x <(kubectl get pods)", "echo x > >(kubectl apply -f -)"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+
+    def test_documented_false_refusals(self):
+        # Expected and documented (README): commands that may send or run text are not data contexts, so text
+        # that merely quotes a client name is refused there too.
+        for cmd in ("orca orchestration ask --question 'run kubectl get pods?'",
+                    "orca orchestration send --text 'kubectl get pods?'", "gh issue comment 1 -b 'kubectl get pods'",
+                    "rg kubectl docs", "git -c alias.x='!kubectl get ns' x", "git config alias.k '!kubectl get ns'",
+                    "sort --compress-program=kubectl f", "less kubectl.txt kubectl"):
+            self.deny(cmd, "H15")
+
     def test_a_command_the_hook_cannot_parse_is_refused(self):
         # Connector review of a338d882: `kube\ctl get secrets <<\EOF ...` hid the client from a raw-text match.
         # Any parse failure is now refused (H05); quoted and escaped here-document delimiters parse as bash
@@ -330,6 +372,14 @@ class Allowed(unittest.TestCase):
                     "bash ./script.sh <<< 'plain data'"):
             self.allow(cmd)
 
+    def test_data_only_commands_and_pipes_without_a_client(self):
+        for cmd in ("echo kubectl get pods | tee notes.txt", "git log --grep kubectl", "printf x | python3 -",
+                    "cat f | bash", "watch -n 5 date",
+                    "jq '.items' pods.json", "sort f | uniq -c", "cat <(echo hello)", "echo kubectl > notes.txt",
+                    "git commit -m 'kubectl notes'", "grep -c kubectl README.md", "source ./env.sh",
+                    "git show HEAD:kubectl-notes.md"):
+            self.allow(cmd)
+
     def test_help_and_client_side_template(self):
         for cmd in ("kubectl get pods --help=false --help", "kubectl get pods -h", "helm template x ./c --dry-run",
                     "helm template x ./c --dry-run=client", "helm template x ./c --dry-run=none"):
@@ -343,7 +393,7 @@ class Allowed(unittest.TestCase):
         for cmd in ("command -v kubectl", "which kubectl helm flux", "grep -rn kubectl ops", "echo kubectl get pods",
                     "cat ops/flux/prod.sh", "python3 ops/flux/classify-diff.py x", "bash ops/flux/staging.sh --help",
                     "cat > notes.md <<'EOF'\nkubectl get pods\nEOF", "git commit -m 'kubectl guard notes'",
-                    "orca orchestration ask --question 'run kubectl get pods?'", "man kubectl"):
+                    "man kubectl"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):

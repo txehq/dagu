@@ -35,6 +35,12 @@ recursively, and wrappers (timeout, env, xargs, watch, sudo, nice, nohup, ...) a
 the hook does not know may take a value, so it cannot tell which word is the command: when a cluster client
 follows it, the command is refused (H03).
 
+POSITIVE CLASSIFICATION (H15): a client's name is accepted only in a context the hook understands. Those are a
+client's own classified argv, the installed kube-run's argv, a data-only command (DATA_ONLY, git with a text
+subcommand) whose output does not reach a shell or interpreter, `command -v`, and substitutions classified
+recursively. Anywhere else it is refused. This is not containment of arbitrary scripts or interpreters: commands
+absent from the text (script files, run-time names, earlier aliases) cannot be seen.
+
 Diagnostics are value-free. They give the client and the subcommand only when each is in the hook's fixed
 lists, a stable rule id, and the location as a simple-command index with a character span. The span is
 counted in the command after line continuations are removed. No argument, flag value, path, context name
@@ -73,7 +79,8 @@ LOCAL_ONLY = {"kustomize"}
 VENDOR_WRAPPERS = {"k3s", "microk8s", "minikube"}
 KUBE_RUN_NAMES = {"kube-run", "kube_run.py", "kube-run.py"}
 CLIENT_NAMES = sorted(set(FAMILY) | GLOBAL_MUTATORS, key=len, reverse=True)
-MENTION = re.compile(r"(?:^|(?<=[\s'\"`(;|&=\[,{]))(?:[\w.~-]*/)*(?:" + "|".join(map(re.escape, CLIENT_NAMES))
+# "!" is in the left context too: git and shell aliases run `!kubectl ...`.
+MENTION = re.compile(r"(?:^|(?<=[\s'\"`(;|&=\[,{!]))(?:[\w.~-]*/)*(?:" + "|".join(map(re.escape, CLIENT_NAMES))
                      + r")(?=$|[\s'\"`);|&,\]}:@])")
 CLUSTER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
@@ -171,7 +178,20 @@ RULES = {
     "H12": "the command nests shells or substitutions too deeply to read",
     "H13": "the hook input could not be read, or the hook failed, and the input names a cluster client",
     "H14": "this tool or event shape is not one the hook guards, and its command names a cluster client",
+    "H15": "a cluster client is named in a position the hook does not understand (only data-only commands may "
+           "carry its name as text)",
 }
+# ACCEPTED DATA CONTEXTS. A client's name may appear as data only here, and only under these syntax conditions:
+# - DATA_ONLY commands: any argument or input. Each of these only reads or prints, and has no option that runs a
+#   program (rg --pre, sort --compress-program, less's ! commands and orca/gh text sent onward are why those are
+#   not listed);
+# - git, only with a GIT_TEXT_SUBCOMMANDS subcommand and no option before it (git -c alias.x='!cmd' runs code);
+# - and in every case only while the output does not reach code: a shell or interpreter reading the pipe, or an
+#   output process substitution >(...) (checked as a pipe receiver), is refused when the command names a client.
+# Anything else naming a client is refused (H15). A shell, interpreter or wrapper is never a data context.
+DATA_ONLY = {"echo", "printf", "grep", "egrep", "fgrep", "cat", "head", "tail", "wc", "uniq", "cut", "tr", "tee",
+             "ls", "diff", "jq", "which", "type", "man", "whatis", "apropos", "test", "[", "true", "false", ":"}
+GIT_TEXT_SUBCOMMANDS = {"commit", "log", "show", "grep", "diff", "status", "blame"}
 
 class ParseError(Exception):
     pass
@@ -373,7 +393,8 @@ def simple_commands(s):
             op = t[1]
             if op in SEPARATORS:
                 cmds.append(cur)
-                cur = {"words": [], "stdin": []}
+                # A pipe edge is kept: the next command READS what the previous one writes.
+                cur = {"words": [], "stdin": [], "piped": op in ("|", "|&")}
             elif op in REDIRECTS:
                 skip_next = True
             elif op == "<<<":
@@ -406,6 +427,19 @@ def substitutions(text):
         elif text[i] == "`":
             j = _backtick_end(text, i + 1)
             out.append(text[i + 1:j - 1])
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def output_substitutions(text):
+    """The inner text of every OUTPUT process substitution >(...) in a word (a subset of substitutions())."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        if text.startswith(">(", i):
+            j = _balanced(text, i + 2, "(", ")")
+            out.append(text[i + 2:j - 1])
             i = j
         else:
             i += 1
@@ -455,8 +489,10 @@ class Guard:
                 r.where = (k, len(cmds), span)
                 raise
 
-    def check_text(self, text, depth):
-        """A nested text: a -c string, eval's arguments, a here-document fed to a shell, a substitution."""
+    def check_text(self, text, depth, piped=False):
+        """A nested text: a -c string, eval's arguments, a here-document fed to a shell, a substitution.
+        piped=True when the text's first command reads another command's output (an output process
+        substitution)."""
         if depth > MAX_DEPTH:
             if mentions(text):
                 raise Refusal("H12")
@@ -468,6 +504,8 @@ class Guard:
             r = Refusal("H05")
             r.nested = True
             raise r
+        if piped and cmds:
+            cmds[0]["piped"] = True
         for cmd in cmds:
             try:
                 self.check_cmd(cmd, depth)
@@ -486,8 +524,11 @@ class Guard:
                 if mentions(t):
                     raise Refusal("H05")
                 continue
+            out_inners = output_substitutions(t)
             for inner in inners:
-                self.check_text(inner, depth + 1)
+                # An output process substitution >(...) READS what the command writes: its first command is
+                # checked as a pipe receiver (`echo kubectl ... > >(bash)`, `... | tee >(sh)`).
+                self.check_text(inner, depth + 1, piped=inner in out_inners)
         self._command(cmd, depth)
 
     def _command(self, cmd, depth):
@@ -524,6 +565,13 @@ class Guard:
         w = words[0][0]
         base = os.path.basename(w)
         args = [x[0] for x in words[1:]]
+        runs_text = base in SHELLS or base in ("eval", "source", ".") or bool(INTERPRETERS.match(base))
+        if runs_text and self.whole_mentions and (
+                cmd.get("piped") or any(a.startswith(("<(", ">(")) or "$(" in a or "`" in a for a in args)):
+            # A shell, interpreter or `source` reading a PIPE, or given generated text as its program
+            # (`printf 'kubectl ...' | bash`, `bash <(echo kubectl ...)`, `source <(...)`), runs text the hook
+            # cannot place.
+            raise Refusal("H03")
         if base in SHELLS:
             return self._shell(args, cmd, depth)
         if base == "eval":
@@ -531,8 +579,9 @@ class Guard:
         if base in ("source", "."):
             return
         if INTERPRETERS.match(base):
-            code = [a for i, a in enumerate(args) if i > 0 and args[i - 1] in ("-c", "-e", "-E", "--eval")]
-            if any(mentions(t) for t in code + cmd["stdin"]):
+            # Its code (-c/-e or a script), its arguments and its input are all opaque to the hook: a client
+            # named in any of them is refused (`python3 -c ...`, `node x.js kubectl get ns`).
+            if any(mentions(t) for t in args + cmd["stdin"]):
                 raise Refusal("H03")
             return
         if base in OPAQUE:
@@ -549,6 +598,15 @@ class Guard:
             return self._kube_run(w, args)
         fam = FAMILY.get(base)
         if fam is None:
+            # Any other command. A data-only command (echo, grep, cat, git, ...) may carry a client's name as text.
+            # Every other command naming a client, in an argument, a redirect target or its input, is a position
+            # the hook does not understand, so it is refused (H15): only understood positions are allowed.
+            data = base in DATA_ONLY or (base == "git" and bool(args) and args[0] in GIT_TEXT_SUBCOMMANDS)
+            targets = cmd.get("redirect_targets", [])
+            if any(t.startswith((">(", "<(")) for t in targets):
+                data = False     # a redirection into a process substitution feeds another program
+            if not data and any(mentions(t) for t in args + targets + cmd["stdin"]):
+                raise Refusal("H15")
             return
         p = parse_flags(args, VALUE_FLAGS[fam])
         kind = classify(fam, p)
@@ -603,6 +661,7 @@ class Guard:
 
     def _unwrap(self, base, rest, env, depth):
         valued = WRAPPERS[base]
+        watch_exec = False
         while rest:
             a = rest[0][0]
             if a == "--":
@@ -620,6 +679,8 @@ class Guard:
                 return None
             if not a.startswith("-") or a == "-":
                 break
+            if base == "watch" and a in ("-x", "--exec"):
+                watch_exec = True
             if a in valued:
                 rest = rest[2:]
             elif (a.startswith("--") and "=" in a) or a in WRAPPER_FLAGS.get(base, set()):
@@ -630,6 +691,10 @@ class Guard:
                 if any(mentions(w[0]) for w in rest[1:]):
                     raise Refusal("H03")
                 rest = rest[1:]
+        if base == "watch" and not watch_exec:
+            # watch joins its words with spaces and runs them with `sh -c` unless --exec: that is shell text.
+            self.check_text(" ".join(x[0] for x in rest), depth + 1)
+            return None
         if base in DURATION_WRAPPERS and rest:
             rest = rest[1:]
         if base in ("env", "sudo", "doas"):
@@ -640,20 +705,25 @@ class Guard:
         # The -c string is checked when present. Standard input fed to a shell is ALWAYS checked as a program:
         # with -s (or no operand) bash runs it, and its operands are only positional parameters (`bash -s x <<<
         # '...'`); with a script operand, the script may still run it (eval, `. /dev/stdin`). Fail closed.
-        i = 0
+        # The options are parsed to their end BEFORE the -c string is taken: with -c, the command string is the
+        # first operand after the options (`bash -c -- 'x'`, `bash -c -e 'x'`), not the word after -c.
+        i, c_mode = 0, False
         while i < len(args):
             a = args[i]
-            if a == "-c" or (re.match(r"^-[a-zA-Z]+$", a) and "c" in a[1:]):
-                if i + 1 < len(args):
-                    self.check_text(args[i + 1], depth + 1)
+            if a == "--":
+                i += 1
                 break
             if a in ("-o", "+o", "-O", "+O"):
                 i += 2
                 continue
             if a.startswith("-") or a.startswith("+"):
+                if re.match(r"^-[a-zA-Z]+$", a) and "c" in a[1:]:
+                    c_mode = True
                 i += 1
                 continue
             break
+        if c_mode and i < len(args):
+            self.check_text(args[i], depth + 1)
         for text in cmd["stdin"]:
             self.check_text(text, depth + 1)
 
