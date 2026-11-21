@@ -381,7 +381,7 @@ class Authorization(Base):
         self.refused(ARGS, "KR09")
 
     def test_request_outside_scope(self):
-        self.refused(["txe-onprem-ci", "--", "delete", "pod", "x", "-n", "arc-runners"], "KR08")
+        self.refused(["txe-onprem-ci", "--", "top", "pods", "-n", "arc-runners"], "KR08")   # a read verb not granted
         self.refused(["txe-onprem-ci", "--", "get", "secrets", "-n", "arc-runners"], "KR08")
         self.refused(["txe-onprem-ci", "--", "get", "pods,secrets", "-n", "arc-runners"], "KR08")
         self.refused(["txe-onprem-ci", "--", "get", "pods", "-n", "kube-system"], "KR08")
@@ -466,16 +466,26 @@ class RequestScope(Base):
         rc, _, e, t = call(["txe-onprem-ci", "--", "get", "pods/a", "pods/b", "-n", "arc-runners"])
         self.assertEqual((rc, len(t.calls)), (0, 2), e)
 
-    def test_label_and_annotation_values_are_not_resources(self):
-        self.assertEqual(self.scope(["label", "pods", "a", "app.kubernetes.io/name=x", "team-"])["resources"],
-                         ["pods"])
-        self.assertEqual(self.scope(["annotate", "pods/a", "pods/b", "note=a/b"])["resources"], ["pods"])
-
-    def test_a_cp_operand_naming_its_own_namespace_is_refused(self):
-        self.refused_by_parser(["cp", "kube-system/pod-a:/etc/private", "/tmp/local-copy"])
-        self.refused_by_parser(["cp", "/tmp/local", "kube-system/pod-a:/tmp/x"])
-        r = self.scope(["cp", "pod-a:/etc/x", "/tmp/y", "-n", "arc-runners"])
-        self.assertEqual((r["resources"], r["namespace"]), (["pods"], "arc-runners"))
+    def test_kube_run_is_read_only(self):
+        # Root's decision on PR 298: kube-run runs only read verbs. Every mutating, interactive and tunnelling
+        # verb is refused before contact, whatever the record grants. cp (including the ns/pod operand of the
+        # round-1 finding), label/annotate, patch --subresource and rollout mutators are among them.
+        for verb in sorted(kr.MUTATING_VERBS):
+            self.refused_by_parser([verb, "pods", "x"])
+        for args in (["cp", "kube-system/pod-a:/etc/private", "/tmp/local-copy"], ["cp", "pod-a:/x", "/tmp/y"],
+                     ["exec", "pod-a", "--", "id"], ["exec", "-it", "pod-a", "--", "sh"],
+                     ["label", "pods", "a", "app.kubernetes.io/name=x"], ["port-forward", "pod/a", "8080:80"],
+                     ["patch", "pods/victim", "--subresource=ephemeralcontainers", "-p", "{}"],
+                     ["-n", "arc-runners", "delete", "pod", "x"],
+                     ["rollout", "restart", "deploy/x"], ["rollout", "undo", "deploy/x"],
+                     ["rollout", "pause", "deploy/x"], ["rollout", "resume", "deploy/x"]):
+            self.refused_by_parser(args)
+        self.assertFalse(set(kr.VERBS) & kr.MUTATING_VERBS)
+        # End to end, under a record that grants everything: refused, and nothing contacted.
+        F.write_record(verbs=["*"], resources=["*"], namespaces=["*"])
+        for kargs in (["delete", "pod", "x", "-n", "arc-runners"], ["exec", "pod-a", "--", "id"],
+                      ["cp", "pod-a:/etc/x", "/tmp/y"], ["rollout", "restart", "deploy/x"]):
+            self.refused(["txe-onprem-ci", "--"] + kargs, "KR05")
 
     def test_every_true_spelling_of_all_namespaces(self):
         for a in ("-A", "--all-namespaces", "--all-namespaces=true", "--all-namespaces=TRUE", "--all-namespaces=True",
@@ -492,8 +502,8 @@ class RequestScope(Base):
         self.assertEqual(self.scope(["get", "pods/a", "--", "secrets/b"])["resources"], ["pods", "secrets"])
         self.refused_by_parser(["get", "pods", "--", "secrets/b"])
         self.refused_by_parser(["--", "get", "pods"])
-        r = self.scope(["exec", "pod-a", "--", "get", "secrets/b"])      # exec: the pod's own command
-        self.assertEqual((r["verb"], r["resources"]), ("exec", ["pods"]))
+        r = self.scope(["logs", "pod-a", "--", "secrets/b"])     # a fixed-resource verb: still pods only
+        self.assertEqual((r["verb"], r["resources"]), ("logs", ["pods"]))
         self.refused(["txe-onprem-ci", "--", "get", "pods/a", "-n", "arc-runners", "--", "secrets/b"], "KR08")
 
     def test_an_attached_or_clustered_short_server_override_is_refused(self):
@@ -512,17 +522,20 @@ class RequestScope(Base):
             self.refused_by_parser(args)
         r = self.scope(["get", "pods", "-w", "-o", "json", "--show-labels", "-l", "app=x", "--output=wide"])
         self.assertEqual((r["resources"], r["namespace"]), (["pods"], "ctx-ns"))
-        self.assertEqual(self.scope(["exec", "-it", "pod-a", "--", "sh", "-c", "id"])["resources"], ["pods"])
+        self.assertEqual(self.scope(["logs", "pod-a", "-c", "app", "-p", "--timestamps"])["resources"], ["pods"])
         self.assertEqual(self.scope(["logs", "pod-a", "--tail", "10", "-f"])["resources"], ["pods"])
+        self.refused_by_parser(["logs", "pod-a", "-it"])             # a cluster: refused like any other
         self.refused(["txe-onprem-ci", "--", "get", "pods", "-wA"], "KR05")
 
     def test_file_based_and_create_requests_are_refused(self):
         # A manifest names its own kinds and namespaces, and `create <kind>` can be cluster-scoped (connector
-        # review of 85bde125); neither can be read from the arguments before contact.
+        # review of 85bde125). The mutating forms are refused as mutations; file reads by read verbs are refused
+        # because their scope cannot be read from the arguments before contact.
         for args in (["apply", "-f", "x.yaml"], ["create", "clusterrolebinding", "x", "--clusterrole", "admin"],
                      ["create", "-f", "x.yaml"], ["replace", "-f", "x.yaml"], ["diff", "-f", "x.yaml"],
                      ["delete", "-f", "x.yaml"], ["get", "pods", "-f", "x.yaml"], ["delete", "-k", "dir"],
-                     ["get", "pods", "--filename=x.yaml"], ["apply", "-k", "dir"]):
+                     ["get", "pods", "--filename=x.yaml"], ["apply", "-k", "dir"], ["describe", "-f", "x.yaml"],
+                     ["get", "-k", "dir"]):
             self.refused_by_parser(args)
         F.write_record(verbs=["apply", "create"], resources=["<files>", "clusterrolebindings"])
         self.refused(["txe-onprem-ci", "--", "apply", "-f", "x.yaml"], "KR05")
@@ -534,11 +547,11 @@ class RequestScope(Base):
                      ["get", "pods", "--subresource=a/b"], ["get", "pods", "--subresource", "a", "--subresource=b"]):
             self.refused_by_parser(args)
         self.assertEqual(self.scope(["cluster-info"])["resources"], ["<discovery>"])
-        self.assertEqual(self.scope(["patch", "pods/victim", "--subresource=ephemeralcontainers", "-p", "{}"])
-                         ["resources"], ["pods/ephemeralcontainers"])
+        self.assertEqual(self.scope(["get", "pods/victim", "--subresource=ephemeralcontainers"])["resources"],
+                         ["pods/ephemeralcontainers"])
         self.assertEqual(self.scope(["get", "pods", "x", "--subresource", "status"])["resources"], ["pods/status"])
-        F.write_record(verbs=["patch"])     # resources: pods, namespaces
-        self.refused(["txe-onprem-ci", "--", "patch", "pods/victim", "--subresource=ephemeralcontainers", "-p", "{}",
+        # A record for get on pods does not cover a pods subresource (resources: pods, namespaces).
+        self.refused(["txe-onprem-ci", "--", "get", "pods/victim", "--subresource=ephemeralcontainers",
                       "-n", "arc-runners"], "KR08")
 
     def test_auth_and_rollout_carry_their_subcommand(self):
@@ -546,18 +559,20 @@ class RequestScope(Base):
         self.assertEqual((r["verb"], r["resources"]), ("auth can-i", ["selfsubjectaccessreviews"]))
         r = self.scope(["auth", "whoami"])
         self.assertEqual((r["verb"], r["resources"]), ("auth whoami", ["selfsubjectreviews"]))
-        r = self.scope(["rollout", "restart", "deploy/x"])
-        self.assertEqual((r["verb"], r["resources"]), ("rollout restart", ["deploy"]))
+        r = self.scope(["rollout", "status", "deploy/x"])
+        self.assertEqual((r["verb"], r["resources"]), ("rollout status", ["deploy"]))
+        r = self.scope(["rollout", "history", "deploy/x", "--revision", "2"])
+        self.assertEqual((r["verb"], r["resources"]), ("rollout history", ["deploy"]))
         for args in (["auth", "reconcile", "-f", "rbac.yaml"], ["auth"], ["auth", "--bogus", "can-i"],
-                     ["rollout", "frobnicate", "deploy/x"], ["rollout"]):
+                     ["rollout", "frobnicate", "deploy/x"], ["rollout"], ["rollout", "restart", "deploy/x"]):
             self.refused_by_parser(args)
         # End to end: a record granting "auth can-i" covers it, and never "auth reconcile".
         F.write_record(verbs=["auth can-i"], resources=["selfsubjectaccessreviews"])
         rc, _, e, t = call(["txe-onprem-ci", "--", "auth", "can-i", "get", "pods"])
         self.assertEqual((rc, len(t.calls)), (0, 2), e)
         self.refused(["txe-onprem-ci", "--", "auth", "reconcile", "-f", "rbac.yaml"], "KR05")
-        F.write_record(verbs=["rollout status"], resources=["deploy"])
-        self.refused(["txe-onprem-ci", "--", "rollout", "restart", "deploy/x"], "KR08")
+        F.write_record(verbs=["rollout status", "rollout restart"], resources=["deploy"])
+        self.refused(["txe-onprem-ci", "--", "rollout", "restart", "deploy/x"], "KR05")   # read-only, whatever granted
 
 
 class ValueFreeDiagnostics(Base):

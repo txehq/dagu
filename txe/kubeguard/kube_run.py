@@ -15,14 +15,19 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
  1. ARGUMENTS. The caller names a registry cluster id, never a kubeconfig or context. Arguments that pick
     or change the target, the identity or TLS (--kubeconfig, --context, --server/-s, --cluster, --user,
     --token, --as*, --username, --password, --certificate-authority, --client-*, --tls-server-name,
-    --insecure-skip-tls-verify, --kuberc) are refused. The verb, resources and namespace are read from the
-    arguments. A plugin, an unknown verb or an ambiguous flag is refused. Every resource operand counts
-    (`get pods/a secrets/b` is pods AND secrets), every true spelling of --all-namespaces/-A means all
-    namespaces, a `cp` operand naming its own namespace is refused, and auth and rollout carry their
-    subcommand ("auth can-i", "rollout restart") so a record grants exactly the operation it names. Only
-    options kube-run knows are forwarded; any other option, and any attached or clustered short option
-    (`-wA`, `-inother`), is refused. File-based and create requests (apply, create, replace, diff, -f, -k)
-    are refused, because the kinds and namespaces they act on cannot be read from the arguments.
+    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get, describe,
+    top, logs, events, rollout status|history, auth can-i|whoami and the discovery verbs (api-resources,
+    api-versions, explain, version, cluster-info, with no operand). Every mutating, interactive or tunnelling
+    verb (delete, patch, edit, apply, create, exec, cp, port-forward, rollout restart, ...) is refused before
+    contact, and so are plugins and unknown verbs. A read is still authorized by cluster, resources and
+    namespace:
+    - every resource operand counts (`get pods/a secrets/b` is pods AND secrets, after `--` too);
+    - every true spelling of --all-namespaces/-A means all namespaces;
+    - --subresource=<s> is authorized as <resource>/<s>;
+    - auth and rollout carry their subcommand ("auth can-i", "rollout status");
+    - only options kube-run knows are forwarded, and any other option, or any attached or clustered short
+      option (`-wA`, `-ojson`), is refused;
+    - -f/-k (file or kustomization reads) are refused on every verb but logs, where -f is follow.
  2. REGISTRY. The entry for the id gives the pinned kubeconfig path, context, server URL, CA SHA-256 and
     kube-system Namespace UID. The registry path is fixed (~/.coding_global/kube-clusters.json); the CLI
     cannot point it elsewhere.
@@ -129,43 +134,41 @@ OVERRIDE_FLAGS = ("--kubeconfig", "--context", "--server", "-s", "--cluster", "-
                   "--password", "--as", "--as-group", "--as-uid", "--certificate-authority",
                   "--client-certificate", "--client-key", "--tls-server-name", "--insecure-skip-tls-verify",
                   "--kuberc")
-VALUE_FLAGS = {"-o", "--output", "-l", "--selector", "-f", "--filename", "-c", "--container", "--field-selector",
-               "--template", "--since", "--tail", "--sort-by", "-L", "--label-columns", "--chunk-size", "--timeout",
-               "--for", "--request-timeout", "--since-time", "--limit-bytes", "-p", "--patch", "--type",
-               "--replicas", "--revision", "--to-revision", "--grace-period", "-k", "--kustomize", "--subresource",
-               "-v", "--v"}
-NAMESPACE_FLAGS = ("-n", "--namespace")
-ALL_NS_FLAGS = ("-A", "--all-namespaces")
+# kube-run is READ-ONLY. These are the only verbs it runs; every other verb is refused before contact.
 # verb -> how to find its resources: an index into the positionals, or a fixed resource name.
 VERBS = {
-    "get": 1, "describe": 1, "delete": 1, "edit": None, "patch": 1, "label": 1, "annotate": 1, "scale": 1,
-    "wait": 1, "apply": "<files>", "create": "<files>", "replace": "<files>", "diff": "<files>",
-    "rollout": 2, "top": 1, "logs": "pods", "exec": "pods", "cp": "pods", "attach": "pods",
-    "port-forward": "pods", "events": "events", "auth": "<subcommand>",
+    "get": 1, "describe": 1, "top": 1, "rollout": 2, "logs": "pods", "events": "events", "auth": "<subcommand>",
     "api-resources": "<discovery>", "api-versions": "<discovery>", "explain": "<discovery>",
     "version": "<discovery>", "cluster-info": "<discovery>",
 }
+# Mutating, interactive and tunnelling verbs: refused with a read-only message, before any file is read.
+MUTATING_VERBS = {"delete", "edit", "patch", "label", "annotate", "scale", "wait", "apply", "create", "replace",
+                  "diff", "exec", "cp", "attach", "port-forward", "run", "debug", "proxy", "expose", "autoscale",
+                  "set", "drain", "cordon", "uncordon", "taint", "certificate", "kustomize", "plugin", "alpha"}
 # Verbs whose subcommand is part of the operation. The request's verb is "<verb> <subcommand>", so an
-# authorization record grants exactly the operations it names ("auth can-i" never grants "auth reconcile", and
-# "rollout status" never grants "rollout restart"). A subcommand not listed here is refused.
+# authorization record grants exactly the operations it names ("auth can-i" never grants "auth reconcile").
+# Only read subcommands are listed; any other is refused (rollout restart/undo/pause/resume included).
 SUBCOMMANDS = {
     "auth": {"can-i": ["selfsubjectaccessreviews"], "whoami": ["selfsubjectreviews"]},
-    "rollout": {s: None for s in ("status", "history", "restart", "undo", "pause", "resume")},
+    "rollout": {"status": None, "history": None},
 }
+# Options kube-run forwards that take a value. Together with NAMESPACE_FLAGS, ALL_NS_FLAGS and BOOL_FLAGS these
+# are the only options it forwards; any other option is refused, attached and clustered short forms included.
+VALUE_FLAGS = {"-o", "--output", "-l", "--selector", "-f", "--filename", "-c", "--container", "--field-selector",
+               "--template", "--since", "--tail", "--sort-by", "-L", "--label-columns", "--chunk-size", "--for",
+               "--request-timeout", "--since-time", "--limit-bytes", "--revision", "-k", "--kustomize",
+               "--subresource", "-v", "--v"}
+NAMESPACE_FLAGS = ("-n", "--namespace")
+ALL_NS_FLAGS = ("-A", "--all-namespaces")
 # pflag's boolean spellings (strconv.ParseBool), for --all-namespaces=<value> and -A=<value>.
 TRUE_WORDS = {"1", "t", "T", "TRUE", "true", "True"}
 FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
-# Operands of these verbs that are labels or annotations (key=value, key-), not resources.
-KEY_VALUE_VERBS = {"label", "annotate"}
-# Options known to take no value. Together with VALUE_FLAGS, NAMESPACE_FLAGS and ALL_NS_FLAGS, these are the
-# only options kube-run forwards; any other option is refused, attached and clustered short forms included.
-BOOL_FLAGS = {"-w", "--watch", "--watch-only", "-i", "-t", "-it", "-ti", "--stdin", "--tty", "-q", "--quiet",
-              "--show-labels", "--no-headers", "--all", "-R", "--recursive", "--previous", "--timestamps",
-              "--all-containers", "--ignore-not-found", "--show-kind", "--output-watch-events", "--prefix",
-              "--follow"}
-# Options that read objects from files or kustomizations, and verbs that take their scope from them.
+# Options kube-run forwards that take no value (-p is logs --previous).
+BOOL_FLAGS = {"-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--recursive", "-p", "--previous",
+              "--timestamps", "--all-containers", "--ignore-not-found", "--show-kind", "--output-watch-events",
+              "--prefix", "--follow"}
+# Options that read objects from files or kustomizations. They are refused on every verb but logs (-f is follow).
 FILE_FLAGS = {"-f", "--filename", "-k", "--kustomize"}
-FILE_VERBS = {"apply", "create", "replace", "diff"}
 # Fixed-resource verbs that take no operand in kube-run. An operand there is a subcommand kube-run does not
 # model (`cluster-info dump` reads nodes, pods and logs across namespaces), so it is refused.
 NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "cluster-info", "events"}
@@ -259,20 +262,24 @@ def parse_request(args, default_namespace):
             raise Refused("KR05", "an option kube-run does not recognise (write each short option and its value "
                                   "separately)")
         else:
+            if not pos and a in MUTATING_VERBS:
+                raise Refused("KR05", "kube-run is read-only: mutating, interactive and tunnelling verbs are "
+                                      "refused")
             pos.append(a)
         i += 1
     if not pos:
         raise Refused("KR05", "no kubectl verb")
     verb = pos[0]
     if verb not in VERBS:
-        raise Refused("KR05", "the verb is not one kube-run supports (plugins and unknown verbs are refused)")
+        raise Refused("KR05", "the verb is not one kube-run supports (it is read-only; plugins and unknown verbs "
+                              "are refused)")
     if unknown_at == 0:
         raise Refused("KR05", "an unknown flag comes before the verb")
-    if verb in FILE_VERBS or (files and verb != "logs"):
-        # A manifest or kustomization carries its own kinds and namespaces, and `create <kind>` can name a
-        # cluster-scoped object; none of that can be read from the arguments before contact.
-        raise Refused("KR05", "file-based and create requests are refused: their resources and namespaces cannot "
-                              "be established from the arguments before contact")
+    if files and verb != "logs":
+        # A manifest or kustomization carries its own kinds and namespaces, which cannot be read from the
+        # arguments before contact.
+        raise Refused("KR05", "file-based requests are refused: their resources and namespaces cannot be "
+                              "established from the arguments before contact")
     how = VERBS[verb]
     if how is None:
         raise Refused("KR05", "interactive verbs are not supported")
@@ -294,8 +301,6 @@ def parse_request(args, default_namespace):
         # cannot be placed, so it is refused.
         typed = "/" in pos[how]
         for extra in pos[how + 1:]:
-            if verb in KEY_VALUE_VERBS and ("=" in extra or extra.endswith("-")):
-                continue
             if typed:
                 if "/" not in extra:
                     raise Refused("KR05", "a TYPE/NAME list contains an operand without a type")
@@ -316,12 +321,6 @@ def parse_request(args, default_namespace):
         if len(set(subresources)) > 1 or not re.fullmatch(r"[a-z]+", subresources[-1]):
             raise Refused("KR05", "the subresource is ambiguous or not a plain name")
         resources = [f"{r}/{subresources[-1]}" for r in resources]
-    if verb == "cp":
-        # kubectl cp takes [<namespace>/]<pod>:<path>; a namespace there bypasses -n, so it is refused.
-        for operand in pos[1:]:
-            head, sep, _ = operand.partition(":")
-            if sep and "/" in head:
-                raise Refused("KR05", "a cp operand names its own namespace; use -n <namespace> instead")
     if len(set(namespaces)) > 1:
         raise Refused("KR05", "more than one namespace is named")
     if all_ns and namespaces:

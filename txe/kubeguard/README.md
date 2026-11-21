@@ -17,20 +17,27 @@ a context can be repointed inside its file. This directory holds the source of t
   - a kubeconfig re-hash (KR17).
   Only then does it make the request, under B5 host custody. Diagnostics are stable codes with values
   withheld. The full contract is in its docstring.
-  Authorization covers every part of a request that selects scope:
-  - every resource operand (`get pods/a secrets/b` is pods and secrets), including those after `--`;
+  **kube-run is read-only.** It runs only these verbs:
+  - `get`, `describe`, `top`, `logs` and `events`;
+  - `rollout status` and `rollout history`;
+  - `auth can-i` and `auth whoami`;
+  - the discovery verbs `api-resources`, `api-versions`, `explain`, `version` and `cluster-info` (with no
+    operand, so `cluster-info dump` is refused).
+  Every mutating, interactive or tunnelling verb is refused before contact: `delete`, `edit`, `patch`, `label`,
+  `annotate`, `scale`, `wait`, `apply`, `create`, `replace`, `diff`, `exec`, `cp`, `attach`, `port-forward`,
+  `run`, `debug`, `proxy`, `expose`, `autoscale`, `set`, `drain`, `cordon`, `uncordon`, `taint`, `certificate`,
+  `rollout restart|undo|pause|resume`, and any plugin or unknown verb.
+  A read is still authorized by cluster, resources and namespace, because a read can widen too:
+  - every resource operand counts (`get pods/a secrets/b` is pods and secrets), including those after `--`;
+  - every true spelling of `--all-namespaces` and `-A` means all namespaces;
+  - `--subresource=<s>` is authorized as `<resource>/<s>`;
+  - `auth` and `rollout` are authorized with their subcommand (`auth can-i`, `rollout status`);
   - an attached or clustered `-s` (`-sURL`, `-its`) is a server override, refused like `--server`;
-  - every true spelling of `--all-namespaces` and `-A`;
-  - a `cp` operand that names its own namespace is refused;
-  - `auth` and `rollout` are authorized with their subcommand (`auth can-i`, `rollout restart`), from an
-    allowlist;
-  - only options kube-run knows are forwarded. Any other option, and any attached or clustered short option
-    (`-wA`, `-inother`, `-ojson`), is refused: write each option and its value separately;
-  - file-based and create requests (`apply`, `create`, `replace`, `diff`, `-f`, `-k`; `logs -f` excepted) are
-    refused, because the kinds and namespaces they act on cannot be read from the arguments before contact;
-  - discovery verbs take no operand, so `cluster-info dump` is refused, and `--subresource=<s>` is authorized
-    as `<resource>/<s>`.
+  - only options kube-run knows are forwarded. Any other option (`--raw` included), and any attached or
+    clustered short option (`-wA`, `-ojson`), is refused: write each option and its value separately;
+  - `-f`/`-k` (file or kustomization reads) are refused on every verb but `logs`, where `-f` is follow.
   The registry entry must pin kubectl by absolute path. kube-run never looks kubectl up on the caller's PATH.
+  Example: `kube-run --authorization rec.json txe-onprem-ci -- get pods -n arc-runners -o wide`.
 - **`b5_custody.py`**: the reviewed B5 host-process custody, copied byte for byte (provenance below) and
   pinned by sha256 in `kube_run.py`.
 - **`kubectl-context-guard.py`**: a PreToolUse hook that lets an agent's cluster API call through only on the

@@ -105,7 +105,7 @@ ALLOWED_RESTS = ("txe-onprem-ci -- get pods -n arc-runners",
                  "--authorization /x/rec.json txe-onprem-ci -- get pods -n arc-runners",
                  "--timeout 30 txe-onprem-ci -- logs deploy/x -c y",
                  "--timeout 30 --authorization /x/rec.json txe-onprem-ci -- describe pod x",
-                 "txe-onprem-ci -- exec pod -- sh -c 'echo hi'")
+                 "txe-onprem-ci -- logs pod-a -c app --since 1h")
 H10_RESTS = ("txe-onprem-ci get pods", "txe-onprem-ci --", "Bad_Id -- get pods", "-- get pods",
              "--registry /x txe-onprem-ci -- get pods", "$C -- get pods", "--bogus txe-onprem-ci -- get",
              "--timeout x txe-onprem-ci -- get pods", "--timeout txe-onprem-ci -- get pods")

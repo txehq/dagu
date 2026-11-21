@@ -17,7 +17,8 @@ and checks the kube-system UID at contact. This hook only makes sure that kube-r
   - `<installed kube-run> [--authorization F] [--timeout N] <cluster-id> -- <kubectl args>` is let through
     when kube-run is the installed path (H09), its own arguments are well formed (H10), and the kubectl
     arguments carry no target, identity or TLS override (H11). kube-run repeats every check at run time,
-    on the arguments it actually receives.
+    on the arguments it actually receives. kube-run is read-only, and refuses every mutating, interactive or
+    tunnelling verb itself.
   - Local commands need nothing: kubectl version --client, help/--help/-h, completion, options, plugin list,
     kustomize, config current-context|get-contexts|get-clusters|get-users|view (not --raw/--flatten, H08);
     helm version|template (not --validate)|lint|package|repo|show|pull|dependency|...; flux version --client,
