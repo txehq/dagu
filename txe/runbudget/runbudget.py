@@ -20,6 +20,9 @@ from dataclasses import dataclass
 SCHEMA = "txe.runbudget/v1"
 
 RESERVATION_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{2,63}")
+# Ids a reservation may not take: "unknown" is how capacitygate reports a container with no owner, so a reservation by
+# that name would collide with it. Refusing it here keeps the two apart in every reader.
+RESERVED_IDS = frozenset({"unknown"})
 TICKET_RE = re.compile(r"TXE-[1-9][0-9]*")
 SESSION_RE = re.compile(r"cc[0-9]*-[a-z0-9][a-z0-9._-]{0,63}")
 GRANT_RE = re.compile(r"msg_[0-9a-f]{12}")
@@ -50,7 +53,7 @@ CODES = {
     "B04": "missing key",
     "B05": "wrong type (an integer must be a JSON integer, not a bool or a float)",
     "B06": "integer out of range",
-    "B07": "reservation_id does not match ^[a-z0-9][a-z0-9._-]{2,63}$",
+    "B07": "reservation_id does not match ^[a-z0-9][a-z0-9._-]{2,63}$, or is a reserved id (RESERVED_IDS)",
     "B08": "owner field does not match its pattern",
     "B09": "disk path is not absolute and normalised",
     "B10": "disk path repeated",
@@ -163,7 +166,7 @@ def validate(doc):
         raise BudgetError("B02", "schema")
     _keys(doc, TOP_KEYS, "")
     rid = doc["reservation_id"]
-    if not isinstance(rid, str) or not RESERVATION_ID_RE.fullmatch(rid):
+    if not isinstance(rid, str) or not RESERVATION_ID_RE.fullmatch(rid) or rid in RESERVED_IDS:
         raise BudgetError("B07", "reservation_id")
     owner = doc["owner"]
     _keys(owner, OWNER_KEYS, "owner")

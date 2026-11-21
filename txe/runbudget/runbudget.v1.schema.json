@@ -8,7 +8,7 @@
   "required": ["schema", "reservation_id", "owner", "containers", "time", "disk", "policy"],
   "properties": {
     "schema": {"const": "txe.runbudget/v1"},
-    "reservation_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$"},
+    "reservation_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$", "not": {"enum": ["unknown"]}},
     "owner": {
       "type": "object",
       "additionalProperties": false,

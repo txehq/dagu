@@ -17,7 +17,8 @@ Neither guard imports the other. This directory imports nothing from either.
 ## Fields
 
 See the schema document. In short:
-- **`reservation_id`:** the key into the coordinator's reservation inventory.
+- **`reservation_id`:** the key into the coordinator's reservation inventory. `unknown` is reserved (`RESERVED_IDS`):
+  capacitygate reports it as the owner of an unattributed container.
 - **`owner`:** `{ticket, session, grant}`. The grant is an audit reference, not cryptographic approval.
 - **`containers`:** `{concurrent, cpus_milli, memory_bytes}`. The caps are **per container**.
 - **`time`:** `{run_bound_s, kill_after_s, cleanup_reserve_s}`. Their sum is the receipt's claimed deadline, which

@@ -450,7 +450,7 @@ def parse_inventory(data):
         where = f"reservations[{i}]"
         _ikeys(r, RES_KEYS, where)
         rid = r["id"]
-        if not isinstance(rid, str) or not runbudget.RESERVATION_ID_RE.fullmatch(rid):
+        if not isinstance(rid, str) or not runbudget.RESERVATION_ID_RE.fullmatch(rid) or rid in runbudget.RESERVED_IDS:
             raise Bad("unreadable", "N10", f"{where}.id")
         if rid in ids:
             raise Bad("unreadable", "N11", f"{where} duplicate id")
@@ -661,18 +661,40 @@ def nearest_device(path, stat_fn):
             p = os.path.dirname(p)
 
 
-def walk_used(roots, max_s, max_entries, monotonic=time.monotonic):
-    """Bytes in use under each (reservation id, path) root, by an lstat walk. Returns {(rid, path): (used or None,
-    flags)}; None means the walk failed and the caller charges the full cap.
+WALK_MAX_DEPTH = 256         # txe/mutate/mutate-sandboxed.py dir_usage's max_depth (TXE-7549)
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 
-    - The root must be a real directory, not a symlink. Symlinks below it are never followed or counted; a FIFO,
-      socket or device file fails that root. A different st_dev below the root is not descended (a mount).
+
+class _WalkStop(Exception):
+    """A walk that must fail closed; its argument is the flag recorded for that root."""
+
+
+def walk_used(roots, max_s, max_entries, monotonic=time.monotonic, _open=os.open):
+    """Bytes in use under each (reservation id, path) root. Returns {(rid, path): (used or None, flags)}; None means
+    the walk failed and the caller charges the full remaining cap.
+
+    The claim tree may be written by the running reservation WHILE it is walked, so the walk works on directory
+    DESCRIPTORS (the txe/mutate dir_usage pattern):
+    - The root, and each directory below it, is opened with O_NOFOLLOW: the root relative to its path, each child
+      relative to its parent's descriptor. A directory swapped for a symlink fails to open, and the root fails.
+    - Each opened directory's fstat (st_dev, st_ino) must equal the lstat taken when it was listed (or, for the root,
+      before it was opened). A directory replaced between the two fails closed (identity_changed).
+    - Symlinks below the root are never followed or counted. A FIFO, socket or device file fails that root. A
+      different st_dev below the root is not descended (a mount).
     - Each (st_dev, st_ino) is counted once across ALL roots, so hard links and overlapping paths never count twice.
-    - A shared wall-clock bound and a per-root entry bound; exceeding either fails that root (and later roots)."""
+    - Bounds: a shared wall-clock bound, a per-root entry bound, and WALK_MAX_DEPTH levels. Exceeding any of them
+      fails that root. One descriptor is open per level.
+    Limit: the path components ABOVE the root are resolved normally. The claim path is bound to its reservation id,
+    but its parent directories must not be writable by the reservation."""
     seen, out = set(), {}
     start = monotonic()
+
+    def same(st, fd):
+        f = os.fstat(fd)
+        return (f.st_dev, f.st_ino) == (st.st_dev, st.st_ino) and _stat.S_ISDIR(f.st_mode)
+
     for rid, path in sorted(roots):
-        flags = []
+        flags, tally = [], {"used": 0, "entries": 0}
         try:
             st = os.lstat(path)
         except OSError:
@@ -681,45 +703,68 @@ def walk_used(roots, max_s, max_entries, monotonic=time.monotonic):
         if _stat.S_ISLNK(st.st_mode) or not _stat.S_ISDIR(st.st_mode):
             out[(rid, path)] = (None, ["root_not_a_real_directory"])
             continue
-        dev, used, entries, failed = st.st_dev, 0, 0, None
-        key = (st.st_dev, st.st_ino)
-        if key not in seen:
-            seen.add(key)
-            used += st.st_blocks * 512
-        stack = [path]
+        dev = st.st_dev
+
+        def count(s):
+            k = (s.st_dev, s.st_ino)
+            if k not in seen:
+                seen.add(k)
+                tally["used"] += s.st_blocks * 512
+
+        def walk(fd, depth):
+            if depth > WALK_MAX_DEPTH:
+                raise _WalkStop("depth_bound")
+            with os.scandir(fd) as it:
+                for e in it:
+                    tally["entries"] += 1
+                    if tally["entries"] > max_entries:
+                        raise _WalkStop("entry_bound")
+                    if monotonic() - start > max_s:
+                        raise _WalkStop("time_bound")
+                    s = e.stat(follow_symlinks=False)
+                    if _stat.S_ISLNK(s.st_mode):
+                        if "symlink_not_followed" not in flags:
+                            flags.append("symlink_not_followed")
+                        continue
+                    if s.st_dev != dev:
+                        if "mount_not_descended" not in flags:
+                            flags.append("mount_not_descended")
+                        continue
+                    if _stat.S_ISDIR(s.st_mode):
+                        try:
+                            sub = _open(e.name, _DIR_FLAGS, dir_fd=fd)
+                        except OSError:
+                            raise _WalkStop("open_refused") from None
+                        try:
+                            if not same(s, sub):
+                                raise _WalkStop("identity_changed")
+                            count(s)
+                            walk(sub, depth + 1)
+                        finally:
+                            os.close(sub)
+                    elif _stat.S_ISREG(s.st_mode):
+                        count(s)
+                    else:
+                        raise _WalkStop("special_file")
+
+        failed = None
         try:
-            while stack and failed is None:
-                d = stack.pop()
-                with os.scandir(d) as it:
-                    for e in it:
-                        entries += 1
-                        if entries > max_entries:
-                            failed = "entry_bound"
-                            break
-                        if monotonic() - start > max_s:
-                            failed = "time_bound"
-                            break
-                        s = e.stat(follow_symlinks=False)
-                        if _stat.S_ISLNK(s.st_mode):
-                            if "symlink_not_followed" not in flags:
-                                flags.append("symlink_not_followed")
-                            continue
-                        if s.st_dev != dev:
-                            if "mount_not_descended" not in flags:
-                                flags.append("mount_not_descended")
-                            continue
-                        if _stat.S_ISDIR(s.st_mode):
-                            stack.append(e.path)
-                        elif not _stat.S_ISREG(s.st_mode):
-                            failed = "special_file"
-                            break
-                        k = (s.st_dev, s.st_ino)
-                        if k not in seen:
-                            seen.add(k)
-                            used += s.st_blocks * 512
+            top = _open(path, _DIR_FLAGS)
+        except OSError:
+            out[(rid, path)] = (None, ["open_refused"])
+            continue
+        try:
+            if not same(st, top):
+                raise _WalkStop("identity_changed")
+            count(st)
+            walk(top, 0)
+        except _WalkStop as stop:
+            failed = stop.args[0]
         except OSError:
             failed = "lookup_failed"
-        out[(rid, path)] = (None, flags + [failed]) if failed else (used, flags)
+        finally:
+            os.close(top)
+        out[(rid, path)] = (None, flags + [failed]) if failed else (tally["used"], flags)
     return out
 
 

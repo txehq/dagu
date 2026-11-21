@@ -135,13 +135,19 @@ charged_disk(d) = N_disk(d) + Σ_{r running, p on d} left(r, p) + Σ_{p ∈ Pend
 **The walk** (D1). `used(r, p)` comes from a bounded `lstat` walk of the claim's path:
 - **The path is bound to the reservation's identity:** one of its components is the reservation id. Otherwise the
   inventory refuses (78, N14).
+- **The walk works on directory descriptors, because the claim tree may be written while it is walked** (the
+  `txe/mutate` `dir_usage` pattern). The root, and each directory below it, is opened with `O_NOFOLLOW`, each child
+  relative to its parent's descriptor. Each opened directory's `(st_dev, st_ino)` must equal the `lstat` taken when it
+  was listed. A directory swapped for a symlink (`open_refused`) or replaced (`identity_changed`) fails closed. The
+  path components above the root are resolved normally, so they must not be writable by the reservation.
 - **The root must be a real directory, not a symlink.**
   - Symlinks below the root are never followed or counted.
   - A FIFO, socket or device file fails the walk.
   - A different `st_dev` is not descended.
   - `..` cannot appear, because paths are normalised.
 - **Every `(st_dev, st_ino)` is counted once across all walks,** so hard links and overlapping paths never count twice.
-- **The bounds are `disk_walk_max_s` and `disk_walk_max_entries`.** Exceeding either fails that walk.
+- **The bounds are `disk_walk_max_s`, `disk_walk_max_entries`, and 256 levels deep** (dir_usage's `max_depth`).
+  Exceeding any of them fails that walk.
 
 **Fallbacks:**
 - **Any failure charges the full remaining cap, flagged `fallback_full_remaining_cap`.** That over-reserves on purpose;
@@ -243,6 +249,8 @@ The budget is `txe.runbudget/v1`, a separate data contract with no import betwee
 - `match.kind: "ids"` lists the full ids the owner started.
 - **Do not register unrelated foreign containers as reservations just to avoid a refusal** (D2 clarification 4).
 - A label naming an unregistered id gives no ownership, and is flagged `label_unregistered`.
+- **`unknown` is a reserved id** (`runbudget.RESERVED_IDS`). It is the owner the receipt reports for an unattributed
+  container, so neither a budget nor an inventory reservation may take it (76 / 78).
 
 **Refusals (exit 78):**
 

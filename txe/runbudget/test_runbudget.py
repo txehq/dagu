@@ -138,7 +138,7 @@ class Negative(unittest.TestCase):
                 d = base()
                 d["owner"][key] = bad
                 self.assertEqual(refused(d)[0], "B08")
-        for bad in ("ab", "Res-1", "-res", "r" * 65):
+        for bad in ("ab", "Res-1", "-res", "r" * 65, "unknown"):
             d = base()
             d["reservation_id"] = bad
             self.assertEqual(refused(d)[0], "B07")
@@ -221,6 +221,7 @@ class SchemaDocument(unittest.TestCase):
     def test_patterns_agree(self):
         p = self.s["properties"]
         self.assertEqual(p["reservation_id"]["pattern"], "^" + R.RESERVATION_ID_RE.pattern + "$")
+        self.assertEqual(p["reservation_id"]["not"]["enum"], sorted(R.RESERVED_IDS))
         for key, rx in (("ticket", R.TICKET_RE), ("session", R.SESSION_RE), ("grant", R.GRANT_RE)):
             self.assertEqual(p["owner"]["properties"][key]["pattern"], "^" + rx.pattern + "$")
 

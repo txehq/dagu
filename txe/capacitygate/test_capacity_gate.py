@@ -725,6 +725,68 @@ class Walk(unittest.TestCase):
         out = G.walk_used([("x", os.path.join(self.root, "absent"))], 30, 1000)
         self.assertEqual(out[("x", os.path.join(self.root, "absent"))], (None, ["lookup_failed"]))
 
+    def racing_open(self, victim, swap):
+        """An os.open that runs `swap()` just before it opens the directory named `victim`: the window between the
+        walk listing a directory and opening it."""
+        real = os.open
+        done = []
+
+        def opener(name, flags, *args, dir_fd=None, **kw):
+            if not done and os.path.basename(name) == victim:
+                done.append(1)
+                swap()
+            return real(name, flags, *args, dir_fd=dir_fd, **kw) if dir_fd is not None else real(name, flags)
+        return opener
+
+    def test_a_directory_swapped_for_a_symlink_mid_walk_is_not_followed_and_fails_closed(self):
+        claim = os.path.join(self.root, "claim")
+        os.makedirs(os.path.join(claim, "sub"))
+        self.mk("elsewhere/big.bin", 262144)                 # blocks the walk must never count as the claim's
+
+        def swap():
+            os.rmdir(os.path.join(claim, "sub"))
+            os.symlink(os.path.join(self.root, "elsewhere"), os.path.join(claim, "sub"))
+        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
+        self.assertEqual(out[("c", claim)], (None, ["open_refused"]))   # O_NOFOLLOW refuses it; the full cap is charged
+
+    def test_a_directory_replaced_mid_walk_fails_closed_on_identity(self):
+        claim = os.path.join(self.root, "claim")
+        os.makedirs(os.path.join(claim, "sub"))
+        self.mk("claim/sub/a.bin", 1)
+
+        def swap():
+            os.rename(os.path.join(claim, "sub"), os.path.join(self.root, "sub-moved"))
+            os.makedirs(os.path.join(claim, "sub"))
+        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("sub", swap))
+        self.assertEqual(out[("c", claim)], (None, ["identity_changed"]))
+
+    def test_a_root_replaced_before_it_is_opened_fails_closed(self):
+        claim = os.path.join(self.root, "claim")
+        os.makedirs(claim)
+
+        def swap():
+            os.rename(claim, os.path.join(self.root, "claim-moved"))
+            os.makedirs(claim)
+        out = G.walk_used([("c", claim)], 30, 1000, _open=self.racing_open("claim", swap))
+        self.assertEqual(out[("c", claim)], (None, ["identity_changed"]))
+
+
+class ReservedId(unittest.TestCase):
+    """'unknown' is the owner capacitygate reports for an unattributed container, so no reservation may take it."""
+
+    def test_a_budget_named_unknown_is_refused(self):
+        w = World(self)
+        w.budget["reservation_id"] = "unknown"
+        w.budget["disk"] = [{"path": "/w/unknown/work", "need_bytes": 18 * GIB}]
+        self.assertEqual(w.go().exit_code, 76)
+
+    def test_an_inventory_reservation_named_unknown_is_refused(self):
+        w = World(self)
+        w.inventory["reservations"][1]["id"] = "unknown"
+        v = w.go()
+        self.assertEqual(v.exit_code, 78)
+        self.assertEqual([f.code for f in v.failures if f.reading == "inventory"], ["N10"])
+
 
 if __name__ == "__main__":
     unittest.main()
