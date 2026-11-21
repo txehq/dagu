@@ -197,6 +197,8 @@ DATA_OPTIONS = {
     "cat": ("", "", set()),
     "grep": ("rRnilcvwxEFo", "e", set()), "egrep": ("rRnilcvwxo", "e", set()), "fgrep": ("rRnilcvwxo", "e", set()),
     "which": ("a", "", set()),
+    # `[` (the test command with its closing `]`) is classified before the DYNAMIC check in _command, with test's
+    # rules; it is listed here only to document that.
     "test": "any", "[": "any", "true": "any", "false": "any", ":": "any",
 }
 DATA_ONLY = set(DATA_OPTIONS)
@@ -584,6 +586,15 @@ class Guard:
         words = self._take_assignments(words, env)
         while words:
             w, fl = words[0]
+            if w == "[" and "ansi" not in fl:
+                # The exact command word `[` is the POSIX test command, not a glob: classified HERE, before the
+                # generic DYNAMIC check. It needs its closing `]` as the last argument; malformed bracket syntax is
+                # refused (H05). It then gets test's rules: its arguments are data (an expression; it runs
+                # nothing), and any substitution in them was already classified recursively in check_cmd.
+                # Only the exact word: `[a-z]`, `[k]ubectl` or `x[` stay run-time command words (H02).
+                if len(words) < 2 or words[-1][0] != "]":
+                    raise Refusal("H05")
+                return
             if "ansi" in fl or DYNAMIC.search(w):
                 args = [x[0] for x in words[1:]]
                 operand = first_operand(args)

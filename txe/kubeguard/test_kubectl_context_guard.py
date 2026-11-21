@@ -309,6 +309,21 @@ class Refused(unittest.TestCase):
                     "which -a kubectl", "test -n kubectl", "[ -x kubectl ]", ": kubectl"):
             self.assertIsNone(F.run(cmd)[0], cmd)
 
+    def test_the_bracket_test_command_is_classified_before_the_glob_check(self):
+        # run-s1-local-09 found `[ -x kubectl ]` refused as a run-time command word: `[` contains a glob character.
+        # Root's ruling: the EXACT word `[` with a closing `]` is the POSIX test command, classified before DYNAMIC
+        # with test's rules. Genuinely dynamic bracket words stay H02; malformed syntax is H05; substitutions inside
+        # are still classified recursively; and pipeline rules still apply.
+        for cmd in ("[a-z] kubectl get ns", "[k]ubectl get pods", "x[ kubectl ]"):
+            self.deny(cmd, "H02")
+        for cmd in ("[ -x kubectl", "[ -x kubectl ] ]x", "["):
+            self.deny(cmd, "H05")
+        r = self.deny('[ "$(kubectl get ns)" ]', "H01", "kubectl")
+        self.assertIn("nested", r)
+        self.deny("[ -x kubectl ] | bash", "H03")
+        for cmd in ("[ -x kubectl ]", "[ -n kubectl ] && echo y", '[ "$X" = kubectl ]', "[ -f ./kubectl ]"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
+
     def test_a_command_the_hook_cannot_parse_is_refused(self):
         # Connector review of a338d882: `kube\ctl get secrets <<\EOF ...` hid the client from a raw-text match.
         # Any parse failure is now refused (H05); quoted and escaped here-document delimiters parse as bash
