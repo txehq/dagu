@@ -166,6 +166,9 @@ BOOL_FLAGS = {"-w", "--watch", "--watch-only", "-i", "-t", "-it", "-ti", "--stdi
 # Options that read objects from files or kustomizations, and verbs that take their scope from them.
 FILE_FLAGS = {"-f", "--filename", "-k", "--kustomize"}
 FILE_VERBS = {"apply", "create", "replace", "diff"}
+# Fixed-resource verbs that take no operand in kube-run. An operand there is a subcommand kube-run does not
+# model (`cluster-info dump` reads nodes, pods and logs across namespaces), so it is refused.
+NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "cluster-info", "events"}
 
 
 # kubectl's short options that take a value. In a pflag shorthand cluster (`-it`, `-ojson`), every letter up to
@@ -206,7 +209,7 @@ def parse_request(args, default_namespace):
     if any(is_override(a) for a in args):
         raise Refused("KR04", "an argument selects or changes the cluster, identity or TLS; kube-run supplies "
                               "the kubeconfig and context from the registry")
-    pos, namespaces, all_ns, unknown_at, files = [], [], False, None, False
+    pos, namespaces, all_ns, unknown_at, files, subresources = [], [], False, None, False, []
     i = 0
     while i < len(args):
         a = args[i]
@@ -236,9 +239,13 @@ def parse_request(args, default_namespace):
                 raise Refused("KR05", "an all-namespaces flag has a value that is not a boolean")
         elif a in VALUE_FLAGS:
             files = files or a in FILE_FLAGS
+            if a == "--subresource":
+                subresources.append(args[i + 1] if i + 1 < len(args) else "")
             i += 1
         elif a.startswith("--") and "=" in a:
             name = a.partition("=")[0]
+            if name == "--subresource":
+                subresources.append(a.partition("=")[2])
             if name not in VALUE_FLAGS and name not in BOOL_FLAGS:
                 raise Refused("KR05", "an option kube-run does not recognise")
             files = files or name in FILE_FLAGS
@@ -297,9 +304,18 @@ def parse_request(args, default_namespace):
                 raise Refused("KR05", "an operand names a resource type after a bare type; name every operand as "
                                       "TYPE/NAME, or one type and its names")
     elif isinstance(how, str):
+        if verb in NO_OPERAND_VERBS and len(pos) > 1:
+            # e.g. `cluster-info dump`, which reads nodes, pods and logs across namespaces.
+            raise Refused("KR05", "this verb takes no operand in kube-run (subcommands such as cluster-info dump "
+                                  "are refused)")
         resources = [how]
     if not resources:
         raise Refused("KR05", "the request's resources could not be determined")
+    if subresources:
+        # The API authorizes a subresource separately (pods/ephemeralcontainers, deployments/scale, ...).
+        if len(set(subresources)) > 1 or not re.fullmatch(r"[a-z]+", subresources[-1]):
+            raise Refused("KR05", "the subresource is ambiguous or not a plain name")
+        resources = [f"{r}/{subresources[-1]}" for r in resources]
     if verb == "cp":
         # kubectl cp takes [<namespace>/]<pod>:<path>; a namespace there bypasses -n, so it is refused.
         for operand in pos[1:]:
@@ -836,9 +852,11 @@ def run(argv, registry_path, transport, now, environ, stdout, stderr):
                               "process group, so kube-run refuses it")
     request = parse_request(kargs, ctx_ns or "default")
     authorize(entry, cluster_id, record, request, now)
-    kubectl = entry.get("kubectl") or shutil.which("kubectl", path=environ.get("PATH"))
-    if not kubectl:
-        raise Refused("KR19", "kubectl is not on PATH and the registry entry pins none")
+    # The kubectl binary is deployment-controlled: the registry entry must pin it by absolute path. The caller's
+    # PATH is never consulted, because a binary it selects could answer the probe and ignore the request.
+    kubectl = entry.get("kubectl")
+    if not isinstance(kubectl, str) or not os.path.isabs(kubectl):
+        raise Refused("KR19", "the registry entry pins no absolute kubectl path, and kube-run never uses PATH")
     env = child_env(environ)
     probe = pinned(kubectl, entry) + ["--request-timeout=" + PROBE_REQUEST_TIMEOUT, "get", "namespace",
                                       "kube-system", "-o", "jsonpath={.metadata.uid}"]

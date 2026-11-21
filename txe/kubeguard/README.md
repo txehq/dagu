@@ -27,7 +27,10 @@ a context can be repointed inside its file. This directory holds the source of t
   - only options kube-run knows are forwarded. Any other option, and any attached or clustered short option
     (`-wA`, `-inother`, `-ojson`), is refused: write each option and its value separately;
   - file-based and create requests (`apply`, `create`, `replace`, `diff`, `-f`, `-k`; `logs -f` excepted) are
-    refused, because the kinds and namespaces they act on cannot be read from the arguments before contact.
+    refused, because the kinds and namespaces they act on cannot be read from the arguments before contact;
+  - discovery verbs take no operand, so `cluster-info dump` is refused, and `--subresource=<s>` is authorized
+    as `<resource>/<s>`.
+  The registry entry must pin kubectl by absolute path. kube-run never looks kubectl up on the caller's PATH.
 - **`b5_custody.py`**: the reviewed B5 host-process custody, copied byte for byte (provenance below) and
   pinned by sha256 in `kube_run.py`.
 - **`kubectl-context-guard.py`**: a PreToolUse hook that lets an agent's cluster API call through only on the

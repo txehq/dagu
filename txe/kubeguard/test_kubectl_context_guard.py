@@ -185,6 +185,13 @@ class Refused(unittest.TestCase):
             r = self.deny(cmd, "H01")
             self.assertIn("nested", r, cmd)
 
+    def test_env_split_string_keeps_the_other_argument_boundaries(self):
+        # Connector review of 2ce8d2d2: env splits only S; `bash -c 'kubectl get secrets'` keeps its -c argument.
+        for cmd in ("env -S bash -c 'kubectl get secrets'", "env --split-string=bash -c 'kubectl get secrets'",
+                    "env -S 'bash -c' 'kubectl get secrets'"):
+            r = self.deny(cmd, "H01", "kubectl", "get")
+            self.assertIn("nested", r, cmd)
+
     def test_opaque_executors(self):
         # Inert strings fed to the hook as command text; nothing here is executed (os.system included).
         for cmd in ('python3 -c "import subprocess; subprocess.run([\'kubectl\', \'get\', \'ns\'])"',

@@ -58,6 +58,7 @@ Usage (hook command): kubectl-context-guard.py [--kube-run PATH]   (default ~/.c
 import json
 import os
 import re
+import shlex
 import sys
 
 DEFAULT_KUBE_RUN = "~/.coding_global/bin/kube-run"
@@ -607,8 +608,12 @@ class Guard:
             if base == "command" and a in ("-v", "-V"):
                 return None
             if base == "env" and (a in ("-S", "--split-string") or a.startswith("--split-string=")):
-                text = rest[1][0] if a in ("-S", "--split-string") and len(rest) > 1 else a.partition("=")[2]
-                self.check_text(text + " " + " ".join(x[0] for x in rest[2:]), depth + 1)
+                separate = a in ("-S", "--split-string")
+                text = (rest[1][0] if len(rest) > 1 else "") if separate else a.partition("=")[2]
+                # env splits only S; the words after it keep their boundaries, so they are re-quoted, not joined
+                # (`env -S bash -c 'kubectl get secrets'` runs bash with ONE -c argument).
+                after = rest[2:] if separate else rest[1:]
+                self.check_text(" ".join([text] + [shlex.quote(x[0]) for x in after]), depth + 1)
                 return None
             if not a.startswith("-") or a == "-":
                 break

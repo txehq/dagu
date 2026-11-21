@@ -426,10 +426,19 @@ class Arguments(Base):
         self.refused(ARGS, "KR02")
 
     def test_kubectl_must_be_found(self):
-        F.write_registry(kubectl=None)
-        rc, _, e, t = call(ARGS, environ={"PATH": str(F.root / "empty-bin")})
-        self.assertEqual((rc, len(t.calls)), (3, 0))
-        self.assertIn("[KR19 ", e)
+        # The registry must pin an absolute kubectl. The caller's PATH is never consulted, even when it holds a
+        # kubectl (connector review of 2ce8d2d2: a PATH-selected binary could answer the probe and ignore the
+        # request).
+        bindir = F.root / "caller-bin"
+        bindir.mkdir(exist_ok=True)
+        fake = bindir / "kubectl"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o700)
+        for pinned in (None, "kubectl", "bin/kubectl"):
+            F.write_registry(kubectl=pinned)
+            rc, _, e, t = call(ARGS, environ={"PATH": str(bindir)})
+            self.assertEqual((rc, len(t.calls)), (3, 0), pinned)
+            self.assertIn("[KR19 ", e)
 
 
 class RequestScope(Base):
@@ -517,6 +526,20 @@ class RequestScope(Base):
             self.refused_by_parser(args)
         F.write_record(verbs=["apply", "create"], resources=["<files>", "clusterrolebindings"])
         self.refused(["txe-onprem-ci", "--", "apply", "-f", "x.yaml"], "KR05")
+
+    def test_no_operand_verbs_and_subresources(self):
+        # Connector review of 2ce8d2d2: `cluster-info dump` reads across namespaces, and --subresource is
+        # authorized separately by the API.
+        for args in (["cluster-info", "dump"], ["api-resources", "x"], ["version", "x"],
+                     ["get", "pods", "--subresource=a/b"], ["get", "pods", "--subresource", "a", "--subresource=b"]):
+            self.refused_by_parser(args)
+        self.assertEqual(self.scope(["cluster-info"])["resources"], ["<discovery>"])
+        self.assertEqual(self.scope(["patch", "pods/victim", "--subresource=ephemeralcontainers", "-p", "{}"])
+                         ["resources"], ["pods/ephemeralcontainers"])
+        self.assertEqual(self.scope(["get", "pods", "x", "--subresource", "status"])["resources"], ["pods/status"])
+        F.write_record(verbs=["patch"])     # resources: pods, namespaces
+        self.refused(["txe-onprem-ci", "--", "patch", "pods/victim", "--subresource=ephemeralcontainers", "-p", "{}",
+                      "-n", "arc-runners"], "KR08")
 
     def test_auth_and_rollout_carry_their_subcommand(self):
         r = self.scope(["auth", "can-i", "get", "pods"])
