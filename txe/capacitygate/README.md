@@ -49,8 +49,10 @@ converted with exact decimal arithmetic and **rounded up**.
   existing ancestor's device). It is sampled before AND after the walks, and `free(d)` is the smaller sample. A block a
   running reservation writes during its walk is then never both deducted from its remaining claim and counted as
   free. A failed second sample (D03), or a path whose device or filesystem id changed (D04), fails the disk check
-  closed (75). **The two samples reserve no capacity:** a writer may still allocate after the second sample, so this
-  is not an atomic admission snapshot, and the inventory and concurrent-writer limits still apply.
+  closed (75). Where `statvfs` gives no filesystem id, D04 sees only an `st_dev` change, and the receipt says so
+  (`fsid_check: "fsid_unavailable"`, otherwise `"in_force"`). **The two samples reserve no capacity:** a writer may
+  still allocate after the second sample, so this is not an atomic admission snapshot, and the inventory and
+  concurrent-writer limits still apply.
 
 **Inventory** (§4.2). A running or pending reservation `r` has:
 - its total caps `cap_mem(r)` and `cap_cpu(r)`;

@@ -804,7 +804,8 @@ def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
     also out of the second sample, so it is never both deducted from that reservation's remaining claim and still
     counted as free. A block freed during the walk only lowers used(r), which is conservative, and the min() never
     credits it. A failed second sample (D03), or a path whose device or filesystem id changed between the samples
-    (D04), fails that disk check closed.
+    (D04), fails that disk check closed. Without a filesystem id (f_fsid None on either sample), D04 sees only an
+    st_dev change, and the device records fsid_check "fsid_unavailable" (else "in_force").
     What the two samples do NOT do: they reserve no capacity, and a writer may still allocate after the second
     sample. This is not an atomic admission snapshot; the inventory and concurrent-writer limits still apply."""
     failures, devices, other, first_dev = [], {}, [], {}
@@ -863,12 +864,17 @@ def account_disk(budget, inv, policy, statfs, stat_fn, walker, monotonic):
             continue
         e = devices[dev2]
         e["free_after"] = min(e.get("free_after", free2), free2)
+        # Without a filesystem id on either sample, D04 can only see an st_dev change. Say so in the receipt rather
+        # than let that branch silently not apply.
+        if fsid2 is None or first_dev[d.path][1] is None:
+            e["fsid_check"] = "fsid_unavailable"
     if failures:
         return {"devices": [], "other_device_claims": other}, failures
     out = []
     for dev in sorted(devices):
         e = devices[dev]
         e["free"] = min(e["free_before"], e["free_after"])
+        e.setdefault("fsid_check", "in_force")
         e["F_disk"] = policy["disk_floor_bytes"]
         e["charged"] = e["N_disk"] + sum(e["left"].values()) + sum(e["P_disk"].values()) + e["F_disk"]
         e["headroom"] = e["free"] - e["charged"]

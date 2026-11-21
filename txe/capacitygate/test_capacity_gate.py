@@ -846,6 +846,15 @@ class DiskSampling(unittest.TestCase):
         dev = w.receipt()["accounting"]["disk"]["devices"][0]
         self.assertEqual((dev["free_before"], dev["free_after"], dev["free"]), (50 * GIB, 60 * GIB, 50 * GIB))
 
+    def test_a_missing_filesystem_id_is_recorded_not_silently_skipped(self):
+        w = World(self)
+        self.assertTrue(w.go().admit)
+        self.assertEqual(w.receipt()["accounting"]["disk"]["devices"][0]["fsid_check"], "in_force")
+        w = World(self)
+        w.statfs = lambda path: (7, FREE_S, None)                        # a platform without statvfs f_fsid
+        self.assertTrue(w.go().admit)                                     # recorded, not refused
+        self.assertEqual(w.receipt()["accounting"]["disk"]["devices"][0]["fsid_check"], "fsid_unavailable")
+
     def test_a_failed_or_moved_second_sample_fails_closed(self):
         w = World(self)
         calls = []
