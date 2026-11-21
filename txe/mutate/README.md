@@ -116,9 +116,17 @@ is always kept.
   `command_exit` and `command_exit_attribution: ambiguous: docker-or-command`.
 - **Anything unexpected is a finding.** An exception the runner does not expect (a host-side step
   failing, such as removing a run directory the command made unremovable) is exit 5 with
-  `report["error"]`; whenever a report is written, its `exit` equals the process's exit status. The end-of-run
-  read-only mount check has its own 60 s allowance under `--deadline`; past it the check is
-  incomplete, exit 6.
+  `report["error"]`; whenever a report is written, its `exit` equals the process's exit status.
+  A `--report` that cannot be written turns 0 or 7 into 5 (`report_error`). Both reports are
+  written before the `DIAGNOSTIC` line, and a closed stdout does not change the exit.
+- **Three budgets under `--deadline`, none extended.** The command budget: runs end a cleanup
+  reserve (a third of `--deadline`, at most 45 s) before the deadline, each at most `--timeout`.
+  The post-run allowance is that reserve: settlement and the read-only mount checks after a run
+  and at the end must finish by the deadline itself. The outer deadline: only bounded cleanup calls
+  (a 1 s floor each) run past it. A diagnostic whose budget is exhausted is exit 6, never 7.
+- **Settlement after "removal already in progress".** When `rm -f` fails, the runner inspects the
+  same owner-checked container once more, under the cleanup deadline; only docker's own "no such"
+  counts as absent. Anything else, "in progress" included, is unconfirmed: exit 5.
 
 **`--ro-mount SRC:DST:SHA256`** gives the container a read-only view of a directory, in either
 mode. SRC is only read on the host and never mounted: the runner copies it into

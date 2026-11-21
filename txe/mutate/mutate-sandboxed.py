@@ -84,9 +84,6 @@ EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_S
 # A completed --diagnostic run, whatever the command's own status: never 0, so no `&&` chain and no
 # gate that reads exit 0 as "done, no finding" proceeds on a diagnostic (TXE-8053).
 EXIT_DIAGNOSTIC = 7
-# The end-of-run read-only mount check's own allowance under --deadline (it must still run on a stop
-# path whose run deadline has passed); past it the check is incomplete, exit 6, never a pass.
-FINAL_CHECK_S = 60.0
 # The only container paths a --ro-mount may target. /work/src/.git is the one path under /work/src
 # the tree copy can never hold (.git is excluded at every depth), so the mount shadows no tree
 # content, and git finds it with no environment change.
@@ -936,8 +933,12 @@ class Runner:
         self.work = work
         self.docker = docker
         self.seq = 0
-        # Runs stop a cleanup reserve before the hard deadline, so removing a container whose
-        # client was killed fits inside it.
+        # Three budgets under --deadline, none ever extended (TXE-8053):
+        # - the COMMAND budget: every run ends by `deadline` (hard_end - reserve), each at most --timeout;
+        # - the POST-RUN allowance: the reserve between `deadline` and `hard_end`, for settlement
+        #   (removing or confirming the container) and the integrity checks after a run and at the end;
+        # - the OUTER deadline `hard_end`: nothing but bounded cleanup calls (1 s floor each, so at most
+        #   about 2 s over) runs past it. A check that cannot finish by hard_end did not complete: exit 6.
         self.hard_end = args.deadline_at
         self.reserve = min(45.0, args.deadline / 3) if args.deadline else 0.0
         self.deadline = args.deadline_at - self.reserve if args.deadline_at else None
@@ -955,12 +956,6 @@ class Runner:
         self.diagnostic = bool(getattr(args, "diagnostic", False))
         self.err_log = None  # the open stderr file of the run in progress, in diagnostic mode
         self.err_path: Path | None = None  # the last run's stderr file, in diagnostic mode
-
-    def check_allowance(self) -> float | None:
-        """The deadline for a check after a run: FINAL_CHECK_S from now, never past the hard deadline."""
-        if self.hard_end is None:
-            return None
-        return min(self.hard_end, time.monotonic() + FINAL_CHECK_S)
 
     def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
         """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
@@ -1191,9 +1186,8 @@ class Runner:
         for f, digest in self.live.items():
             if file_digest(self.args.tree / f) != digest:
                 raise SharedStateChanged(f"after {label}: the live tree's {f} changed")
-        # A run that used its whole limit still gets its after-run check: a fixed allowance, capped at
-        # the hard deadline (the cleanup reserve lies between the run deadline and it).
-        self.verify_ro_mounts(f"after {label}", self.check_allowance())
+        # The after-run check is post-run work: it runs in the reserve, by the outer deadline, never past it.
+        self.verify_ro_mounts(f"after {label}", self.hard_end)
         if outcome is None:
             if code in DOCKER_INFRA_EXITS:
                 outcome = "ERROR"
@@ -1624,10 +1618,9 @@ def main(argv: list[str]) -> int:
                     for f, digest in runner.live.items():
                         if file_digest(args.tree / f) != digest:
                             raise SharedStateChanged(f"at the end of the run: the live tree's {f} changed")
-                    # Its own allowance when a --deadline was given: the run's deadline may already
-                    # have passed on a stop path, and this check must still run (overrun <= FINAL_CHECK_S).
-                    final_by = time.monotonic() + FINAL_CHECK_S if args.deadline_at else None
-                    runner.verify_ro_mounts("at the end of the run", final_by)
+                    # By the outer deadline, never extended: when it is exhausted the check is
+                    # incomplete (exit 6, integrity incomplete), never a manufactured 7.
+                    runner.verify_ro_mounts("at the end of the run", runner.hard_end)
             except SharedStateChanged as e:
                 loud(str(e))
                 report["shared_state_changed"] = str(e)
@@ -1684,9 +1677,19 @@ def main(argv: list[str]) -> int:
                         code = EXIT_FINDINGS
                     print(f"work directory kept: {work.path}", file=sys.stderr)
         report["exit"] = code
-        text = json.dumps(report, indent=2, default=str)
         if args.report:
-            args.report.write_text(text)
+            try:
+                args.report.write_text(json.dumps(report, indent=2, default=str))
+            except OSError as e:  # evidence the caller asked for is missing: never a pass, never 7
+                print(f"mutate-sandboxed: cannot write the report {args.report}: {e}", file=sys.stderr)
+                report["report_error"] = f"{type(e).__name__}: {e}"
+                if code in (EXIT_OK, EXIT_DIAGNOSTIC):
+                    code = EXIT_FINDINGS
+                    report["exit"] = code
+                    if isinstance(report.get("diagnostic"), dict):
+                        report["diagnostic"]["evidence"] = "incomplete"
+                        report["diagnostic"]["status"] = "not-completed: report not written"
+        text = json.dumps(report, indent=2, default=str)
         if work and kept:
             try:
                 (work.path / "report.json").write_text(text)

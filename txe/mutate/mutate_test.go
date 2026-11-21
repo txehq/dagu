@@ -115,6 +115,9 @@ if args[:2] == ["rm", "-f"]:
         save(r)
         print("Error response from daemon: removal of container is already in progress", file=sys.stderr)
         sys.exit(1)
+    if os.path.exists(LOG + ".rmrace-stays"):  # "in progress", but the container is still there
+        print("Error response from daemon: removal of container is already in progress", file=sys.stderr)
+        sys.exit(1)
     if os.path.exists(LOG + ".rmfail"):
         print("Error response from daemon: removal failed", file=sys.stderr)
         sys.exit(1)
@@ -2601,4 +2604,56 @@ func TestRemovalInProgressCountsAbsent(t *testing.T) {
 	assert.Equal(t, "confirmed", o.report["diagnostic"].(map[string]any)["settlement"])
 	assert.Contains(t, o.stderr, ": absent")
 	assert.Empty(t, registry(t, f.log))
+}
+
+// "Removal already in progress" with the container still there is not absence: settlement is
+// unconfirmed and the diagnostic is 5, with its raw command_exit kept.
+func TestRemovalInProgressStillPresentIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmrace-stays", nil, 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "unconfirmed", d["settlement"])
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A --report that cannot be written (here a directory) is missing evidence: the diagnostic is 5,
+// never 7, and the kept work directory's report says so, with no DIAGNOSTIC line.
+func TestReportWriteFailureIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	dir := filepath.Join(f.root, "report-is-a-directory")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	o := f.diag(t, "--report", dir) // the later --report wins
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "cannot write the report")
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	inner, err := filepath.Glob(filepath.Join(f.workRoot, "mutate-sandboxed-*", "report.json"))
+	require.NoError(t, err)
+	require.Len(t, inner, 1)
+	raw, err := os.ReadFile(inner[0])
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.Contains(t, rep["report_error"], "Error")
+	d := rep["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.Equal(t, "not-completed: report not written", d["status"])
+	assert.EqualValues(t, 0, d["command_exit"], "the raw command result is kept as evidence")
+}
+
+// A diagnostic whose command uses up the whole budget is exit 6 (the deadline), never a
+// manufactured 7: nothing is extended past --deadline.
+func TestDiagnosticDeadlineExhaustedIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	start := time.Now()
+	o := f.diag(t, "--image", "hang", "--deadline", "6")
+	assert.Less(t, time.Since(start), 30*time.Second)
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 6, o.report["exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	assert.Contains(t, o.report["stopped"], "deadline")
 }
