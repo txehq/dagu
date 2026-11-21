@@ -41,6 +41,7 @@ LOADER = textwrap.dedent(
     \t{key: hubKeyFileKey, env: hubKeyFileEnv, secret: true},
     \t{key: "license.key", env: "LICENSE_KEY", secret: true},
     \t{key: "auth.proxy.enabled", env: "AUTH_PROXY_ENABLED", requires: SectionServer},
+    \t{key: forkFeaturesKey, env: forkFeaturesEnv},
     %EXTRA%
     }
 
@@ -67,6 +68,10 @@ CONSTS = textwrap.dedent(
     const (
     \thubKeyFileKey = "coordinator.auth.hub_key_file"
     \thubKeyFileEnv = "COORDINATOR_AUTH_HUB_KEY_FILE"
+
+    \tforkKey         = "license.fork_policy"
+    \tforkFeaturesKey = forkKey + ".features"
+    \tforkFeaturesEnv = "LICENSE_FORK_FEATURES"
     )
     """
 )
@@ -147,6 +152,29 @@ class DeriveFake(unittest.TestCase):
         d = derive_fake(extra='\t{key: "new.thing.api_token", env: "NEW_THING_API_TOKEN", secret: true},')
         self.assertIn("new.thing.api_token", d.keys)
         self.assertIn("DAGU_NEW_THING_API_TOKEN", d.envs)
+
+    def test_concatenated_constant_resolves(self):
+        # loader.go binds license.fork_policy keys as forkPolicyKey + ".features".
+        d = derive_fake(
+            extra='\t{key: secretForkKey, env: "FORK_TOKEN", secret: true},',
+            files={"more.go": 'package config\nconst secretForkKey = forkKey + ".token"\n'},
+        )
+        self.assertIn("license.fork_policy.token", d.keys)
+
+    def test_concatenation_with_unknown_part(self):
+        self.assertIncomplete(
+            extra="\t{key: badKey, env: \"BAD\", secret: true},",
+            files={"more.go": "package config\nconst badKey = undeclaredPrefix + \".x\"\n"},
+        )
+
+    def test_concatenation_with_non_string_part(self):
+        self.assertIncomplete(
+            extra="\t{key: badKey, env: \"BAD\", secret: true},",
+            files={"more.go": "package config\nconst badKey = forkKey + fmt.Sprint(1)\n"},
+        )
+
+    def test_constant_declared_twice_differently(self):
+        self.assertIncomplete(files={"more.go": 'package config\nfunc f() {\n\tconst hubKeyFileKey = "elsewhere"\n}\n'})
 
     def test_new_secret_file_is_picked_up(self):
         d = derive_fake(secret_files='\tsecrets = append(secrets, newSecretFile("git_sync.auth.token", a, &b))')

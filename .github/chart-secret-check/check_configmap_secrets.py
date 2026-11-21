@@ -30,7 +30,8 @@ tokenizer, not a Go parser. It accepts only these forms and exits 2 on anything
 else:
   * `var envBindings = []envBinding{ {field: value, ...}, ... }` with fields
     key, env, isPath, requires, secret; key and env are string literals or
-    identifiers bound by a string `const` in the package; secret and isPath are
+    identifiers bound by a string `const` in the package (a literal, or a +
+    concatenation of literals and such constants); secret and isPath are
     the literals true or false;
   * no other assignment or append to envBindings in the package;
   * `newSecretFile(<string literal> | fmt.Sprintf(<literal using %d>, ...), ...)`;
@@ -222,18 +223,39 @@ def go_string(token: str) -> str | None:
     return m.group(1)
 
 
-def string_consts(sources: dict[str, str]) -> dict[str, str]:
-    """String constants declared in the package, by name."""
-    consts: dict[str, str] = {}
-    spec = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][A-Za-z0-9_.]*)?\s*=\s*("(?:[^"\\\n]|\\.)*")\s*$')
+def _split_plus(expr: str) -> list[str] | None:
+    """Split a constant expression on + outside string literals; None if empty."""
+    parts, start, j = [], 0, 0
+    while j < len(expr):
+        if expr[j] in "\"'`":
+            j = _skip_string(expr, j)
+            continue
+        if expr[j] == "+":
+            parts.append(expr[start:j].strip())
+            start = j + 1
+        j += 1
+    parts.append(expr[start:].strip())
+    return None if any(not p for p in parts) else parts
 
-    def record(name: str, literal: str) -> None:
-        value = go_string(literal)
-        if value is None:
-            return
-        if name in consts and consts[name] != value:
-            raise Incomplete(f"constant {name} declared twice with different values")
-        consts[name] = value
+
+def string_consts(sources: dict[str, str]) -> dict[str, str]:
+    """String constants declared in the package, by name.
+
+    A constant is a string literal, or a + concatenation of string literals and
+    other string constants (license.fork_policy keys in loader.go). Anything
+    else (iota, typed numbers, calls) is not recorded, so a binding that uses
+    it fails to resolve and the derivation stops: fail closed.
+    """
+    exprs: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    spec = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s+[A-Za-z_][A-Za-z0-9_.]*)?\s*=\s*(\S.*?)\s*$")
+
+    def record(name: str, expr: str) -> None:
+        # A name declared twice with different values (function-local
+        # constants) resolves to nothing, so a binding using it stops.
+        if name in exprs and exprs[name] != expr:
+            ambiguous.add(name)
+        exprs[name] = expr
 
     for text in sources.values():
         for m in re.finditer(r"\bconst\b", text):
@@ -251,6 +273,35 @@ def string_consts(sources: dict[str, str]) -> dict[str, str]:
                 s = spec.match(text[k : len(text) if line_end < 0 else line_end])
                 if s:
                     record(s.group(1), s.group(2))
+
+    consts: dict[str, str] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, expr in exprs.items():
+            if name in consts or name in ambiguous:
+                continue
+            try:
+                parts = _split_plus(expr)
+            except Incomplete:
+                parts = None  # a literal that does not close on this line
+            if parts is None:
+                continue
+            values = []
+            for part in parts:
+                try:
+                    literal = go_string(part)
+                except Incomplete:
+                    break  # an escaped literal: left unresolved, so a binding using it stops the derivation
+                if literal is not None:
+                    values.append(literal)
+                elif GO_IDENT.match(part) and part in consts:
+                    values.append(consts[part])
+                else:
+                    break
+            else:
+                consts[name] = "".join(values)
+                changed = True
     return consts
 
 

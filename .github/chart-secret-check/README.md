@@ -30,7 +30,7 @@ keys (`isPath`, or a name ending in `_file`) are recorded and not denied.
 The parser is a small Go tokenizer, not a Go parser. It accepts only the forms
 listed in the checker's docstring and exits 2 on anything else: an entry in
 another form, an unknown field, an identifier that no string `const` in the
-package binds, an assignment or append to `envBindings` elsewhere, a
+package binds (a literal, or a `+` concatenation of literals and such constants), an assignment or append to `envBindings` elsewhere, a
 `newSecretFile` key that is neither a literal nor `fmt.Sprintf` with `[%d]`, or
 zero results. When Dagu's config code changes shape, the check goes red and the
 parser is extended; it never passes on a partial read. A credential Dagu reads
