@@ -154,6 +154,9 @@ class Word:
     def __init__(self):
         self.text = ""
         self.procsub: "list[Cmd] | None" = None  # when the word is <(...) or >(...)
+        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks), so
+        # that `text` is not what the program receives (TXE-8183: such code is never cleared).
+        self.expanded = False
 
 
 class Cmd:
@@ -163,7 +166,8 @@ class Cmd:
     def __init__(self):
         self.words: list[Word] = []
         # Descriptor ("0" is stdin, "3", "{name}") -> ("file", path) | ("procsub", cmds) |
-        # ("text", here-string) | ["text", here-document body] (a list, filled in when the body
+        # ("text"|"text-expanding", here-string) | ["text"|"text-expanding", here-document body]
+        # ("text-expanding" when the shell expands it first; a list, filled in when the body
         # is read at the next newline, so a duplication made before then shares it) |
         # ("unknown", descriptor) for a duplication of a descriptor this command does not set.
         self.fds: dict = {}
@@ -197,6 +201,7 @@ class Parser:
         self.heredocs = []  # (cmd, delimiter, strip_tabs, quoted) waiting for the next newline
         self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
         self.braces = []  # where each open `{ ...` group starts in self.cmds
+        self.expansions = 0  # how many expansions have been read (Word.expanded compares counts)
 
     def parse(self) -> list:
         self.seq(None)
@@ -311,11 +316,15 @@ class Parser:
         src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
-            pending = ["text", ""]  # its body is read at the next newline
+            quoted = any(q in raw for q in "'\"\\")
+            # An unquoted body is expanded by the shell ($VAR, $(...), backticks, backslashes), so
+            # the text read here is not the text the program receives: "text-expanding" is never
+            # cleared as data (TXE-8183).
+            pending = ["text" if quoted else "text-expanding", ""]  # its body is read at the next newline
             cur.set_source(key, pending)
-            self.heredocs.append((pending, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
+            self.heredocs.append((pending, target.text, op == "<<-", quoted))
         elif op == "<<<":
-            cur.set_source(key, ("text", target.text))
+            cur.set_source(key, ("text-expanding" if target.expanded else "text", target.text))
         elif op in ("<&", ">&") and re.fullmatch(r"[0-9]+-?", target.text):
             cur.duplicate(key, str(int(target.text.rstrip("-"))))  # `<&3` or `<&3-` (move)
         elif op in ("<&", ">&") and target.text == "-":
@@ -381,6 +390,7 @@ class Parser:
                 w.procsub = self.seq(")")
                 self.depth -= 1
             return w
+        start = self.expansions
         while self.i < len(s) and s[self.i] not in WORD_END:
             c = s[self.i]
             if c == "'":
@@ -389,6 +399,9 @@ class Parser:
                 w.text += s[self.i + 1:end]
                 self.i = end + 1
             elif s.startswith("$'", self.i):
+                # ANSI-C quoting: its escapes (\n, \x3b, ...) are not decoded here, so the text
+                # differs from what the program receives; counted as an expansion.
+                self.expansions += 1
                 self.i += 2
                 while self.i < len(s) and s[self.i] != "'":
                     if s[self.i] == "\\" and self.i + 1 < len(s):
@@ -408,11 +421,13 @@ class Parser:
             else:
                 w.text += c
                 self.i += 1
+        w.expanded = self.expansions != start
         return w
 
     def substitution(self) -> str:
         """At $ or a backtick: read a command substitution (its commands are recorded), an
         arithmetic expansion, or a plain $; return the text it adds to the word."""
+        self.expansions += 1  # any $ or backtick, outside single quotes (TXE-8183)
         s = self.s
         if s.startswith("$((", self.i):
             self.arithmetic("$((")
@@ -526,6 +541,8 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0, la
         return True if fd_of_path(value) is not None else mutant_named(value)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
+    if kind == "text-expanding" and lang == "python":
+        lang = "python-strict"  # the shell expands this text first: never cleared (TXE-8183)
     return refuses(value, depth + 1) if shell else code_runs_mutant(value, lang)
 
 
@@ -977,6 +994,9 @@ class Judge:
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
                     lang = self.python_lang(flags, unsupported)
+                    code_word = args[j] if t[k + 1:] else (args[j + 1] if j + 1 < len(args) else None)
+                    if code_word is None or code_word.expanded:
+                        lang = "python-strict"  # "...$(cmd)..." or $'...': not the text Python gets
                     return (code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
                             or self.interactive_stdin(flags, cmd))
                 if ch == "m":

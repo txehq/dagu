@@ -852,6 +852,14 @@ var guardRefused = []string{
 	"python3 -I - <<'EOF'\n# first line\f\n# -*- coding: utf-7 -*-\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	"python3 -I - <<'EOF'\n\f# coding: utf-7\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	"python3 -I - <<'EOF'\n\ufeffimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	// Code the shell expands first is not the text the guard read, so it is never cleared
+	// (security review of 31e6ea3d2): a substitution or variable in double quotes, ANSI-C
+	// quoting, an unquoted here-document and an expanded here-string.
+	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])))$(printf ';x=1')" mutants.json`,
+	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])))$TAIL" mutants.json`,
+	`python3 -I -c $'import json, sys\x3b print(json.load(open(sys.argv[1])))' mutants.json`,
+	"python3 -I - <<EOF\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	`python3 -I <<< "import json; print(json.load(open('mutants.json')))$TAIL"`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -985,6 +993,8 @@ var guardAllowed = []string{
 	// The supported form's flag and wrapper variants.
 	`python3 -IB -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))' mutants.json`,
 	`timeout 60 python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
+	// A here-string in single quotes is not expanded, so it can be cleared.
+	`python3 -I <<< 'import json; print(json.load(open("mutants.json")))'`,
 	"python3 -I - <<'EOF'\nimport json\nwith open(\"mutants.json\") as f:\n    r = json.load(f)\nprint(r[\"container_cleanup\"])\nEOF",
 	`python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' /tmp/mutate-sandboxed-1_y5j3xh/.mutate-sandboxed-owned`,
 }

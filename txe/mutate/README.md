@@ -165,6 +165,10 @@ and process substitution, redirections, here-documents) and judges only what wou
   - no def, lambda, comprehension, loop, class, `del`, `_` name or attribute, `*args`/`**kwargs`,
     coding comment, `\r` or BOM.
 
+  The code must also reach Python exactly as written. It must come from single quotes, a quoted
+  here-document or a single-quoted here-string. Code that the shell expands first is never
+  cleared: `"...$X..."`, `"...$(cmd)..."`, `$'...'`, an unquoted `<<EOF` or an expanded `<<<`.
+
   Code in any other form or shape is not cleared. A json.load of a mutant-named input without `-I`
   is therefore still refused, as it was before TXE-8183: a documented false positive, pending
   explicit review. With `-i`, the stdin that Python reads after the code is judged as a program.
