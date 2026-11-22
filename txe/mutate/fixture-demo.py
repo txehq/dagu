@@ -14,11 +14,14 @@
     fake cache and the runner inside must exit 3. Nothing runs on this machine but `docker run`.
 
 <image-id> is an image already present locally, named by its immutable id (sha256:...); nothing
-is pulled. --deadline bounds the WHOLE demo, every container, error handling and cleanup
-included: the runner gets the deadline less a cleanup margin, and past it the demo stops the
-runner (SIGTERM, then SIGKILL) and force-removes the containers that were recorded as started
-(docker's --cidfile, outside every mount), each only when docker reports that container's own
-name and owner token. SIGTERM, SIGINT or SIGHUP to the demo do the same.
+is pulled. --deadline bounds the demo's runs and checks: the runner gets the deadline less a
+margin and less its own cleanup and termination allowance (mutate-sandboxed's
+EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S, 15 s), so it ends inside the demo's wait; past the
+deadline the demo stops the runner (SIGTERM, then SIGKILL) and force-removes the containers that
+were recorded as started (docker's --cidfile, outside every mount), each only when docker reports
+that container's own name and owner token, within EMERGENCY_CLEANUP_S (10 s) more. SIGTERM,
+SIGINT or SIGHUP to the demo do the same. The runner needs at least 10 s, so the sandboxed step
+needs --deadline 38 or more (2D/3 - 15 >= 10).
 
 The demo writes only inside one directory it creates exclusively (mkdtemp) and stamps with a
 random token; it removes that directory only when the token and the directory's identity
@@ -114,7 +117,9 @@ class Demo:
         shutil.copytree(HERE / "testdata" / "fixture", root / "fixture", symlinks=True)
         before = self.fake_state(modcache, gocache)
         self.say("fake caches before: " + json.dumps(before, default=str))
-        runner_deadline = int(self.left() - self.margin)
+        # The runner's own process bound is its --deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S
+        # (TXE-8053): give it that much less, so it ends inside the wait below (left - margin/2).
+        runner_deadline = int(self.left() - self.margin - ms.EMERGENCY_CLEANUP_S - ms.TERMINATION_MARGIN_S)
         if runner_deadline < 10:
             raise ms.Stopped(f"only {runner_deadline}s left for the runner")
         report = self.evidence / f"{self.args.step}.report.json"
@@ -193,7 +198,9 @@ class Demo:
                 targets.append((cid, f"mutate-sandboxed-{token[:12]}-{cid.stem}", token))
         for cidfile, name, token in targets:
             try:
-                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env, self.end))
+                # One emergency budget past the demo's deadline, consumed by every call (TXE-8053).
+                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env,
+                                                              self.end + ms.EMERGENCY_CLEANUP_S))
             except (OSError, subprocess.TimeoutExpired) as e:
                 self.cleanup.append(f"{name}: cleanup error {e}")
         self.say(f"container sweep: {self.cleanup or 'nothing recorded'}")

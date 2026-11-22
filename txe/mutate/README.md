@@ -69,8 +69,9 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   and the ownership token written into it at creation still match.
 
 Exit codes: 0 done with no finding (survivors are listed, not failures); 2 refused or bad input;
-3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (the
-whole run, every container included) or by SIGTERM, SIGINT or SIGHUP; 7 a `--diagnostic` run
+3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (every
+run, settlement and integrity check; cleanup and exit follow within 15 s, see "The bounds" below) or
+by SIGTERM, SIGINT or SIGHUP; 7 a `--diagnostic` run
 completed and was recorded (below). Any exit from 3 to 7 keeps the work directory as evidence.
 
 ## Diagnostic runs and the read-only git view (TXE-8053)
@@ -117,16 +118,34 @@ is always kept.
 - **Anything unexpected is a finding.** An exception the runner does not expect (a host-side step
   failing, such as removing a run directory the command made unremovable) is exit 5 with
   `report["error"]`; whenever a report is written, its `exit` equals the process's exit status.
-  A `--report` that cannot be written turns 0 or 7 into 5 (`report_error`). Both reports are
-  written before the `DIAGNOSTIC` line, and a closed stdout does not change the exit.
-- **Three budgets under `--deadline`, none extended.** The command budget: runs end a cleanup
-  reserve (a third of `--deadline`, at most 45 s) before the deadline, each at most `--timeout`.
-  The post-run allowance is that reserve: settlement and the read-only mount checks after a run
-  and at the end must finish by the deadline itself. The outer deadline: only bounded cleanup calls
-  (a 1 s floor each) run past it. A diagnostic whose budget is exhausted is exit 6, never 7.
+- **Reports first, terminal output last.** At the end the runner writes `--report` and, when the
+  work directory stays, `<work>/report.json`; only then removes the work directory; and only
+  then writes its held stderr lines and the `DIAGNOSTIC` line. A report that cannot be written
+  (`report_error`; the work directory is then kept as the evidence that survives), a work
+  directory that cannot be removed (`cleanup_error`), and a terminal write that fails for any
+  reason but a broken stream (`stream_errors`) each turn 0 or 7 into 5, and the reports are
+  written again with that exit. A broken pipe or a closed stdout or stderr, the expected case of a
+  reader that went away, is only noted (`broken_streams`) and changes nothing. No report can be
+  promised on a filesystem that refuses every write: then the exit is 5 and stderr says why.
+- **The bounds under `--deadline D`, none extended** (the report's `budgets`):
+  - **D, the active and integrity deadline.** Runs end a reserve before it: min(45, D/3) s,
+    chosen to hold settlement and the read-only mount checks after a run and at the end, each a
+    full re-hash of the view (with a view, the reserve has to cover two hashes; a large view or a
+    small D makes the end check run out). The reserve's adequacy is not measured. A run, a
+    settlement or an integrity check that cannot finish by D is exit 6 (integrity `incomplete`
+    when it is the end check), never 7; an earlier 4 or 5 also becomes 6, the report keeping its
+    findings and results.
+  - **Emergency cleanup: 10 s after D,** one budget that every container-removal call past D
+    consumes (each call's timeout is what is left of it; none restarts its own); once it is spent
+    no call starts and the container is reported as not confirmed removed.
+  - **A 5 s termination margin** for the local steps left: the end-of-run host check (identities
+    and one-level listings of the watched directories, which has no deadline of its own), the
+    reports and terminal output. It is a stated allowance, not a measurement.
+  - So the process bound is **D + 15 s**; `--deadline` alone is not a process-exit bound. A caller
+    that wraps the runner needs an outer bound of at least that.
 - **Settlement after "removal already in progress".** When `rm -f` fails, the runner inspects the
-  same owner-checked container once more, under the cleanup deadline; only docker's own "no such"
-  counts as absent. Anything else, "in progress" included, is unconfirmed: exit 5.
+  same owner-checked container once more, within the emergency cleanup budget; only docker's own
+  "no such" counts as absent. Anything else, "in progress" included, is unconfirmed: exit 5.
 
 **`--ro-mount SRC:DST:SHA256`** gives the container a read-only view of a directory, in either
 mode. SRC is only read on the host and never mounted: the runner copies it into
@@ -185,11 +204,11 @@ ownership check, and stays as evidence whenever the work directory is kept.
 records its container id with `--cidfile` in the work directory, outside every mount, and carries
 a unique name and an owner label holding the run's random token. On a timeout, the deadline or a
 signal, the runner force-removes each container whose docker client had not returned, and only
-when docker reports that exact name and token on it. Runs stop a cleanup reserve (a third of `--deadline`, at most
-45 s) before the deadline, and each cleanup call is cut to what remains, with a 1 s floor: a
-container left running is still removed when the deadline has just passed, so cleanup can overrun
-the deadline by about 2 s per such container (at most one: runs are sequential). A cleanup that
-fails is reported as `cleanup error` on stderr and in the report.
+when docker reports that exact name and token on it. Runs stop the reserve (a third of `--deadline`, at most
+45 s) before the deadline, and every cleanup call draws on one emergency budget that ends 10 s after
+the deadline (above): a container left running is still removed when the deadline has just passed,
+and no cleanup runs past that budget. A cleanup that fails is reported as `cleanup error` on stderr
+and in the report.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.

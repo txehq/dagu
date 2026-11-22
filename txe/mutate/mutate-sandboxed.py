@@ -84,6 +84,16 @@ EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_S
 # A completed --diagnostic run, whatever the command's own status: never 0, so no `&&` chain and no
 # gate that reads exit 0 as "done, no finding" proceeds on a diagnostic (TXE-8053).
 EXIT_DIAGNOSTIC = 7
+# The process's bounds under --deadline D (TXE-8053; see Runner.__init__ and the README):
+# - D, the ACTIVE AND INTEGRITY deadline: every run, settlement after a run and every integrity
+#   check (the read-only mount re-hashes) ends by it; its last min(45, D/3) s are the reserve;
+# - EMERGENCY_CLEANUP_S after D: the one budget every container-removal call past D consumes;
+# - TERMINATION_MARGIN_S after that: the local steps left (the end-of-run host check, writing the
+#   reports, terminal output), which have no deadline of their own.
+# So the OUTER process bound is D + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S; --deadline alone is
+# not a process-exit bound. The margin is a stated allowance, not a measurement.
+EMERGENCY_CLEANUP_S = 10.0
+TERMINATION_MARGIN_S = 5.0
 # The only container paths a --ro-mount may target. /work/src/.git is the one path under /work/src
 # the tree copy can never hold (.git is excluded at every depth), so the mount shadows no tree
 # content, and git finds it with no environment change.
@@ -773,22 +783,28 @@ SANDBOX_ENV_DIRS = {
 }
 
 
-def call_limit(cap: float, hard_end: float | None) -> float:
-    """A cleanup call's timeout: cap, cut to what the hard deadline leaves, never under 1 s (a
-    container is still removed when the deadline has just passed; the overrun is bounded)."""
-    if hard_end is None:
+def call_limit(cap: float, end: float | None) -> float:
+    """A cleanup call's timeout: cap, cut to what is left of the ONE cleanup budget ending at `end`.
+    Every call consumes that same budget (none restarts an allowance of its own); once it is spent
+    no further call starts: TimeoutExpired, so the container stays pending and is reported."""
+    if end is None:
         return cap
-    return max(1.0, min(cap, hard_end - time.monotonic()))
+    left = end - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired("docker (the emergency cleanup budget is spent)", 0)
+    return min(cap, left)
 
 
 def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, env: dict[str, str],
-                           hard_end: float | None = None) -> str:
+                           end: float | None = None) -> str:
     """Force-remove one container this run started, and nothing else.
 
     The container is the one docker recorded in cidfile (kept outside every mount, so no sandboxed
     code can rewrite it), or failing that the run's unique name. It is removed only when docker
-    reports that exact name and this run's owner label on it. Returns what happened.
+    reports that exact name and this run's owner label on it. Every docker call consumes what is
+    left of the cleanup budget ending at `end` (call_limit). Returns what happened.
     """
+    hard_end = end
     target = name
     try:
         cid = cidfile.read_text().strip()
@@ -933,15 +949,20 @@ class Runner:
         self.work = work
         self.docker = docker
         self.seq = 0
-        # Three budgets under --deadline, none ever extended (TXE-8053):
+        # The budgets under --deadline, none ever extended (TXE-8053; the sum is at EMERGENCY_CLEANUP_S):
         # - the COMMAND budget: every run ends by `deadline` (hard_end - reserve), each at most --timeout;
-        # - the POST-RUN allowance: the reserve between `deadline` and `hard_end`, for settlement
-        #   (removing or confirming the container) and the integrity checks after a run and at the end;
-        # - the OUTER deadline `hard_end`: nothing but bounded cleanup calls (1 s floor each, so at most
-        #   about 2 s over) runs past it. A check that cannot finish by hard_end did not complete: exit 6.
+        # - the RESERVE, min(45, D/3) s between `deadline` and `hard_end`: settlement after a run and
+        #   the integrity checks (the read-only mount re-hashes, after each run and at the end). With a
+        #   view it must cover two full hashes; that it does is not measured here. Spent = Stopped = 6;
+        # - `hard_end`, the ACTIVE AND INTEGRITY deadline: no run, settlement or integrity check runs past it;
+        # - `cleanup_end` = hard_end + EMERGENCY_CLEANUP_S: the one budget every removal call consumes;
+        # - after it, the TERMINATION_MARGIN_S local steps. The end-of-run host check (watch.verify:
+        #   identities and one-level listings of the watched directories) has no deadline of its own
+        #   (pre-existing) and is counted in that margin.
         self.hard_end = args.deadline_at
         self.reserve = min(45.0, args.deadline / 3) if args.deadline else 0.0
         self.deadline = args.deadline_at - self.reserve if args.deadline_at else None
+        self.cleanup_end = args.deadline_at + EMERGENCY_CLEANUP_S if args.deadline_at else None
         # Every mutation target's live content, read before the tree was copied.
         self.live = {m.file: file_digest(args.tree / m.file) for m in live_targets}
         # (name, cidfile) of every container started whose docker client has not returned.
@@ -959,10 +980,10 @@ class Runner:
 
     def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
         """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
-        mount and after every run (inside the run deadline), and at the end of the run (inside the
-        final check's own allowance): once the copy was verified, a failure means the read-only
-        boundary failed, so it is exit 3 with no verdict, never a refusal. A deadline passed during
-        the check raises Stopped: the check did not complete, which is never a pass."""
+        mount (by the run deadline) and after every run and at the end of the run (by hard_end, in
+        the reserve): once the copy was verified, a failure means the read-only boundary failed, so
+        it is exit 3 with no verdict, never a refusal. A deadline passed during the check raises
+        Stopped: the check did not complete, which is never a pass."""
         for m in self.ro_mounts:
             try:
                 verify_ro_copy(m, self.ro_limits, deadline if deadline is not None else self.deadline)
@@ -1043,7 +1064,7 @@ class Runner:
         for name, cidfile in list(self.pending.items()):
             try:
                 outcome = remove_owned_container(self.docker, cidfile, name, self.work.token,
-                                                 self.docker_env(), self.hard_end)
+                                                 self.docker_env(), self.cleanup_end)
             except (OSError, subprocess.TimeoutExpired) as e:
                 outcome = f"{name}: cleanup error {e}"
             self.cleanup_log.append(outcome)
@@ -1152,9 +1173,9 @@ class Runner:
         self.pending[name] = cidfile
         self.containers[label] = (cidfile, name)
         self.overrun = None
-        with open(log_path, "wb") as log, open(self.err_path or os.devnull, "wb") as err:
-            self.err_log = err if self.err_path else None
-            proc = subprocess.Popen(argv, stdout=log, stderr=err if self.err_path else subprocess.STDOUT,
+        with open(log_path, "wb") as log, open(self.err_path or os.devnull, "wb") as errf:
+            self.err_log = errf if self.err_path else None
+            proc = subprocess.Popen(argv, stdout=log, stderr=errf if self.err_path else subprocess.STDOUT,
                                     env=self.docker_env())
             try:
                 code = self.watch_run(proc, d, log, start, limit)
@@ -1173,7 +1194,7 @@ class Runner:
             else:
                 outcome = "ERROR"
                 self.cleanup_log.append(f"{name}: stopped: {self.overrun}")
-                print(f"mutate-sandboxed: {label}: stopped: {self.overrun}", file=sys.stderr)
+                err(f"mutate-sandboxed: {label}: stopped: {self.overrun}")
         elif code < 0:
             # The docker client died by a signal: nothing shows the container finished.
             self.clear_pending()
@@ -1311,8 +1332,10 @@ def parse(argv: list[str]):
     p.add_argument("--network", default="none", help="docker network for the sandbox (default none)")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per sandboxed run")
     p.add_argument("--deadline", type=int, default=0,
-                   help="seconds for the whole run, every container included; 0 means none. Past it the "
-                        "run stops, removes the containers it started and exits 6")
+                   help="D: seconds for every run, settlement and integrity check (the last min(45, D/3) s are "
+                        "the reserve for settlement and integrity); 0 means none. Past it the run stops (exit 6) "
+                        f"and removes its containers within {EMERGENCY_CLEANUP_S:.0f} s more; the process exits by "
+                        f"D + {EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s (D is not a process-exit bound)")
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
     p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
     p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
@@ -1383,9 +1406,9 @@ def resolve_shared(args) -> tuple[Path, Path, Path, dict[str, str]]:
 def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report: dict) -> int:
     base = runner.run("baseline", pristine, None)
     report["results"].append(base.__dict__)
-    print(f"baseline: {base.outcome} ({base.seconds}s)", flush=True)
+    out(f"baseline: {base.outcome} ({base.seconds}s)")
     if base.outcome != "PASSED":
-        print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
+        err(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}")
         return EXIT_BASELINE
     if args.warm_gocache:
         # The baseline's container wrote this tree: no symlink may lie on the path to it, and it
@@ -1415,19 +1438,19 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
             findings.append(f"{mu.name}: {r.outcome}, log {r.log}")
         report["results"].append(r.__dict__)
         runner.discard(r)
-        print(line, flush=True)
+        out(line)
 
     final = runner.run("baseline (after)", pristine, None)
     report["results"].append(final.__dict__)
     runner.discard(final)
-    print(f"baseline after: {final.outcome}", flush=True)
+    out(f"baseline after: {final.outcome}")
     if final.outcome != "PASSED":
         findings.append(f"the unmutated tree failed after the mutants: {final.outcome}, log {final.log}")
     report["findings"] = findings
     killed = sum(1 for r in report["results"] if r["outcome"] == "KILLED")
-    print(f"mutants: {killed}/{len(mutants)} killed; findings: {len(findings)}", flush=True)
+    out(f"mutants: {killed}/{len(mutants)} killed; findings: {len(findings)}")
     for f in findings:
-        print(f"FINDING: {f}", file=sys.stderr)
+        err(f"FINDING: {f}")
     return EXIT_FINDINGS if findings else EXIT_OK
 
 
@@ -1477,7 +1500,7 @@ def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
     if not runner.remove_pending():
         diag.update(settlement="unconfirmed", status="not-completed: container not confirmed removed")
         report["findings"] = [f"diagnostic: container {name} not confirmed removed"]
-        print(f"FINDING: diagnostic did not complete: container {name} not confirmed removed", file=sys.stderr)
+        err(f"FINDING: diagnostic did not complete: container {name} not confirmed removed")
         return EXIT_FINDINGS  # the run's directory is kept: the container may still mount it
     diag["settlement"] = "confirmed"
     runner.discard(r)
@@ -1487,14 +1510,66 @@ def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
     # ERROR (docker's own 125-127, a bound, a client signal) or TIMEOUT: the run did not complete.
     diag["status"] = f"not-completed: {r.outcome}"
     report["findings"] = [f"diagnostic: {r.outcome} (docker client exit {r.exit_code}), log {r.log}"]
-    print(f"FINDING: diagnostic did not complete: {r.outcome} (docker client exit {r.exit_code})", file=sys.stderr)
+    err(f"FINDING: diagnostic did not complete: {r.outcome} (docker client exit {r.exit_code})")
     return EXIT_FINDINGS
+
+
+# Terminal output is best effort and never decides the result (TXE-8053). Only the EXPECTED broken
+# stream (a reader that went away: BrokenPipeError, or a stream Python could not open) is absorbed,
+# and noted in the report; any other write failure is recorded in STREAM_ERRORS, and main turns a
+# pass or a recorded diagnostic into 5 for it. Either way the stream is pointed at the null device,
+# so later writes and the interpreter's flush at exit cannot fail again.
+BROKEN_STREAMS: list[str] = []
+STREAM_ERRORS: list[str] = []
+_DEFERRED: list[str] | None = None  # while main finishes: stderr lines held until the reports are written
+
+
+def _null_out(stream) -> None:
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(fd, stream.fileno())
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(fd)
+
+
+def _emit(stream, name: str, text: str) -> None:
+    if stream is None:  # Python started with that descriptor closed
+        if f"{name}: closed" not in BROKEN_STREAMS:
+            BROKEN_STREAMS.append(f"{name}: closed")
+        return
+    try:
+        stream.write(text + "\n")
+        stream.flush()
+    except BrokenPipeError:
+        if f"{name}: broken pipe" not in BROKEN_STREAMS:
+            BROKEN_STREAMS.append(f"{name}: broken pipe")
+        _null_out(stream)
+    except (OSError, ValueError) as e:  # not the expected case: recorded, and a finding
+        STREAM_ERRORS.append(f"{name}: {type(e).__name__}: {e}")
+        _null_out(stream)
+
+
+def out(text: str) -> None:
+    """A line to stdout, best effort (see BROKEN_STREAMS)."""
+    _emit(sys.stdout, "stdout", text)
+
+
+def err(text: str) -> None:
+    """A line to stderr, best effort; held back while main writes its reports."""
+    if _DEFERRED is not None:
+        _DEFERRED.append(text)
+        return
+    _emit(sys.stderr, "stderr", text)
 
 
 def loud(msg: str) -> None:
     bar = "!" * 72
-    print(f"\n{bar}\nMUTATE-SANDBOXED: SHARED STATE CHANGED. STOP AND TELL YOUR COORDINATOR.\n{msg}\n{bar}\n",
-          file=sys.stderr, flush=True)
+    err(f"\n{bar}\nMUTATE-SANDBOXED: SHARED STATE CHANGED. STOP AND TELL YOUR COORDINATOR.\n{msg}\n{bar}")
 
 
 def main(argv: list[str]) -> int:
@@ -1502,7 +1577,7 @@ def main(argv: list[str]) -> int:
         args = parse(argv)
         if args.ro_manifest is not None:
             try:
-                print(ro_manifest_sha256(args.ro_manifest, ro_limits(args)))
+                out(ro_manifest_sha256(args.ro_manifest, ro_limits(args)))
             except OSError as e:
                 raise Refused(f"cannot read {args.ro_manifest}: {e}") from e
             return EXIT_OK
@@ -1510,10 +1585,10 @@ def main(argv: list[str]) -> int:
         ro_mounts = parse_ro_mounts(args.ro_mount)
         modcache, gocache, gopath, go_facts = resolve_shared(args)
     except Refused as e:
-        print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: refused: {e}")
         return EXIT_REFUSED
     except Stopped as e:
-        print(f"mutate-sandboxed: stopped: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: stopped: {e}")
         return EXIT_STOPPED
     home = real(os.environ.get("HOME") or Path.home())
     forbidden = {"shared GOMODCACHE": modcache, "shared GOCACHE": gocache, "GOPATH": gopath, "HOME": home,
@@ -1582,33 +1657,35 @@ def main(argv: list[str]) -> int:
         code = EXIT_SHARED_CHANGED
         args.keep = True  # evidence
     except Refused as e:
-        print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: refused: {e}")
         code = EXIT_REFUSED
     except Stopped as e:
-        print(f"mutate-sandboxed: stopped: {e}; removing the containers this run started", file=sys.stderr)
+        err(f"mutate-sandboxed: stopped: {e}; removing the containers this run started")
         report["stopped"] = str(e)
         code = EXIT_STOPPED
         args.keep = True  # evidence
     except Exception as e:  # anything unexpected (an OSError from a host-side step, say) is a finding
         report["error"] = f"{type(e).__name__}: {e}"
-        print(f"mutate-sandboxed: error: {type(e).__name__}: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: error: {type(e).__name__}: {e}")
         code = EXIT_FINDINGS
         args.keep = True  # evidence
     finally:
+        global _DEFERRED
+        _DEFERRED = []  # every stderr line from here on waits until the reports are written
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
         if runner:
             if not runner.remove_pending():  # the retry of anything an earlier attempt left
                 left = ", ".join(runner.pending)
                 report["containers_left"] = left
-                print(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "
-                      "after checking their owner label", file=sys.stderr)
+                err(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "
+                    "after checking their owner label")
                 if code in (EXIT_OK, EXIT_DIAGNOSTIC):
                     code = EXIT_FINDINGS
                 args.keep = True  # never delete a directory a container may still have mounted
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
-                print(f"mutate-sandboxed: container {line}", file=sys.stderr)
+                err(f"mutate-sandboxed: container {line}")
         # Every exit path, a stop by the deadline or a signal included, ends with the host check
         # against the state read at the start: a boundary failure is never reported as exit 6.
         if code != EXIT_SHARED_CHANGED:
@@ -1618,8 +1695,8 @@ def main(argv: list[str]) -> int:
                     for f, digest in runner.live.items():
                         if file_digest(args.tree / f) != digest:
                             raise SharedStateChanged(f"at the end of the run: the live tree's {f} changed")
-                    # By the outer deadline, never extended: when it is exhausted the check is
-                    # incomplete (exit 6, integrity incomplete), never a manufactured 7.
+                    # By the active and integrity deadline, never extended: when it is exhausted the
+                    # check is incomplete (exit 6, integrity incomplete), never a manufactured 7.
                     runner.verify_ro_mounts("at the end of the run", runner.hard_end)
             except SharedStateChanged as e:
                 loud(str(e))
@@ -1632,79 +1709,126 @@ def main(argv: list[str]) -> int:
                 code = EXIT_SHARED_CHANGED
                 args.keep = True
             except Stopped as e:  # the final check did not complete: never a pass, never 7
-                print(f"mutate-sandboxed: the final read-only mount check did not complete: {e}", file=sys.stderr)
+                err(f"mutate-sandboxed: the final read-only mount check did not complete: {e}")
                 report["final_check"] = f"incomplete: {e}"
                 code = EXIT_STOPPED
                 args.keep = True
-        d = report.get("diagnostic")
-        if isinstance(d, dict):
-            # Separate facts, never merged: the raw command_exit stays as recorded; integrity,
-            # settlement and evidence completeness are set here, after cleanup and the final checks.
-            if code == EXIT_SHARED_CHANGED:
-                d["integrity"] = "failed"
-            elif "final_check" in report:
-                d["integrity"] = "incomplete"
-            else:
-                d["integrity"] = "held"
-            if "containers_left" in report:
-                d["settlement"] = "unconfirmed"
-            d["evidence"] = "complete" if code == EXIT_DIAGNOSTIC else "incomplete"
-            if code == EXIT_SHARED_CHANGED:
-                d["status"] = "invalid: shared state changed"
-            elif d["settlement"] == "unconfirmed":
-                d["status"] = "not-completed: container not confirmed removed"
-            elif code != EXIT_DIAGNOSTIC and not str(d.get("status", "")).startswith("not-completed"):
-                d["status"] = f"not-completed: runner exit {code}"
         try:
             report["identity_after"] = watch.snapshot()
         except OSError as e:
             report["identity_after"] = f"unreadable: {e}"
-        # The work directory goes (when it may) BEFORE either report is written, so the exit both
-        # reports carry is final: a removal that fails turns a pass into a finding, and the
-        # directory, kept then, receives the report.
-        kept = True
-        if work:
-            if args.keep or code in (EXIT_BASELINE, EXIT_FINDINGS):  # a failure keeps its evidence
-                print(f"work directory kept: {work.path}", file=sys.stderr)
-            else:
-                try:
-                    work.remove()
-                    kept = False
-                except (Refused, OSError) as e:
-                    print(f"mutate-sandboxed: cleanup error: {e}", file=sys.stderr)
-                    report["cleanup_error"] = f"{type(e).__name__}: {e}"
-                    if code == EXIT_OK:  # a pass whose cleanup failed is a finding, and says so
-                        code = EXIT_FINDINGS
-                    print(f"work directory kept: {work.path}", file=sys.stderr)
-        report["exit"] = code
-        if args.report:
-            try:
-                args.report.write_text(json.dumps(report, indent=2, default=str))
-            except OSError as e:  # evidence the caller asked for is missing: never a pass, never 7
-                print(f"mutate-sandboxed: cannot write the report {args.report}: {e}", file=sys.stderr)
-                report["report_error"] = f"{type(e).__name__}: {e}"
-                if code in (EXIT_OK, EXIT_DIAGNOSTIC):
-                    code = EXIT_FINDINGS
-                    report["exit"] = code
-                    if isinstance(report.get("diagnostic"), dict):
-                        report["diagnostic"]["evidence"] = "incomplete"
-                        report["diagnostic"]["status"] = "not-completed: report not written"
-        text = json.dumps(report, indent=2, default=str)
-        if work and kept:
-            try:
-                (work.path / "report.json").write_text(text)
-            except OSError as e:  # a partly removed directory: --report, if given, still holds it
-                print(f"mutate-sandboxed: cannot write {work.path / 'report.json'}: {e}", file=sys.stderr)
-        if code == EXIT_DIAGNOSTIC:  # only now: settled, checked and both reports written
-            d = report["diagnostic"]
-            try:
-                print(f"DIAGNOSTIC: command exit {d['command_exit']} (evidence only, never a pass; runner exit "
-                      f"{EXIT_DIAGNOSTIC}); stdout {d['stdout']['path']}, stderr {d['stderr']['path']}", flush=True)
-            except OSError:  # stdout closed (`| head`): the reports already hold the result
-                try:
-                    os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())  # no second error at exit
-                except OSError:
-                    pass
+        if args.deadline:
+            report["budgets"] = budgets(args.deadline)
+        code = finish(args, report, work, code)
+    return code
+
+
+def budgets(deadline: int) -> dict:
+    """The process's bounds for --deadline D, in seconds (see EMERGENCY_CLEANUP_S)."""
+    return {"active_and_integrity_deadline_s": deadline, "reserve_s": min(45.0, deadline / 3),
+            "emergency_cleanup_s": EMERGENCY_CLEANUP_S, "termination_margin_s": TERMINATION_MARGIN_S,
+            "outer_process_bound_s": deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S}
+
+
+def mark_diagnostic(report: dict, code: int) -> None:
+    """Set the diagnostic's integrity, settlement, evidence and status for the exit as it now
+    stands. Separate facts, never merged: the raw command_exit stays as recorded."""
+    d = report.get("diagnostic")
+    if not isinstance(d, dict):
+        return
+    if code == EXIT_SHARED_CHANGED:
+        d["integrity"] = "failed"
+    elif "final_check" in report:
+        d["integrity"] = "incomplete"
+    else:
+        d["integrity"] = "held"
+    if "containers_left" in report:
+        d["settlement"] = "unconfirmed"
+    d["evidence"] = "complete" if code == EXIT_DIAGNOSTIC else "incomplete"
+    if code == EXIT_SHARED_CHANGED:
+        d["status"] = "invalid: shared state changed"
+    elif d["settlement"] == "unconfirmed":
+        d["status"] = "not-completed: container not confirmed removed"
+    elif code != EXIT_DIAGNOSTIC:
+        for key, why in (("report_error", "report not written"), ("cleanup_error", "work directory not removed"),
+                         ("stream_errors", "terminal output failed")):
+            if key in report:
+                d["status"] = f"not-completed: {why}"
+                break
+        else:
+            if not str(d.get("status", "")).startswith("not-completed"):
+                d["status"] = f"not-completed: runner exit {code}"
+
+
+def downgrade(code: int) -> int:
+    """A pass or a recorded diagnostic whose evidence was then lost or not delivered is a finding."""
+    return EXIT_FINDINGS if code in (EXIT_OK, EXIT_DIAGNOSTIC) else code
+
+
+def write_reports(args, report: dict, work: "WorkDir | None", kept: bool, code: int) -> list[str]:
+    """Write --report and, when the work directory stays, <work>/report.json, as the report now
+    stands with exit `code`. Returns the writes that failed (none is retried)."""
+    report["exit"] = code
+    if BROKEN_STREAMS:
+        report["broken_streams"] = list(BROKEN_STREAMS)
+    if STREAM_ERRORS:
+        report["stream_errors"] = list(STREAM_ERRORS)
+    mark_diagnostic(report, code)
+    text = json.dumps(report, indent=2, default=str)
+    targets = ([args.report] if args.report else []) + ([work.path / "report.json"] if work and kept else [])
+    failed = []
+    for p in targets:
+        try:
+            Path(p).write_text(text)
+        except OSError as e:
+            failed.append(f"{p}: {type(e).__name__}: {e}")
+    return failed
+
+
+def finish(args, report: dict, work: "WorkDir | None", code: int) -> int:
+    """The end of every run, in this order: (1) the reports, while the work directory still exists;
+    (2) the work directory's removal, only after them; (3) terminal output, best effort, last. A
+    report that cannot be written, a removal that fails, and a terminal write that fails for any
+    reason but a broken stream each turn a pass or a recorded diagnostic into 5, and the reports
+    are written again with that exit. Whenever a report is written, its exit is the process's."""
+    global _DEFERRED
+    removable = bool(work) and not args.keep and code not in (EXIT_BASELINE, EXIT_FINDINGS)
+    kept = bool(work) and not removable
+    failed = write_reports(args, report, work, kept, code)
+    if failed:
+        report["report_error"] = "; ".join(failed)
+        err(f"mutate-sandboxed: cannot write the report: {report['report_error']}")
+        code = downgrade(code)
+        kept = bool(work)  # keep the directory as the evidence that survives
+        removable = False
+        write_reports(args, report, work, kept, code)
+    if removable and work:
+        try:
+            work.remove()
+        except (Refused, OSError) as e:
+            report["cleanup_error"] = f"{type(e).__name__}: {e}"
+            err(f"mutate-sandboxed: cleanup error: {e}")
+            if code == EXIT_OK:  # a pass whose cleanup failed is a finding, and says so
+                code = EXIT_FINDINGS
+            kept = True
+            write_reports(args, report, work, kept, code)
+    if work and kept:
+        err(f"work directory kept: {work.path}")
+    held, _DEFERRED = _DEFERRED or [], None
+    for line in held:
+        err(line)
+    if STREAM_ERRORS and code in (EXIT_OK, EXIT_DIAGNOSTIC):
+        code = downgrade(code)
+        write_reports(args, report, work, kept, code)
+    if code == EXIT_DIAGNOSTIC:  # only now: settled, checked, reported and no output failure
+        d = report["diagnostic"]
+        out(f"DIAGNOSTIC: command exit {d['command_exit']} (evidence only, never a pass; runner exit "
+            f"{EXIT_DIAGNOSTIC}); stdout {d['stdout']['path']}, stderr {d['stderr']['path']}")
+        if STREAM_ERRORS:
+            code = downgrade(code)
+            err("mutate-sandboxed: the DIAGNOSTIC line could not be written: " + STREAM_ERRORS[-1])
+    if BROKEN_STREAMS or STREAM_ERRORS:
+        write_reports(args, report, work, kept, code)  # the final word, with the streams recorded
     return code
 
 

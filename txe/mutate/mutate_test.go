@@ -106,6 +106,8 @@ if args[:1] == ["inspect"]:
         print("/%s %s" % tuple(r[args[-1]]))
     sys.exit(0)
 if args[:2] == ["rm", "-f"]:
+    if os.path.exists(LOG + ".slowrm"):  # a slow removal that uses up the reserve
+        time.sleep(float(open(LOG + ".slowrm").read()))
     if os.path.exists(LOG + ".rmtamper"):  # the stand-in for a boundary failing during cleanup
         with open(open(LOG + ".rmtamper").read().strip(), "a") as fh:
             fh.write("tampered during rm\n")
@@ -1379,7 +1381,7 @@ func TestDemoDeadlineRemovesOnlyRecorded(t *testing.T) {
 	docker := fakeDocker(t, root, log)
 	foreignContainer(t, log)
 	start := time.Now()
-	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "30")
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "45")
 	require.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
 	assert.Less(t, time.Since(start), 30*time.Second)
 	dir := demoRoot(t, out.String())
@@ -1480,9 +1482,12 @@ func TestCleanupInsideDeadline(t *testing.T) {
 	start := time.Now()
 	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	// 6 s deadline, 2 s cleanup reserve, inspect cut to the 2 s left (floor 1 s).
-	assert.Less(t, time.Since(start), 12*time.Second)
+	// 6 s deadline: the hung inspect is cut to what is left of the ONE emergency budget (it ends
+	// 10 s after the deadline), and the retry in the finalizer finds it spent and starts nothing.
+	// So the process ends inside the documented bound, D + 10 + 5 = 21 s.
+	assert.Less(t, time.Since(start), 21*time.Second)
 	assert.Contains(t, o.stderr, "cleanup error")
+	assert.Contains(t, o.stderr, "emergency cleanup budget is spent")
 }
 
 // A symlink in the tree that leads outside it (here an absolute go.sum link back into the live
@@ -2656,4 +2661,179 @@ func TestDiagnosticDeadlineExhaustedIsSix(t *testing.T) {
 	assert.EqualValues(t, 6, o.report["exit"])
 	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 	assert.Contains(t, o.report["stopped"], "deadline")
+}
+
+// runnerWith runs the runner with the fixture's usual arguments plus extra, and the given stdout
+// and stderr (an *os.File, so a closed pipe or /dev/full can stand in for a failing terminal).
+func (f fixture) runnerWith(t *testing.T, stdout, stderr *os.File, mode []string, extra ...string) (int, map[string]any) {
+	t.Helper()
+	report := filepath.Join(f.root, "report.json")
+	_ = os.Remove(report)
+	args := append([]string{"-I", script(t, "mutate-sandboxed.py")}, mode...)
+	args = append(append(args, "--tree", f.tree, "--shared-modcache", f.modcache, "--shared-gocache", f.gocache,
+		"--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60",
+		"--image", "fixture-image"), extra...)
+	cmd := exec.Command(python(t), append(args, "--", "sh", "check.sh")...)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else {
+		require.NoError(t, err)
+	}
+	var rep map[string]any
+	if raw, err := os.ReadFile(report); err == nil {
+		require.NoError(t, json.Unmarshal(raw, &rep))
+	}
+	return code, rep
+}
+
+// closedPipe is the write end of a pipe whose reader has gone: every write is a broken pipe.
+func closedPipe(t *testing.T) *os.File {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	t.Cleanup(func() { _ = w.Close() })
+	return w
+}
+
+func captureFile(t *testing.T, name string) *os.File {
+	t.Helper()
+	fh, err := os.Create(filepath.Join(t.TempDir(), name))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fh.Close() })
+	return fh
+}
+
+func fileText(t *testing.T, fh *os.File) string {
+	t.Helper()
+	raw, err := os.ReadFile(fh.Name())
+	require.NoError(t, err)
+	return string(raw)
+}
+
+// A mutation run with stdout gone (`| head`) is still a pass: the progress lines' broken pipe is
+// the expected case, absorbed and noted; the report says 0, as the process does, with no traceback.
+func TestMutationClosedStdout(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	stderr := captureFile(t, "stderr")
+	code, rep := f.runnerWith(t, closedPipe(t), stderr, []string{"--mutants", f.mutants(t, []map[string]any{cleanupMutant})})
+	require.Equal(t, 0, code, fileText(t, stderr))
+	assert.NotContains(t, fileText(t, stderr), "Traceback")
+	assert.EqualValues(t, 0, rep["exit"])
+	assert.Contains(t, rep["broken_streams"], "stdout: broken pipe")
+	assert.NotContains(t, rep, "stream_errors")
+}
+
+// A closed stderr neither blocks the reports nor changes the result: a diagnostic is still 7 with
+// both reports written, the broken stream noted.
+func TestDiagnosticClosedStderr(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	stdout := captureFile(t, "stdout")
+	code, rep := f.runnerWith(t, stdout, closedPipe(t), []string{"--diagnostic"})
+	require.Equal(t, 7, code, fileText(t, stdout))
+	assert.EqualValues(t, 7, rep["exit"])
+	assert.Contains(t, rep["broken_streams"], "stderr: broken pipe")
+	inner, err := os.ReadFile(filepath.Join(rep["workdir"].(string), "report.json"))
+	require.NoError(t, err)
+	var in map[string]any
+	require.NoError(t, json.Unmarshal(inner, &in))
+	assert.EqualValues(t, 7, in["exit"])
+	assert.Contains(t, fileText(t, stdout), "DIAGNOSTIC: command exit 0")
+}
+
+// A terminal write that fails for another reason (a full device: /dev/full, Linux only) is not
+// the expected broken stream: the DIAGNOSTIC line not written turns 7 into 5, recorded in the report.
+func TestDiagnosticFullStdoutIsFinding(t *testing.T) {
+	full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/full on this system")
+	}
+	t.Cleanup(func() { _ = full.Close() })
+	f := newFixture(t, passingCheck)
+	stderr := captureFile(t, "stderr")
+	code, rep := f.runnerWith(t, full, stderr, []string{"--diagnostic"})
+	require.Equal(t, 5, code, fileText(t, stderr))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.NotEmpty(t, rep["stream_errors"])
+	assert.Contains(t, fileText(t, stderr), "the DIAGNOSTIC line could not be written")
+	d := rep["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+}
+
+// The kept <work>/report.json cannot be written (the fake docker made a directory of that name):
+// a diagnostic is then 5, and --report, the evidence that survives, says 5 and names the failure.
+func TestKeptReportWriteFailureIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	f.docker = fakeDocker(t, f.root, f.log, `os.makedirs(os.path.join(os.path.dirname(mounts["/work"]), "report.json"), exist_ok=True)`)
+	o := f.diag(t)
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 5, o.report["exit"])
+	assert.Contains(t, o.report["report_error"], "report.json")
+	assert.Equal(t, "not-completed: report not written", o.report["diagnostic"].(map[string]any)["status"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A clean pass whose --report cannot be written does not leave nothing behind: the work directory
+// is kept (removed only after the reports) and its report.json says 5, as the process does.
+func TestCleanPassReportFailureKeepsWorkDir(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	dir := filepath.Join(f.root, "report-is-a-directory")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--report", dir)
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	inner, err := filepath.Glob(filepath.Join(f.workRoot, "mutate-sandboxed-*", "report.json"))
+	require.NoError(t, err)
+	require.Len(t, inner, 1, "the work directory is kept as the evidence that survives")
+	raw, err := os.ReadFile(inner[0])
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.Contains(t, rep["report_error"], "report-is-a-directory")
+}
+
+// The reserve used up after the run (a slow, still-bounded removal during settlement) leaves the
+// end-of-run read-only check no time: exit 6 with integrity incomplete, never 7, the raw
+// command_exit kept; nothing is extended past --deadline.
+func TestEndCheckReserveExhaustedIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	view := gitView(t, f.root)
+	require.NoError(t, os.WriteFile(f.log+".slowrm", []byte("7"), 0o644))
+	start := time.Now()
+	o := f.diag(t, "--image", "staysup", "--deadline", "6", "--ro-mount", view+":/work/src/.git:"+goManifest(t, view))
+	assert.Less(t, time.Since(start), 30*time.Second)
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.report["final_check"], "incomplete")
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["integrity"])
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	b := o.report["budgets"].(map[string]any)
+	assert.EqualValues(t, 6, b["active_and_integrity_deadline_s"])
+	assert.EqualValues(t, 21, b["outer_process_bound_s"])
+}
+
+// Every cleanup call consumes ONE budget: a call's timeout is what is left of it, and once it is
+// spent no call starts (TimeoutExpired), so a container stays pending; none restarts its own floor.
+func TestCleanupBudgetIsShared(t *testing.T) {
+	prog := `
+import importlib.util, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+print(ms.call_limit(30, None))
+print(ms.call_limit(30, time.monotonic() + 3) <= 3)
+try:
+    ms.call_limit(30, time.monotonic() - 0.01)
+    print("started")
+except subprocess.TimeoutExpired:
+    print("refused")
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py")).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "30\nTrue\nrefused\n", string(out))
 }
