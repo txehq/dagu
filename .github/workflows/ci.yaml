@@ -226,6 +226,12 @@ jobs:
       - name: Check llms.txt is generated from skills/dagu
         run: make llms-check
 
+      # The chart's ConfigMap credential check fails closed when it cannot
+      # derive Dagu's credential keys (TXE-8035). Its tests run here as well as
+      # in HelmChartCI, so a change to internal/cmn/config alone runs them.
+      - name: Test the chart ConfigMap credential check
+        run: python3 -I .github/chart-secret-check/test_check_configmap_secrets.py
+
   # Lint Go code
   golint:
     name: Go Linter

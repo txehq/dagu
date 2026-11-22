@@ -18,6 +18,10 @@ on:
       - "charts/dagu/charts/**"
       - "charts/dagu/crds/**"
       - ".github/workflows/chart-ci.yaml"
+      # The ConfigMap credential check and the Dagu config sources its
+      # credential keys are derived from (TXE-8035).
+      - ".github/chart-secret-check/**"
+      - "internal/cmn/config/**"
   pull_request:
     types:
       - opened
@@ -37,6 +41,10 @@ on:
       - "charts/dagu/charts/**"
       - "charts/dagu/crds/**"
       - ".github/workflows/chart-ci.yaml"
+      # The ConfigMap credential check and the Dagu config sources its
+      # credential keys are derived from (TXE-8035).
+      - ".github/chart-secret-check/**"
+      - "internal/cmn/config/**"
 
 # Restrict to read-only: this workflow only lints and packages the chart,
 # it never pushes or creates releases. An explicit block prevents the default
@@ -132,6 +140,14 @@ jobs:
 
       - name: Lint chart
         run: helm lint --strict ./charts/dagu
+
+      # No credential reaches any ConfigMap the chart renders, across the value
+      # combinations in .github/chart-secret-check/values, and planted leaks
+      # fail the check (TXE-8035). The runner's python3 has PyYAML (python3-yaml).
+      - name: Check no credential reaches a ConfigMap
+        run: |
+          work="$(mktemp -d)"
+          bash .github/chart-secret-check/render-check.sh "${work}"
 
       - name: Render standalone defaults
         run: |

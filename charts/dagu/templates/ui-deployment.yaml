@@ -66,6 +66,13 @@ spec:
                   name: {{ .Values.auth.basic.existingSecret | quote }}
                   key: {{ .Values.auth.basic.passwordKey | quote }}
 {{- end }}
+{{- with .Values.auth.builtin.token.existingSecret }}
+            - name: DAGU_AUTH_TOKEN_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.auth.builtin.token.secretKey | quote }}
+{{- end }}
 {{- with .Values.license.existingSecret }}
             - name: DAGU_LICENSE_KEY
               valueFrom:

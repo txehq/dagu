@@ -1,0 +1,12 @@
+# Planted leak (inert fake data): an unrelated ConfigMap whose value holds a
+# YAML document as a string, with a password inside it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-planted-nested
+data:
+  settings.yaml: |
+    integration:
+      embedded: |
+        database:
+          password: "fake-planted-value-nested"

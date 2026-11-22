@@ -80,6 +80,19 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default (include "dagu.componentName" (dict "root" . "component" "data")) .Values.persistence.existingClaim -}}
 {{- end }}
 
+{{- /*
+dagu.envConfigName: an extraEnv name as Dagu's config reader matches it, for
+the guards in configmap.yaml (TXE-8035). Besides each bound name
+(DAGU_AUTH_TOKEN_SECRET), Viper's AutomaticEnv reads DAGU_ plus the YAML key
+upper-cased with its dots kept (DAGU_AUTH.BUILTIN.TOKEN.SECRET), and that alias
+wins over the bound name. Upper-casing and turning dots into underscores folds
+every such alias onto a name a guard can list, so a guard lists the bound name
+and DAGU_<key with dots as underscores> and compares this form.
+*/}}
+{{- define "dagu.envConfigName" -}}
+{{- . | toString | upper | replace "." "_" -}}
+{{- end }}
+
 {{- define "dagu.extraEnv" -}}
 {{- with .Values.extraEnv }}
 {{ toYaml . }}

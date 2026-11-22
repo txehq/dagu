@@ -176,7 +176,15 @@ auth:
     passwordKey: password
   builtin:
     token:
-      secret: ""               # optional: auto-generated at {data_dir}/auth/token_secret
+      # JWT signing key from an existing Kubernetes Secret in the release
+      # namespace, exposed only to the server container as
+      # DAGU_AUTH_TOKEN_SECRET. Empty keeps Dagu's default: a key generated on
+      # first start at {data_dir}/auth/token_secret on the data volume.
+      existingSecret: ""
+      secretKey: token-secret
+      # Removed: a value here was rendered into the config ConfigMap. Leave it
+      # empty; a non-empty value fails rendering with migration steps.
+      secret: ""
       ttl: "24h"
   oidc:
     enabled: false

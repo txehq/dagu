@@ -1,0 +1,7 @@
+# Planted leak (inert fake data): an OIDC client secret inside base64 binaryData.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-planted-binary
+binaryData:
+  extra.yaml: YXV0aDoKICBvaWRjOgogICAgY2xpZW50X3NlY3JldDogZmFrZS1wbGFudGVkLXZhbHVlLWJpbmFyeQo=

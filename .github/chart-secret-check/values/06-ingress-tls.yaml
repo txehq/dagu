@@ -1,0 +1,7 @@
+ingress:
+  enabled: true
+  className: nginx
+  host: dagu.example.com
+  tls:
+    enabled: true
+    secretName: fake-ref-tls

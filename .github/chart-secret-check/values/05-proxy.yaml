@@ -1,0 +1,4 @@
+auth:
+  proxy:
+    enabled: true
+    source: oauth2-proxy

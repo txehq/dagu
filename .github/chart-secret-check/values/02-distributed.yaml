@@ -1,0 +1,4 @@
+deploymentMode: distributed
+persistence:
+  accessMode: ReadWriteMany
+  storageClass: nfs-client
