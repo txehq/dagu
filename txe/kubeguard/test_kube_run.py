@@ -237,7 +237,8 @@ class HappyPath(Base):
         pin = [F.kubectl, "--kubeconfig", str(F.kc), "--context", "txe-onprem-ci"]
         self.assertEqual(probe[:5], pin)
         self.assertIn("--request-timeout=10s", probe)
-        self.assertEqual(request, pin + ["get", "pods", "-n", "arc-runners"])
+        self.assertEqual(request, pin + ["get", "pods.v1.", "-n", "arc-runners"])   # forwarded in canonical form
+        self.assertEqual(probe[probe.index("get") + 1], "namespaces.v1.")            # the probe too
         for _, env, _ in t.calls:
             self.assertNotIn("KUBECONFIG", env)
             self.assertNotIn("KUBECTL_X", env)
@@ -458,8 +459,8 @@ class RequestScope(Base):
 
     def test_every_resource_operand_is_authorized(self):
         self.assertEqual(self.scope(["get", "pods/a", "secrets/b"])["resources"], ["pods", "secrets"])
-        self.assertEqual(self.scope(["get", "rc/web", "service/frontend", "pods/web-1"])["resources"],
-                         ["rc", "service", "pods"])
+        self.assertEqual(self.scope(["get", "replicationcontroller/web", "service/frontend", "pods/web-1"])["resources"],
+                         ["replicationcontrollers", "services", "pods"])
         self.assertEqual(self.scope(["get", "pods", "a", "b"])["resources"], ["pods"])
         self.refused_by_parser(["get", "pods", "a", "secrets/b"])     # a typed operand after a bare type
         self.refused_by_parser(["get", "pods/a", "b"])                # a bare name inside a TYPE/NAME list
@@ -489,6 +490,36 @@ class RequestScope(Base):
                       ["cp", "pod-a:/etc/x", "/tmp/y"], ["rollout", "restart", "deploy/x"]):
             self.refused(["txe-onprem-ci", "--"] + kargs, "KR05")
 
+    def test_resource_operands_are_closed_and_forwarded_canonically(self):
+        # Root's choice (2), with a collision trace at kubectl v1.34.9: the builder expands ANY word equal to a
+        # discovered category (builder.go:642-665, category_expansion.go:59-88), and a CRD may claim a short name
+        # (shortcut.go:154-180). A CRD's categories and short names are DNS-1035 labels (no dots;
+        # apiextensions validation.go:769-781), and a dotted operand is a fully specified resource. So only exact
+        # built-in names are accepted, authorized by plural, and forwarded as `resource.version.group`.
+        for args in (["get", "po"], ["get", "svc"], ["get", "deploy/x"], ["get", "pods,po"], ["get", "po/a"],
+                     ["get", "foos"], ["get", "foos.v1.example.com"], ["get", "widgets.example.com/x"],
+                     ["rollout", "status", "deploy/x"], ["logs", "po/a"], ["get", "pods", "--", "po/a"],
+                     ["get", "pods/a", "--", "svc/b"]):
+            self.refused_by_parser(args)
+        for args, resources, argv in (
+                (["get", "pods"], ["pods"], ["get", "pods.v1."]),
+                (["get", "pod", "a", "b"], ["pods"], ["get", "pods.v1.", "a", "b"]),
+                (["get", "pods/a"], ["pods"], ["get", "pods.v1./a"]),
+                (["get", "pods,secrets", "-n", "x"], ["pods", "secrets"], ["get", "pods.v1.,secrets.v1.", "-n", "x"]),
+                (["get", "deployment/web", "service/frontend"], ["deployments", "services"],
+                 ["get", "deployments.v1.apps/web", "services.v1./frontend"]),
+                (["get", "pods.v1."], ["pods"], ["get", "pods.v1."]),
+                (["get", "ingresses.v1.networking.k8s.io"], ["ingresses"], ["get", "ingresses.v1.networking.k8s.io"]),
+                (["get", "pods", "--", "pods"], ["pods"], ["get", "pods.v1.", "--", "pods"]),   # a pod named pods
+                (["rollout", "status", "deployment/x"], ["deployments"], ["rollout", "status", "deployments.v1.apps/x"]),
+                (["logs", "pod/a", "-c", "app"], ["pods"], ["logs", "pod/a", "-c", "app"])):
+            r = self.scope(args)
+            self.assertEqual((r["resources"], r["argv"]), (resources, argv), args)
+        # Every built-in maps to a dotted canonical form, and its plural is its authorization name.
+        for spelling, (canon, plural) in kr.RESOURCE_SPELLINGS.items():
+            self.assertGreaterEqual(canon.count("."), 2, spelling)
+            self.assertTrue(canon.startswith(plural + "."), spelling)
+
     def test_read_verbs_with_implicit_reads_are_refused(self):
         # Connector review of 77689338: `describe nodes/node-a` also lists pods, so a record granting nodes
         # exposed pods. Audit at kubectl v1.34.9 (README): every read verb whose implementation reads a resource
@@ -502,7 +533,7 @@ class RequestScope(Base):
         self.assertFalse(set(kr.VERBS) & kr.IMPLICIT_READ_VERBS)
         self.assertNotIn("history", kr.SUBCOMMANDS["rollout"])
         # The pod forms of logs, and get on named types, still authorize exactly what they name.
-        for args, want in ((["logs", "pod-a"], ["pods"]), (["logs", "pod/a"], ["pods"]), (["logs", "po/a"], ["pods"]),
+        for args, want in ((["logs", "pod-a"], ["pods"]), (["logs", "pod/a"], ["pods"]), (["logs", "pods/a"], ["pods"]),
                            (["logs", "-l", "app=x"], ["pods"]), (["get", "pods,services"], ["pods", "services"])):
             self.assertEqual(self.scope(args)["resources"], want, args)
         # End to end, under a record that grants everything: refused, and nothing contacted.
@@ -543,7 +574,7 @@ class RequestScope(Base):
         # there are pod names.
         self.assertEqual(self.scope(["get", "pods", "--", "svc"])["resources"], ["pods"])
         self.assertEqual(self.scope(["get", "pods", "--", "all"])["resources"], ["pods"])
-        self.assertEqual(self.scope(["get", "pods/a", "--", "svc/b"])["resources"], ["pods", "svc"])
+        self.assertEqual(self.scope(["get", "pods/a", "--", "services/b"])["resources"], ["pods", "services"])
         self.refused(["txe-onprem-ci", "--", "get", "pods/a", "-n", "arc-runners", "--", "secrets/b"], "KR08")
 
     def test_an_attached_or_clustered_short_server_override_is_refused(self):
@@ -570,7 +601,7 @@ class RequestScope(Base):
     # A valid request per supported verb, which each option case below extends.
     VERB_SAMPLES = {
         "get": ["get", "pods"], "logs": ["logs", "pod-a"],
-        "events": ["events"], "rollout": ["rollout", "status", "deploy/x"], "auth": ["auth", "can-i", "get", "pods"],
+        "events": ["events"], "rollout": ["rollout", "status", "deployment/x"], "auth": ["auth", "can-i", "get", "pods"],
         "api-resources": ["api-resources"], "api-versions": ["api-versions"], "explain": ["explain", "pods"],
         "version": ["version"],
     }
@@ -614,7 +645,7 @@ class RequestScope(Base):
         self.refused_by_parser(["get", "pods/a", "--", "-n", "kube-system"])   # a typeless operand in a TYPE/NAME list
         self.refused_by_parser(["get", "pods", "--", "secrets/b"])
         self.assertEqual(self.scope(["logs", "pod-a", "--", "-n", "x"])["namespace"], "ctx-ns")
-        self.assertEqual(self.scope(["rollout", "status", "deploy/x", "--", "deploy/y"])["resources"], ["deploy"])
+        self.assertEqual(self.scope(["rollout", "status", "deployment/x", "--", "deployments/y"])["resources"], ["deployments"])
 
     def test_only_known_options_are_forwarded(self):
         # pflag reads `-wA` as -w -A (all namespaces) and `-inother` as -i -n other (connector review of
@@ -661,8 +692,8 @@ class RequestScope(Base):
         self.assertEqual((r["verb"], r["resources"]), ("auth can-i", ["selfsubjectaccessreviews"]))
         r = self.scope(["auth", "whoami"])
         self.assertEqual((r["verb"], r["resources"]), ("auth whoami", ["selfsubjectreviews"]))
-        r = self.scope(["rollout", "status", "deploy/x"])
-        self.assertEqual((r["verb"], r["resources"]), ("rollout status", ["deploy"]))
+        r = self.scope(["rollout", "status", "deployment/x"])
+        self.assertEqual((r["verb"], r["resources"]), ("rollout status", ["deployments"]))
         for args in (["auth", "reconcile", "-f", "rbac.yaml"], ["auth"], ["auth", "--bogus", "can-i"],
                      ["rollout", "frobnicate", "deploy/x"], ["rollout"], ["rollout", "restart", "deploy/x"]):
             self.refused_by_parser(args)

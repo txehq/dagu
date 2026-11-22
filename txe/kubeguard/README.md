@@ -18,7 +18,7 @@ a context can be repointed inside its file. This directory holds the source of t
   Only then does it make the request, under B5 host custody. Diagnostics are stable codes with values
   withheld. The full contract is in its docstring.
   **kube-run is read-only.** It runs only these verbs:
-  - `get` (not the category `all`), `logs` (on a pod only) and `events`;
+  - `get` on the closed built-in resource types (forwarded in canonical form; no short names, categories or CRDs), `logs` (on a pod only) and `events`;
   - `rollout status`;
   - `auth can-i` and `auth whoami`;
   - the discovery verbs `api-resources`, `api-versions`, `explain` and `version` (with no operand).
@@ -32,7 +32,7 @@ a context can be repointed inside its file. This directory holds the source of t
 
   | Verb | (1) Discovery and version metadata | (2) Resource reads | (3) Subresource reads | Verdict, and what a grant authorizes |
   |---|---|---|---|---|
-  | `get` | RESTMapper and discovery to resolve names; a category name expands through discovery (`cli-runtime/pkg/resource/builder.go:642-654`) | the named types only (`cmd/get/get.go:470`, `:616`) | `--subresource=<s>` | KEEP. A grant on `<type>` authorizes reading that type in the namespace. `<type>/<s>` must be granted for a subresource. `all` is refused. Other categories (defined by CRDs) are a reviewed prerequisite: a record must name resource types, never a category |
+  | `get` | RESTMapper and discovery to resolve names; a category name expands through discovery (`cli-runtime/pkg/resource/builder.go:642-654`) | the named types only (`cmd/get/get.go:470`, `:616`) | `--subresource=<s>` | KEEP, for the closed built-in resources only, forwarded in canonical form (below). A grant on the plural `<type>` authorizes reading that type in the namespace. `<type>/<s>` must be granted for a subresource. Short names, categories (`all` included) and custom resources are refused |
   | `logs` | RESTMapper | the pod (a NAME, `pod/NAME`, or pods by `-l`) | `pods/log` | KEEP for pods only. A `logs` grant on `pods` authorizes reading the pods and their `pods/log`. Any other `TYPE/NAME` reads that object and then its pods (`polymorphichelpers/logsforobject.go:169-175`), so it is refused |
   | `events` | RESTMapper for `--for` (`cmd/events/events.go:165-171`) | `events` only, filtered by field selector (`:231-233`, list and watch `:239-248`) | none | KEEP. A grant on `events` authorizes listing events |
   | `rollout status` | RESTMapper | the named object, list and watch (`cmd/rollout/rollout_status.go:187-192`); the status viewers read only that object (`polymorphichelpers/rollout_status.go:59-120`) | none | KEEP. A grant on the object's type authorizes it |
@@ -47,13 +47,28 @@ a context can be repointed inside its file. This directory holds the source of t
   Every verb also reads cached discovery metadata. That is metadata, not a resource grant.
 
   **What kube-run does and does not establish here:**
-  - **Resource versus category.** kube-run does NOT positively tell a resource from a category: it decides
-    before any cluster contact, with no discovery data. It refuses the one built-in category, `all` (as a type,
-    also inside `pods,all` and `all/x`). A category a CRD declares (`categories:`) is NOT detected. kubectl
-    expands it through discovery (cli-runtime `builder.go:642-654`), and a record granting that literal name
-    would authorize its whole expansion. This rests on an explicit trusted-configuration ASSUMPTION, not runtime
-    enforcement: whoever writes authorization records names resource types only, never a category, and knows
-    the cluster's CRD categories. kube-run does not check it.
+  - **Resource versus category: closed, canonical operands** (`RESOURCE_SPELLINGS`). The trace at the pinned
+    sources (cli-runtime and client-go v0.34.9):
+    - the builder replaces EVERY comma piece of the first argument that equals ANY discovered category name
+      with that category's members, before REST mapping and with no precedence for real resource names
+      (`resource/builder.go:618`, `:642-665`; `restmapper/category_expansion.go:59-88`). So a CRD declaring
+      `categories: [pods]` would turn `get pods` into a read of that CRD, and no plain word is safe;
+    - a CRD can claim a short name, and the shortcut expander takes the first match
+      (`restmapper/shortcut.go:154-180`). An exact resource name or singular is never rewritten (`:132-146`);
+    - a CRD's categories and short names must be DNS-1035 labels, so they never contain `.` or `/`
+      (apiextensions-apiserver `validation.go:769-781`). An operand with two or more dots is a fully specified
+      group/version/resource (`schema.ParseResourceArg`; builder `mappingFor`, `:768-780`).
+    So kube-run accepts only the exact plural or singular name, or the canonical form, of the built-in
+    resources in `RESOURCE_SPELLINGS`. It authorizes each by its plural name, and FORWARDS it in canonical
+    `resource.version.group` form (core: `pods.v1.`; for example `deployments.v1.apps/web`). A dotted operand
+    cannot equal a CRD category or short name, and it is mapped exactly. The identity probe names
+    `namespaces.v1.` too. After a bare type, later words are names and are forwarded unchanged. `logs` takes
+    `pod`/`pods` only (its typed pod operand is resolved by REST mapping; `po` could be claimed).
+    - **Residual, a prerequisite:** an aggregated API server (an APIService, installed by a cluster admin) serves
+      its own discovery, which CRD validation does not cover. One that advertises a dotted category could still
+      collide. That is trusted cluster configuration, not something kube-run checks at runtime.
+    - **Current source-contract limitation:** custom resources (CRDs) cannot be read through kube-run, and
+      short names are refused. A fully-qualified CRD allowlist would be a separate, reviewed extension.
   - **Discovery metadata.** Every verb reads API discovery (`/api`, `/apis`, cached) through the RESTMapper.
     `explain` also reads the OpenAPI document, and `version` reads `/version`. Records do NOT authorize or scope
     this metadata: it is read with the cluster credential and is not limited by kube-run. It reveals the

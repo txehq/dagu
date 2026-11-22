@@ -15,8 +15,8 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
  1. ARGUMENTS. The caller names a registry cluster id, never a kubeconfig or context. Arguments that pick
     or change the target, the identity or TLS (--kubeconfig, --context, --server/-s, --cluster, --user,
     --token, --as*, --username, --password, --certificate-authority, --client-*, --tls-server-name,
-    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get (not the
-    category `all`), logs (on a pod), events, rollout status, auth can-i|whoami and the discovery verbs
+    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get (closed built-in
+    resource types, forwarded canonically), logs (on a pod), events, rollout status, auth can-i|whoami and the discovery verbs
     (api-resources, api-versions, explain, version, with no operand). describe, top, cluster-info and
     rollout history are refused: their implementations read resource types the request does not name
     (IMPLICIT_READ_VERBS). Every mutating, interactive or tunnelling
@@ -155,7 +155,7 @@ VERBS = {
 IMPLICIT_READ_VERBS = {"describe", "top", "cluster-info"}
 # logs reads the pod's log (pods/log). For any other TYPE/NAME it first reads that object and then its pods
 # (polymorphichelpers/logsforobject.go:169-175), so only pod operands are accepted.
-LOG_POD_TYPES = {"pod", "pods", "po"}
+LOG_POD_TYPES = {"pod", "pods"}   # exact names only: a short name such as `po` can be claimed by a CRD (shortcut.go:154-180)
 # The verbs that accept operands after `--`, and the rule that checks them there (the same as before `--`).
 TERMINATOR_OPERANDS = {
     "get": "resource operands: TYPE[,TYPE], TYPE/NAME, or a type then NAMEs; `all` refused as a type",
@@ -239,6 +239,71 @@ def is_override(arg):
             or short_cluster_has(arg, "s"))
 
 
+# CLOSED, COLLISION-PROOF RESOURCE OPERANDS (root's choice (2); trace at kubectl v1.34.9 / cli-runtime and
+# client-go v0.34.9):
+# - The builder replaces EVERY comma piece of the first argument that equals ANY discovered category name with
+#   that category's members, before REST mapping and with no precedence for real resource names
+#   (cli-runtime resource/builder.go:618, :642-665; client-go restmapper/category_expansion.go:59-88). So a CRD
+#   declaring `categories: [pods]` would turn `get pods` into a read of that CRD: no plain word is safe.
+# - A short name can be claimed by a CRD, and the shortcut expander takes the first match (client-go
+#   restmapper/shortcut.go:154-180). An exact resource name or singular is never rewritten (:132-146).
+# - A CRD's categories and shortNames must be DNS-1035 labels (apiextensions-apiserver .../validation/
+#   validation.go:769-781): never a `.` or a `/`. And an operand with two or more dots is a fully specified
+#   group/version/resource (apimachinery runtime/schema ParseResourceArg; builder mappingFor :768-780).
+# So kube-run accepts only the exact plural or singular names of the built-in resources below (no short names,
+# no CRDs), authorizes them by plural name, and FORWARDS each one in its canonical `resource.version.group` form
+# (core: `resource.v1.`). A dotted operand cannot equal a CRD category or short name, and is mapped exactly.
+# RESIDUAL, recorded as a prerequisite: an aggregated API server (an APIService, installed by a cluster admin)
+# advertises its own discovery, which CRD validation does not cover. One advertising a dotted category could
+# still collide. CRD reads are not available through kube-run (a current source-contract limitation).
+_BUILTIN_RESOURCES = {
+    # plural: (singular, version, group)
+    "pods": ("pod", "v1", ""), "services": ("service", "v1", ""), "configmaps": ("configmap", "v1", ""),
+    "secrets": ("secret", "v1", ""), "namespaces": ("namespace", "v1", ""), "nodes": ("node", "v1", ""),
+    "events": ("event", "v1", ""), "endpoints": ("endpoints", "v1", ""),
+    "persistentvolumeclaims": ("persistentvolumeclaim", "v1", ""), "persistentvolumes": ("persistentvolume", "v1", ""),
+    "serviceaccounts": ("serviceaccount", "v1", ""), "replicationcontrollers": ("replicationcontroller", "v1", ""),
+    "resourcequotas": ("resourcequota", "v1", ""), "limitranges": ("limitrange", "v1", ""),
+    "deployments": ("deployment", "v1", "apps"), "replicasets": ("replicaset", "v1", "apps"),
+    "statefulsets": ("statefulset", "v1", "apps"), "daemonsets": ("daemonset", "v1", "apps"),
+    "controllerrevisions": ("controllerrevision", "v1", "apps"),
+    "jobs": ("job", "v1", "batch"), "cronjobs": ("cronjob", "v1", "batch"),
+    "ingresses": ("ingress", "v1", "networking.k8s.io"), "networkpolicies": ("networkpolicy", "v1", "networking.k8s.io"),
+    "ingressclasses": ("ingressclass", "v1", "networking.k8s.io"),
+    "poddisruptionbudgets": ("poddisruptionbudget", "v1", "policy"),
+    "storageclasses": ("storageclass", "v1", "storage.k8s.io"),
+    "roles": ("role", "v1", "rbac.authorization.k8s.io"), "rolebindings": ("rolebinding", "v1", "rbac.authorization.k8s.io"),
+    "clusterroles": ("clusterrole", "v1", "rbac.authorization.k8s.io"),
+    "clusterrolebindings": ("clusterrolebinding", "v1", "rbac.authorization.k8s.io"),
+    "leases": ("lease", "v1", "coordination.k8s.io"), "endpointslices": ("endpointslice", "v1", "discovery.k8s.io"),
+    "horizontalpodautoscalers": ("horizontalpodautoscaler", "v2", "autoscaling"),
+    "customresourcedefinitions": ("customresourcedefinition", "v1", "apiextensions.k8s.io"),
+}
+# Every accepted spelling (plural, singular, canonical) -> (canonical forwarded form, plural authorization name).
+RESOURCE_SPELLINGS = {}
+for _plural, (_singular, _version, _group) in _BUILTIN_RESOURCES.items():
+    _canon = f"{_plural}.{_version}.{_group}"
+    for _spelling in (_plural, _singular, _canon):
+        RESOURCE_SPELLINGS[_spelling] = (_canon, _plural)
+
+
+def _resource_spelling(name):
+    """(canonical, plural) for an accepted built-in spelling, or KR05."""
+    if name not in RESOURCE_SPELLINGS:
+        raise Refused("KR05", "the resource type is not an exact built-in resource name (short names, categories and "
+                              "custom resources are refused: their meaning depends on the cluster's discovery)")
+    return RESOURCE_SPELLINGS[name]
+
+
+def _canonical_operand(operand):
+    """The operand with every resource type in its canonical form: `pods,secrets` -> `pods.v1.,secrets.v1.`,
+    `deployment/x` -> `deployments.v1.apps/x`."""
+    if "/" in operand:
+        rtype, rest = operand.split("/", 1)
+        return _resource_spelling(rtype.strip().lower())[0] + "/" + rest
+    return ",".join(_resource_spelling(p.strip().lower())[0] for p in operand.split(","))
+
+
 def _types(operand):
     """The resource types in one operand: `pods`, `pods,secrets`, `pods/a` or `deploy/x`, lower-cased."""
     types = []
@@ -256,6 +321,8 @@ def parse_request(args, default_namespace):
         raise Refused("KR04", "an argument selects or changes the cluster, identity or TLS; kube-run supplies "
                               "the kubeconfig and context from the registry")
     pos, namespaces, all_ns, unknown_at, subresources = [], [], False, None, []
+    pos_at = []        # the argv index of each operand in pos, so a canonicalised operand replaces exactly its token
+    rewrite = {}       # argv index -> the canonical token forwarded instead (CLOSED, COLLISION-PROOF RESOURCE OPERANDS)
     i = 0
     while i < len(args):
         a = args[i]
@@ -271,6 +338,7 @@ def parse_request(args, default_namespace):
                     raise Refused("KR05", "tokens after -- are operands this verb does not authorize; kube-run "
                                           "forwards nothing it did not inspect")
                 pos.extend(after)
+                pos_at.extend(range(i + 1, len(args)))
             break
         if a in NAMESPACE_FLAGS:
             if i + 1 >= len(args) or args[i + 1].startswith("-"):
@@ -332,6 +400,7 @@ def parse_request(args, default_namespace):
                 raise Refused("KR05", "this read verb reads resources the request does not name, so its scope "
                                       "cannot be authorized from the arguments (use get)")
             pos.append(a)
+            pos_at.append(i)
         i += 1
     if not pos:
         raise Refused("KR05", "no kubectl verb")
@@ -374,6 +443,18 @@ def parse_request(args, default_namespace):
             # (cli-runtime pkg/resource/builder.go:642-654), so the request would read types it does not name.
             raise Refused("KR05", "the category `all` expands to resource types the request does not name; name "
                                   "each resource type")
+        # CLOSED operands: every resource type is an exact built-in spelling, authorized by its plural name and
+        # forwarded in its canonical dotted form (see RESOURCE_SPELLINGS). After a bare type, later words are
+        # names and are forwarded unchanged.
+        authorized = []
+        for r in resources:
+            plural = _resource_spelling(r)[1]
+            if plural not in authorized:
+                authorized.append(plural)
+        resources = authorized
+        type_positions = [how] + ([k for k in range(how + 1, len(pos))] if typed else [])
+        for k in type_positions:
+            rewrite[pos_at[k]] = _canonical_operand(pos[k])
     elif isinstance(how, str):
         if verb in NO_OPERAND_VERBS and len(pos) > 1:
             # e.g. `cluster-info dump`, which reads nodes, pods and logs across namespaces.
@@ -398,7 +479,8 @@ def parse_request(args, default_namespace):
     namespace = "*" if all_ns else (namespaces[0] if namespaces else default_namespace)
     if not namespace:
         raise Refused("KR05", "an empty namespace")
-    return {"verb": verb, "resources": resources, "namespace": namespace}
+    argv = [rewrite.get(k, t) for k, t in enumerate(args)]
+    return {"verb": verb, "resources": resources, "namespace": namespace, "argv": argv}
 
 
 # ---- 2. registry ---------------------------------------------------------------------------------
@@ -927,8 +1009,11 @@ def run(argv, registry_path, transport, now, environ, stdout, stderr):
     if not isinstance(kubectl, str) or not os.path.isabs(kubectl):
         raise Refused("KR19", "the registry entry pins no absolute kubectl path, and kube-run never uses PATH")
     env = child_env(environ)
-    probe = pinned(kubectl, entry) + ["--request-timeout=" + PROBE_REQUEST_TIMEOUT, "get", "namespace",
-                                      "kube-system", "-o", "jsonpath={.metadata.uid}"]
+    # The probe names its type in canonical form too (`namespaces.v1.`), so no cluster-defined category or
+    # short name can redirect it (CLOSED, COLLISION-PROOF RESOURCE OPERANDS).
+    probe = pinned(kubectl, entry) + ["--request-timeout=" + PROBE_REQUEST_TIMEOUT, "get",
+                                      RESOURCE_SPELLINGS["namespaces"][0], "kube-system", "-o",
+                                      "jsonpath={.metadata.uid}"]
     try:
         rc, out, _ = _call(transport, probe, env, PROBE_TIMEOUT_S, "the identity probe")
     except Timeout:
@@ -942,7 +1027,7 @@ def run(argv, registry_path, transport, now, environ, stdout, stderr):
     if hashlib.sha256(read_bytes(entry["kubeconfig"])).digest() != digest:
         raise Refused("KR17", "the kubeconfig changed after its pins were checked; the request was not made")
     try:
-        rc, out, err = _call(transport, pinned(kubectl, entry) + kargs, env, timeout, "the request")
+        rc, out, err = _call(transport, pinned(kubectl, entry) + request["argv"], env, timeout, "the request")
     except Timeout:
         raise Refused("KR18", "the request exceeded --timeout and was killed", EXIT_TIMEOUT)
     stdout.write(out)
