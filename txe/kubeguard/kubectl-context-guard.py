@@ -145,7 +145,8 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 #   - POSIX/Bash shell text, by this file's lexer: sh, bash, zsh, dash and ksh with -c, stdin or a here-document;
 #     eval; $(...), backticks and <(...)/>(...); watch's words (it runs sh -c); env -S payloads with no `\` or `$`.
 #     zsh, dash and ksh differ from Bash only where the decoded forms over-approximate (dash has no $'...').
-#   - REFUSED, because the grammar is not modelled (H03): fish text (UNMODELLED_SHELLS); an env -S payload with
+#   - REFUSED, because the grammar is not modelled (H03): fish text other than a literal script path
+#     (UNMODELLED_SHELLS); an unread env split-string spelling (abbreviation, S in a cluster); an env -S payload with
 #     a backslash or `$` (env's own escapes and ${NAME}); every xargs in a client line (it builds argv from input).
 #   - OPAQUE, refused when the text names a client (H03/H15, read through mention_forms): interpreters (python,
 #     node, perl, ...), OPAQUE executors (ssh, docker, find -exec, ...), and every unclassified command, including
@@ -1067,13 +1068,19 @@ class Guard:
         w = words[0][0]
         base = os.path.basename(w)
         args = [x[0] for x in words[1:]]
-        if base in UNMODELLED_SHELLS and (
-                cmd.get("piped") or cmd["stdin"] or any(a.startswith("-") for a in args)
-                or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", []))):
+        if base in UNMODELLED_SHELLS:
             # fish's grammar is not the POSIX shell's this lexer reads (`\x63` and `\u` escapes outside quotes,
             # `(cmd)` substitution without `$`, different quoting), so text it would run is refused (H03), whatever
-            # it seems to name. `fish ./script.fish` (a script file, opaque as for every shell) is unchanged.
-            raise Refusal("H03")
+            # it seems to name. ONLY a plain script file is accepted (opaque, as for every shell): one or more
+            # LITERAL words (literal_word on their source: no substitution, process substitution, expansion or
+            # option), and no pipe, stdin or input redirection. `fish <(printf ...)` (plugin review of fc305d8f),
+            # `fish $(...)`, `fish "$S"` and a bare `fish` (it reads stdin) are refused.
+            src, operands = cmd.get("src", ""), words[1:]
+            literal_script = bool(operands) and all(
+                len(x) >= 4 and not x[0].startswith("-") and literal_word(src[x[2]:x[3]]) for x in operands)
+            if (not literal_script or cmd.get("piped") or cmd["stdin"]
+                    or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", []))):
+                raise Refusal("H03")
         runs_text = base in SHELLS or base in ("eval", "source", ".") or bool(INTERPRETERS.match(base))
         if runs_text and self.whole_mentions and (
                 cmd.get("piped") or any(a.startswith(("<(", ">(")) or "$(" in a or "`" in a for a in args)):
@@ -1200,6 +1207,15 @@ class Guard:
                 break
             if base == "command" and a in ("-v", "-V"):
                 return None
+            if base == "env" and ((a.startswith("--") and len(a.partition("=")[0]) > 2
+                                   and a.partition("=")[0] != "--split-string"
+                                   and "--split-string".startswith(a.partition("=")[0]))
+                                  or (len(a) > 2 and a[0] == "-" and a[1] not in "-S" and "S" in a[2:])):
+                # A split-string payload in a spelling the branch below does not read (plugin review of fc305d8f):
+                # a getopt abbreviation (`--sp=...`, `--split ...`; no other GNU env long option starts with
+                # `--s`) or S inside a short-option cluster (`-iS'...'`, `-vS ...`). Not modelled, so refused (H03),
+                # whatever it names. A cluster whose attached value merely contains an S (`-uSOME`) is refused too.
+                raise Refusal("H03")
             if base == "env" and (a in ("-S", "--split-string") or a.startswith("--split-string=")
                                   or (a.startswith("-S") and len(a) > 2)):
                 # All three spellings carry a split-string payload: `-S <text>`, `--split-string=<text>`, and the

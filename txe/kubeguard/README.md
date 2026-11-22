@@ -387,10 +387,14 @@ of four ways (the inventory is in the source, above `UNMODELLED_SHELLS`):
 - **POSIX/Bash shell text**, read by the lexer. This covers `sh`/`bash`/`zsh`/`dash`/`ksh` with `-c`, stdin or a
   here-document; `eval`; substitutions; `watch` (which runs `sh -c`); and an `env -S` payload with no `\` or `$`.
 - **Refused (H03), because the grammar is not modelled:**
-  - text that `fish` would run (`-c`, any option, a pipe, stdin or an input redirection). Only `fish <script>`
-    is unchanged;
+  - text that `fish` would run. Only a plain script file is accepted: one or more LITERAL words, with no option,
+    substitution, process substitution or expansion, and no pipe, stdin or input redirection. So `fish -c ...`,
+    `fish <(printf ...)`, `fish "$S"` and a bare `fish` are refused;
   - an `env -S`/`--split-string` payload holding a backslash or `$` (env's `\_` separator, `\c`, escapes and
     `${NAME}`), in every spelling, whether or not a client is visible;
+  - an `env` split-string option in a spelling the hook does not read: a getopt abbreviation (`--sp=...`,
+    `--split ...`) or an `S` inside a short-option cluster (`-iS ...`). A cluster whose attached value merely
+    contains an `S` (`-uSOME`) is refused too;
   - every `xargs` in a client line.
 - **Opaque, refused when its text names a client (H03/H15):** interpreters, OPAQUE executors, and every
   unclassified command, including the languages inside `awk`, `sed` and `jq`. Their own escapes and run-time
