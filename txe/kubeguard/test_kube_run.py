@@ -515,6 +515,21 @@ class RequestScope(Base):
                 (["logs", "pod/a", "-c", "app"], ["pods"], ["logs", "pod/a", "-c", "app"])):
             r = self.scope(args)
             self.assertEqual((r["resources"], r["argv"]), (resources, argv), args)
+        # The table is security-critical reviewed data (a wrong but existing GVR would name another resource): it is
+        # pinned here to the 34 entries verified against Kubernetes v1.34.9 API registration (README table).
+        self.assertEqual(sorted(f"{p}.{v}.{g}" for p, (_, v, g) in kr._BUILTIN_RESOURCES.items()), sorted([
+            "pods.v1.", "services.v1.", "configmaps.v1.", "secrets.v1.", "namespaces.v1.", "nodes.v1.", "events.v1.",
+            "endpoints.v1.", "persistentvolumeclaims.v1.", "persistentvolumes.v1.", "serviceaccounts.v1.",
+            "replicationcontrollers.v1.", "resourcequotas.v1.", "limitranges.v1.",
+            "deployments.v1.apps", "replicasets.v1.apps", "statefulsets.v1.apps", "daemonsets.v1.apps",
+            "controllerrevisions.v1.apps", "jobs.v1.batch", "cronjobs.v1.batch",
+            "ingresses.v1.networking.k8s.io", "networkpolicies.v1.networking.k8s.io",
+            "ingressclasses.v1.networking.k8s.io", "poddisruptionbudgets.v1.policy",
+            "storageclasses.v1.storage.k8s.io", "roles.v1.rbac.authorization.k8s.io",
+            "rolebindings.v1.rbac.authorization.k8s.io", "clusterroles.v1.rbac.authorization.k8s.io",
+            "clusterrolebindings.v1.rbac.authorization.k8s.io", "leases.v1.coordination.k8s.io",
+            "endpointslices.v1.discovery.k8s.io", "horizontalpodautoscalers.v2.autoscaling",
+            "customresourcedefinitions.v1.apiextensions.k8s.io"]))
         # Every built-in maps to a dotted canonical form, and its plural is its authorization name.
         for spelling, (canon, plural) in kr.RESOURCE_SPELLINGS.items():
             self.assertGreaterEqual(canon.count("."), 2, spelling)

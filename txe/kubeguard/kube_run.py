@@ -239,7 +239,7 @@ def is_override(arg):
             or short_cluster_has(arg, "s"))
 
 
-# CLOSED, COLLISION-PROOF RESOURCE OPERANDS (root's choice (2); trace at kubectl v1.34.9 / cli-runtime and
+# CLOSED, CANONICAL RESOURCE OPERANDS (root's choice (2); trace at kubectl v1.34.9 / cli-runtime and
 # client-go v0.34.9):
 # - The builder replaces EVERY comma piece of the first argument that equals ANY discovered category name with
 #   that category's members, before REST mapping and with no precedence for real resource names
@@ -256,6 +256,12 @@ def is_override(arg):
 # RESIDUAL, recorded as a prerequisite: an aggregated API server (an APIService, installed by a cluster admin)
 # advertises its own discovery, which CRD validation does not cover. One advertising a dotted category could
 # still collide. CRD reads are not available through kube-run (a current source-contract limitation).
+# The guarantee holds under that traced model only. The table is SECURITY-CRITICAL REVIEWED DATA: a wrong but
+# EXISTING group/version would name a DIFFERENT API resource, while authorization uses the plural name. Each entry
+# below was verified against the pinned Kubernetes v1.34.9 API registration (the REST storage providers and the
+# default-enabled version list; README table). A change needs the same verification, and the test pins the table.
+# A version that a cluster has disabled (--runtime-config) makes kubectl fail on that exact GVR; it is not
+# remapped.
 _BUILTIN_RESOURCES = {
     # plural: (singular, version, group)
     "pods": ("pod", "v1", ""), "services": ("service", "v1", ""), "configmaps": ("configmap", "v1", ""),
@@ -322,7 +328,7 @@ def parse_request(args, default_namespace):
                               "the kubeconfig and context from the registry")
     pos, namespaces, all_ns, unknown_at, subresources = [], [], False, None, []
     pos_at = []        # the argv index of each operand in pos, so a canonicalised operand replaces exactly its token
-    rewrite = {}       # argv index -> the canonical token forwarded instead (CLOSED, COLLISION-PROOF RESOURCE OPERANDS)
+    rewrite = {}       # argv index -> the canonical token forwarded instead (CLOSED, CANONICAL RESOURCE OPERANDS)
     i = 0
     while i < len(args):
         a = args[i]
@@ -1010,7 +1016,7 @@ def run(argv, registry_path, transport, now, environ, stdout, stderr):
         raise Refused("KR19", "the registry entry pins no absolute kubectl path, and kube-run never uses PATH")
     env = child_env(environ)
     # The probe names its type in canonical form too (`namespaces.v1.`), so no cluster-defined category or
-    # short name can redirect it (CLOSED, COLLISION-PROOF RESOURCE OPERANDS).
+    # short name can redirect it (CLOSED, CANONICAL RESOURCE OPERANDS).
     probe = pinned(kubectl, entry) + ["--request-timeout=" + PROBE_REQUEST_TIMEOUT, "get",
                                       RESOURCE_SPELLINGS["namespaces"][0], "kube-system", "-o",
                                       "jsonpath={.metadata.uid}"]

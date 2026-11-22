@@ -69,6 +69,31 @@ a context can be repointed inside its file. This directory holds the source of t
       collide. That is trusted cluster configuration, not something kube-run checks at runtime.
     - **Current source-contract limitation:** custom resources (CRDs) cannot be read through kube-run, and
       short names are refused. A fully-qualified CRD allowlist would be a separate, reviewed extension.
+    - **Scope of the guarantee.** Canonicalization removes category and short-name expansion UNDER THE TRACED
+      MODEL above, with the aggregated-API prerequisite. It does NOT make an incorrect table entry harmless: a
+      wrong but EXISTING group or version would name a DIFFERENT API resource, while authorization uses the
+      plural name. The table is security-critical reviewed data, pinned by a test, and each entry was verified
+      against the pinned Kubernetes v1.34.9 API registration:
+
+      | Group / version | Resources (canonical `resource.version.group`) | Registration (kubernetes@v1.34.9) | Enabled by default |
+      |---|---|---|---|
+      | core `v1` | pods, replicationcontrollers, services, endpoints, nodes, limitranges, persistentvolumes, persistentvolumeclaims | `pkg/registry/core/rest/storage_core.go:232`, `:257`, `:284`, `:290`, `:294`, `:300`, `:304`, `:309` | yes (`pkg/controlplane/instance.go:448`) |
+      | core `v1` | events, resourcequotas, namespaces, secrets, serviceaccounts, configmaps | `pkg/registry/core/rest/storage_core_generic.go:125`, `:129`, `:134`, `:140`, `:144`, `:151` | yes (`instance.go:448`) |
+      | `apps/v1` | deployments, statefulsets, daemonsets, replicasets, controllerrevisions | `pkg/registry/apps/rest/storage_apps.go:56`, `:67`, `:78`, `:88`, `:99` | yes (`instance.go:449`) |
+      | `batch/v1` | jobs, cronjobs | `pkg/registry/batch/rest/storage_batch.go:51`, `:61` | yes (`instance.go:454`) |
+      | `networking.k8s.io/v1` | networkpolicies, ingresses, ingressclasses | `pkg/registry/networking/rest/storage_settings.go:61`, `:70`, `:80` | yes (`instance.go:459`) |
+      | `policy/v1` | poddisruptionbudgets | `pkg/registry/policy/rest/storage_policy.go:49` | yes (`instance.go:461`) |
+      | `storage.k8s.io/v1` | storageclasses | `pkg/registry/storage/rest/storage_storage.go:107` | yes (`instance.go:464`) |
+      | `rbac.authorization.k8s.io/v1` | roles, rolebindings, clusterroles, clusterrolebindings | `pkg/registry/rbac/rest/storage_rbac.go:109`, `:114`, `:119`, `:124` | yes (`instance.go:462`) |
+      | `coordination.k8s.io/v1` | leases | `pkg/registry/coordination/rest/storage_coordination.go:65` | yes (`instance.go:456`) |
+      | `discovery.k8s.io/v1` | endpointslices | `pkg/registry/discovery/rest/storage_discovery.go:51` | yes (`instance.go:457`) |
+      | `autoscaling/v2` | horizontalpodautoscalers | `pkg/registry/autoscaling/rest/storage_autoscaling.go:86` (v2; v1 also exists at `:70`) | yes (`instance.go:453`) |
+      | `apiextensions.k8s.io/v1` | customresourcedefinitions | `staging/src/k8s.io/apiextensions-apiserver/pkg/apiserver/apiserver.go:148` | its own server (the CRD definitions only, not custom resources) |
+
+      Version availability: `events` is the core `v1` resource. `events.k8s.io/v1` also serves events
+      (`pkg/registry/events/rest/storage_events.go:54`) and is not reachable through kube-run. HPAs are pinned to
+      `autoscaling/v2`. A cluster that disables a version (`--runtime-config`) makes kubectl fail on that exact
+      GVR, rather than remapping it.
   - **Discovery metadata.** Every verb reads API discovery (`/api`, `/apis`, cached) through the RESTMapper.
     `explain` also reads the OpenAPI document, and `version` reads `/version`. Records do NOT authorize or scope
     this metadata: it is read with the cluster credential and is not limited by kube-run. It reveals the
