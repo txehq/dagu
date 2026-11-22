@@ -142,6 +142,19 @@ class Rules(unittest.TestCase):
         self.assertEqual(rules("cat <<\\\nEOF\n$(step-one)\nEOF\n"), ["H1"])
         self.assertEqual(rules("cat <<\\\n-EOF\n\t$(step-one)\n\tEOF\n"), ["H1"])
 
+    def test_a_continued_line_in_an_unquoted_heredoc_body_refuses(self):
+        """PR 301 review of e3a48c48: the shell joins `prefix\\<nl>EOF` into one body line, so the
+        first physical EOF is not the terminator. An unquoted body line ending in an odd number of
+        backslashes is refused (L1); an even number is an escaped backslash."""
+        self.assertIn("L1", rules("cat <<EOF\nprefix\\\nEOF\n'$(step-one)'\nEOF\n"))
+        self.assertEqual(G.check("cat <<EOF\nprefix\\\\\nEOF\n"), [])
+        self.assertEqual(G.check("cat <<'EOF'\nprefix\\\nEOF\n"), [])  # quoted: no joining
+
+    def test_single_quotes_in_a_heredoc_parameter_expansion_are_literal(self):
+        """PR 301 review of e3a48c48: in an unquoted heredoc, '...' inside ${ } does not quote."""
+        self.assertEqual(rules("cat <<EOF\n${UNSET:-'$(step-one)'}\nEOF\n"), ["H1"])
+        self.assertEqual(G.check("V=${UNSET:-'$(step-one)'}"), [])  # unquoted code: single quotes are quotes
+
     def test_double_quoted_delimiter_uses_double_quote_rules(self):
         """PR 301 review: <<"E\\$OF" ends at a line E$OF; text after it is code and is scanned."""
         hidden = "cat <<\"E\\$OF\"\nE$OF\nprintf '%s\\n' \"$(step-one)\"\nE\\$OF\n"

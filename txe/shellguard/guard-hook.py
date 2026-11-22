@@ -122,7 +122,9 @@ class Scanner:
         return self.stack[-1]
 
     def has_dq_ancestor(self):
-        return any(f.kind == DQ for f in self.stack)
+        """Inside double quotes or an unquoted heredoc body. In both, a single quote within ${ }
+        is a literal character, not a quote, so a $( ) after it still runs."""
+        return any(f.kind in (DQ, HDOC) for f in self.stack)
 
     def substitution(self, backtick, at):
         """An active substitution at `at`: its nearest quoting context decides the rule."""
@@ -487,6 +489,10 @@ class Scanner:
                     body_end = pos
                     self.i = self.n if e < 0 else e + 1
                     break
+                if not quoted and (len(line) - len(line.rstrip("\\"))) % 2:
+                    # The shell joins this line to the next before it looks for the terminator,
+                    # so physical-line matching would end the body in the wrong place. Refuse.
+                    self.find("L1", pos + len(line) - 1)
                 pos = self.n if e < 0 else e + 1
             if not quoted:
                 sub = Scanner(s[start:body_end], HDOC, self.base + start, self.budget - len(self.stack))
