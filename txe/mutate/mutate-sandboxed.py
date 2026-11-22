@@ -1057,14 +1057,17 @@ class Runner:
             raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed before {what}")
         return min(float(self.args.timeout), left)
 
-    def remove_pending(self) -> bool:
+    def remove_pending(self, emergency: bool = False) -> bool:
         """Remove every pending container. An entry leaves pending only when its removal or its
         absence is confirmed; anything else stays, for the finalizer's retry. Returns whether
-        nothing is left pending."""
+        nothing is left pending. During the run (settlement, and clearing a stopped run) every
+        call draws on the active deadline, hard_end; only the finalizer's emergency removal
+        (emergency=True) draws on the one budget that ends at cleanup_end."""
+        end = self.cleanup_end if emergency else self.hard_end
         for name, cidfile in list(self.pending.items()):
             try:
                 outcome = remove_owned_container(self.docker, cidfile, name, self.work.token,
-                                                 self.docker_env(), self.cleanup_end)
+                                                 self.docker_env(), end)
             except (OSError, subprocess.TimeoutExpired) as e:
                 outcome = f"{name}: cleanup error {e}"
             self.cleanup_log.append(outcome)
@@ -1335,7 +1338,9 @@ def parse(argv: list[str]):
                    help="D: seconds for every run, settlement and integrity check (the last min(45, D/3) s are "
                         "the reserve for settlement and integrity); 0 means none. Past it the run stops (exit 6) "
                         f"and removes its containers within {EMERGENCY_CLEANUP_S:.0f} s more; the process exits by "
-                        f"D + {EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s (D is not a process-exit bound)")
+                        f"D + {EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s (D is not a process-exit bound). "
+                        "A stop in the end-of-run check reports 6 even after an earlier 2, 4 or 5 (stderr may "
+                        "already have said so); the report keeps the earlier findings and containers_left")
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
     p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
     p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
@@ -1494,10 +1499,16 @@ def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
     report["diagnostic"] = diag
     # Settlement is positive and bounded: docker's --rm after the client returned is not taken on
     # trust. The run's container must be confirmed removed or absent by the owner-checked cleanup
-    # call (each docker call under its own timeout) before the run's directory is touched.
+    # call before the run's directory is touched, and BY THE ACTIVE DEADLINE (every call draws on
+    # hard_end; the emergency budget after it is the finalizer's alone). A settlement that cannot
+    # finish by the deadline, or that ends past it, is Stopped: exit 6, never 7.
     cidfile, name = runner.containers[r.name]
     runner.pending[name] = cidfile
-    if not runner.remove_pending():
+    settled = runner.remove_pending()
+    if runner.hard_end is not None and time.monotonic() >= runner.hard_end:
+        diag["settlement"] = "confirmed after the deadline" if settled else "not confirmed by the deadline"
+        raise Stopped(f"the whole-run deadline ({runner.args.deadline}s) passed during the diagnostic's settlement")
+    if not settled:
         diag.update(settlement="unconfirmed", status="not-completed: container not confirmed removed")
         report["findings"] = [f"diagnostic: container {name} not confirmed removed"]
         err(f"FINDING: diagnostic did not complete: container {name} not confirmed removed")
@@ -1580,6 +1591,9 @@ def main(argv: list[str]) -> int:
                 out(ro_manifest_sha256(args.ro_manifest, ro_limits(args)))
             except OSError as e:
                 raise Refused(f"cannot read {args.ro_manifest}: {e}") from e
+            if STREAM_ERRORS or BROKEN_STREAMS:  # the digest is this mode's only output: not delivered, not done
+                err(f"mutate-sandboxed: the digest could not be written: {(STREAM_ERRORS + BROKEN_STREAMS)[-1]}")
+                return EXIT_FINDINGS
             return EXIT_OK
         mutants = [] if args.diagnostic else load_mutants(args.mutants, args.tree)
         ro_mounts = parse_ro_mounts(args.ro_mount)
@@ -1675,7 +1689,7 @@ def main(argv: list[str]) -> int:
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
         if runner:
-            if not runner.remove_pending():  # the retry of anything an earlier attempt left
+            if not runner.remove_pending(emergency=True):  # the retry of anything an earlier attempt left
                 left = ", ".join(runner.pending)
                 report["containers_left"] = left
                 err(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "

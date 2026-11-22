@@ -1381,7 +1381,7 @@ func TestDemoDeadlineRemovesOnlyRecorded(t *testing.T) {
 	docker := fakeDocker(t, root, log)
 	foreignContainer(t, log)
 	start := time.Now()
-	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "45")
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "60")
 	require.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
 	assert.Less(t, time.Since(start), 30*time.Second)
 	dir := demoRoot(t, out.String())
@@ -1482,12 +1482,15 @@ func TestCleanupInsideDeadline(t *testing.T) {
 	start := time.Now()
 	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	// 6 s deadline: the hung inspect is cut to what is left of the ONE emergency budget (it ends
-	// 10 s after the deadline), and the retry in the finalizer finds it spent and starts nothing.
-	// So the process ends inside the documented bound, D + 10 + 5 = 21 s.
-	assert.Less(t, time.Since(start), 21*time.Second)
+	// D = 6 s, reserve 2 s: the hung run is stopped at 4 s; clearing it during the run draws on the
+	// active deadline, so its hung inspect is cut at D = 6 s; the finalizer's emergency retry draws
+	// on the one budget ending at D + 10 = 16 s and is cut there. Expected end: about 16 s, with up
+	// to 3 s of margin for process start and the local steps (the documented bound is D + 15 = 21 s).
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed, 14*time.Second, "the emergency retry used its budget")
+	assert.Less(t, elapsed, 19*time.Second)
 	assert.Contains(t, o.stderr, "cleanup error")
-	assert.Contains(t, o.stderr, "emergency cleanup budget is spent")
+	assert.NotEmpty(t, o.report["containers_left"])
 }
 
 // A symlink in the tree that leads outside it (here an absolute go.sum link back into the live
@@ -2836,4 +2839,92 @@ except subprocess.TimeoutExpired:
 	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py")).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "30\nTrue\nrefused\n", string(out))
+}
+
+// Settlement is part of the active budget, view or no view: a removal still running at D (a slow,
+// bounded fake rm under --deadline 6, no --ro-mount, so no end-of-run re-hash can stop the run
+// instead) is cut at D and the diagnostic is 6, never 7. The finalizer's emergency removal, inside
+// its own 10 s, then confirms the container gone; the raw command_exit is kept.
+func TestDiagnosticSettlementPastDeadlineIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".slowrm", []byte("7"), 0o644))
+	start := time.Now()
+	o := f.diag(t, "--image", "staysup", "--deadline", "6")
+	assert.Less(t, time.Since(start), 21*time.Second, "inside D + 15 s")
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.report["stopped"], "settlement")
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	assert.NotContains(t, o.report, "containers_left", "the emergency removal confirmed it")
+	assert.Empty(t, registry(t, f.log))
+}
+
+// --ro-manifest's digest is the mode's only output: a stdout that cannot take it (/dev/full, Linux
+// only) is exit 5, never 0.
+func TestRoManifestFullStdoutIsFinding(t *testing.T) {
+	full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/full on this system")
+	}
+	t.Cleanup(func() { _ = full.Close() })
+	view := gitView(t, t.TempDir())
+	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", view)
+	var errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = full, &errb
+	err = cmd.Run()
+	ee, ok := err.(*exec.ExitError)
+	require.True(t, ok, "exit 0 with the digest lost: %v %s", err, errb.String())
+	assert.Equal(t, 5, ee.ExitCode())
+	assert.Contains(t, errb.String(), "the digest could not be written")
+}
+
+// The cleanup budget is threaded, not only computed: one removal whose inspect and slow rm together
+// pass its end is cut there, and a second call against the same spent end starts no docker call.
+// Runner.remove_pending draws on hard_end during the run and on cleanup_end only in an emergency.
+func TestCleanupBudgetPlumbing(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	tree := filepath.Join(root, "tree")
+	require.NoError(t, os.Mkdir(tree, 0o755))
+	prog := `
+import importlib.util, json, subprocess, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+docker, log, root, tree = sys.argv[2], sys.argv[3], Path(sys.argv[4]), sys.argv[5]
+def calls():
+    return sum(1 for _ in open(log)) if Path(log).exists() else 0
+args = ms.parse(["--diagnostic", "--image", "img", "--tree", tree, "--docker", docker, "--deadline", "100", "--", "true"])
+runner = ms.Runner(args, ms.Watch({}), {}, ms.WorkDir(root), docker, [])
+cid, name = "a" * 64, "mutate-sandboxed-plumb-001"
+json.dump({cid: [name, runner.work.token]}, open(log + ".containers", "w"))
+cidfile = root / "c.cid"; cidfile.write_text(cid)
+open(log + ".slowrm", "w").write("3")
+env = ms.docker_client_env()
+t0 = time.monotonic(); end = t0 + 1.5
+try:
+    ms.remove_owned_container(docker, cidfile, name, runner.work.token, env, end); print("finished")
+except subprocess.TimeoutExpired:
+    print("cut", time.monotonic() - t0 < 2.5)
+n = calls()
+try:
+    ms.remove_owned_container(docker, cidfile, name, runner.work.token, env, end); print("started")
+except subprocess.TimeoutExpired:
+    print("refused", calls() == n)
+runner.pending[name] = cidfile
+runner.hard_end = time.monotonic() - 1      # the active deadline has passed
+runner.cleanup_end = time.monotonic() + 1.5  # the emergency budget has not
+n = calls()
+print("active", runner.remove_pending(), calls() == n)
+t1 = time.monotonic()
+print("emergency", runner.remove_pending(emergency=True), calls() > n, time.monotonic() - t1 < 2.5)
+`
+	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, log, root, tree).CombinedOutput()
+	require.NoError(t, err, string(out))
+	// cut: the slow rm ends at the budget, well before its 3 s; refused: nothing started past it;
+	// active: past hard_end nothing starts; emergency: it draws on cleanup_end, starts, and is cut.
+	assert.Equal(t, "cut True\nrefused True\nactive False True\nemergency False True True\n", string(out))
 }

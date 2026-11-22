@@ -133,7 +133,7 @@ is always kept.
     full re-hash of the view (with a view, the reserve has to cover two hashes; a large view or a
     small D makes the end check run out). The reserve's adequacy is not measured. A run, a
     settlement or an integrity check that cannot finish by D is exit 6 (integrity `incomplete`
-    when it is the end check), never 7; an earlier 4 or 5 also becomes 6, the report keeping its
+    when it is the end check), never 7; an earlier 2, 4 or 5 also becomes 6, the report keeping its
     findings and results.
   - **Emergency cleanup: 10 s after D,** one budget that every container-removal call past D
     consumes (each call's timeout is what is left of it; none restarts its own); once it is spent

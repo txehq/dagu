@@ -20,8 +20,8 @@ EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S, 15 s), so it ends inside the demo's 
 deadline the demo stops the runner (SIGTERM, then SIGKILL) and force-removes the containers that
 were recorded as started (docker's --cidfile, outside every mount), each only when docker reports
 that container's own name and owner token, within EMERGENCY_CLEANUP_S (10 s) more. SIGTERM,
-SIGINT or SIGHUP to the demo do the same. The runner needs at least 10 s, so the sandboxed step
-needs --deadline 38 or more (2D/3 - 15 >= 10).
+SIGINT or SIGHUP to the demo do the same. The sandboxed step refuses to start a runner with less
+than MIN_RUNNER_S (20 s); see that constant for the arithmetic: in practice --deadline 60 or more.
 
 The demo writes only inside one directory it creates exclusively (mkdtemp) and stamps with a
 random token; it removes that directory only when the token and the directory's identity
@@ -51,6 +51,14 @@ _spec.loader.exec_module(ms)
 
 OUTER_PREFIX = "txe-7549-outer"
 SENTINEL_TEXT = "TXE-7549 fixture sentinel\n"
+# The least --deadline the sandboxed step hands the runner. The runner gets
+# int(D - preflight - min(45, D/3) - 15), the preflight (image inspect, mkdtemp, the fixture copy)
+# included, so for D < 135 the step needs D >= 1.5 * (MIN_RUNNER_S + 15 + preflight): 52.5 s plus
+# 1.5 times the preflight; with up to 5 s of preflight, D >= 60. A runner deadline of 20 s leaves its
+# runs 20 - 20/3 = 13.3 s for the baseline, the mutant and the final baseline: enough for the
+# dependency-free fixture under the fake docker the tests use; a real image is not measured here
+# (the step's default --deadline is 300).
+MIN_RUNNER_S = 20
 
 
 class Demo:
@@ -120,8 +128,8 @@ class Demo:
         # The runner's own process bound is its --deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S
         # (TXE-8053): give it that much less, so it ends inside the wait below (left - margin/2).
         runner_deadline = int(self.left() - self.margin - ms.EMERGENCY_CLEANUP_S - ms.TERMINATION_MARGIN_S)
-        if runner_deadline < 10:
-            raise ms.Stopped(f"only {runner_deadline}s left for the runner")
+        if runner_deadline < MIN_RUNNER_S:
+            raise ms.Stopped(f"only {runner_deadline}s left for the runner (it needs {MIN_RUNNER_S}s)")
         report = self.evidence / f"{self.args.step}.report.json"
         argv = [sys.executable, "-I", str(HERE / "mutate-sandboxed.py"), "--mutants", str(root / "fixture" / "mutants.json"),
                 "--tree", str(root / "fixture"), "--shared-modcache", str(modcache), "--shared-gocache", str(gocache),
