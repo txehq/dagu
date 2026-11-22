@@ -307,8 +307,19 @@ class Refused(unittest.TestCase):
         for cmd in ('python3 -c "import subprocess; subprocess.run([\'kubectl\', \'get\', \'ns\'])"',
                     "python3 - <<'EOF'\nimport os; os.system('kubectl get ns')\nEOF", "ssh host kubectl get pods",
                     "find . -exec kubectl apply -f {} \\;", "docker run --rm bitnami/kubectl:1.31 get pods",
-                    "tmux send-keys 'kubectl get pods' Enter"):
+                    "tmux send-keys 'kubectl get pods' Enter",
+                    # Connector review of b0e344e3: an opaque executor reading the PIPE or an input redirection, and
+                    # sudo/doas shell modes (code receivers, not argv passthrough), in a client-relevant line.
+                    "echo 'kubectl get secrets' | su -s /bin/bash root", "echo kubectl get ns | ssh host",
+                    "echo kubectl get ns | docker exec -i c sh", "echo kubectl > f; ssh host < f",
+                    "echo 'kubectl get secrets' | sudo -n -s", "echo kubectl get ns | sudo -s",
+                    "echo kubectl get ns | sudo -i", "echo kubectl get ns | sudo --shell", "echo kubectl get ns | sudo --login",
+                    "echo kubectl get ns | doas -s", "sudo -s <<< 'kubectl get ns'", "echo kubectl get ns | sudo -ns",
+                    "echo kubectl get ns | timeout 5 sudo -s"):
             self.deny(cmd, "H03")
+        # Without a client in the line, these are unchanged.
+        for cmd in ("echo hi | sudo -s", "ls | ssh host cat", "sudo -n true", "echo x | su -s /bin/sh u"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_help_is_its_final_value_and_server_side_template_is_an_api_call(self):
         # Connector review of bcca1dcc and 85bde125: help counts only when its LAST value is true, and helm

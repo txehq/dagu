@@ -153,7 +153,10 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 #     the languages inside awk, sed and jq. Their own escapes and run-time construction are the documented limit.
 #   - argv passthrough, no grammar: env (without -S), timeout, gtimeout, nice, nohup, sudo, doas, command, exec,
 #     builtin, time, stdbuf, caffeinate, unbuffer (WRAPPERS, closed option tables), and k3s/microk8s/minikube
-#     before kubectl (VENDOR_WRAPPERS).
+#     before kubectl (VENDOR_WRAPPERS). EXCEPT sudo/doas shell modes (SHELL_MODE_OPTIONS: -s, -i, --shell,
+#     --login), which are code receivers and are refused in a client-relevant line.
+#   An OPAQUE executor or interpreter reading a pipe or an input redirection in a client-relevant line is refused,
+#   as a shell reading one is.
 UNMODELLED_SHELLS = {"fish"}
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time", "coproc"}
 OPAQUE = {"ssh", "find", "parallel", "su", "script", "expect", "tmux", "screen", "docker", "podman", "nsenter",
@@ -182,12 +185,16 @@ WRAPPER_FLAGS = {
              "--askpass", "--background", "--preserve-env", "--set-home", "--login", "--remove-timestamp",
              "--reset-timestamp", "--non-interactive", "--preserve-groups", "--stdin", "--shell"},
     "doas": {"-n", "-s"}, "caffeinate": {"-d", "-i", "-m", "-s", "-u"}, "unbuffer": {"-p"},
+    # (sudo/doas shell modes are flags here, but they are code receivers: see SHELL_MODE_OPTIONS.)
     "watch": {"-t", "--no-title", "-e", "--errexit", "-g", "--chgexit", "-b", "--beep", "-c", "--color", "-x",
               "--exec", "-p", "--precise"},
     "xargs": {"-0", "--null", "-r", "--no-run-if-empty", "-t", "--verbose", "-p", "--interactive", "-x", "--exit"},
     "timeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
     "gtimeout": {"--preserve-status", "--foreground", "-v", "--verbose"},
 }
+# wrapper -> its options that start a SHELL (a code receiver: it reads a pipe or stdin when no command follows), not
+# argv passthrough. In a client-relevant line they are refused (H03) in _unwrap.
+SHELL_MODE_OPTIONS = {"sudo": {"-s", "--shell", "-i", "--login"}, "doas": {"-s"}}
 # wrapper -> its options whose value is OPTIONAL and can only be attached (GNU getopt `x::`): the bare form takes
 # NO value, so the next word is never consumed (`watch -d 'kubectl get secrets'` runs the quoted command). An
 # attached short form (`-d1`, `-ifoo`) is not modelled and is treated as unknown (fail closed); `--long=value`
@@ -1115,6 +1122,12 @@ class Guard:
             # `ssh host < <(echo kubectl get secrets)` feeds the process substitution's text to the remote shell).
             if any(mentions(t) for t in args + cmd["stdin"] + cmd.get("redirect_targets", [])):
                 raise Refusal("H03")
+            # The PIPE and an input redirection are channels too (connector review of b0e344e3:
+            # `echo 'kubectl get secrets' | su -s /bin/bash root`). In a client-relevant line an opaque executor
+            # reading either is refused (H03), the same rule as a shell or interpreter reading a pipe.
+            if self.whole_mentions and (
+                    cmd.get("piped") or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", []))):
+                raise Refusal("H03")
             return
         if base in GLOBAL_MUTATORS:
             raise Refusal("H06", base)
@@ -1212,6 +1225,13 @@ class Guard:
             if a == "--":
                 rest = rest[1:]
                 break
+            if a in SHELL_MODE_OPTIONS.get(base, ()) and self.whole_mentions:
+                # A shell mode is a code receiver, not argv passthrough (connector review of b0e344e3): `sudo -s`
+                # and `sudo -i` run the target user's shell, which reads the PIPE or stdin when no command follows
+                # (`echo 'kubectl get secrets' | sudo -n -s`). In a client-relevant line it is refused (H03), the
+                # same rule as a shell reading a pipe. A cluster holding the letter (`-ns`) is an unknown option and
+                # is already refused there.
+                raise Refusal("H03")
             if base == "command" and a in ("-v", "-V"):
                 return None
             if base == "env" and ((a.startswith("--") and len(a.partition("=")[0]) > 2

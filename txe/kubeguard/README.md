@@ -411,9 +411,13 @@ of four ways (the inventory is in the source, above `UNMODELLED_SHELLS`):
   - every `xargs` in a client line.
 - **Opaque, refused when its text names a client (H03/H15):** interpreters, OPAQUE executors, and every
   unclassified command, including the languages inside `awk`, `sed` and `jq`. Their own escapes and run-time
-  construction are the documented limit.
+  construction are the documented limit. In a client line, an opaque executor reading a pipe or an input
+  redirection is refused too (`echo 'kubectl get secrets' | su -s /bin/bash root`, `... | ssh host`), as a shell
+  reading one is.
 - **Argv passthrough with closed option tables:** `env` (without `-S`), `timeout`, `nice`, `nohup`, `sudo`,
-  `doas`, `command`, `exec` and the rest of `WRAPPERS`, and `k3s`/`microk8s`/`minikube kubectl`.
+  `doas`, `command`, `exec` and the rest of `WRAPPERS`, and `k3s`/`microk8s`/`minikube kubectl`. The exception is
+  sudo's and doas's shell modes (`-s`, `-i`, `--shell`, `--login`). They start a shell that reads the pipe or
+  stdin, so they are code receivers, and in a client line they are refused (H03).
 
 Expected false refusals from this rule: `fish -c 'echo hi'`, `echo x | fish`, and `env -S 'date\tx'` or
 `env -S '$HOME/bin/tool'`.
