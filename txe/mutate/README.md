@@ -138,6 +138,36 @@ and process substitution, redirections, here-documents) and judges only what wou
   runs a file or a process (`runpy`, `exec`, `subprocess`, `os.system`, `require`, `load`, ...),
   also when the mutant is one of the code's own arguments (`python3 -c '...' mutants.py`: the
   guard does not follow data flow, so it errs toward refusing).
+- **Python data reads versus execution (TXE-8183).** The shared run-call list above has
+  other-language words (`load`, `system`, `require`), so `json.load(...)` used to count as running
+  a file. Python code (`python3 -c`, or a here-document, here-string or descriptor on python3's
+  stdin) is now parsed with `ast.parse`, which builds a tree and runs nothing. It is cleared as
+  data only when every construct is in a small supported grammar:
+  - imports only of `json`, `ast` (parse, dump, walk, literal_eval, ...), `sys`, `re`, `hashlib`,
+    `pprint`, `collections`, `csv` and `base64`,
+    and only their listed attributes;
+  - calls only to listed builtins, to listed methods (`read`, `get`, `split`, ...), which are also
+    the only attributes allowed on anything but a module and only when called, and to
+    functions the code defines;
+  - `open()` only in a literal read mode, and with no opener;
+  - no class, no async code, no name or attribute starting with `_`, and no `exec`, `eval`,
+    `compile`, `getattr`, `globals`, `vars`, `type` or similar name anywhere.
+
+  Cleared code is data, whatever its arguments, variables or tokens name. That includes
+  `mutants.json` and a `mutate-sandboxed-*` work directory, so a runner's `report.json` can be
+  read. Code that is not cleared is judged as before, with two additions:
+  - executable deserialization and dynamic access count as run calls (`pickle`, `marshal`,
+    `importlib`, `getattr`, `__builtins__`, ...): `pickle.load` is execution and `json.load` is
+    not;
+  - an input names a mutant when ANY path component does, whatever its extension. So
+    `exec(open("mutants.json").read())`, `runpy` on `mutants` or on a `.txt` file, and execution of
+    a file under a `mutate-sandboxed-*` work directory are refused.
+
+  No extension or path is exempt. A pathname alone proves neither execution nor its absence;
+  only code shown not to execute makes its inputs data. A command that sets any `PYTHON*` variable
+  (PYTHONPATH, PYTHONSTARTUP, ...) is judged by the language-neutral rule, because such a
+  variable can change what `import json` loads. Every newly allowed read in `guardAllowed` has
+  executing counterparts in `guardRefused`.
 - **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
   `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
   and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
@@ -174,6 +204,19 @@ the controls for them.
   (`while read l; do python3; done < mutants.py`). `( … )` and `{ …; }` groups do.
 - State set outside the command: an exported variable, an alias or function from the shell's rc
   files, an `exec 3<` in an earlier call.
+- **Python's import path outside the command (TXE-8183).** A cleared data read trusts that
+  `import json` loads the standard module. Without `-I`, Python also imports from the current
+  directory, so a file named `json.py` there would be loaded instead: that is a renamed script. A
+  `PYTHON*` variable exported earlier is state outside the command.
+- **`python3 -i -c CODE`** reads more program from stdin after CODE. Only CODE is judged (this was
+  so before TXE-8183).
+- **Other languages keep the shared run-call list.** `node -e`, `perl -e` and `ruby -e` code are
+  judged as before, and no read-only grammar clears them. They can still be refused for a word
+  like `load` or `require` used as data.
+- **Python's path-component rule over-refuses.** Uncleared Python code that may run something
+  is refused when any word names a mutant in any component, for example
+  `subprocess.run(["go", "test", "./txe/mutate/..."])`. That code is not a data read; ask your
+  coordinator.
 
 A shape gets a parser fix only when an agent would plausibly write it by accident while running a
 mutant, with a fixture in `guardRefused` that shows it.

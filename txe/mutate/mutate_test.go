@@ -755,6 +755,47 @@ var guardRefused = []string{
 	`perl -I ./mutants.pl -e 'do "x"'`,
 	"python3 /dev/fd/3 3< /dev/fd/4",
 	"python3 /dev/fd/3 3> /dev/fd/4",
+	// TXE-8183: each Python data read newly allowed in guardAllowed is paired here with code that
+	// EXECUTES the same kind of input. An extension, a missing extension or a runner-like path does
+	// not make an executed input data; only code proven not to execute does.
+	// Data extensions, executed (allowed before TXE-8183: the code token needed a script extension).
+	`python3 -c 'exec(open("mutants.json").read())'`,
+	`python3 -c 'import pickle; pickle.load(open("mutants.json", "rb"))'`,
+	"python3 - <<'EOF'\nimport json\nexec(json.load(open(\"mutants.json\"))[\"code\"])\nEOF",
+	`python3 -c 'import sys; exec(open(sys.argv[1]).read())' mutants.json`,
+	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' mutants.txt`,
+	`python3 -c 'import json, sys; exec(json.load(open(sys.argv[1]))["code"])' mutants.json`,
+	// Extensionless files, executed.
+	`python3 -c 'exec(open("mutants").read())'`,
+	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' mutants`,
+	// Runner-like paths, executed (the work directory is a path component, not the base name).
+	`python3 -I -c 'import sys; exec(open(sys.argv[1]).read())' /tmp/mutate-sandboxed-1_y5j3xh/report.json`,
+	`python3 -c 'import subprocess, sys; subprocess.run([sys.executable, sys.argv[1]])' /tmp/mutate-sandboxed-1_y5j3xh/sandbox/tool.py`,
+	`W=/tmp/mutate-sandboxed-1_y5j3xh; python3 -I -c 'import sys; exec(open(sys.argv[1]).read())' $W/report.json`,
+	`python3 -c 'import runpy, sys; runpy.run_path(sys.argv[1])' /tmp/mutate-sandboxed-1_y5j3xh/.mutate-sandboxed-owned`,
+	// Aliases and language-specific run calls next to an allowed data read.
+	`python3 -c 'import builtins as b, sys; b.exec(open(sys.argv[1]).read())' mutants.json`,
+	`python3 -c 'from runpy import run_path as go; import sys; go(sys.argv[1])' mutants.cfg`,
+	`python3 -c 'from os import system as s; import json, sys; s("python3 " + sys.argv[1])' mutants.json`,
+	`python3 -c 'import sys; getattr(__builtins__, "ex" + "ec")(open(sys.argv[1]).read())' mutants.json`,
+	`python3 -c 'import json, sys; json.__dict__["__builtins__"]["ex" "ec"](open(sys.argv[1]).read())' mutants.json`,
+	`python3 -c 'import sys; sys.modules["os"].system("python3 " + sys.argv[1])' mutants.json`,
+	`python3 -c 'import pickle, sys; print(pickle.load(open(sys.argv[1], "rb")))' mutants.pkl`,
+	`python3 -c 'import marshal, sys; exec(marshal.loads(open(sys.argv[1], "rb").read()))' mutants.bin`,
+	`python3 -c 'import importlib.util as u, sys; s = u.spec_from_file_location("m", sys.argv[1])' mutants.dat`,
+	// Counterparts of observed false positives 7 and 8: the same variables and arguments, executed.
+	`K=$R/mutate-sandboxed-1_y5j3xh; python3 -I -c 'import json,sys; exec(json.load(open(sys.argv[1]))["code"])' $E/report.json`,
+	`T=tests/scripts/test_mutant_consumers.py; python3 -I -c 'import ast,sys; exec(compile(ast.parse(open(sys.argv[1]).read()), "m", "exec"))' $T`,
+	`python3 -I -c 'import ast, runpy, sys; ast.parse(open(sys.argv[1]).read()); runpy.run_path(sys.argv[1])' tests/scripts/test_mutant_consumers.py`,
+	// Code outside the read-only grammar is not cleared, so its JSON read of a mutant-named input
+	// is judged by the run-call rule (security review of 3b91409a7): open() in a write mode hidden
+	// by *args or passed to map, and a coding declaration that changes how Python decodes stdin.
+	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); open(*[sys.argv[1], "w"])' mutants.json`,
+	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map(open, [sys.argv[1]], ["w"]))' mutants.json`,
+	"python3 - <<'EOF'\n# -*- coding: utf-7 -*-\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map((x for x in ()).gi_frame.f_globals["__builtins__"]["exec"], ["print(1)"]))' mutants.json`,
+	// A data read whose imports a PYTHON* variable can redirect is judged by the language-neutral rule.
+	`PYTHONPATH=/tmp/x python3 -c 'import json, sys; print(json.load(open(sys.argv[1])))' mutants.json`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -863,6 +904,28 @@ var guardAllowed = []string{
 	"case $x in mutants) echo python3 mutants.py;; esac",
 	"for f in mutants.py run-mutations.sh; do wc -l $f; done",
 	"cat <<'A' <<'B'\npython3 mutants.py\nA\nbash run-mutations.sh\nB",
+	// TXE-8183: Python code proven not to execute reads data, whatever it is given. Each shape is
+	// paired with executing counterparts in guardRefused.
+	// Observed false positive 6 (cc1, 2026-11-22 15:20Z, TXE-7549 comment 59b3690c), verbatim
+	// with the worktree path replaced.
+	`cd /home/u/work/txe-8047 && sed -n 54,66p conftest.py; python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r["suites"]["pytest-mutants"],indent=1)); print(r["images"])' ops/ci/mutant-consumers.json`,
+	// Observed false positive 7 (cc1, 2026-11-22 16:03:00Z, TXE-7549 comment ac5e6264), verbatim
+	// from the transcript copy (txe-8047 hook-refusal-case2-exact.json, sha256 0c8321b6...) with
+	// the scratchpad path replaced. K names the runner's work directory.
+	`SP=/tmp/scratch; E=$(cat $SP/first-run2-E.txt); R=$(cat $SP/first-run2-R.txt); K=$R/mutate-sandboxed-1_y5j3xh; O=$E/post-run.txt; { echo "== container custody"; python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print("container_cleanup:", json.dumps(r.get("container_cleanup"))); print("workdir:", json.dumps(r.get("workdir"))); print("image:", json.dumps(r.get("image"))); print("tree:", json.dumps(r.get("tree"))); print("seeded:", r.get("seeded"))' $E/report.json; for c in "$K"/cids/*; do echo "cidfile $(basename $c): $(cat $c)"; cid=$(cat $c); echo "  docker inspect now: $(docker inspect --format '{{.Id}}' $cid 2>&1 | head -1)"; done; echo "owner token file present: $(test -f $K/.mutate-sandboxed-owned && echo yes)"; } >> $O 2>&1; command cp -p "$K/report.json" $E/logs/workdir-report.json; tail -12 $O; cd $E && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs shasum -a 256 >| SHA256SUMS && cat SHA256SUMS`,
+	// Observed false positive 8 (cc1, 2026-11-22 16:08:51Z, TXE-7549 comment 11e5209c), verbatim
+	// (txe-8047 HOOK-REFUSAL-3-exact.json, sha256 518ba63a...): a sed edit whose text says
+	// globals(), then an ast parse and a json parse. T names a test file with mutant in its name.
+	`T=tests/scripts/test_mutant_consumers.py; sed -i '' -e 's|    monkeypatch.setattr(sys.modules\[__name__\], "REGISTRY", tmp_path / "reg.json")|    monkeypatch.setitem(globals(), "REGISTRY", tmp_path / "reg.json")|' -e 's|    monkeypatch.setattr(sys.modules\[__name__\], "VALIDATION_IMAGE", tmp_path / "man.json")|    monkeypatch.setitem(globals(), "VALIDATION_IMAGE", tmp_path / "man.json")|' $T; grep -n 'monkeypatch.setitem(globals()' $T; python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read()); print("ast ok (parser)")' $T; python3 -I -c 'import json,sys; json.load(open(sys.argv[1])); print("json ok (parser)")' ops/ci/validation-image/manifest.json`,
+	// The same parse that passed earlier that day, with the file as its argument.
+	`python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' tests/scripts/test_mutant_consumers.py`,
+	`python3 -c 'import ast, sys; print(ast.dump(ast.parse(open(sys.argv[1]).read())))' mutants.py`,
+	`python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
+	`M=mutants.json python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$M"`,
+	`python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["container_cleanup"])' /tmp/mutate-sandboxed-1_y5j3xh/report.json`,
+	`python3 -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' mutants`,
+	"python3 -I - <<'EOF'\nimport json\nwith open(\"mutants.json\") as f:\n    r = json.load(f)\nprint(r[\"container_cleanup\"])\nEOF",
+	`python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' /tmp/mutate-sandboxed-1_y5j3xh/.mutate-sandboxed-owned`,
 }
 
 // The guard hook refuses a mutation run started outside mutate-sandboxed and leaves everything else.
