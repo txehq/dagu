@@ -156,6 +156,12 @@ IMPLICIT_READ_VERBS = {"describe", "top", "cluster-info"}
 # logs reads the pod's log (pods/log). For any other TYPE/NAME it first reads that object and then its pods
 # (polymorphichelpers/logsforobject.go:169-175), so only pod operands are accepted.
 LOG_POD_TYPES = {"pod", "pods", "po"}
+# The verbs that accept operands after `--`, and the rule that checks them there (the same as before `--`).
+TERMINATOR_OPERANDS = {
+    "get": "resource operands: TYPE[,TYPE], TYPE/NAME, or a type then NAMEs; `all` refused as a type",
+    "rollout": "the subcommand's object operand (TYPE/NAME)",
+    "logs": "pod operands only (LOG_POD_TYPES); any other TYPE/NAME refused",
+}
 # Mutating, interactive and tunnelling verbs: refused with a read-only message, before any file is read.
 MUTATING_VERBS = {"delete", "edit", "patch", "label", "annotate", "scale", "wait", "apply", "create", "replace",
                   "diff", "exec", "cp", "attach", "port-forward", "run", "debug", "proxy", "expose", "autoscale",
@@ -254,10 +260,17 @@ def parse_request(args, default_namespace):
     while i < len(args):
         a = args[i]
         if a == "--":
-            # kubectl reads what follows `--` as operands. For a verb whose operands are resources, those are
-            # authorized too. For exec and the other fixed-resource verbs, they are the command run in the pod.
-            if pos and isinstance(VERBS.get(pos[0]), int):
-                pos.extend(args[i + 1:])
+            # kubectl reads what follows `--` as operands. kube-run forwards NOTHING it did not inspect: a token
+            # after `--` joins the operands only for a verb in TERMINATOR_OPERANDS, whose own operand rule then
+            # authorizes or refuses it. For every other verb (events, auth, the discovery verbs, or no verb yet),
+            # any token after `--` is refused (connector-driven local-15 finding: logs used to drop them from
+            # authorization while kubectl still read them).
+            after = args[i + 1:]
+            if after:
+                if not pos or pos[0] not in TERMINATOR_OPERANDS:
+                    raise Refused("KR05", "tokens after -- are operands this verb does not authorize; kube-run "
+                                          "forwards nothing it did not inspect")
+                pos.extend(after)
             break
         if a in NAMESPACE_FLAGS:
             if i + 1 >= len(args) or args[i + 1].startswith("-"):

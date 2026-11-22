@@ -45,6 +45,27 @@ a context can be repointed inside its file. This directory holds the source of t
   | `rollout history` | RESTMapper | the object, AND ReplicaSets (`polymorphichelpers/history.go:313-319`) or ControllerRevisions (`:338`, `:359`) | none | REMOVE (KR05) |
 
   Every verb also reads cached discovery metadata. That is metadata, not a resource grant.
+
+  **What kube-run does and does not establish here:**
+  - **Resource versus category.** kube-run does NOT positively tell a resource from a category: it decides
+    before any cluster contact, with no discovery data. It refuses the one built-in category, `all` (as a type,
+    also inside `pods,all` and `all/x`). A category a CRD declares (`categories:`) is NOT detected. kubectl
+    expands it through discovery (cli-runtime `builder.go:642-654`), and a record granting that literal name
+    would authorize its whole expansion. This rests on an explicit trusted-configuration ASSUMPTION, not runtime
+    enforcement: whoever writes authorization records names resource types only, never a category, and knows
+    the cluster's CRD categories. kube-run does not check it.
+  - **Discovery metadata.** Every verb reads API discovery (`/api`, `/apis`, cached) through the RESTMapper.
+    `explain` also reads the OpenAPI document, and `version` reads `/version`. Records do NOT authorize or scope
+    this metadata: it is read with the cluster credential and is not limited by kube-run. It reveals the
+    cluster's resource types and versions, not objects.
+  - **Subresources.**
+    - `logs` reads the `pods/log` subresource of the named pods. A `logs` grant on `pods` is taken to authorize
+      both the pods read and `pods/log`, with no separate `pods/log` entry. That is a stated semantic of the
+      record, not separate enforcement.
+    - `events` reads only the `events` resource, by list and watch, with no subresource.
+    - `rollout status` lists and watches the named object's resource. It reads the status field, with no
+      subresource.
+    - `get --subresource=<s>` must be granted as `<type>/<s>`, which is enforced.
   Every mutating, interactive or tunnelling verb is refused before contact: `delete`, `edit`, `patch`, `label`,
   `annotate`, `scale`, `wait`, `apply`, `create`, `replace`, `diff`, `exec`, `cp`, `attach`, `port-forward`,
   `run`, `debug`, `proxy`, `expose`, `autoscale`, `set`, `drain`, `cordon`, `uncordon`, `taint`, `certificate`,
@@ -62,7 +83,11 @@ a context can be repointed inside its file. This directory holds the source of t
     its value separately;
   - a value is never another option, so `-o --namespace x` and `-l -A` are refused. A value that looks like an
     option (`--tail=-1`, `--tail -1`) is refused rather than reinterpreted. `--opt=value` is read explicitly,
-    and after `--` every token is an operand;
+    and after `--` every token is an operand. **kube-run forwards nothing it did not inspect:** only `get`,
+    `rollout` and `logs` (`TERMINATOR_OPERANDS`) take operands after `--`, each checked by its own operand rule.
+    For every other verb, or before a verb, any token after `--` is refused (KR05). After a bare type, later
+    words are names: kubectl expands aliases and categories only in the first argument (cli-runtime
+    `resource/builder.go`, `ResourceTypeOrNameArgs`);
   - `-f`/`--filename`/`-k`/`--kustomize` (file or kustomization reads) are refused on every verb.
   The registry entry must pin kubectl by absolute path. kube-run never looks kubectl up on the caller's PATH.
   Example: `kube-run --authorization rec.json txe-onprem-ci -- get pods -n arc-runners -o wide`.

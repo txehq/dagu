@@ -531,6 +531,19 @@ class RequestScope(Base):
         self.refused_by_parser(["logs", "pod-a", "--", "secrets/b"])
         r = self.scope(["logs", "pod-a", "--", "pod/b"])
         self.assertEqual((r["verb"], r["resources"]), ("logs", ["pods"]))
+        # local-15 finding: kube-run forwards NOTHING it did not inspect. After `--`, only TERMINATOR_OPERANDS
+        # verbs take operands, checked by their own rule; for every other verb, or before a verb, it is KR05.
+        for args in (["logs", "--", "deploy/x"], ["logs", "pod-a", "--", "deploy/x"], ["events", "--", "x"],
+                     ["version", "--", "x"], ["auth", "can-i", "get", "pods", "--", "x"], ["get", "--", "all"],
+                     ["api-resources", "--", "x"], ["explain", "pods", "--", "x"]):
+            self.refused_by_parser(args)
+        self.assertEqual(set(kr.TERMINATOR_OPERANDS), {"get", "rollout", "logs"})
+        # After a bare type, kubectl's builder treats every later word as a NAME, and expands aliases and
+        # categories only in the first (cli-runtime resource/builder.go ResourceTypeOrNameArgs). So `svc` and `all`
+        # there are pod names.
+        self.assertEqual(self.scope(["get", "pods", "--", "svc"])["resources"], ["pods"])
+        self.assertEqual(self.scope(["get", "pods", "--", "all"])["resources"], ["pods"])
+        self.assertEqual(self.scope(["get", "pods/a", "--", "svc/b"])["resources"], ["pods", "svc"])
         self.refused(["txe-onprem-ci", "--", "get", "pods/a", "-n", "arc-runners", "--", "secrets/b"], "KR08")
 
     def test_an_attached_or_clustered_short_server_override_is_refused(self):
