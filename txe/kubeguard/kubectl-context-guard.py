@@ -140,6 +140,20 @@ SAFE_SUBCOMMANDS = CLUSTER_VERBS | KUBECTL_LOCAL_1 | HELM_LOCAL | {"version", "c
                                                                    "export", "envsubst", "info"}
 
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+# SUB-GRAMMAR INVENTORY (root msg_ed14544cad6a: never classify one grammar by silently treating it as another). The
+# text a recognized wrapper or code receiver runs is read in ONE of these ways, and nothing else:
+#   - POSIX/Bash shell text, by this file's lexer: sh, bash, zsh, dash and ksh with -c, stdin or a here-document;
+#     eval; $(...), backticks and <(...)/>(...); watch's words (it runs sh -c); env -S payloads with no `\` or `$`.
+#     zsh, dash and ksh differ from Bash only where the decoded forms over-approximate (dash has no $'...').
+#   - REFUSED, because the grammar is not modelled (H03): fish text (UNMODELLED_SHELLS); an env -S payload with
+#     a backslash or `$` (env's own escapes and ${NAME}); every xargs in a client line (it builds argv from input).
+#   - OPAQUE, refused when the text names a client (H03/H15, read through mention_forms): interpreters (python,
+#     node, perl, ...), OPAQUE executors (ssh, docker, find -exec, ...), and every unclassified command, including
+#     the languages inside awk, sed and jq. Their own escapes and run-time construction are the documented limit.
+#   - argv passthrough, no grammar: env (without -S), timeout, gtimeout, nice, nohup, sudo, doas, command, exec,
+#     builtin, time, stdbuf, caffeinate, unbuffer (WRAPPERS, closed option tables), and k3s/microk8s/minikube
+#     before kubectl (VENDOR_WRAPPERS).
+UNMODELLED_SHELLS = {"fish"}
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time", "coproc"}
 OPAQUE = {"ssh", "find", "parallel", "su", "script", "expect", "tmux", "screen", "docker", "podman", "nsenter",
           "chroot", "flock", "rsudo", "osascript", "alias", "trap", "nix-shell", "devbox", "make", "just",
@@ -1053,6 +1067,13 @@ class Guard:
         w = words[0][0]
         base = os.path.basename(w)
         args = [x[0] for x in words[1:]]
+        if base in UNMODELLED_SHELLS and (
+                cmd.get("piped") or cmd["stdin"] or any(a.startswith("-") for a in args)
+                or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", []))):
+            # fish's grammar is not the POSIX shell's this lexer reads (`\x63` and `\u` escapes outside quotes,
+            # `(cmd)` substitution without `$`, different quoting), so text it would run is refused (H03), whatever
+            # it seems to name. `fish ./script.fish` (a script file, opaque as for every shell) is unchanged.
+            raise Refusal("H03")
         runs_text = base in SHELLS or base in ("eval", "source", ".") or bool(INTERPRETERS.match(base))
         if runs_text and self.whole_mentions and (
                 cmd.get("piped") or any(a.startswith(("<(", ">(")) or "$(" in a or "`" in a for a in args)):
@@ -1188,6 +1209,14 @@ class Guard:
                     text = rest[1][0] if len(rest) > 1 else ""
                 else:
                     text = a.partition("=")[2] if a.startswith("--") else a[2:]
+                # env's split-string grammar is NOT the shell's (connector review of 3fd542d9): `\_` separates
+                # arguments, `\c` ends the string, `\t` and the other escapes make characters, and `${NAME}` expands
+                # a variable, so `env -S 'kubectl\_get\_secrets'` runs `kubectl get secrets`. The hook does not
+                # model that grammar, so a payload holding a backslash or a `$` is refused (H03), whatever it
+                # seems to name. The check reads the payload as env receives it (after this shell's quote removal).
+                # Without them, the payload's words split as in the shell and it is checked as shell text.
+                if "\\" in text or "$" in text:
+                    raise Refusal("H03")
                 # env splits only S; the words after it keep their boundaries, so they are re-quoted, not joined
                 # (`env -S bash -c 'kubectl get secrets'` runs bash with ONE -c argument).
                 after = rest[2:] if separate else rest[1:]

@@ -381,6 +381,26 @@ Also:
   client in the line, xargs is unchanged (`ls | xargs echo`);
 - the forms the lexer cannot parse (H05).
 
+**Sub-grammars: one inventory, and refusal where a grammar is not modelled.** The hook never classifies one
+grammar by treating it as another. The text that a recognized wrapper or code receiver runs is read in exactly one
+of four ways (the inventory is in the source, above `UNMODELLED_SHELLS`):
+- **POSIX/Bash shell text**, read by the lexer. This covers `sh`/`bash`/`zsh`/`dash`/`ksh` with `-c`, stdin or a
+  here-document; `eval`; substitutions; `watch` (which runs `sh -c`); and an `env -S` payload with no `\` or `$`.
+- **Refused (H03), because the grammar is not modelled:**
+  - text that `fish` would run (`-c`, any option, a pipe, stdin or an input redirection). Only `fish <script>`
+    is unchanged;
+  - an `env -S`/`--split-string` payload holding a backslash or `$` (env's `\_` separator, `\c`, escapes and
+    `${NAME}`), in every spelling, whether or not a client is visible;
+  - every `xargs` in a client line.
+- **Opaque, refused when its text names a client (H03/H15):** interpreters, OPAQUE executors, and every
+  unclassified command, including the languages inside `awk`, `sed` and `jq`. Their own escapes and run-time
+  construction are the documented limit.
+- **Argv passthrough with closed option tables:** `env` (without `-S`), `timeout`, `nice`, `nohup`, `sudo`,
+  `doas`, `command`, `exec` and the rest of `WRAPPERS`, and `k3s`/`microk8s`/`minikube kubectl`.
+
+Expected false refusals from this rule: `fish -c 'echo hi'`, `echo x | fish`, and `env -S 'date\tx'` or
+`env -S '$HOME/bin/tool'`.
+
 **Expected false refusals, documented:** text that only QUOTES a client name, inside a command that is not a data
 context, is refused too. Examples: an orchestration message (`orca orchestration ask --question 'run kubectl get
 pods?'`), a `gh` comment, an `rg` search, a `git commit -m` message, `git log --grep` and `man kubectl`. Write such

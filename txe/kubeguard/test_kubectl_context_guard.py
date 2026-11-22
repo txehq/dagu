@@ -276,6 +276,23 @@ class Refused(unittest.TestCase):
                     "env -S 'bash -c' 'kubectl get secrets'"):
             r = self.deny(cmd, "H01", "kubectl", "get")
             self.assertIn("nested", r, cmd)
+        # Connector review of 3fd542d9 and root msg_ed14544cad6a: env's split-string grammar is not the shell's
+        # (`\_` separates arguments, `\c` ends, `\t` and others are escapes, `${NAME}` expands), so a payload holding
+        # a backslash or `$` is refused (H03) in every spelling, whether or not a client is visible.
+        for cmd in ("env -S 'kubectl\\_get\\_secrets'", "env -S'kubectl\\_get\\_secrets'",
+                    "env --split-string='kubectl\\_get\\_secrets'", "env --split-string 'kubectl\\_get'",
+                    'env -S "kubectl\\_get\\_secrets"', "env -S 'x\\cy'", "env -S 'date\\tx'",
+                    "env -S 'kubectl${X}'", "env -S '$K get pods'", "env -S'${K}'"):
+            self.deny(cmd, "H03")
+        # The same rule for an unmodelled SHELL: fish's grammar (`\x63` escapes outside quotes, `(cmd)`
+        # substitution) is not the one this lexer reads, so any text fish would run is refused (H03).
+        for cmd in ("fish -c 'kube\\x63tl get secrets'", "fish -c 'echo hi'", "fish --command='ls'", "echo x | fish",
+                    "fish <<< 'kubectl get ns'", "fish < cmds.fish", "env -S 'fish -c ls'", "timeout 5 fish -c ls"):
+            self.deny(cmd, "H03")
+        # Allowed: a payload without env's escapes, read as env receives it (an unquoted `\_` is removed by this
+        # shell, so env gets `kubectl_get`, which is not a client), and a fish script file.
+        for cmd in ("env -S 'date -u'", "env -S date", "env -S kubectl\\_get", "fish ./script.fish"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_opaque_executors(self):
         # Inert strings fed to the hook as command text; nothing here is executed (os.system included).
