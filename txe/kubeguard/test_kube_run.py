@@ -66,7 +66,8 @@ SERVER = "https://127.0.0.1:9"
 OTHER_SERVER = "https://127.0.0.1:10"
 
 
-def kubeconfig(server=SERVER, ca=CA, ctx_cluster="ci", insecure=False, extra_cluster="", users=None, head=""):
+def kubeconfig(server=SERVER, ca=CA, ctx_cluster="ci", insecure=False, extra_cluster="", users=None, head="",
+               ctx_ns="arc-runners"):
     b64 = base64.b64encode(ca).decode()
     other = base64.b64encode(OTHER_CA).decode()
     # insecure: False (no key), True (`true`), or the value's exact source text (a str, quotes kept; "" = empty).
@@ -103,7 +104,8 @@ def kubeconfig(server=SERVER, ca=CA, ctx_cluster="ci", insecure=False, extra_clu
             "contexts:\n"
             "- context:\n"
             f"    cluster: {ctx_cluster}\n"
-            "    namespace: arc-runners\n"
+            # ctx_ns: the namespace value's exact source text (quotes kept), "" for an empty value, None for no key.
+            + ("" if ctx_ns is None else f"    namespace:{' ' + ctx_ns if ctx_ns else ''}\n") +
             "    user: ci-user\n"
             "  name: txe-onprem-ci\n"
             "current-context: txe-onprem-ci\n"
@@ -309,6 +311,47 @@ class PreContactPinsRefuseWithoutAProbe(Base):
         F.kc.write_text(kubeconfig(server="https://127.0.0.1:9/k8s"))
         rc, _, e, _ = call(ARGS)
         self.assertEqual(rc, 0, e)
+
+    def test_context_namespace_is_read_as_kubectl_reads_it_or_refused(self):
+        # Connector review of 6a4b64b3: an unquoted `namespace: null` was read as the string "null", while kubectl
+        # decodes YAML null as empty and client-go then uses "default", so a record granting "null" authorized a read
+        # of `default`. Implicit YAML non-strings, empty values and non-names are refused (KR11) before any kubectl
+        # call, with and without -n (the pinned context itself is not accepted).
+        no_n = ["txe-onprem-ci", "--", "get", "pods"]
+        for value in ("null", "Null", "NULL", "~", "true", "True", "yes", "on", "off", "no", "y", "n", "false",
+                      "0", "123", "-1", "0x1f", "0o17", "017", "0b101", "1e3", "1.5", ".5", ".inf", ".nan",
+                      "", "''", '""', "Arc-Runners", "arc_runners", "'arc runners'", '"a.b"', "-x"):
+            F.kc.write_text(kubeconfig(ctx_ns=value))
+            F.write_record(namespaces=["null", "arc-runners", "default"])
+            self.refused(ARGS, "KR11")
+            self.refused(no_n, "KR11")
+        # Quoted names are strings, and are matched EXACTLY: `"null"` is the namespace null, never `default`.
+        F.kc.write_text(kubeconfig(ctx_ns='"null"'))
+        F.write_record(namespaces=["null"])
+        rc, _, e, t = call(no_n)
+        self.assertEqual((rc, len(t.calls)), (0, 2), e)
+        F.write_record(namespaces=["default"])
+        self.refused(no_n, "KR08")
+        # Ordinary names, unquoted, quoted or with a comment, scope exactly as before.
+        for value in ("arc-runners", "'arc-runners'", '"arc-runners"', "arc-runners # pinned", "e5", "team-1"):
+            F.kc.write_text(kubeconfig(ctx_ns=value))
+            name = value.split(" ")[0].strip("'\"")
+            F.write_record(namespaces=[name])
+            rc, _, e, t = call(no_n)
+            self.assertEqual((rc, len(t.calls)), (0, 2), f"{value}: {e}")
+            F.write_record(namespaces=["kube-system"])
+            self.refused(no_n, "KR08")
+        # No namespace key: kubectl uses "default", and so does the scope check. Nothing else is implied.
+        F.kc.write_text(kubeconfig(ctx_ns=None))
+        F.write_record(namespaces=["arc-runners"])
+        self.refused(no_n, "KR08")
+        F.write_record(namespaces=["default"])
+        rc, _, e, t = call(no_n)
+        self.assertEqual((rc, len(t.calls)), (0, 2), e)
+        # An explicit -n is still checked against the record, whatever the context says.
+        F.write_record(namespaces=["arc-runners"])
+        rc, _, e, t = call(ARGS)
+        self.assertEqual((rc, len(t.calls)), (0, 2), e)
 
     def test_ca_mismatch(self):
         F.kc.write_text(kubeconfig(ca=OTHER_CA))

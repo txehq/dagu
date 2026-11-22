@@ -14,7 +14,12 @@ a context can be repointed inside its file. This directory holds the source of t
   - server and CA sha256 pins before any contact (KR10 to KR14), and an `https://` server only, in the
     registry entry and in the kubeconfig (KR27). A cluster's `insecure-skip-tls-verify` must be absent or an
     unquoted `false`/`False`/`FALSE`; every other value is KR14. That is conservative: kubectl reads YAML 1.1
-    booleans (`y`, `on`, ...), and kube-run refuses even the other false spellings (`n`, `no`, `off`, `"false"`);
+    booleans (`y`, `on`, ...), and kube-run refuses even the other false spellings (`n`, `no`, `off`, `"false"`).
+    The pinned context's `namespace`, which a request without `-n` is authorized against, is read as kubectl reads
+    it or refused (KR11). No key means `default`, as in kubectl. A namespace name is accepted unquoted, or quoted
+    as a string. An unquoted YAML 1.1 null, boolean or number (`null`, `~`, `true`, `yes`, `123`, `0x1f`, `1e3`), an
+    empty value or `""`, and anything that is not a namespace name are refused before any kubectl call, never
+    mapped to `default`. Quote a name that looks like one of these (`namespace: "null"`);
   - static credentials only (KR23);
   - a TLS-verified kube-system Namespace UID probe (KR15, KR16);
   - a kubeconfig re-hash (KR17).

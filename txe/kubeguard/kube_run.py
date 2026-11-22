@@ -45,7 +45,9 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     it must be authorized explicitly (allow_identity_probe). A record is a declaration of scope, not proof
     of authority: who may issue one is deployment policy, and is not decided here. Ordering: the "is a
     policy configured" check runs before the kubeconfig is opened. The scope check runs right after step 4,
-    because a request without -n takes the pinned context's namespace. Both run before any contact.
+    because a request without -n takes the pinned context's namespace. Both run before any contact. That
+    namespace is read as kubectl reads it or refused (KR11, context_namespace): an absent key is "default", and
+    a YAML implicit null, bool or number, an empty value, or a non-name is refused, never mapped to "default".
  4. PRE-CONTACT PINS, from the kubeconfig as inert data. The file is read into memory as bytes and hashed.
     Its top-level sections are found by a restricted line reader. Only the "clusters" and "contexts"
     sections are parsed into values. In "users", kube-run reads two things: each item's `name`, to find the
@@ -829,6 +831,43 @@ def tls_verify_explicitly_false(cluster):
     return raw in TLS_VERIFY_FALSE
 
 
+# The pinned context's namespace (connector review of 6a4b64b3). A request without -n is authorized against it, so
+# kube-run must read it as kubectl does. kubectl decodes the kubeconfig with YAML 1.1 implicit types (via
+# sigs.k8s.io/yaml), so an unquoted `null`, `~`, `true`, `yes`, `0x1f` or `1e3` is not that string. YAML null decodes
+# as empty, and client-go's namespace resolution then uses "default" (client-go tools/clientcmd/client_config.go,
+# Namespace()). kube-run does not try to reproduce that decoding. It accepts only:
+#   - no namespace key, which is "default", exactly what kubectl uses;
+#   - a namespace name (DNS-1123 label), unquoted and NOT one of YAML 1.1's implicit null/bool/number spellings, or
+#     quoted ('...' or "...", a string in every YAML reader).
+# Anything else is refused (KR11) before any probe or kubectl call: an implicit non-string, an empty value or "",
+# a nested value, or a string that is not a namespace name. A record's scope is never silently mapped to "default".
+# This is the restricted reader's rule, not a claim of YAML or PyYAML equivalence.
+K8S_NAMESPACE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
+YAML_IMPLICIT_NON_STRING = re.compile(
+    r"~|null|y|yes|n|no|true|false|on|off"                          # YAML 1.1 null and bool spellings
+    r"|[-+]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9_]+)(?:e[-+]?[0-9]+)?"   # decimal integers and floats (1, 1.5, 1e3)
+    r"|[-+]?0x[0-9a-f_]+|[-+]?0o?[0-7_]+|[-+]?0b[01_]+"             # hex, octal and binary integers
+    r"|[-+]?\.inf|\.nan", re.I)
+
+
+def context_namespace(ctx):
+    """The pinned context's namespace as kubectl reads it, None when the key is absent (kubectl uses "default"), or
+    Refused (KR11) for a value kube-run will not decode (see K8S_NAMESPACE)."""
+    if "namespace" not in ctx:
+        return None
+    raw = getattr(ctx, "raw", {}).get("namespace")
+    value = ctx["namespace"]
+    if not isinstance(raw, str) or not isinstance(value, str):
+        raise Refused("KR11", "the pinned context's namespace is empty or not a scalar")
+    quoted = raw[:1] in ("'", '"')
+    if not quoted and YAML_IMPLICIT_NON_STRING.fullmatch(value):
+        raise Refused("KR11", "the pinned context's namespace is a YAML null, boolean or number, not a string; quote "
+                              "it if it is a name")
+    if not K8S_NAMESPACE.fullmatch(value):
+        raise Refused("KR11", "the pinned context's namespace is not a namespace name")
+    return value
+
+
 def check_pins(entry, data, kubeconfig_dir):
     """Raises Refused unless the pinned context resolves to the pinned server and CA. Returns the context's
     namespace (or None). Uses only the clusters and contexts sections."""
@@ -862,9 +901,9 @@ def check_pins(entry, data, kubeconfig_dir):
         raise Refused("KR13", "the pinned cluster's CA cannot be read")
     if hashlib.sha256(ca).hexdigest() != entry["ca_sha256"]:
         raise Refused("KR13", "the pinned cluster's CA is not the registry's CA")
-    ns = ctx.get("namespace")
+    ns = context_namespace(ctx)
     user = ctx.get("user")
-    return (ns if isinstance(ns, str) and ns else None), (user if isinstance(user, str) and user else None)
+    return ns, (user if isinstance(user, str) and user else None)
 
 
 # ---- 5, 6. bounded execution -----------------------------------------------------------------
