@@ -1,0 +1,1234 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""kube-run (TXE-8039): one kubectl call, bound to a registered cluster's identity. It runs kubectl through the
+reviewed B5 host custody (b5_custody.py, pinned by sha256). This is source only: nothing installs or wires it.
+
+    kube-run [--authorization FILE] [--timeout SECONDS] <cluster-id> -- <kubectl arguments>
+
+Why: on 2026-11-21 at 07:14:57Z an agent's `kubectl get ... -A` with no --context read the PRODUCTION
+cluster, because that workstation's default context is production. Naming a context is not enough: a context name
+is a local alias, the same name can mean another cluster in another file, and a context can be repointed
+inside its file. kube-run binds the call to the cluster itself.
+
+What it does, in order. Each step fails closed, and no step contacts a cluster until every earlier one passed:
+
+ 1. ARGUMENTS. The caller names a registry cluster id, never a kubeconfig or context. Arguments that pick
+    or change the target, the identity or TLS (--kubeconfig, --context, --server/-s, --cluster, --user,
+    --token, --as*, --username, --password, --certificate-authority, --client-*, --tls-server-name,
+    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get (closed built-in
+    resource types, forwarded canonically), logs (on a pod), events, rollout status, auth can-i|whoami and the discovery verbs
+    (api-resources, api-versions, explain, version, with no operand). describe, top, cluster-info and
+    rollout history are refused: their implementations read resource types the request does not name
+    (IMPLICIT_READ_VERBS). Every mutating, interactive or tunnelling
+    verb (delete, patch, edit, apply, create, exec, cp, port-forward, rollout restart, ...) is refused before
+    contact, and so are plugins and unknown verbs. A read is still authorized by cluster, resources and
+    namespace:
+    - every resource operand counts (`get pods/a secrets/b` is pods AND secrets, after `--` too);
+    - every true spelling of --all-namespaces/-A means all namespaces;
+    - --subresource=<s> is authorized as <resource>/<s>;
+    - auth and rollout carry their subcommand ("auth can-i", "rollout status");
+    - options follow the per-verb arity table VERB_OPTIONS (in logs, -f and -p take no value). Any other
+      option, or any attached or clustered short option (`-wA`, `-ojson`), is refused;
+    - a value is never another option or a dash-looking token (`-o --namespace x`, `--tail=-1` are refused);
+    - -f/--filename/-k/--kustomize (file or kustomization reads) are refused on every verb.
+ 2. REGISTRY. The entry for the id gives the pinned kubeconfig path, context, server URL, CA SHA-256 and
+    kube-system Namespace UID. The registry path is fixed (~/.coding_global/kube-clusters.json); the CLI
+    cannot point it elsewhere.
+ 3. AUTHORIZATION, through a separate interface (authorize() below). The entry's "authorization.policy"
+    names the policy. When it is absent or names no implemented policy, the call is refused as
+    UNCONFIGURED. This file sets no deployment policy and no grant classes, and treats production like any
+    other entry: its authorization is whatever the deployed registry says. The one implemented policy,
+    "task-record", checks a task authorization record (ticket, cluster, verbs, resources, namespaces, expiry,
+    authorized_by) against the request AND against the identity probe. Namespaces are checked per resource
+    scope: a cluster-scoped resource needs the explicit global grant "*", never a named namespace (resource_scope,
+    _task_record). The probe is itself an API read, so
+    it must be authorized explicitly (allow_identity_probe). A record is a declaration of scope, not proof
+    of authority: who may issue one is deployment policy, and is not decided here. Ordering: the "is a
+    policy configured" check runs before the kubeconfig is opened. The scope check runs right after step 4,
+    because a request without -n takes the pinned context's namespace. Both run before any contact. That
+    namespace is read as kubectl reads it or refused (KR11, context_namespace): an absent key is "default", and
+    a YAML implicit null, bool or number, an empty value, or a non-name is refused, never mapped to "default".
+ 4. PRE-CONTACT PINS, from the kubeconfig as inert data. The file is read into memory as bytes and hashed.
+    Its top-level sections are found by a restricted line reader. Only the "clusters" and "contexts"
+    sections are parsed into values. In "users", kube-run reads two things: each item's `name`, to find the
+    user the pinned context names, and the KEY NAMES directly under that user's `user:` mapping (user_keys).
+    It never decodes a value there (token, key data or exec arguments). Every other section is stepped over
+    line by line by indentation. Its lines are in memory, because the whole file was read, but they are
+    never decoded into values, compared, logged or passed anywhere. A user whose keys are not all static
+    credentials (token, tokenFile, client-certificate(-data), client-key(-data), username, password) is
+    refused (KR23). That covers exec, auth-provider and impersonation, because a credential helper is a
+    descendant B5 cannot follow once it leaves the process group. Nothing in the
+    file is executed: no exec plugin and no auth provider. The reader is this file's own, a restricted
+    subset of YAML block syntax (no PyYAML; stdlib only). It refuses anchors, aliases, tags, flow
+    collections, block scalars, multiple documents, JSON and tabs inside the sections it parses, and any
+    top-level line it cannot place. The context must resolve to exactly one cluster, whose server must equal
+    the pinned server and whose CA must hash to the pinned SHA-256. TLS verification must not be disabled:
+    insecure-skip-tls-verify is absent or an unquoted false/False/FALSE, and anything else is KR14.
+    The server must be an https:// URL, in the registry entry (load_entry) and in the kubeconfig (KR27).
+    A mismatch here refuses with NO contact: no probe and no request.
+ 5. IDENTITY PROBE. kubectl, with the pinned --kubeconfig and --context, reads the kube-system Namespace
+    UID. TLS is verified by kubectl against the CA that step 4 pinned, so the read can only reach that
+    cluster. It is bounded by --request-timeout and B5's bounded_run (see B5Transport's stated limit). The UID must
+    equal the pinned one.
+    A mismatch, an error, an empty answer or a timeout refuses the request, which is then never made.
+ 6. REQUEST. The kubeconfig bytes are hashed again. If the file changed since step 4, the request is not
+    made. Otherwise kubectl runs once with the pinned --kubeconfig and --context and the caller's arguments,
+    in an environment without KUBECONFIG and with KUBERC=off, bounded by --timeout (default 120 s, at most
+    600 s), B5's per-stream output cap (4 MiB) and B5's settlement. Its stdout and stderr are passed through, and its
+    exit status is
+    kube-run's.
+
+Diagnostics are stable codes (KRnn) with field names only. Values are withheld: no path, context, server,
+CA, UID, argument text or record content. The cluster id appears only after it has matched a registry id.
+
+Exit status: kubectl's own on a completed request; 3 refused; 4 identity probe failed; 5 processes NOT
+confirmed stopped (settlement UNKNOWN; nothing further runs); 6 stopped by a signal; 124 request timed out.
+
+B5 proves settlement of the OWNED group only. An escaped (setsid) descendant is neither seen nor signalled, and
+shows only as a truncated capture while it holds a pipe. Credential helpers are therefore refused (KR23), and
+kube-run is not ready for real auth plugins. It is not containment for arbitrary exec plugins or client-go
+programs.
+
+Platform: B5 needs macOS (libproc proc_listpids, and os.waitid with WNOWAIT, which needs Python 3.13 there).
+Elsewhere, B5 refuses before it creates any child, and kube-run refuses that call as KR26 (exit 3). Steps 1 to 4
+still run first, so a refusal there keeps its own code.
+
+Residual gaps, stated: a single local user can edit the registry, this file and the kubeconfig, so this is a
+reviewed guard and not a security boundary. There is a window between the step-6 hash and kubectl reading
+the file; the hash narrows it but cannot close it.
+"""
+import base64
+import binascii
+import datetime as _dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import types
+
+REGISTRY_PATH = os.path.expanduser("~/.coding_global/kube-clusters.json")
+PROBE_REQUEST_TIMEOUT = "10s"
+PROBE_TIMEOUT_S = 30
+DEFAULT_TIMEOUT_S = 120
+MAX_TIMEOUT_S = 600
+KILL_GRACE_S = 5
+EXIT_REFUSED, EXIT_PROBE, EXIT_UNSETTLED, EXIT_STOPPED, EXIT_TIMEOUT = 3, 4, 5, 6, 124
+CLUSTER_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+CODES = {
+    "KR01": "usage", "KR02": "registry-invalid", "KR03": "cluster-not-registered", "KR04": "override-argument",
+    "KR05": "arguments-not-understood", "KR06": "authorization-unconfigured", "KR07": "authorization-record-invalid",
+    "KR08": "request-outside-authorized-scope", "KR09": "identity-probe-not-authorized",
+    "KR10": "kubeconfig-unreadable-or-unsupported", "KR11": "context-or-cluster-not-resolved",
+    "KR12": "server-pin-mismatch", "KR13": "ca-pin-mismatch", "KR14": "tls-verification-disabled",
+    "KR15": "identity-probe-failed", "KR16": "cluster-uid-mismatch", "KR17": "kubeconfig-changed-during-run",
+    "KR18": "request-timed-out", "KR19": "kubectl-not-found", "KR20": "output-over-bound",
+    "KR21": "stopped-by-signal", "KR22": "settlement-or-capture-not-proven", "KR23": "credential-helper-refused",
+    "KR25": "custody-module-not-pinned", "KR26": "custody-unsupported-on-this-platform",
+    "KR27": "server-not-https",
+}
+# The only server URL kube-run accepts (connector security review of 77f1bac3): lowercase https, a host, no
+# userinfo, query or fragment. A plaintext http:// server would send the credential, in the probe itself, to any
+# on-path observer before any identity check could help. Checked on the registry entry (load_entry) and again on
+# the kubeconfig's cluster (check_pins), both before contact.
+HTTPS_SERVER = re.compile(r"https://[^\s/?#@]+(?:/[^\s?#]*)?")
+
+
+class Refused(Exception):
+    def __init__(self, code, detail, exit_code=EXIT_REFUSED):
+        super().__init__(code)
+        self.code, self.detail, self.exit_code = code, detail, exit_code
+
+
+# ---- 1. arguments --------------------------------------------------------------------------------
+OVERRIDE_FLAGS = ("--kubeconfig", "--context", "--server", "-s", "--cluster", "--user", "--token", "--username",
+                  "--password", "--as", "--as-group", "--as-uid", "--certificate-authority",
+                  "--client-certificate", "--client-key", "--tls-server-name", "--insecure-skip-tls-verify",
+                  "--kuberc")
+# kube-run is READ-ONLY. These are the only verbs it runs; every other verb is refused before contact.
+# verb -> how to find its resources: an index into the positionals, or a fixed resource name.
+VERBS = {
+    "get": 1, "rollout": 2, "logs": "pods", "events": "events", "auth": "<subcommand>",
+    "api-resources": "<discovery>", "api-versions": "<discovery>", "explain": "<discovery>",
+    "version": "<discovery>",
+}
+# Read verbs whose kubectl implementation reads resource types the request does not name. An authorization
+# record cannot scope them from the arguments, so they are refused (connector review of 77689338; audit against
+# kubernetes/kubernetes@v1.34.9 staging/src/k8s.io/kubectl/pkg, table in the README):
+# - describe: describers read related resources (NodeDescriber lists pods; events and controllers in general);
+# - top: reads the metrics API (cmd/top/top_node.go:216-220, top_pod.go:233-239) besides nodes and pods;
+# - cluster-info: lists Services in kube-system by label (cmd/clusterinfo/clusterinfo.go:98-100);
+# - rollout history (a subcommand, below): reads ReplicaSets and ControllerRevisions
+#   (polymorphichelpers/history.go:313-319, 338, 359).
+IMPLICIT_READ_VERBS = {"describe", "top", "cluster-info"}
+# logs reads the pod's log (pods/log). For any other TYPE/NAME it first reads that object and then its pods
+# (polymorphichelpers/logsforobject.go:169-175), so only pod operands are accepted.
+LOG_POD_TYPES = {"pod", "pods"}   # exact names only: a short name such as `po` can be claimed by a CRD (shortcut.go:154-180)
+# The verbs that accept operands after `--`, and the rule that checks them there (the same as before `--`).
+TERMINATOR_OPERANDS = {
+    "get": "resource operands: TYPE[,TYPE], TYPE/NAME, or a type then NAMEs; `all` refused as a type",
+    "rollout": "the subcommand's object operand (TYPE/NAME)",
+    "logs": "pod operands only (LOG_POD_TYPES); any other TYPE/NAME refused",
+}
+# Mutating, interactive and tunnelling verbs: refused with a read-only message, before any file is read.
+MUTATING_VERBS = {"delete", "edit", "patch", "label", "annotate", "scale", "wait", "apply", "create", "replace",
+                  "diff", "exec", "cp", "attach", "port-forward", "run", "debug", "proxy", "expose", "autoscale",
+                  "set", "drain", "cordon", "uncordon", "taint", "certificate", "kustomize", "plugin", "alpha"}
+# Verbs whose subcommand is part of the operation. The request's verb is "<verb> <subcommand>", so an
+# authorization record grants exactly the operations it names ("auth can-i" never grants "auth reconcile").
+# Only read subcommands are listed; any other is refused (rollout restart/undo/pause/resume included).
+SUBCOMMANDS = {
+    "auth": {"can-i": ["selfsubjectaccessreviews"], "whoami": ["selfsubjectreviews"]},
+    "rollout": {"status": None},       # status watches only the named object (cmd/rollout/rollout_status.go:187-192)
+}
+NAMESPACE_FLAGS = ("-n", "--namespace")
+ALL_NS_FLAGS = ("-A", "--all-namespaces")
+# pflag's boolean spellings (strconv.ParseBool), for --all-namespaces=<value>, -A=<value> and --<bool>=<value>.
+TRUE_WORDS = {"1", "t", "T", "TRUE", "true", "True"}
+FALSE_WORDS = {"0", "f", "F", "FALSE", "false", "False"}
+# PER-VERB OPTION ARITY. For each read verb, the ONLY options kube-run forwards, as the options that take a value
+# and the options that take none. Arity is per verb because kubectl's is (in logs, -f is --follow and -p is
+# --previous, both booleans). Together with GLOBAL_OPTIONS, NAMESPACE_FLAGS and ALL_NS_FLAGS, these are all the
+# options kube-run accepts; any other option is refused, and so is any attached or clustered short form.
+GLOBAL_OPTIONS = {"value": {"-v", "--v", "--request-timeout"}, "bool": set()}
+VERB_OPTIONS = {
+    "get": {"value": {"-o", "--output", "-l", "--selector", "--field-selector", "--template", "--sort-by", "-L",
+                      "--label-columns", "--chunk-size", "--subresource"},
+            "bool": {"-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--ignore-not-found",
+                     "--show-kind", "--output-watch-events"}},
+    "logs": {"value": {"-c", "--container", "-l", "--selector", "--since", "--since-time", "--tail",
+                       "--limit-bytes"},
+             "bool": {"-f", "--follow", "-p", "--previous", "--timestamps", "--all-containers", "--prefix"}},
+    "events": {"value": {"--for", "-o", "--output"}, "bool": {"-w", "--watch", "--no-headers"}},
+    "rollout": {"value": {"--revision"}, "bool": {"-w", "--watch"}},
+    "auth": {"value": {"-o", "--output"}, "bool": set()},
+    "api-resources": {"value": {"-o", "--output", "--api-group", "--verbs"}, "bool": {"--no-headers", "--namespaced"}},
+    "api-versions": {"value": set(), "bool": set()},
+    "explain": {"value": {"--api-version", "--output"}, "bool": {"--recursive"}},
+    "version": {"value": {"-o", "--output"}, "bool": set()},
+}
+# Options that read objects from files or kustomizations. No verb accepts them (logs -f is --follow above); they
+# are named here only so that the refusal can say why.
+FILE_FLAGS = {"-f", "--filename", "-k", "--kustomize"}
+
+
+def option_arity(verb, name):
+    """"value", "bool" or None (not accepted) for option `name` of `verb` (None before the verb is known)."""
+    for table in (GLOBAL_OPTIONS, VERB_OPTIONS.get(verb, {"value": set(), "bool": set()}) if verb else None):
+        if table and name in table["value"]:
+            return "value"
+        if table and name in table["bool"]:
+            return "bool"
+    return None
+# Fixed-resource verbs that take no operand in kube-run. An operand there is a subcommand kube-run does not
+# model (`cluster-info dump` reads nodes, pods and logs across namespaces), so it is refused.
+NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "events"}
+
+
+# kubectl's short options that take a value. In a pflag shorthand cluster (`-it`, `-ojson`), every letter up to
+# the first of these is a boolean, and everything after it is that option's value.
+SHORT_VALUE_LETTERS = set("olfcnpkLvs")
+
+
+def short_cluster_has(arg, letter):
+    """True when the single-dash token `arg` sets the short option `letter` (`-sURL`, `-its`, `-s=URL`)."""
+    if not arg.startswith("-") or arg.startswith("--") or len(arg) < 2:
+        return False
+    for ch in arg[1:]:
+        if ch == letter:
+            return True
+        if ch in SHORT_VALUE_LETTERS or not ch.isalpha():
+            return False
+    return False
+
+
+def is_override(arg):
+    return (any(arg == f or arg.startswith(f + "=") for f in OVERRIDE_FLAGS)
+            or short_cluster_has(arg, "s"))
+
+
+# CLOSED, CANONICAL RESOURCE OPERANDS (root's choice (2); trace at kubectl v1.34.9 / cli-runtime and
+# client-go v0.34.9):
+# - The builder replaces EVERY comma piece of the first argument that equals ANY discovered category name with
+#   that category's members, before REST mapping and with no precedence for real resource names
+#   (cli-runtime resource/builder.go:618, :642-665; client-go restmapper/category_expansion.go:59-88). So a CRD
+#   declaring `categories: [pods]` would turn `get pods` into a read of that CRD: no plain word is safe.
+# - A short name can be claimed by a CRD, and the shortcut expander takes the first match (client-go
+#   restmapper/shortcut.go:154-180). An exact resource name or singular is never rewritten (:132-146).
+# - A CRD's categories and shortNames must be DNS-1035 labels (apiextensions-apiserver .../validation/
+#   validation.go:769-781): never a `.` or a `/`. And an operand with two or more dots is a fully specified
+#   group/version/resource (apimachinery runtime/schema ParseResourceArg; builder mappingFor :768-780).
+# So kube-run accepts only the exact plural or singular names of the built-in resources below (no short names,
+# no CRDs), authorizes them by plural name, and FORWARDS each one in its canonical `resource.version.group` form
+# (core: `resource.v1.`). A dotted operand cannot equal a CRD category or short name, and is mapped exactly.
+# RESIDUAL, recorded as a prerequisite: an aggregated API server (an APIService, installed by a cluster admin)
+# advertises its own discovery, which CRD validation does not cover. One advertising a dotted category could
+# still collide. CRD reads are not available through kube-run (a current source-contract limitation).
+# The guarantee holds under that traced model only. The table is SECURITY-CRITICAL REVIEWED DATA: a wrong but
+# EXISTING group/version would name a DIFFERENT API resource, while authorization uses the plural name. Each entry
+# below was verified against the pinned Kubernetes v1.34.9 API registration (the REST storage providers and the
+# default-enabled version list; README table). A change needs the same verification, and the test pins the table.
+# A version that a cluster has disabled (--runtime-config) makes kubectl fail on that exact GVR; it is not
+# remapped.
+# SCOPE (Codex security review of 64fc3ec4): each entry records whether the resource is NAMESPACED or CLUSTER-wide,
+# from its pinned v1.34.9 registry strategy's NamespaceScoped() (pkg/registry/<group>/<resource>/strategy.go; the
+# CRD strategy in apiextensions-apiserver pkg/registry/customresourcedefinition/strategy.go:54). kubectl ignores
+# -n for a cluster-scoped type and reads the whole cluster's collection, so a namespace grant must never cover it
+# (see resource_scope and _task_record).
+NAMESPACED, CLUSTER = "namespaced", "cluster"
+SCOPES = (NAMESPACED, CLUSTER)
+_BUILTIN_RESOURCES = {
+    # plural: (singular, version, group, scope)   scope: NamespaceScoped() at kubernetes@v1.34.9, file:line
+    "pods": ("pod", "v1", "", NAMESPACED),                                 # core/pod/strategy.go:70
+    "services": ("service", "v1", "", NAMESPACED),                         # core/service/strategy.go:54
+    "configmaps": ("configmap", "v1", "", NAMESPACED),                     # core/configmap/strategy.go:52
+    "secrets": ("secret", "v1", "", NAMESPACED),                           # core/secret/strategy.go:51
+    "namespaces": ("namespace", "v1", "", CLUSTER),                        # core/namespace/strategy.go:48
+    "nodes": ("node", "v1", "", CLUSTER),                                  # core/node/strategy.go:58
+    "events": ("event", "v1", "", NAMESPACED),                             # core/event/strategy.go:51
+    "endpoints": ("endpoints", "v1", "", NAMESPACED),                      # core/endpoint/strategy.go:43
+    "persistentvolumeclaims": ("persistentvolumeclaim", "v1", "", NAMESPACED),   # core/persistentvolumeclaim/strategy.go:48
+    "persistentvolumes": ("persistentvolume", "v1", "", CLUSTER),          # core/persistentvolume/strategy.go:49
+    "serviceaccounts": ("serviceaccount", "v1", "", NAMESPACED),           # core/serviceaccount/strategy.go:42
+    "replicationcontrollers": ("replicationcontroller", "v1", "", NAMESPACED),   # core/replicationcontroller/strategy.go:77
+    "resourcequotas": ("resourcequota", "v1", "", NAMESPACED),             # core/resourcequota/strategy.go:42
+    "limitranges": ("limitrange", "v1", "", NAMESPACED),                   # core/limitrange/strategy.go:40
+    "deployments": ("deployment", "v1", "apps", NAMESPACED),               # apps/deployment/strategy.go:57
+    "replicasets": ("replicaset", "v1", "apps", NAMESPACED),               # apps/replicaset/strategy.go:63
+    "statefulsets": ("statefulset", "v1", "apps", NAMESPACED),             # apps/statefulset/strategy.go:55
+    "daemonsets": ("daemonset", "v1", "apps", NAMESPACED),                 # apps/daemonset/strategy.go:53
+    "controllerrevisions": ("controllerrevision", "v1", "apps", NAMESPACED),     # apps/controllerrevision/strategy.go:47
+    "jobs": ("job", "v1", "batch", NAMESPACED),                            # batch/job/strategy.go:77
+    "cronjobs": ("cronjob", "v1", "batch", NAMESPACED),                    # batch/cronjob/strategy.go:67
+    "ingresses": ("ingress", "v1", "networking.k8s.io", NAMESPACED),       # networking/ingress/strategy.go:48
+    "networkpolicies": ("networkpolicy", "v1", "networking.k8s.io", NAMESPACED),  # networking/networkpolicy/strategy.go:42
+    "ingressclasses": ("ingressclass", "v1", "networking.k8s.io", CLUSTER),       # networking/ingressclass/strategy.go:44
+    "poddisruptionbudgets": ("poddisruptionbudget", "v1", "policy", NAMESPACED),  # policy/poddisruptionbudget/strategy.go:45
+    "storageclasses": ("storageclass", "v1", "storage.k8s.io", CLUSTER),          # storage/storageclass/strategy.go:41
+    "roles": ("role", "v1", "rbac.authorization.k8s.io", NAMESPACED),             # rbac/role/strategy.go:48
+    "rolebindings": ("rolebinding", "v1", "rbac.authorization.k8s.io", NAMESPACED),   # rbac/rolebinding/strategy.go:48
+    "clusterroles": ("clusterrole", "v1", "rbac.authorization.k8s.io", CLUSTER),      # rbac/clusterrole/strategy.go:49
+    "clusterrolebindings": ("clusterrolebinding", "v1", "rbac.authorization.k8s.io", CLUSTER),  # rbac/clusterrolebinding/strategy.go:48
+    "leases": ("lease", "v1", "coordination.k8s.io", NAMESPACED),                 # coordination/lease/strategy.go:42
+    "endpointslices": ("endpointslice", "v1", "discovery.k8s.io", NAMESPACED),    # discovery/endpointslice/strategy.go:55
+    "horizontalpodautoscalers": ("horizontalpodautoscaler", "v2", "autoscaling", NAMESPACED),  # autoscaling/horizontalpodautoscaler/strategy.go:44
+    "customresourcedefinitions": ("customresourcedefinition", "v1", "apiextensions.k8s.io", CLUSTER),  # apiextensions .../customresourcedefinition/strategy.go:54
+}
+# The fixed resources some verbs read that are not table types, with their scope:
+# - selfsubjectaccessreviews (auth can-i): authorization/selfsubjectaccessreview/rest.go:44, NamespaceScoped false;
+# - selfsubjectreviews (auth whoami): authentication/selfsubjectreview/rest.go:49, NamespaceScoped false;
+# - <discovery> (api-resources, api-versions, explain, version): non-resource paths (/api, /apis, /version,
+#   /openapi), which have no namespace.
+FIXED_RESOURCE_SCOPES = {"selfsubjectaccessreviews": CLUSTER, "selfsubjectreviews": CLUSTER, "<discovery>": CLUSTER}
+
+
+def resource_scope(resource):
+    """NAMESPACED or CLUSTER for a request resource (a table plural, `plural/subresource`, or a fixed resource).
+    Unknown or missing scope metadata REFUSES: no request is authorized without a known scope."""
+    base = resource.split("/", 1)[0]
+    entry = _BUILTIN_RESOURCES.get(base)
+    scope = entry[3] if entry is not None and len(entry) == 4 else FIXED_RESOURCE_SCOPES.get(base)
+    if scope not in SCOPES:
+        raise Refused("KR08", "a resource's scope (namespaced or cluster-wide) is not known, so the request cannot "
+                              "be authorized")
+    return scope
+
+
+# Every accepted spelling (plural, singular, canonical) -> (canonical forwarded form, plural authorization name).
+RESOURCE_SPELLINGS = {}
+for _plural, (_singular, _version, _group, _scope) in _BUILTIN_RESOURCES.items():
+    _canon = f"{_plural}.{_version}.{_group}"
+    for _spelling in (_plural, _singular, _canon):
+        RESOURCE_SPELLINGS[_spelling] = (_canon, _plural)
+
+
+def _resource_spelling(name):
+    """(canonical, plural) for an accepted built-in spelling, or KR05."""
+    if name not in RESOURCE_SPELLINGS:
+        raise Refused("KR05", "the resource type is not an exact built-in resource name (short names, categories and "
+                              "custom resources are refused: their meaning depends on the cluster's discovery)")
+    return RESOURCE_SPELLINGS[name]
+
+
+def _canonical_operand(operand):
+    """The operand with every resource type in its canonical form: `pods,secrets` -> `pods.v1.,secrets.v1.`,
+    `deployment/x` -> `deployments.v1.apps/x`."""
+    if "/" in operand:
+        rtype, rest = operand.split("/", 1)
+        return _resource_spelling(rtype.strip().lower())[0] + "/" + rest
+    return ",".join(_resource_spelling(p.strip().lower())[0] for p in operand.split(","))
+
+
+def _types(operand):
+    """The resource types in one operand: `pods`, `pods,secrets`, `pods/a` or `deploy/x`, lower-cased."""
+    types = []
+    for part in operand.split(","):
+        r = part.split("/", 1)[0].strip().lower()
+        if not r:
+            raise Refused("KR05", "an empty resource name")
+        types.append(r)
+    return types
+
+
+def parse_request(args, default_namespace):
+    """{"verb", "resources", "namespace"} for a kubectl argument list, or Refused."""
+    if any(is_override(a) for a in args):
+        raise Refused("KR04", "an argument selects or changes the cluster, identity or TLS; kube-run supplies "
+                              "the kubeconfig and context from the registry")
+    pos, namespaces, all_ns, unknown_at, subresources = [], [], False, None, []
+    pos_at = []        # the argv index of each operand in pos, so a canonicalised operand replaces exactly its token
+    rewrite = {}       # argv index -> the canonical token forwarded instead (CLOSED, CANONICAL RESOURCE OPERANDS)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            # kubectl reads what follows `--` as operands. kube-run forwards NOTHING it did not inspect: a token
+            # after `--` joins the operands only for a verb in TERMINATOR_OPERANDS, whose own operand rule then
+            # authorizes or refuses it. For every other verb (events, auth, the discovery verbs, or no verb yet),
+            # any token after `--` is refused (connector-driven local-15 finding: logs used to drop them from
+            # authorization while kubectl still read them).
+            after = args[i + 1:]
+            if after:
+                if not pos or pos[0] not in TERMINATOR_OPERANDS:
+                    raise Refused("KR05", "tokens after -- are operands this verb does not authorize; kube-run "
+                                          "forwards nothing it did not inspect")
+                pos.extend(after)
+                pos_at.extend(range(i + 1, len(args)))
+            break
+        if a in NAMESPACE_FLAGS:
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                raise Refused("KR05", "a namespace flag has no value, or its value looks like an option")
+            namespaces.append(args[i + 1])
+            i += 2
+            continue
+        verb_so_far = pos[0] if pos else None
+        if a.startswith("--namespace="):
+            value = a.partition("=")[2]
+            if not value or value.startswith("-"):
+                raise Refused("KR05", "a namespace value is empty or looks like an option")
+            namespaces.append(value)
+        elif a.startswith("-n") and a != "-n" and not a.startswith("--"):
+            raise Refused("KR05", "an attached short namespace flag is not accepted; use -n <namespace>")
+        elif a in ALL_NS_FLAGS:
+            all_ns = True
+        elif a.startswith("--all-namespaces=") or a.startswith("-A="):
+            value = a.partition("=")[2]
+            if value in TRUE_WORDS:
+                all_ns = True
+            elif value not in FALSE_WORDS:
+                raise Refused("KR05", "an all-namespaces flag has a value that is not a boolean")
+        elif a.startswith("-") and a != "-":
+            # `--opt=value` and `-o=value` name the option before the first "="; anything else is the token itself.
+            name, eq, value = a.partition("=")
+            arity = option_arity(verb_so_far, name)
+            if arity is None:
+                if name in FILE_FLAGS:
+                    raise Refused("KR05", "file-based requests are refused: their resources and namespaces cannot "
+                                          "be established from the arguments before contact")
+                if verb_so_far is None:
+                    raise Refused("KR05", "an option comes before the verb")
+                # Only options this verb is known to take are forwarded. An unknown option may select scope (pflag
+                # reads `-wA` as -w -A and `-inother` as -i -n other), so attached and clustered short options are
+                # refused too: write each option and its value separately.
+                raise Refused("KR05", "an option kube-run does not recognise for this verb (write each short option "
+                                      "and its value separately)")
+            if arity == "bool":
+                if eq and value not in TRUE_WORDS and value not in FALSE_WORDS:
+                    raise Refused("KR05", "a no-value option was given a value that is not a boolean")
+            else:
+                if not eq:
+                    value = args[i + 1] if i + 1 < len(args) else ""
+                    i += 1
+                # A value-taking option never swallows an option (`-o --namespace x`, `-l -A` would hide the scope
+                # the swallowed token selects), and a value that looks like an option (`--tail=-1`) is refused
+                # rather than reinterpreted. A missing or empty value is refused too.
+                if not value or value.startswith("-"):
+                    raise Refused("KR05", "an option's value is missing, empty or looks like an option; write the "
+                                          "value right after the option")
+                if name == "--subresource":
+                    subresources.append(value)
+        else:
+            if not pos and a in MUTATING_VERBS:
+                raise Refused("KR05", "kube-run is read-only: mutating, interactive and tunnelling verbs are "
+                                      "refused")
+            if not pos and a in IMPLICIT_READ_VERBS:
+                raise Refused("KR05", "this read verb reads resources the request does not name, so its scope "
+                                      "cannot be authorized from the arguments (use get)")
+            pos.append(a)
+            pos_at.append(i)
+        i += 1
+    if not pos:
+        raise Refused("KR05", "no kubectl verb")
+    verb = pos[0]
+    if verb not in VERBS:
+        raise Refused("KR05", "the verb is not one kube-run supports (it is read-only; plugins and unknown verbs "
+                              "are refused)")
+    if unknown_at == 0:
+        raise Refused("KR05", "an unknown flag comes before the verb")
+    how = VERBS[verb]
+    if how is None:
+        raise Refused("KR05", "interactive verbs are not supported")
+    resources = None   # never a default: an empty list would pass every scope check
+    if verb in SUBCOMMANDS:
+        if len(pos) < 2 or (unknown_at is not None and unknown_at <= 1) or pos[1] not in SUBCOMMANDS[verb]:
+            raise Refused("KR05", "the subcommand is missing or is not one kube-run supports for this verb")
+        fixed = SUBCOMMANDS[verb][pos[1]]
+        verb = f"{verb} {pos[1]}"
+        if fixed is not None:
+            how = None
+            resources = list(fixed)
+    if isinstance(how, int):
+        if len(pos) <= how or (unknown_at is not None and unknown_at <= how):
+            raise Refused("KR05", "the resource cannot be read from the arguments unambiguously")
+        resources = _types(pos[how])
+        # Every further operand is authorized too. After TYPE/NAME, each one must be TYPE/NAME as well (kubectl
+        # accepts `get pods/a secrets/b`). After a bare type, each one is a NAME, and an operand carrying a type
+        # cannot be placed, so it is refused.
+        typed = "/" in pos[how]
+        for extra in pos[how + 1:]:
+            if typed:
+                if "/" not in extra:
+                    raise Refused("KR05", "a TYPE/NAME list contains an operand without a type")
+                resources += [r for r in _types(extra) if r not in resources]
+            elif "/" in extra:
+                raise Refused("KR05", "an operand names a resource type after a bare type; name every operand as "
+                                      "TYPE/NAME, or one type and its names")
+        if "all" in resources:
+            # `all` is a category: kubectl expands it to several resource types through discovery
+            # (cli-runtime pkg/resource/builder.go:642-654), so the request would read types it does not name.
+            raise Refused("KR05", "the category `all` expands to resource types the request does not name; name "
+                                  "each resource type")
+        # CLOSED operands: every resource type is an exact built-in spelling, authorized by its plural name and
+        # forwarded in its canonical dotted form (see RESOURCE_SPELLINGS). After a bare type, later words are
+        # names and are forwarded unchanged.
+        authorized = []
+        for r in resources:
+            plural = _resource_spelling(r)[1]
+            if plural not in authorized:
+                authorized.append(plural)
+        resources = authorized
+        type_positions = [how] + ([k for k in range(how + 1, len(pos))] if typed else [])
+        for k in type_positions:
+            rewrite[pos_at[k]] = _canonical_operand(pos[k])
+    elif isinstance(how, str):
+        if verb in NO_OPERAND_VERBS and len(pos) > 1:
+            # e.g. `cluster-info dump`, which reads nodes, pods and logs across namespaces.
+            raise Refused("KR05", "this verb takes no operand in kube-run (subcommands such as cluster-info dump "
+                                  "are refused)")
+        if verb == "logs" and any("/" in o and o.split("/", 1)[0] not in LOG_POD_TYPES for o in pos[1:]):
+            # logs TYPE/NAME for anything but a pod reads that object and then its pods (logsforobject.go:169-175).
+            raise Refused("KR05", "logs takes a pod (NAME or pod/NAME) or -l; another TYPE/NAME reads resources the "
+                                  "request does not name")
+        resources = [how]
+    if not resources:
+        raise Refused("KR05", "the request's resources could not be determined")
+    if subresources:
+        # The API authorizes a subresource separately (pods/ephemeralcontainers, deployments/scale, ...).
+        if len(set(subresources)) > 1 or not re.fullmatch(r"[a-z]+", subresources[-1]):
+            raise Refused("KR05", "the subresource is ambiguous or not a plain name")
+        resources = [f"{r}/{subresources[-1]}" for r in resources]
+    if len(set(namespaces)) > 1:
+        raise Refused("KR05", "more than one namespace is named")
+    if all_ns and namespaces:
+        raise Refused("KR05", "both a namespace and all namespaces are named")
+    namespace = "*" if all_ns else (namespaces[0] if namespaces else default_namespace)
+    if not namespace:
+        raise Refused("KR05", "an empty namespace")
+    argv = [rewrite.get(k, t) for k, t in enumerate(args)]
+    return {"verb": verb, "resources": resources, "namespace": namespace, "argv": argv}
+
+
+# ---- 2. registry ---------------------------------------------------------------------------------
+REQUIRED_ENTRY = ("kubeconfig", "context", "server", "ca_sha256", "uid")
+
+
+def load_entry(registry_path, cluster_id):
+    try:
+        with open(registry_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        raise Refused("KR02", "the registry is missing or is not JSON")
+    clusters = data.get("clusters") if isinstance(data, dict) else None
+    if not isinstance(clusters, dict):
+        raise Refused("KR02", "the registry has no clusters object")
+    if not CLUSTER_ID.match(cluster_id) or cluster_id not in clusters:
+        raise Refused("KR03", "the cluster id is not in the registry")
+    e = clusters[cluster_id]
+    if not isinstance(e, dict) or any(not isinstance(e.get(k), str) or not e.get(k) for k in REQUIRED_ENTRY):
+        raise Refused("KR02", "the registry entry lacks one of " + ", ".join(REQUIRED_ENTRY))
+    if not os.path.isabs(e["kubeconfig"]) or not re.fullmatch(r"[0-9a-f]{64}", e["ca_sha256"]):
+        raise Refused("KR02", "the registry entry's kubeconfig is not absolute or its ca_sha256 is not hex")
+    if not HTTPS_SERVER.fullmatch(e["server"]):
+        raise Refused("KR27", "the registry entry's server is not an https:// URL")
+    if "kubectl" in e and (not isinstance(e["kubectl"], str) or not os.path.isabs(e["kubectl"])):
+        raise Refused("KR02", "the registry entry's kubectl is not an absolute path")
+    return e
+
+
+# ---- 3. authorization interface ------------------------------------------------------------------
+def _parse_time(s):
+    if not isinstance(s, str) or not s.endswith("Z"):
+        raise ValueError("not a UTC time")
+    return _dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=_dt.timezone.utc)
+
+
+RECORD_FIELDS = {"ticket": str, "cluster_id": str, "verbs": list, "resources": list, "namespaces": list,
+                 "allow_identity_probe": bool, "not_after": str, "authorized_by": str}
+
+
+def _task_record(entry, cluster_id, record_path, request, probe, now):
+    """Policy "task-record": a task authorization record must cover the request and the probe."""
+    if not record_path:
+        raise Refused("KR07", "this cluster's policy needs --authorization <record>")
+    try:
+        with open(record_path, encoding="utf-8") as f:
+            rec = json.load(f)
+        if not isinstance(rec, dict):
+            raise ValueError
+        for k, t in RECORD_FIELDS.items():
+            if not isinstance(rec.get(k), t) or (t is str and not rec[k]):
+                raise ValueError
+        for k in ("verbs", "resources", "namespaces"):
+            if not rec[k] or not all(isinstance(x, str) and x for x in rec[k]):
+                raise ValueError
+        not_after = _parse_time(rec["not_after"])
+    except (OSError, ValueError):
+        raise Refused("KR07", "the authorization record is missing, unreadable or lacks a required field")
+    if rec["cluster_id"] != cluster_id:
+        raise Refused("KR07", "the authorization record is for another cluster")
+    if now >= not_after:
+        raise Refused("KR07", "the authorization record has expired")
+    if not rec["allow_identity_probe"]:
+        raise Refused("KR09", "the record does not authorize the kube-system identity read that must precede "
+                              "the request")
+
+    def covers(allowed, value):
+        return "*" in allowed or value in allowed
+
+    if not covers(rec["verbs"], request["verb"]):
+        raise Refused("KR08", "the verb is outside the authorized scope")
+    if not all(covers(rec["resources"], r) for r in request["resources"]):
+        raise Refused("KR08", "a resource is outside the authorized scope")
+    # Every scope the request actually reads must be covered, per resource (Codex security review of 64fc3ec4).
+    # A namespaced resource is read in the request's namespace (`*` with --all-namespaces). A cluster-scoped one
+    # is read cluster-wide whatever -n says, so it needs the record's explicit global grant, namespaces ["*"]:
+    # a namespace flag never grants cluster access. A mixed request needs both, so a cluster grant never widens
+    # the namespaced part. Unknown scope metadata refuses (resource_scope).
+    if not request["resources"]:
+        raise Refused("KR08", "the request names no resource to authorize")
+    for r in request["resources"]:
+        if resource_scope(r) == CLUSTER:
+            if "*" not in rec["namespaces"]:
+                raise Refused("KR08", "a cluster-scoped resource is read cluster-wide, so it needs a record that "
+                                      "grants every namespace (\"*\"); a namespace does not grant it")
+        elif not covers(rec["namespaces"], request["namespace"]):
+            raise Refused("KR08", "the namespace is outside the authorized scope")
+
+
+POLICIES = {"task-record": _task_record}
+
+
+def configured_policy(entry):
+    """The entry's policy function. Refuses, before any file but the registry is read, when none is set."""
+    auth = entry.get("authorization")
+    policy = auth.get("policy") if isinstance(auth, dict) else None
+    if policy not in POLICIES:
+        raise Refused("KR06", "the registry entry has no implemented authorization policy configured, so every "
+                              "call to it is refused")
+    return POLICIES[policy]
+
+
+def authorize(entry, cluster_id, record_path, request, now):
+    """The authorization interface. Deployment chooses the policy per registry entry; none is the default."""
+    probe = {"verb": "get", "resources": ["namespaces"], "namespace": None}
+    configured_policy(entry)(entry, cluster_id, record_path, request, probe, now)
+
+
+# ---- 4. kubeconfig as inert data -----------------------------------------------------------------
+class Unsupported(Exception):
+    pass
+
+
+SCALAR_REFUSED = tuple("&*!|>{[%@`")
+
+
+def _scalar(text):
+    t = text.strip()
+    if not t:
+        return ""
+    if t[0] == "'":
+        if len(t) < 2 or t[-1] != "'":
+            raise Unsupported("single-quoted scalar")
+        return t[1:-1].replace("''", "'")
+    if t[0] == '"':
+        if len(t) < 2 or t[-1] != '"' or re.search(r'(?<!\\)(?:\\\\)*"', t[1:-1]):
+            raise Unsupported("double-quoted scalar")
+        body = t[1:-1]
+        if re.search(r"\\[^\\\"/nt]", body):
+            raise Unsupported("escape")
+        return body.replace("\\\\", "\0").replace('\\"', '"').replace("\\/", "/").replace("\\n", "\n") \
+            .replace("\\t", "\t").replace("\0", "\\")
+    if t.startswith(SCALAR_REFUSED) or t in ("-", "?", ":"):
+        raise Unsupported("anchor, alias, tag, block scalar or flow collection")
+    m = re.search(r"\s#", t)
+    if m:
+        t = t[:m.start()].rstrip()
+    if ": " in t or t.endswith(":"):
+        raise Unsupported("nested mapping in a scalar")
+    return t
+
+
+def _key_value(text):
+    m = re.match(r"^([A-Za-z0-9_.\-]+):(?:\s+(.*))?$", text)
+    if not m:
+        raise Unsupported("not a key")
+    return m.group(1), (m.group(2) or "")
+
+
+class _Mapping(dict):
+    """A block mapping. .raw keeps each scalar value's source text, quotes included, for a check that must not
+    decide on the quote-stripped value (insecure-skip-tls-verify)."""
+
+    def __init__(self):
+        super().__init__()
+        self.raw = {}
+
+
+def _block(lines, i, indent):
+    """Parse a block mapping or sequence at exactly `indent`. Returns (value, next index)."""
+    if i >= len(lines) or lines[i][0] != indent:
+        raise Unsupported("indentation")
+    if lines[i][1] == "-" or lines[i][1].startswith("- "):
+        seq = []
+        while i < len(lines) and lines[i][0] == indent and (lines[i][1] == "-" or lines[i][1].startswith("- ")):
+            rest = lines[i][1][1:].lstrip(" ")
+            if not rest:
+                value, i = _block(lines, i + 1, lines[i + 1][0] if i + 1 < len(lines) else -1)
+                seq.append(value)
+                continue
+            inner = indent + (len(lines[i][1]) - len(rest))
+            if re.match(r"^[A-Za-z0-9_.\-]+:(\s|$)", rest):
+                sub = [(inner, rest)] + []
+                j = i + 1
+                while j < len(lines) and lines[j][0] > indent:
+                    sub.append(lines[j])
+                    j += 1
+                value, k = _block(sub, 0, inner)
+                if k != len(sub):
+                    raise Unsupported("indentation in a sequence item")
+                seq.append(value)
+                i = j
+            else:
+                seq.append(_scalar(rest))
+                i += 1
+        if i < len(lines) and lines[i][0] > indent:
+            raise Unsupported("indentation after a sequence")
+        return seq, i
+    mapping = _Mapping()
+    while i < len(lines) and lines[i][0] == indent:
+        if lines[i][1].startswith("-"):
+            raise Unsupported("a sequence item inside a mapping")
+        key, raw = _key_value(lines[i][1])
+        if key in mapping:
+            raise Unsupported("duplicate key")
+        i += 1
+        if raw.strip() and not raw.strip().startswith("#"):
+            mapping[key] = _scalar(raw)
+            mapping.raw[key] = raw.strip()
+        elif i < len(lines) and lines[i][0] > indent:
+            mapping[key], i = _block(lines, i, lines[i][0])
+        elif i < len(lines) and lines[i][0] == indent and (lines[i][1] == "-" or lines[i][1].startswith("- ")):
+            mapping[key], i = _block(lines, i, indent)
+        else:
+            mapping[key] = None
+    if i < len(lines) and lines[i][0] > indent:
+        raise Unsupported("indentation after a mapping")
+    return mapping, i
+
+
+TOP_KEY = re.compile(r"^([A-Za-z0-9_.\-]+):(?:[ \t]+(\S.*))?$")
+
+
+def read_sections(data):
+    """{"clusters": [...], "contexts": [...]} from kubeconfig bytes. Other sections are skipped unparsed."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Unsupported("not UTF-8")
+    raw = text.split("\n")
+    sections, current, seen, first = {}, None, set(), True
+    for n, line in enumerate(raw):
+        line = line.rstrip("\r")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if line[0] not in " -":  # a column-0 line that is not a sequence item: a top-level key or a marker
+            if stripped == "---" and first:
+                first = False
+                continue
+            first = False
+            m = TOP_KEY.match(line)
+            if not m:
+                raise Unsupported("a top-level line that is not a key (JSON, flow style, a document marker)")
+            key = m.group(1)
+            if key in seen:
+                raise Unsupported("duplicate top-level key")
+            seen.add(key)
+            if key in ("clusters", "contexts"):
+                if m.group(2) and m.group(2).strip() != "[]":
+                    raise Unsupported("an inline value for a parsed section")
+                current = key
+                sections[key] = []
+            else:
+                current = None  # stepped over: its lines are never interpreted
+            continue
+        first = False
+        if current is None:
+            continue
+        if "\t" in line[:len(line) - len(line.lstrip())]:
+            raise Unsupported("a tab in indentation")
+        sections[current].append((len(line) - len(line.lstrip(" ")), line.strip()))
+    out = {}
+    for key in ("clusters", "contexts"):
+        lines = sections.get(key)
+        if not lines:
+            out[key] = []
+            continue
+        value, i = _block(lines, 0, lines[0][0])
+        if i != len(lines) or not isinstance(value, list):
+            raise Unsupported(f"the {key} section is not a sequence")
+        out[key] = value
+    return out
+
+
+def _one(items, name, field):
+    found = [x for x in items if isinstance(x, dict) and x.get("name") == name]
+    if len(found) != 1 or not isinstance(found[0].get(field), dict):
+        raise Refused("KR11", f"the pinned {field} is missing or defined more than once in the kubeconfig")
+    return found[0][field]
+
+
+# insecure-skip-tls-verify (connector security review of ad2765b4): kubectl reads a kubeconfig through YAML 1.1
+# booleans, so y, Y, yes, on and more are true. kube-run does not try to decode that set. When the key is present,
+# it is admissible ONLY as an unquoted YAML false spelled false, False or FALSE, read from the value's SOURCE text
+# (quotes kept): a quoted "false" is a string, not a boolean. Any other value (a truthy form, n/no/off, a quoted or
+# empty value, a nested block) is refused as KR14. That is conservative: some values kubectl reads as false are
+# refused too.
+TLS_VERIFY_FALSE = ("false", "False", "FALSE")
+
+
+def tls_verify_explicitly_false(cluster):
+    raw = getattr(cluster, "raw", {}).get("insecure-skip-tls-verify")
+    if not isinstance(raw, str):
+        return False
+    m = re.search(r"\s#", raw)
+    if m and raw[:1] not in ("'", '"'):
+        raw = raw[:m.start()].rstrip()
+    return raw in TLS_VERIFY_FALSE
+
+
+# The pinned context's namespace (connector review of 6a4b64b3). A request without -n is authorized against it, so
+# kube-run must read it as kubectl does. kubectl decodes the kubeconfig with YAML 1.1 implicit types (via
+# sigs.k8s.io/yaml), so an unquoted `null`, `~`, `true`, `yes`, `0x1f` or `1e3` is not that string. YAML null decodes
+# as empty, and client-go's namespace resolution then uses "default" (client-go tools/clientcmd/client_config.go,
+# Namespace()). kube-run does not try to reproduce that decoding. It accepts only:
+#   - no namespace key, which is "default", exactly what kubectl uses;
+#   - a namespace name (DNS-1123 label), unquoted and NOT one of YAML 1.1's implicit null/bool/number spellings, or
+#     quoted ('...' or "...", a string in every YAML reader).
+# Anything else is refused (KR11) before any probe or kubectl call: an implicit non-string, an empty value or "",
+# a nested value, or a string that is not a namespace name. A record's scope is never silently mapped to "default".
+# This is the restricted reader's rule, not a claim of YAML or PyYAML equivalence.
+K8S_NAMESPACE = re.compile(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?")
+YAML_IMPLICIT_NON_STRING = re.compile(
+    r"~|null|y|yes|n|no|true|false|on|off"                          # YAML 1.1 null and bool spellings
+    r"|[-+]?(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9_]+)(?:e[-+]?[0-9]+)?"   # decimal integers and floats (1, 1.5, 1e3)
+    r"|[-+]?0x[0-9a-f_]+|[-+]?0o?[0-7_]+|[-+]?0b[01_]+"             # hex, octal and binary integers
+    r"|[-+]?\.inf|\.nan", re.I)
+
+
+def context_namespace(ctx):
+    """The pinned context's namespace as kubectl reads it, None when the key is absent (kubectl uses "default"), or
+    Refused (KR11) for a value kube-run will not decode (see K8S_NAMESPACE)."""
+    if "namespace" not in ctx:
+        return None
+    raw = getattr(ctx, "raw", {}).get("namespace")
+    value = ctx["namespace"]
+    if not isinstance(raw, str) or not isinstance(value, str):
+        raise Refused("KR11", "the pinned context's namespace is empty or not a scalar")
+    quoted = raw[:1] in ("'", '"')
+    if not quoted and YAML_IMPLICIT_NON_STRING.fullmatch(value):
+        raise Refused("KR11", "the pinned context's namespace is a YAML null, boolean or number, not a string; quote "
+                              "it if it is a name")
+    if not K8S_NAMESPACE.fullmatch(value):
+        raise Refused("KR11", "the pinned context's namespace is not a namespace name")
+    return value
+
+
+def check_pins(entry, data, kubeconfig_dir):
+    """Raises Refused unless the pinned context resolves to the pinned server and CA. Returns the context's
+    namespace (or None). Uses only the clusters and contexts sections."""
+    try:
+        sec = read_sections(data)
+    except Unsupported:
+        raise Refused("KR10", "the kubeconfig uses syntax kube-run's restricted reader does not accept")
+    ctx = _one(sec["contexts"], entry["context"], "context")
+    cluster_name = ctx.get("cluster")
+    if not isinstance(cluster_name, str) or not cluster_name:
+        raise Refused("KR11", "the pinned context names no cluster")
+    cluster = _one(sec["clusters"], cluster_name, "cluster")
+    if "insecure-skip-tls-verify" in cluster and not tls_verify_explicitly_false(cluster):
+        raise Refused("KR14", "the pinned cluster disables TLS verification, or sets it in a form kube-run does not "
+                              "accept (only an unquoted false, False or FALSE is accepted)")
+    if not isinstance(cluster.get("server"), str) or not HTTPS_SERVER.fullmatch(cluster["server"]):
+        raise Refused("KR27", "the pinned cluster's server is not an https:// URL")
+    if cluster.get("server") != entry["server"]:
+        raise Refused("KR12", "the pinned context's server is not the registry's server")
+    data_field, path_field = cluster.get("certificate-authority-data"), cluster.get("certificate-authority")
+    if bool(data_field) == bool(path_field):
+        raise Refused("KR13", "the pinned cluster must carry exactly one CA (data or file)")
+    try:
+        if data_field:
+            ca = base64.b64decode("".join(str(data_field).split()), validate=True)
+        else:
+            p = os.path.join(kubeconfig_dir, os.path.expanduser(str(path_field)))
+            with open(p, "rb") as f:
+                ca = f.read()
+    except (OSError, binascii.Error, ValueError):
+        raise Refused("KR13", "the pinned cluster's CA cannot be read")
+    if hashlib.sha256(ca).hexdigest() != entry["ca_sha256"]:
+        raise Refused("KR13", "the pinned cluster's CA is not the registry's CA")
+    ns = context_namespace(ctx)
+    user = ctx.get("user")
+    return ns, (user if isinstance(user, str) and user else None)
+
+
+# ---- 5, 6. bounded execution -----------------------------------------------------------------
+class Timeout(Exception):
+    pass
+
+
+class OutputOverBound(Exception):
+    pass
+
+
+class Stopped(BaseException):
+    """A signal asked kube-run to stop. BaseException, so no `except Exception` on the way swallows it."""
+
+
+class Unsettled(Exception):
+    """B5 could not prove settlement or a complete capture (its rc 125)."""
+
+    def __init__(self, cause):
+        super().__init__(cause)
+        self.cause = cause
+
+
+class PlatformUnsupported(Exception):
+    """B5 refused before creating any child, because this platform lacks a capability it needs (its rc 125 with
+    "refused before any child")."""
+
+    def __init__(self, cause):
+        super().__init__(cause)
+        self.cause = cause
+
+
+# ---- the reviewed B5 host custody, loaded from its pinned copy ---------------------------------
+B5_FILE = "b5_custody.py"
+B5_SHA256 = "b373e5a802132c698d5734f92f686f0a07cd386ebd5c02aa21b1f1de8f8e1b8e"
+# B5's own failure reasons. Only a last line that matches one of these is shown; anything else is withheld,
+# because the rest of stderr is kubectl's and may carry values.
+B5_WHY = re.compile(r"^(?:pid \d+ pgid \d+: [^\n]*|capture truncated: [^\n]*|output over the \d+-byte cap"
+                    r"|spawn failed: \w+|refused before any child: [^\n]*|not run: bound -?\d+)"
+                    r"(?:; harness close failure: [^\n]*)?$")
+
+
+def load_b5(directory=None):
+    """The B5 module, executed from the exact bytes whose sha256 was checked (no re-read between the check and
+    the load). Refused (KR25) when the copy is missing or is not the pinned one."""
+    path = os.path.join(directory or os.path.dirname(os.path.realpath(__file__)), B5_FILE)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        raise Refused("KR25", "the pinned custody module is missing")
+    if hashlib.sha256(data).hexdigest() != B5_SHA256:
+        raise Refused("KR25", "the custody module is not the pinned copy of the reviewed B5 section")
+    module = types.ModuleType("b5_custody")
+    module.__file__ = path
+    exec(compile(data, path, "exec"), module.__dict__)  # the verified bytes, nothing re-read
+    return module
+
+
+def b5_why(err):
+    last = err.rstrip("\n").rsplit("\n", 1)[-1] if err else ""
+    return last if B5_WHY.match(last) else "reason withheld"
+
+
+class B5Transport:
+    """kube-run's transport: B5's bounded_run, unchanged. Its rc 124 is a timeout and its rc 125 an unproven
+    settlement, truncated capture, output over the cap or failed spawn; anything else is kubectl's own status.
+    LIMIT, B5's own and stated: a descendant that calls setsid() leaves the group and is neither signalled nor
+    seen; while it holds a pipe it shows as a truncated capture (refused). kube-run therefore refuses kubeconfig
+    users that run a credential helper (KR23), the one kind of descendant kubectl is known to start. Ambiguity:
+    a kubectl that itself exits 124 or 125 reads as B5's 124 or 125, which fails closed."""
+
+    def __init__(self, b5=None):
+        self.b5 = b5 or load_b5()
+
+    def run(self, argv, env, timeout):
+        rc, out, err = self.b5.bounded_run(list(argv), int(timeout), dict(env))
+        if rc == 124:
+            raise Timeout()
+        if rc == 125:
+            why = b5_why(err)
+            if why.startswith("output over the"):
+                raise OutputOverBound()
+            if why.startswith("refused before any child"):
+                raise PlatformUnsupported(why)
+            raise Unsettled(why)
+        return rc, out.encode("utf-8"), err.encode("utf-8")
+
+
+# ---- credential helpers: refused, because B5 cannot follow a descendant that leaves its group -------------
+STATIC_USER_KEYS = {"token", "tokenFile", "client-certificate", "client-certificate-data", "client-key",
+                    "client-key-data", "username", "password"}
+
+
+def user_keys(data, user_name):
+    """The KEY NAMES directly under users[name == user_name].user. Values are never decoded, except each user
+    item's `name` (to find the one the context names). Unsupported layout raises Unsupported."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Unsupported("not UTF-8")
+    in_users, base, items = False, None, []
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if line[0] not in " -":
+            m = TOP_KEY.match(line)
+            in_users = bool(m) and m.group(1) == "users"
+            if in_users and (m.group(2) or "").strip() not in ("", "[]"):
+                raise Unsupported("an inline users value")
+            continue
+        if not in_users:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if s.startswith("- ") and (base is None or indent == base):
+            base = indent
+            items.append([(indent + 2, s[2:].lstrip(" "))])
+        elif items and indent > base:
+            items[-1].append((indent, s))
+        else:
+            raise Unsupported("a users line outside an item")
+    for item in items:
+        top = base + 2
+        name, user_at, inline = None, None, None
+        for i, (ind, t) in enumerate(item):
+            if ind != top:
+                continue
+            m = re.match(r"^([A-Za-z0-9_.\-]+):(?:\s+(.*))?$", t)
+            if not m:
+                raise Unsupported("a users item line that is not a key")
+            if m.group(1) == "name":
+                name = _scalar(m.group(2) or "")
+            elif m.group(1) == "user":
+                user_at, inline = i, (m.group(2) or "").strip()
+        if name != user_name:
+            continue
+        if user_at is None:
+            raise Unsupported("the user item has no user mapping")
+        if inline:
+            if inline == "{}":
+                return set()
+            raise Unsupported("an inline user mapping")
+        child = []
+        for ind, t in item[user_at + 1:]:
+            if ind <= top:
+                break
+            child.append((ind, t))
+        if not child:
+            return set()
+        level, keys = child[0][0], set()
+        for ind, t in child:
+            if ind == level:
+                m = re.match(r"^([A-Za-z0-9_.\-]+):", t)
+                if not m:
+                    raise Unsupported("a user line that is not a key")
+                keys.add(m.group(1))
+        return keys
+    raise Unsupported("the context's user is not in the users section")
+
+
+def _call(transport, argv, env, timeout, step):
+    """One bounded transport call. Timeout is left to the caller; every other outcome is a fixed refusal."""
+    try:
+        return transport.run(argv, env, timeout)
+    except PlatformUnsupported as p:
+        raise Refused("KR26", f"{step}: B5 custody is not available on this platform ({p.cause}); no process was "
+                              "started")
+    except Unsettled as u:
+        raise Refused("KR22", f"{step}: B5 could not prove settlement or a complete capture ({u.cause}); "
+                              "nothing further was run", EXIT_UNSETTLED)
+    except OutputOverBound:
+        raise Refused("KR20", f"{step} exceeded the output bound and was killed")
+    except OSError:
+        raise Refused("KR19", f"{step}: kubectl could not be started")
+    except Stopped:
+        raise Refused("KR21", f"{step} was stopped by a signal. B5 settles its group in a finally block, but that "
+                              "result is not reported on this path, so treat settlement as UNKNOWN; nothing "
+                              "further was run", EXIT_STOPPED)
+
+
+def child_env(environ):
+    env = {k: environ[k] for k in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME") if k in environ}
+    env["KUBERC"] = "off"
+    return env
+
+
+def pinned(kubectl, entry):
+    return [kubectl, "--kubeconfig", entry["kubeconfig"], "--context", entry["context"]]
+
+
+def read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        raise Refused("KR10", "the pinned kubeconfig cannot be read")
+
+
+def parse_cli(argv):
+    record, timeout, i = None, DEFAULT_TIMEOUT_S, 0
+    while i < len(argv) and argv[i].startswith("--") and argv[i] != "--":
+        a = argv[i]
+        if a == "--authorization" and i + 1 < len(argv):
+            record, i = argv[i + 1], i + 2
+        elif a == "--timeout" and i + 1 < len(argv) and argv[i + 1].isdigit():
+            timeout, i = int(argv[i + 1]), i + 2
+        else:
+            raise Refused("KR01", "usage: kube-run [--authorization FILE] [--timeout SECONDS] <cluster-id> -- "
+                                  "<kubectl arguments>")
+    if not 1 <= timeout <= MAX_TIMEOUT_S:
+        raise Refused("KR01", f"--timeout must be 1..{MAX_TIMEOUT_S}")
+    if i + 1 >= len(argv) or argv[i + 1] != "--" or i + 2 >= len(argv):
+        raise Refused("KR01", "usage: kube-run [--authorization FILE] [--timeout SECONDS] <cluster-id> -- "
+                              "<kubectl arguments>")
+    return record, timeout, argv[i], argv[i + 2:]
+
+
+def run(argv, registry_path, transport, now, environ, stdout, stderr):
+    record, timeout, cluster_id, kargs = parse_cli(argv)
+    if any(is_override(a) for a in kargs):  # before any file is read
+        parse_request(kargs, "default")
+    entry = load_entry(registry_path, cluster_id)
+    configured_policy(entry)  # an unconfigured entry is refused before its kubeconfig is opened
+    data = read_bytes(entry["kubeconfig"])
+    digest = hashlib.sha256(data).digest()
+    # Namespace default comes from the pinned context, so the pins are checked before scope.
+    ctx_ns, ctx_user = check_pins(entry, data, os.path.dirname(entry["kubeconfig"]))
+    if ctx_user is None:
+        raise Refused("KR11", "the pinned context names no user")
+    try:
+        keys = user_keys(data, ctx_user)
+    except Unsupported:
+        raise Refused("KR10", "the pinned user's entry uses a layout kube-run's restricted reader does not accept")
+    if keys - STATIC_USER_KEYS:
+        raise Refused("KR23", "the pinned user runs a credential helper or uses keys kube-run does not support "
+                              "(exec, auth-provider, impersonation); B5 cannot follow a helper that leaves its "
+                              "process group, so kube-run refuses it")
+    request = parse_request(kargs, ctx_ns or "default")
+    authorize(entry, cluster_id, record, request, now)
+    # The kubectl binary is deployment-controlled: the registry entry must pin it by absolute path. The caller's
+    # PATH is never consulted, because a binary it selects could answer the probe and ignore the request.
+    kubectl = entry.get("kubectl")
+    if not isinstance(kubectl, str) or not os.path.isabs(kubectl):
+        raise Refused("KR19", "the registry entry pins no absolute kubectl path, and kube-run never uses PATH")
+    env = child_env(environ)
+    # The probe names its type in canonical form too (`namespaces.v1.`), so no cluster-defined category or
+    # short name can redirect it (CLOSED, CANONICAL RESOURCE OPERANDS).
+    probe = pinned(kubectl, entry) + ["--request-timeout=" + PROBE_REQUEST_TIMEOUT, "get",
+                                      RESOURCE_SPELLINGS["namespaces"][0], "kube-system", "-o",
+                                      "jsonpath={.metadata.uid}"]
+    try:
+        rc, out, _ = _call(transport, probe, env, PROBE_TIMEOUT_S, "the identity probe")
+    except Timeout:
+        raise Refused("KR15", "the identity probe timed out; the request was not made", EXIT_PROBE)
+    if rc != 0 or not out.strip():
+        raise Refused("KR15", "the identity probe failed or returned nothing; the request was not made",
+                      EXIT_PROBE)
+    if out.decode("utf-8", "replace").strip() != entry["uid"]:
+        raise Refused("KR16", "the cluster behind the pinned context is not the registered cluster; the request "
+                              "was not made")
+    if hashlib.sha256(read_bytes(entry["kubeconfig"])).digest() != digest:
+        raise Refused("KR17", "the kubeconfig changed after its pins were checked; the request was not made")
+    try:
+        rc, out, err = _call(transport, pinned(kubectl, entry) + request["argv"], env, timeout, "the request")
+    except Timeout:
+        raise Refused("KR18", "the request exceeded --timeout and was killed", EXIT_TIMEOUT)
+    stdout.write(out)
+    stderr.write(err)
+    stdout.flush()
+    stderr.flush()
+    print(f"kube-run: cluster={cluster_id} verb={request['verb']} identity=verified rc={rc}",
+          file=_text(stderr))
+    return rc
+
+
+def _text(stream):
+    class W:
+        def write(self, s):
+            stream.write(s.encode("utf-8"))
+
+        def flush(self):
+            stream.flush()
+    return W()
+
+
+def _on_signal(signum, _frame):
+    raise Stopped(signal.Signals(signum).name)
+
+
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+
+
+def main(argv, registry_path=REGISTRY_PATH, transport=None, now=None, environ=None, stdout=None, stderr=None):
+    stdout = stdout or sys.stdout.buffer
+    stderr = stderr or sys.stderr.buffer
+    previous = {}
+
+    def refuse(code, detail, exit_code):
+        msg = (f"kube-run (TXE-8039): refused [{code} {CODES[code]}]: {detail}. Values are withheld. "
+               "Report this verbatim to your coordinator; do not work around it.\n")
+        stderr.write(msg.encode("utf-8"))
+        stderr.flush()
+        return exit_code
+
+    try:
+        # A stop signal raises Stopped wherever it lands, so B5's finally settles a running group (an outer
+        # timeout such as gtimeout sends SIGTERM first).
+        for s in STOP_SIGNALS:
+            try:
+                previous[s] = signal.signal(s, _on_signal)
+            except ValueError:  # not the main thread
+                pass
+        return run(argv, registry_path, transport or B5Transport(),
+                   now or _dt.datetime.now(_dt.timezone.utc), os.environ if environ is None else environ,
+                   stdout, stderr)
+    except Refused as r:
+        return refuse(r.code, r.detail, r.exit_code)
+    except Stopped:
+        return refuse("KR21", "stopped by a signal outside a transport call; nothing further was run", EXIT_STOPPED)
+    finally:
+        for s, h in previous.items():
+            signal.signal(s, h)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
