@@ -788,7 +788,7 @@ var guardRefused = []string{
 	`T=tests/scripts/test_mutant_consumers.py; python3 -I -c 'import ast,sys; exec(compile(ast.parse(open(sys.argv[1]).read()), "m", "exec"))' $T`,
 	`python3 -I -c 'import ast, runpy, sys; ast.parse(open(sys.argv[1]).read()); runpy.run_path(sys.argv[1])' tests/scripts/test_mutant_consumers.py`,
 	// Code outside the read-only grammar is not cleared, so its JSON read of a mutant-named input
-	// is judged by the run-call rule (security review of 3b91409a7): open() in a write mode hidden
+	// is judged by the run-call rule (automated security review, TXE-8183): open() in a write mode hidden
 	// by *args or passed to map, and a coding declaration that changes how Python decodes stdin.
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); open(*[sys.argv[1], "w"])' mutants.json`,
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map(open, [sys.argv[1]], ["w"]))' mutants.json`,
@@ -800,7 +800,7 @@ var guardRefused = []string{
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map((x for x in ()).gi_frame.f_globals["__builtins__"]["exec"], ["print(1)"]))' mutants.json`,
 	// A data read whose imports a PYTHON* variable can redirect is judged by the language-neutral rule.
 	`PYTHONPATH=/tmp/x python3 -c 'import json, sys; print(json.load(open(sys.argv[1])))' mutants.json`,
-	// TXE-8183 independent review of c6e39841 (msg_ff5d58c07a39). All inert: none is executed.
+	// TXE-8183 independent review findings F1-F3. All inert: none is executed.
 	// F1: interactive forms are never cleared, and -i's stdin continuation is judged as a program.
 	`python3 -i -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
 	`python3 -Ii -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
@@ -853,7 +853,7 @@ var guardRefused = []string{
 	"python3 -I - <<'EOF'\n\f# coding: utf-7\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	"python3 -I - <<'EOF'\n\ufeffimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	// Code the shell expands first is not the text the guard read, so it is never cleared
-	// (security review of 31e6ea3d2): a substitution or variable in double quotes, ANSI-C
+	// (automated security review, TXE-8183): a substitution or variable in double quotes, ANSI-C
 	// quoting, an unquoted here-document and an expanded here-string.
 	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])))$(printf ';x=1')" mutants.json`,
 	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])))$TAIL" mutants.json`,
@@ -975,21 +975,21 @@ var guardAllowed = []string{
 	"cat <<'A' <<'B'\npython3 mutants.py\nA\nbash run-mutations.sh\nB",
 	// TXE-8183: Python code proven not to execute reads data, whatever it is given. Each shape is
 	// paired with executing counterparts in guardRefused.
-	// Observed false positive 6 (cc1, 2026-11-22 15:20Z, TXE-7549 comment 59b3690c), verbatim
+	// Observed false positive 6 (2026-11-22 15:20Z, recorded on TXE-7549), verbatim
 	// with the worktree path replaced.
 	`cd /home/u/work/txe-8047 && sed -n 54,66p conftest.py; python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r["suites"]["pytest-mutants"],indent=1)); print(r["images"])' ops/ci/mutant-consumers.json`,
-	// Observed false positive 7 (cc1, 2026-11-22 16:03:00Z, TXE-7549 comment ac5e6264), verbatim
-	// from the transcript copy (txe-8047 hook-refusal-case2-exact.json, sha256 0c8321b6...) with
-	// the scratchpad path replaced. K names the runner's work directory.
+	// Observed false positive 7 (2026-11-22 16:03Z, recorded on TXE-7549), verbatim
+	// from the session transcript, with a local scratch path replaced. K names the runner's
+	// work directory.
 	`SP=/tmp/scratch; E=$(cat $SP/first-run2-E.txt); R=$(cat $SP/first-run2-R.txt); K=$R/mutate-sandboxed-1_y5j3xh; O=$E/post-run.txt; { echo "== container custody"; python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); print("container_cleanup:", json.dumps(r.get("container_cleanup"))); print("workdir:", json.dumps(r.get("workdir"))); print("image:", json.dumps(r.get("image"))); print("tree:", json.dumps(r.get("tree"))); print("seeded:", r.get("seeded"))' $E/report.json; for c in "$K"/cids/*; do echo "cidfile $(basename $c): $(cat $c)"; cid=$(cat $c); echo "  docker inspect now: $(docker inspect --format '{{.Id}}' $cid 2>&1 | head -1)"; done; echo "owner token file present: $(test -f $K/.mutate-sandboxed-owned && echo yes)"; } >> $O 2>&1; command cp -p "$K/report.json" $E/logs/workdir-report.json; tail -12 $O; cd $E && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs shasum -a 256 >| SHA256SUMS && cat SHA256SUMS`,
-	// Observed false positive 8 (cc1, 2026-11-22 16:08:51Z, TXE-7549 comment 11e5209c), verbatim
-	// (txe-8047 HOOK-REFUSAL-3-exact.json, sha256 518ba63a...): a sed edit whose text says
-	// globals(), then an ast parse and a json parse. T names a test file with mutant in its name.
+	// Observed false positive 8 (2026-11-22 16:08Z, recorded on TXE-7549), verbatim: a sed edit
+	// whose text says globals(), then an ast parse and a json parse. T names a test file with
+	// mutant in its name.
 	`T=tests/scripts/test_mutant_consumers.py; sed -i '' -e 's|    monkeypatch.setattr(sys.modules\[__name__\], "REGISTRY", tmp_path / "reg.json")|    monkeypatch.setitem(globals(), "REGISTRY", tmp_path / "reg.json")|' -e 's|    monkeypatch.setattr(sys.modules\[__name__\], "VALIDATION_IMAGE", tmp_path / "man.json")|    monkeypatch.setitem(globals(), "VALIDATION_IMAGE", tmp_path / "man.json")|' $T; grep -n 'monkeypatch.setitem(globals()' $T; python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read()); print("ast ok (parser)")' $T; python3 -I -c 'import json,sys; json.load(open(sys.argv[1])); print("json ok (parser)")' ops/ci/validation-image/manifest.json`,
 	// The same parse that passed earlier that day, with the file as its argument.
 	`python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' tests/scripts/test_mutant_consumers.py`,
 	`python3 -c 'import ast, sys; print(ast.dump(ast.parse(open(sys.argv[1]).read())))' mutants.py`,
-	// Review F2 (c6e39841): clearance needs the isolated form, so these three synthetic reads carry
+	// Review F2: clearance needs the isolated form, so these three synthetic reads carry
 	// -I; their non-isolated forms moved to guardRefused as documented false positives.
 	`python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
 	`M=mutants.json python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$M"`,
