@@ -222,6 +222,25 @@ class Refused(unittest.TestCase):
         # As a command word, the word itself is not a client name, so it is an unclassified command naming one.
         self.deny("kube{ctl,x} get pods", "H15")
 
+    def test_xargs_with_input_is_a_receiver_in_a_client_line(self):
+        # Connector security review of 13864551: xargs completes its command from its INPUT, so it is a receiver,
+        # not a transparent wrapper. With input, in a client-relevant line, it is refused whatever it runs.
+        for cmd in ("printf '%s\\n' 'kubectl delete secrets -A' | xargs env",          # the finding
+                    "echo kubectl get ns | xargs", "echo kubectl get ns | xargs echo",  # bare (runs echo); conservative
+                    "echo kubectl get ns | xargs -I {} {}", "echo kubectl get ns | xargs -I{} {}",   # placeholders
+                    "echo kubectl get ns | xargs -n 1 sh -c", "echo kubectl get ns | timeout 5 xargs env",
+                    "printf kubectl | xargs watch", "echo kube''ctl get ns | xargs env",
+                    "echo kubectl get ns > >(xargs env)",                                  # output process substitution
+                    "echo kubectl > f; xargs env < f", "xargs env < <(echo kubectl get secrets)",   # input redirection
+                    "xargs env <<< 'kubectl get secrets'", "xargs env <<'EOF'\nkubectl get secrets\nEOF",
+                    "echo kubectl > f; xargs -a f env", "echo kubectl > f; xargs --arg-file=f env",
+                    "echo kubectl > f; xargs -n 1 -a f env"):
+            self.deny(cmd, "H03")
+        # A cluster client named in the text is still classified: an API call stays H01, and a local form is not
+        # local when xargs appends its input to the arguments.
+        for cmd in ("echo ns | xargs kubectl get", "echo x | xargs kubectl version --client"):
+            self.deny(cmd, "H01", "kubectl")
+
     def test_nested_shells_and_substitutions(self):
         for cmd in ("bash -c 'kubectl get pods'", 'zsh -lc "kubectl get pods"', 'eval "kubectl get pods"',
                     "sh <<'EOF'\nkubectl get pods\nEOF", "bash <<< 'kubectl get pods'", "X=$(kubectl get ns)",
@@ -691,6 +710,12 @@ class Allowed(unittest.TestCase):
                     "echo ${HOME} | bash", "echo {1..3} | sh", "echo {a..z} | sh", "echo {1..5000} | sh",
                     "mkdir -p a/{b,c}", "echo " + "{a,b}" * 9,
                     "find . -name x -exec echo {} \\;"):
+            self.allow(cmd)
+
+    def test_xargs_with_input_in_a_line_without_a_client(self):
+        # The receiver rule applies only to a client-relevant line: ordinary xargs use stays allowed.
+        for cmd in ("ls | xargs echo", "printf 'a\\n' | xargs env", "xargs -a list.txt echo", "xargs echo <<< hello",
+                    "find . -name '*.tmp' | xargs -n 1 ls -l", "echo a | xargs -I {} echo {}"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):

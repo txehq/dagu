@@ -363,6 +363,13 @@ Also:
 - an interpreter whose code, arguments or input name a client;
 - `watch` (its words are shell text unless `--exec` is given);
 - a shell or interpreter reading a pipe;
+- an `xargs` with input: a pipe, an input redirection, a here-document or here-string, or `-a`/`--arg-file`.
+  xargs completes its command from that input at run time (`printf 'kubectl delete secrets -A' | xargs env`
+  runs `env kubectl delete secrets -A`), so it is a receiver, not a wrapper. In a line that names a client it is
+  refused (H03) whatever it runs. The one exception is a client named in the text (`... | xargs kubectl get`),
+  which is still classified: an API call is H01, and a local form is not local, because xargs appends arguments.
+  **Conservative, by design:** `printf kubectl | xargs echo` and a bare `... | xargs` (which runs echo) are
+  refused too. Without a client in the line, xargs is unchanged (`ls | xargs echo`);
 - the forms the lexer cannot parse (H05).
 
 **Expected false refusals, documented:** text that only QUOTES a client name, inside a command that is not a data

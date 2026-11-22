@@ -44,7 +44,10 @@ nesting too deep (H12).
 sh/bash/zsh -c, eval, here-documents and here-strings fed to a shell, $(...), backticks and <(...) are parsed
 recursively, and wrappers (timeout, env, xargs, watch, sudo, nice, nohup, ...) are unwrapped. A wrapper option
 the hook does not know may take a value, so it cannot tell which word is the command: when a cluster client
-follows it, the command is refused (H03).
+follows it, the command is refused (H03). xargs is unwrapped only when it has no input: an xargs that reads a
+pipe, a redirection, a here-document or here-string, or an argument file completes its command at run time, so in
+a line that names a client it is refused (H03), unless what it runs is a client named in the text, which is then
+classified (and is never a local form).
 
 POSITIVE CLASSIFICATION (H15): a client's name is accepted only in a context the hook understands. Those are a
 client's own classified argv, the installed kube-run's argv, a command of the SMALL closed data set (DATA_OPTIONS:
@@ -986,8 +989,17 @@ class Guard:
         while words and words[0][0] in KEYWORDS:
             words.pop(0)
         words = self._take_assignments(words, env)
+        # XARGS IS AN INPUT RECEIVER, not a transparent wrapper (connector security review of 13864551):
+        # `printf 'kubectl delete secrets -A' | xargs env` runs `env kubectl delete secrets -A`, a command completed
+        # at run time from xargs's INPUT. In a client-relevant line, an xargs that has input (a pipe, an input
+        # redirection, a here-document or here-string, or -a/--arg-file) is refused (H03), whatever it runs, with
+        # one exception: when what it finally runs is a cluster client named in the text, that client is still
+        # classified (an API call is H01/H07; a local form is not local, because its arguments are not all known).
+        xargs_input = False
         while words:
             w, fl = words[0][0], words[0][1]
+            if xargs_input and self.whole_mentions and (w == "[" or "ansi" in fl or DYNAMIC.search(w)):
+                raise Refusal("H03")      # `... | xargs [`, `... | xargs $X`: not a client named in the text
             if w == "[" and "ansi" not in fl:
                 # The exact command word `[` is the POSIX test command, not a glob: classified HERE, before the
                 # generic DYNAMIC check. It needs its closing `]` as the last argument; malformed bracket syntax is
@@ -1006,8 +1018,12 @@ class Guard:
                 return
             base = os.path.basename(w)
             if base in WRAPPERS:
+                if base == "xargs" and self._has_input(cmd, words[1:]):
+                    xargs_input = True
                 words = self._unwrap(base, words[1:], env, depth)
                 if words is None:
+                    if xargs_input and self.whole_mentions:
+                        raise Refusal("H03")  # `... | xargs watch`, `... | xargs env -S`: completed from the input
                     return
                 continue
             if base in VENDOR_WRAPPERS and len(words) > 1 and os.path.basename(words[1][0]) == "kubectl":
@@ -1015,6 +1031,10 @@ class Guard:
                 words = [("kubectl", set())] + (rest[1:] if rest and rest[0][0] == "--" else rest)
                 continue
             break
+        if xargs_input and self.whole_mentions and (not words or os.path.basename(words[0][0]) not in FAMILY):
+            # Bare `xargs` runs echo; `xargs env`, `xargs sh -c`, `xargs -I{} {}`, `xargs echo`: all completed from
+            # the input. Conservative by design: `printf kubectl | xargs echo` is refused too.
+            raise Refusal("H03")
         if not words:
             for stdin in cmd["stdin"]:
                 if mentions(stdin):
@@ -1079,8 +1099,10 @@ class Guard:
         p = parse_flags(args, VALUE_FLAGS[fam])
         kind = classify(fam, p)
         sub = safe_sub(p["pos"][0]) if p["pos"] else "-"
-        if kind == "local" and not local_form(base, args, p):
-            kind = "api"      # not one of the closed, evidenced LOCAL_FORMS: an API call (H01/H07)
+        if kind == "local" and (xargs_input or not local_form(base, args, p)):
+            # Not one of the closed, evidenced LOCAL_FORMS, or run by an xargs that appends its input to the
+            # arguments: an API call (H01/H07).
+            kind = "api"
         if kind == "local":
             return
         if kind == "secret-print":
@@ -1124,6 +1146,25 @@ class Guard:
         verb = next((a for a in kargs if not a.startswith("-")), "")
         if any(a == f or a.startswith(f + "=") or short_cluster_has(a, "s") for a in kargs for f in KUBE_RUN_OVERRIDES):
             raise Refusal("H11", "kube-run", safe_sub(verb))
+
+    @staticmethod
+    def _has_input(cmd, rest):
+        """True when an xargs (rest: the words after it) has input it builds commands from: it reads a pipe (or is the
+        first command of an output process substitution), has an input redirection, a here-document or a
+        here-string, or names an argument file in its own options (-a F, -aF, --arg-file F, --arg-file=F)."""
+        if cmd.get("piped") or cmd["stdin"]:
+            return True
+        if any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", [])):
+            return True
+        valued, i = WRAPPERS["xargs"], 0
+        while i < len(rest):
+            a = rest[i][0]
+            if a == "--" or not a.startswith("-") or a == "-":
+                break
+            if a in ("-a", "--arg-file") or a.startswith("--arg-file=") or (a.startswith("-a") and len(a) > 2):
+                return True
+            i += 2 if a in valued else 1
+        return False
 
     def _take_assignments(self, words, env):
         while words and not words[0][1] and ASSIGN.match(words[0][0]):
