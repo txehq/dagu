@@ -608,7 +608,10 @@ PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|
                            r"|\bcode\s*\.\s*interact")
 # A coding declaration on line 1 or 2 makes Python decode a program read as bytes (stdin, a
 # here-document, a descriptor) differently from the text parsed here (utf-7 can hide code).
-PY_CODING_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=]", re.M)
+# Python's lines end at \r, \n or \r\n, str.splitlines() also splits at \f, \x1c-\x1e, \x85 and
+# others, so "line 1 or 2" is not located here at all: a coding comment ANYWHERE, a \r, or a BOM
+# keeps code from being cleared.
+PY_CODING_COOKIE = re.compile(r"#.*?coding[:=]|\r|﻿")
 _read_only_cache: dict = {}
 
 
@@ -623,7 +626,7 @@ def python_reads_only(code: str) -> bool:
 
 
 def _python_reads_only(code: str) -> bool:
-    if PY_CODING_COOKIE.search("\n".join(code.splitlines()[:2])):
+    if PY_CODING_COOKIE.search(code):
         return False
     tree = ast.parse(code)
     modules, functions, parents = {}, set(), {}

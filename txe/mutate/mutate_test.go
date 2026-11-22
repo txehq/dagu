@@ -793,6 +793,10 @@ var guardRefused = []string{
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); open(*[sys.argv[1], "w"])' mutants.json`,
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map(open, [sys.argv[1]], ["w"]))' mutants.json`,
 	"python3 - <<'EOF'\n# -*- coding: utf-7 -*-\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	// The declaration on what CPython counts as line 2, after a \f that str.splitlines() splits at.
+	"python3 - <<'EOF'\nx = 1\f\n# coding: utf-7\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	// ... and after a lone \r, which ends a line for CPython.
+	"python3 - <<'EOF'\nx = 1\r# coding: utf-7\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map((x for x in ()).gi_frame.f_globals["__builtins__"]["exec"], ["print(1)"]))' mutants.json`,
 	// A data read whose imports a PYTHON* variable can redirect is judged by the language-neutral rule.
 	`PYTHONPATH=/tmp/x python3 -c 'import json, sys; print(json.load(open(sys.argv[1])))' mutants.json`,
