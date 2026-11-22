@@ -363,13 +363,19 @@ Also:
 - an interpreter whose code, arguments or input name a client;
 - `watch` (its words are shell text unless `--exec` is given);
 - a shell or interpreter reading a pipe;
-- an `xargs` with input: a pipe, an input redirection, a here-document or here-string, or `-a`/`--arg-file`.
-  xargs completes its command from that input at run time (`printf 'kubectl delete secrets -A' | xargs env`
-  runs `env kubectl delete secrets -A`), so it is a receiver, not a wrapper. In a line that names a client it is
-  refused (H03) whatever it runs. The one exception is a client named in the text (`... | xargs kubectl get`),
-  which is still classified: an API call is H01, and a local form is not local, because xargs appends arguments.
-  **Conservative, by design:** `printf kubectl | xargs echo` and a bare `... | xargs` (which runs echo) are
-  refused too. Without a client in the line, xargs is unchanged (`ls | xargs echo`);
+- **every `xargs` in a line that names a client.** xargs completes its command from its input at run time
+  (`printf 'kubectl delete secrets -A' | xargs env` runs `env kubectl delete secrets -A`), so it is an input
+  consumer, not a wrapper. Its input may be inherited through a group, a loop or the tool's own stdin
+  (`... | ( xargs env )`, `... | while read x; do xargs env; done`, `( xargs env ) < f`), so the hook does not try
+  to detect it. In a client line, every xargs is refused (H03), whatever it runs. A client named in the text after
+  it (`... | xargs kubectl get`) is still classified, but never allowed:
+  - a specific refusal is kept (H08 for `config view --raw`);
+  - every other kind is refused as an API call (H01/H07), including a local form and a config write
+    (`echo 'view --raw' | xargs kubectl --kubeconfig=/tmp/k config`), because xargs can extend its argv.
+
+  **Conservative, and broad, by design:** `printf kubectl | xargs echo`, a bare `... | xargs`, and an xargs with
+  no visible input anywhere in a client line (`echo kubectl; xargs -a list.txt echo`) are all refused. Without a
+  client in the line, xargs is unchanged (`ls | xargs echo`);
 - the forms the lexer cannot parse (H05).
 
 **Expected false refusals, documented:** text that only QUOTES a client name, inside a command that is not a data

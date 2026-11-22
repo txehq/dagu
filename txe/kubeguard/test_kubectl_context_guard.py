@@ -238,12 +238,22 @@ class Refused(unittest.TestCase):
                     # Clustered and abbreviated argument-file spellings: not exact table entries, so _unwrap's closed
                     # option grammar refuses them in a client line before the command is located.
                     "echo kubectl > f; xargs -0a f env", "echo kubectl > f; xargs -ra f env",
-                    "echo kubectl > f; xargs --arg f env"):
+                    "echo kubectl > f; xargs --arg f env",
+                    # Root msg_04775a3d3836: stdin inherited through a group, a loop or the tool itself cannot be
+                    # ruled out, so EVERY xargs in a client line is an input consumer.
+                    "echo kubectl get ns | ( xargs env )", "echo kubectl get ns | { true; xargs env; }",
+                    "echo kubectl get ns | while read x; do xargs env; done", "echo kubectl > f; ( xargs env ) < f",
+                    "echo kubectl; xargs env", "echo kubectl; xargs -a list.txt echo"):
             self.deny(cmd, "H03")
-        # A cluster client named in the text is still classified: an API call stays H01, and a local form is not
-        # local when xargs appends its input to the arguments.
-        for cmd in ("echo ns | xargs kubectl get", "echo x | xargs kubectl version --client"):
+        # A cluster client named in the text after an xargs is classified but never allowed: xargs can extend its
+        # argv. A specific refusal is kept (H08); every other kind (local, config write, api) is H01.
+        for cmd in ("echo ns | xargs kubectl get", "echo x | xargs kubectl version --client",
+                    "echo 'view --raw' | xargs kubectl --kubeconfig=/tmp/k config",                # appended view --raw
+                    "echo 'use-context prod' | xargs kubectl --kubeconfig=/tmp/k config",          # appended context change
+                    "echo prod | xargs kubectl --kubeconfig=/tmp/k config use-context",
+                    "echo x | xargs kubectl config current-context"):
             self.deny(cmd, "H01", "kubectl")
+        self.deny("echo x | xargs kubectl config view --raw", "H08", "kubectl")
 
     def test_nested_shells_and_substitutions(self):
         for cmd in ("bash -c 'kubectl get pods'", 'zsh -lc "kubectl get pods"', 'eval "kubectl get pods"',
@@ -717,9 +727,10 @@ class Allowed(unittest.TestCase):
             self.allow(cmd)
 
     def test_xargs_with_input_in_a_line_without_a_client(self):
-        # The receiver rule applies only to a client-relevant line: ordinary xargs use stays allowed.
+        # The consumer rule applies only to a client-relevant line: ordinary xargs use stays allowed.
         for cmd in ("ls | xargs echo", "printf 'a\\n' | xargs env", "xargs -a list.txt echo", "xargs echo <<< hello",
-                    "find . -name '*.tmp' | xargs -n 1 ls -l", "echo a | xargs -I {} echo {}"):
+                    "find . -name '*.tmp' | xargs -n 1 ls -l", "echo a | xargs -I {} echo {}",
+                    "ls | ( xargs echo )", "ls | while read x; do xargs echo; done", "xargs -0a f echo"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):
