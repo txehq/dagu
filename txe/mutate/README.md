@@ -138,6 +138,59 @@ and process substitution, redirections, here-documents) and judges only what wou
   runs a file or a process (`runpy`, `exec`, `subprocess`, `os.system`, `require`, `load`, ...),
   also when the mutant is one of the code's own arguments (`python3 -c '...' mutants.py`: the
   guard does not follow data flow, so it errs toward refusing).
+- **Python data reads versus execution (TXE-8183).** The shared run-call list above has
+  other-language words (`load`, `system`, `require`), so `json.load(...)` used to count as running
+  a file. Python code is now parsed with `ast.parse`, which builds a tree and runs nothing. It can
+  be cleared as data only in one supported form, and only when it fits a deliberately small grammar.
+
+  The supported form:
+  - the isolated interpreter, `python3 -I` (plus only `-B`/`-u`), with the code given by `-c` or
+    on stdin;
+  - not interactive: no `-i` and no PYTHONINSPECT;
+  - at the top level of the command, either directly or behind
+    timeout/nice/nohup/command/`env` without `-S`. Not inside eval, `env -S`, `bash -c`, go
+    `-exec`, sudo or `uv run`;
+  - with no `PYTHON*` variable set.
+
+  The grammar, in one module scope:
+  - `import` of `json`, `ast` and `sys` only, with no alias that shadows a builtin or a binding;
+  - plain `NAME = ...` assignments, where NAME is never a module or a builtin name;
+  - `with open(...) as NAME:`;
+  - expression statements;
+  - calls only to a few builtins (`print`, `len`, `open` in a literal read mode, ...), to
+    `json.load`/`loads`/`dumps`, `ast.parse`/`dump`/`literal_eval`, and to a few methods (`read`,
+    `get`, `split`, ...), each with only its listed keywords. No callback keyword: `key=`,
+    `object_hook=`, `opener=` and the like are refused;
+  - a module only as `module.attr`, and never assigned or deleted;
+  - no def, lambda, comprehension, loop, class, `del`, `_` name or attribute, `*args`/`**kwargs`,
+    coding comment, `\r` or BOM.
+
+  The code must also reach Python exactly as written. It must come from single quotes, a quoted
+  here-document or a single-quoted here-string. Code that the shell expands first is never
+  cleared: `"...$X..."`, `"...$(cmd)..."`, `$'...'`, an unquoted `<<EOF` or an expanded `<<<`.
+
+  Code in any other form or shape is not cleared. A json.load of a mutant-named input without `-I`
+  is therefore still refused, as it was before TXE-8183: a documented false positive, pending
+  explicit review. With `-i`, the stdin that Python reads after the code is judged as a program.
+
+  Cleared code is data, whatever its arguments, variables or tokens name. That includes
+  `mutants.json` and a `mutate-sandboxed-*` work directory, so a runner's `report.json` can be
+  read. Code that is not cleared is judged as before, with two additions:
+  - executable deserialization and dynamic access count as run calls (`pickle`, `marshal`,
+    `importlib`, `getattr`, `__builtins__`, ...): `pickle.load` is execution and `json.load` is
+    not;
+  - an input names a mutant when ANY path component does, whatever its extension. So
+    `exec(open("mutants.json").read())`, `runpy` on `mutants` or on a `.txt` file, and execution of
+    a file under a `mutate-sandboxed-*` work directory are refused.
+
+  No extension or path is exempt. A pathname alone proves neither execution nor its absence;
+  only code shown not to execute makes its inputs data. Every newly allowed read in `guardAllowed`
+  has executing counterparts in `guardRefused`.
+
+  Trusted, not checked:
+  - `python3` on PATH is CPython, with an unmodified standard library;
+  - its site-packages `.pth` files, which `-I` does not disable, and anything installed system-wide
+    are state outside the command.
 - **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
   `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
   and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
@@ -174,6 +227,22 @@ the controls for them.
   (`while read l; do python3; done < mutants.py`). `( … )` and `{ …; }` groups do.
 - State set outside the command: an exported variable, an alias or function from the shell's rc
   files, an `exec 3<` in an earlier call.
+- **Python's startup state outside the command (TXE-8183).** Clearance requires `-I`, so neither
+  the current directory nor a PYTHON* variable can redirect `import json`. Two kinds of state
+  remain trusted, not checked:
+  - an exported PYTHON* variable is ignored under `-I`, but an unusual `python3` on PATH is not;
+  - a system site-packages `.pth` file runs at startup even under `-I`.
+- **Stdin continuation is judged only from what the command shows.** With `-i` (or
+  PYTHONINSPECT), the stdin that Python reads after the code, module or script is judged as a
+  program, so `< mutants.py` and `cat mutants.py |` are refused. A stdin the command does not
+  show, such as a terminal or an inherited descriptor, cannot be judged.
+- **Other languages keep the shared run-call list.** `node -e`, `perl -e` and `ruby -e` code are
+  judged as before, and no read-only grammar clears them. They can still be refused for a word
+  like `load` or `require` used as data.
+- **Python's path-component rule over-refuses.** Uncleared Python code that may run something
+  is refused when any word names a mutant in any component, for example
+  `subprocess.run(["go", "test", "./txe/mutate/..."])`. That code is not a data read; ask your
+  coordinator.
 
 A shape gets a parser fix only when an agent would plausibly write it by accident while running a
 mutant, with a fixture in `guardRefused` that shows it.

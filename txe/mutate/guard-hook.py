@@ -27,7 +27,13 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
 - a non-shell interpreter given code (`python3 -c`, `node -e`, `perl -e`, a here-document on
   python3's stdin) that imports a mutant module, or names a mutant script or mutation tool and
   calls something that runs a file or a process (runpy, exec, subprocess, os.system, require,
-  child_process, ...).
+  child_process, ...). Python code is also parsed (TXE-8183): in one supported form (isolated
+  `python3 -I -c` or `-I` with stdin, not interactive, top level, no PYTHON* variable), code
+  proven within a small grammar to only read, parse and print data (json.load, ast.parse, open
+  in a read mode, print) is data whatever its arguments name; other Python code that may run
+  something is refused when any input it is given names a mutant in any path component, whatever
+  the extension (`exec(open("mutants.json").read())`, a file under a mutate-sandboxed work
+  directory). With -i, the stdin read after the code is judged as a program.
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
 `--body` or `--text` message, a path given to cat or shasum, the body of a here-document written
 to a file, a comment, and code that only mentions the names (prints them, edits text containing
@@ -38,6 +44,8 @@ name assembled at run time, a mutation run inside a script the command calls, or
 tool it does not know. It is defence in depth that catches the habit that caused the incident; the
 AGENTS.md rule is the policy.
 """
+import ast
+import builtins
 import json
 import os
 import re
@@ -146,6 +154,9 @@ class Word:
     def __init__(self):
         self.text = ""
         self.procsub: "list[Cmd] | None" = None  # when the word is <(...) or >(...)
+        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks), so
+        # that `text` is not what the program receives (TXE-8183: such code is never cleared).
+        self.expanded = False
 
 
 class Cmd:
@@ -155,7 +166,8 @@ class Cmd:
     def __init__(self):
         self.words: list[Word] = []
         # Descriptor ("0" is stdin, "3", "{name}") -> ("file", path) | ("procsub", cmds) |
-        # ("text", here-string) | ["text", here-document body] (a list, filled in when the body
+        # ("text"|"text-expanding", here-string) | ["text"|"text-expanding", here-document body]
+        # ("text-expanding" when the shell expands it first; a list, filled in when the body
         # is read at the next newline, so a duplication made before then shares it) |
         # ("unknown", descriptor) for a duplication of a descriptor this command does not set.
         self.fds: dict = {}
@@ -189,6 +201,7 @@ class Parser:
         self.heredocs = []  # (cmd, delimiter, strip_tabs, quoted) waiting for the next newline
         self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
         self.braces = []  # where each open `{ ...` group starts in self.cmds
+        self.expansions = 0  # how many expansions have been read (Word.expanded compares counts)
 
     def parse(self) -> list:
         self.seq(None)
@@ -303,11 +316,15 @@ class Parser:
         src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
-            pending = ["text", ""]  # its body is read at the next newline
+            quoted = any(q in raw for q in "'\"\\")
+            # An unquoted body is expanded by the shell ($VAR, $(...), backticks, backslashes), so
+            # the text read here is not the text the program receives: "text-expanding" is never
+            # cleared as data (TXE-8183).
+            pending = ["text" if quoted else "text-expanding", ""]  # its body is read at the next newline
             cur.set_source(key, pending)
-            self.heredocs.append((pending, target.text, op == "<<-", any(q in raw for q in "'\"\\")))
+            self.heredocs.append((pending, target.text, op == "<<-", quoted))
         elif op == "<<<":
-            cur.set_source(key, ("text", target.text))
+            cur.set_source(key, ("text-expanding" if target.expanded else "text", target.text))
         elif op in ("<&", ">&") and re.fullmatch(r"[0-9]+-?", target.text):
             cur.duplicate(key, str(int(target.text.rstrip("-"))))  # `<&3` or `<&3-` (move)
         elif op in ("<&", ">&") and target.text == "-":
@@ -373,6 +390,7 @@ class Parser:
                 w.procsub = self.seq(")")
                 self.depth -= 1
             return w
+        start = self.expansions
         while self.i < len(s) and s[self.i] not in WORD_END:
             c = s[self.i]
             if c == "'":
@@ -381,6 +399,9 @@ class Parser:
                 w.text += s[self.i + 1:end]
                 self.i = end + 1
             elif s.startswith("$'", self.i):
+                # ANSI-C quoting: its escapes (\n, \x3b, ...) are not decoded here, so the text
+                # differs from what the program receives; counted as an expansion.
+                self.expansions += 1
                 self.i += 2
                 while self.i < len(s) and s[self.i] != "'":
                     if s[self.i] == "\\" and self.i + 1 < len(s):
@@ -400,11 +421,13 @@ class Parser:
             else:
                 w.text += c
                 self.i += 1
+        w.expanded = self.expansions != start
         return w
 
     def substitution(self) -> str:
         """At $ or a backtick: read a command substitution (its commands are recorded), an
         arithmetic expansion, or a plain $; return the text it adds to the word."""
+        self.expansions += 1  # any $ or backtick, outside single quotes (TXE-8183)
         s = self.s
         if s.startswith("$((", self.i):
             self.arithmetic("$((")
@@ -444,6 +467,10 @@ class Parser:
             elif c == "`" or s.startswith("$(", self.i):
                 text += self.substitution()
             else:
+                if c == "$":
+                    # "$NAME", "${X}", "$1", "$@" are copied as text but the shell replaces them:
+                    # every unescaped $ counts as an expansion (TXE-8183).
+                    self.expansions += 1
                 text += c
                 self.i += 1
         return text
@@ -486,7 +513,7 @@ def fd_of_path(text: str):
     return "?" if FD_DIR.match(p) or p.startswith("/proc/") else None
 
 
-def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) -> bool:
+def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0, lang: str = "other") -> bool:
     """The script an interpreter runs: a file, the output of a process substitution, or a
     descriptor of the command (`python3 /dev/fd/3 3< mutants.py`). A descriptor path the command
     does not set (opened by an earlier `exec 3<`, say) cannot be judged and is refused."""
@@ -494,14 +521,14 @@ def operand_is_mutant(w: Word, cmd=None, shell: bool = False, depth: int = 0) ->
         return any(names_mutant_script(c.words) for c in w.procsub)
     fd = fd_of_path(w.text)
     if fd == "0":
-        return stdin_is_mutant(cmd, shell, depth)
+        return stdin_is_mutant(cmd, shell, depth, lang)
     if fd is not None:
         src = cmd.source(fd) if cmd is not None else None
-        return True if src is None else source_runs_mutant(src, shell, depth, cmd)
+        return True if src is None else source_runs_mutant(src, shell, depth, cmd, lang=lang)
     return mutant_named(w.text)
 
 
-def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0) -> bool:
+def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0, lang: str = "other") -> bool:
     """Whether an input source, read as a program, runs a mutant. A duplicated descriptor whose
     source is not set in this command is refused, and so is a file that is a descriptor path
     (`< /dev/fd/3`) the command does not set; `< /dev/stdin` reads the pipe."""
@@ -518,21 +545,221 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0) ->
         return True if fd_of_path(value) is not None else mutant_named(value)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
-    return refuses(value, depth + 1) if shell else code_runs_mutant(value)
+    if kind == "text-expanding" and lang == "python":
+        lang = "python-strict"  # the shell expands this text first: never cleared (TXE-8183)
+    return refuses(value, depth + 1) if shell else code_runs_mutant(value, lang)
 
 
-def code_runs_mutant(code: str) -> bool:
+def runs_evidence(code: str, lang: str) -> bool:
+    """Whether code may run a file or a process. Python code that python_reads_only() could not
+    clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before."""
+    return bool(CODE_RUNS.search(code) or (lang.startswith("python") and PY_EXTRA_RUNS.search(code)))
+
+
+def mutant_in_path(text: str) -> bool:
+    """For Python code that may run something: the word names a mutant in any path component
+    (`mutants.json`, `mutants`, `/tmp/mutate-sandboxed-x/report.json`), whatever its extension.
+    A pathname alone proves neither execution nor its absence, so where the code may execute,
+    any mutant-named input counts (TXE-8183)."""
+    if mutant_named(text):
+        return True
+    return any(mutant_named(p) for p in text.rsplit(":", 1)[-1].split("/") if p)
+
+
+def code_runs_mutant(code: str, lang: str = "other") -> bool:
     """Whether code for a non-shell interpreter runs a mutant: it imports one, or it names a
     mutant script or a mutation tool and calls something that runs a file or a process. Code that
-    only mentions the names (prints them, edits text that contains them) is data."""
+    only mentions the names (prints them, edits text that contains them) is data. Python code that
+    python_reads_only() proves non-executing is data, whatever it names."""
+    if lang == "python" and python_reads_only(code):
+        return False
     if CODE_IMPORTS_MUTANT.search(CODE_STRING_OR_COMMENT.sub(" ", code)):
         return True  # an import statement, not import text inside a string or a comment
-    if not CODE_RUNS.search(code):
+    if not runs_evidence(code, lang):
         return False
+    if lang.startswith("python"):
+        return any(mutant_in_path(t) or TOOLS.match(base(t)) for t in CODE_TOKEN.findall(code))
     return any(mutant_named(t, need_ext=True) or TOOLS.match(base(t)) for t in CODE_TOKEN.findall(code))
 
 
-def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
+# ------------------------------------------------- Python code proven not to execute (TXE-8183)
+# A shared bare-word regex cannot tell `json.load(f)` (data) from `pickle.load(f)` or `exec(...)`
+# (execution). Python code is therefore parsed (ast.parse only builds a tree; nothing runs) and
+# cleared as data only in one supported form (Judge.python decides the form): an isolated
+# interpreter (`-I`, optionally with -B/-u, and no other flag), not interactive, at the top level of
+# the command or behind timeout/nice/nohup/command/env without -S, with no PYTHON* variable set.
+# The code must then fit this deliberately small read/parse/print grammar, one module scope only:
+# - statements: `import M[, M2]` of the modules below (no alias that shadows a builtin, a module or
+#   another binding), `NAME = expr`, `with open(...) as NAME:` and expression statements;
+# - expressions: constants, f-strings, tuples, lists, dicts, subscripts, comparisons and
+#   arithmetic, names bound above, `module.attr` from the module's list, calls of the listed
+#   builtins (open() in a literal read mode) and of the listed methods, with only the keywords
+#   listed per callee;
+# - nothing else: no def, lambda, class, comprehension, decorator, loop, del, global, attribute or
+#   subscript assignment, rebinding of a module or builtin, *args/**kwargs, `_` name or attribute,
+#   coding declaration, \r or BOM.
+# Anything else, including code that does not parse, is not cleared and is judged by the run-call
+# rule with the Python additions above. Trusted, not checked: the python3 found on PATH is CPython
+# with an unmodified standard library, and its site-packages .pth files (which -I does not disable)
+# are system state outside the command.
+PY_READ_MODULES = {
+    "json": {"load", "loads", "dumps"},
+    # Parsing source is data: ast.parse builds a tree, and compile/exec are not in the grammar.
+    "ast": {"parse", "dump", "literal_eval"},
+    "sys": {"argv", "stdin", "stderr"},
+}
+PY_READ_BUILTINS = {"print", "len", "str", "int", "float", "bool", "repr", "list", "dict", "tuple",
+                    "sorted", "min", "max", "sum", "any", "all", "open"}
+PY_READ_METHODS = {"read", "get", "keys", "values", "items", "split", "strip", "splitlines",
+                   "startswith", "endswith", "join", "count", "lower"}
+# Keywords a cleared call may pass, per callee; none for any other call. No callable-taking keyword
+# (key=, default=, object_hook=, cls=, opener=, ...).
+PY_READ_KEYWORDS = {"print": {"sep", "end", "file"}, "open": {"mode", "encoding", "errors", "newline"},
+                    "json.dumps": {"indent", "sort_keys", "ensure_ascii"}, "sorted": {"reverse"}}
+# Every builtin name: none may be bound as a variable or used as an import alias.
+BUILTIN_NAMES = set(dir(builtins))
+# The flags of the supported isolated form.
+PY_CLEAR_FLAGS = {"I", "B", "u"}
+# Wrappers a cleared command may sit behind (env without -S: -S recurses and is not a clearance form).
+PY_CLEAR_WRAPPERS = {"timeout", "gtimeout", "nice", "nohup", "command", "env"}
+# Run evidence for Python code that was not cleared, on top of CODE_RUNS: dynamic access to
+# builtins, executable deserialization (pickle.load is execution; json.load is not), loaders,
+# interpreters and process pools.
+PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|locals|vars|compile|breakpoint|"
+                           r"pickle|cPickle|_pickle|marshal|shelve|dill|cloudpickle|joblib|ctypes|cffi|"
+                           r"multiprocessing|pty|importlib|exec_module|load_module|run_path|run_module|"
+                           r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop)\b"
+                           r"|\bcode\s*\.\s*interact")
+# A coding declaration on line 1 or 2 makes Python decode a program read as bytes (stdin, a
+# here-document, a descriptor) differently from the text parsed here (utf-7 can hide code).
+# Python's lines end at \r, \n or \r\n, str.splitlines() also splits at \f, \x1c-\x1e, \x85 and
+# others, so "line 1 or 2" is not located here at all: a coding comment ANYWHERE, a \r, or a BOM
+# keeps code from being cleared.
+PY_CODING_COOKIE = re.compile(r"#.*?coding[:=]|\r|\ufeff")  # re reads \ufeff as U+FEFF (BOM)
+_read_only_cache: dict = {}
+
+
+def python_reads_only(code: str) -> bool:
+    """Whether Python code is proven, within the supported grammar above, not to execute anything."""
+    if code not in _read_only_cache:
+        try:
+            _read_only_cache[code] = _python_reads_only(code)
+        except Exception:  # noqa: BLE001 - SyntaxError, RecursionError, ...: not cleared
+            _read_only_cache[code] = False
+    return _read_only_cache[code]
+
+
+def _python_reads_only(code: str) -> bool:
+    if PY_CODING_COOKIE.search(code):
+        return False
+    tree = ast.parse(code)
+    if not isinstance(tree, ast.Module):
+        return False
+    # Bindings, in one module scope (the grammar has no def, lambda, class or comprehension).
+    modules, variables = {}, set()
+
+    def bind(name: str) -> bool:
+        """A new or repeated plain variable; never a module or any builtin name (exec, open, print,
+        ...), and never `_`-prefixed."""
+        if name in modules or name in PY_READ_MODULES or name in BUILTIN_NAMES or name.startswith("_"):
+            return False
+        variables.add(name)
+        return True
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for a in stmt.names:
+                name = a.asname or a.name
+                if a.name not in PY_READ_MODULES or name in BUILTIN_NAMES or name in variables \
+                        or modules.get(name, a.name) != a.name or name.startswith("_"):
+                    return False
+                modules[name] = a.name
+        elif isinstance(stmt, ast.Assign):
+            if not all(isinstance(t, ast.Name) and bind(t.id) for t in stmt.targets):
+                return False  # no attribute, subscript, tuple or starred target
+        elif isinstance(stmt, ast.With):
+            for item in stmt.items:
+                ctx = item.context_expr
+                if not (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name) and ctx.func.id == "open"):
+                    return False
+                if item.optional_vars is not None and not (
+                        isinstance(item.optional_vars, ast.Name) and bind(item.optional_vars.id)):
+                    return False
+            if not all(isinstance(s, (ast.Expr, ast.Assign)) for s in stmt.body):
+                return False
+            for s in stmt.body:
+                if isinstance(s, ast.Assign) and not all(isinstance(t, ast.Name) and bind(t.id) for t in s.targets):
+                    return False
+        elif not isinstance(stmt, ast.Expr):
+            return False
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    allowed = (ast.Module, ast.Expr, ast.Assign, ast.With, ast.withitem, ast.Import, ast.alias, ast.Call,
+               ast.keyword, ast.Name, ast.Attribute, ast.Subscript, ast.Slice, ast.Constant, ast.JoinedStr,
+               ast.FormattedValue, ast.Tuple, ast.List, ast.Dict, ast.Compare, ast.BoolOp, ast.BinOp,
+               ast.UnaryOp, ast.IfExp, ast.Load, ast.Store, ast.operator, ast.boolop, ast.cmpop, ast.unaryop)
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed):
+            return False  # def, lambda, comprehension, loop, del, global, starred, await, ...
+        if isinstance(node, ast.Name):
+            parent = parents.get(node)
+            if isinstance(node.ctx, ast.Store):
+                continue  # checked by bind() above
+            if node.id in modules:
+                if not isinstance(parent, ast.Attribute):
+                    return False  # a module only as `module.attr`, never passed on
+            elif node.id in PY_READ_BUILTINS:
+                if not (isinstance(parent, ast.Call) and parent.func is node):
+                    return False  # a builtin only called, never passed as a callback
+            elif node.id not in variables:
+                return False  # an unbound or unknown name
+        elif isinstance(node, ast.Attribute):
+            if not isinstance(node.ctx, ast.Load) or node.attr.startswith("_"):
+                return False  # no attribute assignment or deletion (json.load = ...)
+            parent = parents.get(node)
+            if isinstance(node.value, ast.Name) and node.value.id in modules:
+                if node.attr not in PY_READ_MODULES[modules[node.value.id]]:
+                    return False
+            elif not (isinstance(parent, ast.Call) and parent.func is node and node.attr in PY_READ_METHODS):
+                return False  # any other attribute only as a listed method being called
+        elif isinstance(node, (ast.Subscript, ast.Tuple, ast.List)) and not isinstance(node.ctx, ast.Load):
+            return False
+        elif isinstance(node, ast.Call):
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                return False
+            f = node.func
+            if isinstance(f, ast.Name) and f.id in PY_READ_BUILTINS:
+                callee = f.id
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in modules:
+                callee = modules[f.value.id] + "." + f.attr
+            elif isinstance(f, ast.Attribute) and f.attr in PY_READ_METHODS:
+                callee = "." + f.attr
+            else:
+                return False  # a call of a call's result, a subscript, a variable, ...: not judged
+            if any(k.arg is None or k.arg not in PY_READ_KEYWORDS.get(callee, ()) for k in node.keywords):
+                return False
+            if callee == "open" and not _open_reads_only(node):
+                return False
+    return True
+
+
+def _open_reads_only(node) -> bool:
+    """open() with no mode, or a literal mode that neither writes, appends, creates nor updates,
+    and no opener."""
+    if len(node.args) > 2:
+        return False  # buffering, encoding, ... and the opener only by keyword, if at all
+    mode = node.args[1] if len(node.args) > 1 else None
+    for k in node.keywords:
+        if k.arg == "mode":
+            mode = k.value
+    if mode is None:
+        return True
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set("wax+")
+
+
+def stdin_is_mutant(cmd, shell: bool, depth: int, lang: str = "other") -> bool:
     """An interpreter with no script reads its program from stdin."""
     if cmd is None:
         return False
@@ -540,7 +767,7 @@ def stdin_is_mutant(cmd, shell: bool, depth: int) -> bool:
     # (python3 < <(cat mutants.py)), a here-document or here-string, or a duplicated descriptor.
     # A redirection from a descriptor path (`< /dev/stdin`, `< /dev/fd/3`) is followed.
     if cmd.source("0") is not None:
-        return source_runs_mutant(cmd.source("0"), shell, depth, cmd)
+        return source_runs_mutant(cmd.source("0"), shell, depth, cmd, lang=lang)
     return piped_mutant(cmd)
 
 
@@ -548,34 +775,51 @@ def piped_mutant(cmd) -> bool:
     return cmd.piped_from is not None and names_mutant_script(cmd.piped_from.words)
 
 
-def code_and_args_run_mutant(code: str, rest: list, env=()) -> bool:
+def code_and_args_run_mutant(code: str, rest: list, env=(), lang: str = "other") -> bool:
     """Code given on the command line, its arguments and the command's variable assignments: the
     code runs a mutant itself, or it calls something that runs a file or a process and an
     argument or an assigned value names a mutant (`python3 -c 'exec(open(sys.argv[1]).read())'
-    mutants.py`, `M=mutants.py python3 -c '...os.environ["M"]...'`)."""
-    if code_runs_mutant(code):
-        return True
-    if not CODE_RUNS.search(code):
+    mutants.py`, `M=mutants.py python3 -c '...os.environ["M"]...'`). Python code proven not to
+    execute (python_reads_only) only reads its arguments, so they are data."""
+    if lang == "python" and python_reads_only(code):
         return False
-    return any(mutant_named(w.text) for w in rest) or any(mutant_named(v) for v in env)
+    if code_runs_mutant(code, lang):
+        return True
+    if not runs_evidence(code, lang):
+        return False
+    named = mutant_in_path if lang.startswith("python") else mutant_named
+    return any(named(w.text) for w in rest) or any(named(v) for v in env)
 
 
 class Judge:
-    def __init__(self, depth: int):
+    def __init__(self, depth: int, outer=None):
         self.depth = depth
         self.vars = {}
+        # Assignments of the command this one is nested in (eval, env -S, bash -c, go -exec): read
+        # as values its code may see and for PYTHON* detection, never to resolve a program, since
+        # an unexported variable is empty in a child shell.
+        self.outer = dict(outer or {})
         self.env_assigned = []
         self.env_assigned_names = []
+        self.via = []  # wrappers and runners the current command was reached through
         self.nest = 0
 
     def env_values(self) -> list:
         """Values a command's code may read from its environment: shell assignments made so far
-        (conservatively, exported or not) and this command's own `env NAME=value` assignments."""
-        return list(self.vars.values()) + self.env_assigned
+        (conservatively, exported or not), the enclosing command's, and this command's own
+        `env NAME=value` assignments."""
+        return list(self.vars.values()) + list(self.outer.values()) + self.env_assigned
+
+    def context(self) -> dict:
+        """Assignments a nested command inherits as values (see `outer`)."""
+        ctx = {**self.outer, **self.vars}
+        ctx.update(n.partition("=")[::2] for n in self.env_assigned_names)
+        return ctx
 
     def runs_mutation(self, cmd: Cmd) -> bool:
         self.env_assigned = []  # per command; never used to resolve a program
         self.env_assigned_names = []
+        self.via = []
         words = list(cmd.words)
         if words and words[0].text in DECLARERS:  # export NAME=value, declare -x NAME=value, ...
             for w in words[1:]:
@@ -616,6 +860,7 @@ class Judge:
             if var and (var.group(1) or var.group(2)) in self.vars:
                 prog = base(self.vars[var.group(1) or var.group(2)].split(" ")[0])
             if prog in WRAPPERS:
+                self.via.append(prog)
                 nxt = self.past_wrapper(prog, words, i + 1)
                 if isinstance(nxt, bool):
                     return nxt
@@ -642,7 +887,7 @@ class Judge:
                 else:
                     payload, after = t.split("=", 1)[1] if t.startswith("--") else t[2:], i + 1
                 rest = " ".join(shlex.quote(w.text) for w in words[after:])
-                return refuses(payload + " " + rest, self.depth + 1)
+                return refuses(payload + " " + rest, self.depth + 1, self.context())
             if t.startswith("-") and len(t) > 1:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
@@ -661,7 +906,7 @@ class Judge:
         if prog in ("source", "."):
             return bool(args) and mutant_named(args[0].text)
         if prog == "eval":
-            return refuses(" ".join(a.text for a in args), self.depth + 1)
+            return refuses(" ".join(a.text for a in args), self.depth + 1, self.context())
         if w0.procsub is None and mutant_named(prog):
             return True
         if SHELLS.match(prog):
@@ -711,14 +956,31 @@ class Judge:
             else:
                 break
         if code:
-            return j < len(args) and refuses(args[j].text, self.depth + 1)
+            return j < len(args) and refuses(args[j].text, self.depth + 1, self.context())
         if from_stdin:  # bash -s [args]: the program is stdin, the words are its arguments
             return stdin_is_mutant(cmd, True, self.depth)
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             return operand_is_mutant(args[j], cmd, True, self.depth)
         return stdin_is_mutant(cmd, True, self.depth)
 
+    def python_names(self) -> list:
+        """Variable names this command's interpreter may see: shell, enclosing and env ones."""
+        return list(self.vars) + list(self.outer) + [n.partition("=")[0] for n in self.env_assigned_names]
+
+    def python_lang(self, flags: set, unsupported: bool) -> str:
+        """"python" when Python code here may be cleared by python_reads_only(), which is only in
+        the supported form: isolated (-I, plus only -B/-u), at the top level of the command (not
+        inside eval, env -S, bash -c or go -exec), reached directly or through PY_CLEAR_WRAPPERS
+        only, with no PYTHON* variable set. Anything else is "python-strict": the Python run-call
+        and path rules, never clearance (TXE-8183 review F1, F2)."""
+        if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
+                or not set(self.via) <= PY_CLEAR_WRAPPERS
+                or any(n.startswith("PYTHON") for n in self.python_names())):
+            return "python-strict"
+        return "python"
+
     def python(self, args: list, cmd) -> bool:
+        flags, unsupported = set(), False
         j = 0
         while j < len(args):
             t = args[j].text
@@ -726,6 +988,7 @@ class Judge:
                 j += 1
                 break
             if t.startswith("--"):
+                unsupported = True  # a long option is not part of the supported form
                 j += 2 if t == "--check-hash-based-pycs" else 1
                 continue
             if not t.startswith("-") or t == "-":
@@ -734,7 +997,12 @@ class Judge:
                 ch = t[k]
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values())
+                    lang = self.python_lang(flags, unsupported)
+                    code_word = args[j] if t[k + 1:] else (args[j + 1] if j + 1 < len(args) else None)
+                    if code_word is None or code_word.expanded:
+                        lang = "python-strict"  # "...$(cmd)..." or $'...': not the text Python gets
+                    return (code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
+                            or self.interactive_stdin(flags, cmd))
                 if ch == "m":
                     attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
@@ -742,14 +1010,26 @@ class Judge:
                         return True
                     # python3 -m runpy|pdb|cProfile|coverage ... runs a script named later.
                     rest = args[j + (1 if attached else 2):]
-                    return mod.split(".")[0] in SCRIPT_RUNNER_MODULES and names_mutant_script(rest)
+                    return ((mod.split(".")[0] in SCRIPT_RUNNER_MODULES and names_mutant_script(rest))
+                            or self.interactive_stdin(flags, cmd))
+                flags.add(ch)
                 if ch in "WXQ":
+                    unsupported = True
                     j += 0 if t[k + 1:] else 1
                     break
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j], cmd, False, self.depth)
-        return stdin_is_mutant(cmd, False, self.depth)
+            # A script operand (or a descriptor holding the program) is never a clearance form.
+            return (operand_is_mutant(args[j], cmd, False, self.depth, "python-strict")
+                    or self.interactive_stdin(flags, cmd))
+        return stdin_is_mutant(cmd, False, self.depth, self.python_lang(flags, unsupported))
+
+    def interactive_stdin(self, flags: set, cmd) -> bool:
+        """-i (or PYTHONINSPECT in the command's variables) reads more program from stdin after the
+        code, module or script: that stdin is judged as a program too (TXE-8183 review F1)."""
+        if "i" not in flags and "PYTHONINSPECT" not in self.python_names():
+            return False
+        return stdin_is_mutant(cmd, False, self.depth, "python-strict")
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0
@@ -891,7 +1171,7 @@ class Judge:
             value = m.group(1) if m.group(1) is not None else (tokens[n + 1] if n + 1 < len(tokens) else "")
             if "$" in value or "`" in value:
                 return True  # a variable or substitution in the program go runs cannot be judged
-            if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
+            if refuses(value, self.depth + 1, self.context()) or mutant_named(value.split(" ")[0]):
                 return True
         return False
 
@@ -921,6 +1201,7 @@ class Judge:
         return any(operand_is_mutant(o) for o in ops)
 
     def runner(self, prog: str, args: list, cmd) -> bool:
+        self.via.append(prog)
         sub, j = RUNNERS[prog], 0
         if sub is not None:
             while j < len(args) and args[j].text != sub:
@@ -938,6 +1219,7 @@ class Judge:
         return self.program(args[j:], cmd)
 
     def find_exec(self, args: list) -> bool:
+        self.via.append("find")
         for j, a in enumerate(args):
             if a.text in FIND_EXEC:
                 rest = []
@@ -950,10 +1232,10 @@ class Judge:
         return False
 
 
-def refuses(command: str, depth: int = 0) -> bool:
+def refuses(command: str, depth: int = 0, outer=None) -> bool:
     if depth > MAX_DEPTH:
         return True  # shell code nested this deep is not read: refused rather than let through
-    judge = Judge(depth)
+    judge = Judge(depth, outer)
     parser = Parser(command, depth)
     cmds = parser.parse()
     if parser.too_deep:
