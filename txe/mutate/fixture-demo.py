@@ -14,13 +14,15 @@
     fake cache and the runner inside must exit 3. Nothing runs on this machine but `docker run`.
 
 <image-id> is an image already present locally, named by its immutable id (sha256:...); nothing
-is pulled. --deadline bounds the demo's runs and checks: the runner gets the deadline less a
-margin and less its own cleanup and termination allowance (mutate-sandboxed's
-EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S, 15 s), so it ends inside the demo's wait; past the
-deadline the demo stops the runner (SIGTERM, then SIGKILL) and force-removes the containers that
-were recorded as started (docker's --cidfile, outside every mount), each only when docker reports
-that container's own name and owner token, within EMERGENCY_CLEANUP_S (10 s) more. SIGTERM,
-SIGINT or SIGHUP to the demo do the same. The sandboxed step refuses to start a runner with less
+is pulled. The demo is the runner's EXTERNAL hard bound (the runner's own bounds are cooperative
+and guarantee no exit time): the runner gets the deadline less a margin and less the allowance its
+README tells a caller to add (EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S, 15 s), and the demo
+waits for it until its own wait ends; past that the demo stops the runner (SIGTERM, then SIGKILL)
+and force-removes the containers that were recorded as started (docker's --cidfile, outside every
+mount), each only when docker reports that container's own name and owner token, drawing on
+EMERGENCY_CLEANUP_S (10 s) more. The demo's own file steps (state reads, logs, removing its root)
+have no deadline either: the demo guarantees no exit time of its own. SIGTERM, SIGINT or SIGHUP to
+the demo do the same. The sandboxed step refuses to start a runner with less
 than MIN_RUNNER_S (20 s); see that constant for the arithmetic: in practice --deadline 60 or more.
 
 The demo writes only inside one directory it creates exclusively (mkdtemp) and stamps with a
@@ -125,8 +127,9 @@ class Demo:
         shutil.copytree(HERE / "testdata" / "fixture", root / "fixture", symlinks=True)
         before = self.fake_state(modcache, gocache)
         self.say("fake caches before: " + json.dumps(before, default=str))
-        # The runner's own process bound is its --deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S
-        # (TXE-8053): give it that much less, so it ends inside the wait below (left - margin/2).
+        # The runner's cooperative bounds end by its --deadline + EMERGENCY_CLEANUP_S plus the margin
+        # its README tells a caller to add (TXE-8053): give it that much less than the wait below
+        # (left - margin/2), which is the hard bound: past it the runner is stopped and swept.
         runner_deadline = int(self.left() - self.margin - ms.EMERGENCY_CLEANUP_S - ms.TERMINATION_MARGIN_S)
         if runner_deadline < MIN_RUNNER_S:
             raise ms.Stopped(f"only {runner_deadline}s left for the runner (it needs {MIN_RUNNER_S}s)")

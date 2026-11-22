@@ -70,7 +70,7 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
 
 Exit codes: 0 done with no finding (survivors are listed, not failures); 2 refused or bad input;
 3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (every
-run, settlement and integrity check; cleanup and exit follow within 15 s, see "The bounds" below) or
+run, settlement and integrity check; cooperative bounds, no process-exit guarantee: see "The bounds" below) or
 by SIGTERM, SIGINT or SIGHUP; 7 a `--diagnostic` run
 completed and was recorded (below). Any exit from 3 to 7 keeps the work directory as evidence.
 
@@ -127,7 +127,9 @@ is always kept.
   written again with that exit. A broken pipe or a closed stdout or stderr, the expected case of a
   reader that went away, is only noted (`broken_streams`) and changes nothing. No report can be
   promised on a filesystem that refuses every write: then the exit is 5 and stderr says why.
-- **The bounds under `--deadline D`, none extended** (the report's `budgets`):
+- **The bounds under `--deadline D`, none extended, all COOPERATIVE** (the report's `budgets`):
+  they bound what the runner checks a clock around. They are not a process-exit guarantee: see
+  the last item.
   - **D, the active and integrity deadline.** Runs end a reserve before it: min(45, D/3) s,
     chosen to hold settlement and the read-only mount checks after a run and at the end, each a
     full re-hash of the view (with a view, the reserve has to cover two hashes; a large view or a
@@ -139,10 +141,17 @@ is always kept.
     consumes (each call's timeout is what is left of it; none restarts its own); once it is spent
     no call starts and the container is reported as not confirmed removed.
   - **A 5 s termination margin** for the local steps left: the end-of-run host check (identities
-    and one-level listings of the watched directories, which has no deadline of its own), the
-    reports and terminal output. It is a stated allowance, not a measurement.
-  - So the process bound is **D + 15 s**; `--deadline` alone is not a process-exit bound. A caller
-    that wraps the runner needs an outer bound of at least that.
+    and one-level listings of the watched directories), the report writes, the work directory's
+    removal and terminal output. These do host I/O with NO deadline of their own, and the
+    finalizer ignores SIGTERM, SIGINT and SIGHUP so that cleanup is not cut short. The margin is
+    an allowance for a caller to add, not something the runner enforces or has measured.
+  - **No process-exit guarantee; the caller owns the hard deadline and custody.** A caller that
+    needs the process gone by a time must enforce it from outside (SIGKILL, a job timeout), no
+    earlier than D + 15 s (`budgets.least_external_hard_deadline_s`), and keep custody of what a
+    kill leaves: the work directory, whose `cids/` holds each started container's id (and whose
+    name and owner label carry the run's token) for removal by hand. txe's CI launcher and
+    `fixture-demo.py` are such callers; the global launcher (`~/.coding_global/bin/mutate-sandboxed`)
+    is not: it execs the runner and adds no bound.
 - **Settlement after "removal already in progress".** When `rm -f` fails, the runner inspects the
   same owner-checked container once more, within the emergency cleanup budget; only docker's own
   "no such" counts as absent. Anything else, "in progress" included, is unconfirmed: exit 5.
@@ -172,7 +181,9 @@ mode. SRC is only read on the host and never mounted: the runner copies it into
 - **The manifest:** every entry below the root, sorted by its relative path as bytes,
   `D <rel>\n` per directory (empty ones included) and `F <size> <sha256> <rel>\n` per file; its
   digest is the sha256 of those lines joined. It covers names, types, sizes and contents, not
-  modes, owners or times. `--ro-manifest DIR` prints it with the same code.
+  modes, owners or times. `--ro-manifest DIR` prints it with the same code. That mode takes no
+  `--deadline` (refused, exit 2): the walk is bounded by the `--ro-max-*` limits, and a caller that
+  needs a time bound wraps the command; a digest it cannot deliver (stdout gone or failing) is 5.
 - **DST** must be exactly `/work/src/.git`, a named exception to "no mount overlaps `/work`".
   Any other destination, a second `--ro-mount`, two mounts on one target, or a read-only source
   that a read-write mount source contains or lies inside is refused. There is no option field: a
@@ -202,13 +213,17 @@ ownership check, and stays as evidence whenever the work directory is kept.
 
 **Containers the runner started, and only those, are removed when it stops.** Each `docker run`
 records its container id with `--cidfile` in the work directory, outside every mount, and carries
-a unique name and an owner label holding the run's random token. On a timeout, the deadline or a
-signal, the runner force-removes each container whose docker client had not returned, and only
-when docker reports that exact name and token on it. Runs stop the reserve (a third of `--deadline`, at most
-45 s) before the deadline, and every cleanup call draws on one emergency budget that ends 10 s after
-the deadline (above): a container left running is still removed when the deadline has just passed,
-and no cleanup runs past that budget. A cleanup that fails is reported as `cleanup error` on stderr
-and in the report.
+a unique name and an owner label holding the run's random token. **A container leaves the
+runner's custody only when an owner-checked inspect or removal confirms it gone**, in every mode
+and outcome: a docker client that returned normally proves nothing (`--rm` is not taken on
+trust). After each run the runner settles it (removed, or confirmed absent) by the deadline before
+the next run starts or its directory is discarded; if a check after the run raises first (an
+integrity incident, the deadline), it stays pending and the finalizer's emergency removal settles
+it, or reports it in `containers_left`. Removal happens only when docker reports that exact name and
+token on the container. Runs stop the reserve (a third of `--deadline`, at most 45 s) before the
+deadline; settlement and the clearing of a stopped run draw on the deadline itself, and only the
+finalizer's emergency removal draws on the one budget that ends 10 s after it (above). A cleanup
+that fails is reported as `cleanup error` on stderr and in the report.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.

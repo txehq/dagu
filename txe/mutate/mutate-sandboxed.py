@@ -52,7 +52,7 @@ Exit codes: 0 done, no finding (survivors are listed, not failures); 2 refused o
 3 shared state changed (LOUD); 4 the unmutated tree failed; 5 findings (an unrepeated kill, a
 sandbox error or a timeout; for --diagnostic, a run that did not complete); 6 stopped by
 --deadline or a signal; 7 a --diagnostic run completed and was recorded (never 0). On a timeout, the deadline or a
-signal, every container this run started whose client had not returned is force-removed, by the
+signal, every container this run started and has not confirmed gone (a client that returned proves nothing) is force-removed, by the
 id docker recorded (--cidfile, outside every mount), and only when docker reports that container's
 own name and this run's owner token on it.
 """
@@ -84,14 +84,19 @@ EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_S
 # A completed --diagnostic run, whatever the command's own status: never 0, so no `&&` chain and no
 # gate that reads exit 0 as "done, no finding" proceeds on a diagnostic (TXE-8053).
 EXIT_DIAGNOSTIC = 7
-# The process's bounds under --deadline D (TXE-8053; see Runner.__init__ and the README):
+# The runner's COOPERATIVE bounds under --deadline D (TXE-8053; see Runner.__init__ and the README).
+# They bound what the runner checks a clock around, not the process:
 # - D, the ACTIVE AND INTEGRITY deadline: every run, settlement after a run and every integrity
 #   check (the read-only mount re-hashes) ends by it; its last min(45, D/3) s are the reserve;
 # - EMERGENCY_CLEANUP_S after D: the one budget every container-removal call past D consumes;
-# - TERMINATION_MARGIN_S after that: the local steps left (the end-of-run host check, writing the
-#   reports, terminal output), which have no deadline of their own.
-# So the OUTER process bound is D + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S; --deadline alone is
-# not a process-exit bound. The margin is a stated allowance, not a measurement.
+# - TERMINATION_MARGIN_S: the allowance a caller is told to add for the local steps left (the
+#   end-of-run host check, the report writes, the work directory's removal, terminal output).
+#   Those do host I/O with NO deadline of their own, and the finalizer ignores SIGTERM, SIGINT and
+#   SIGHUP, so neither the margin nor D is enforced on them.
+# The runner therefore makes NO process-exit guarantee. A caller that needs one must bound the
+# process from outside (a hard deadline it enforces, e.g. SIGKILL, at D + EMERGENCY_CLEANUP_S +
+# TERMINATION_MARGIN_S or later) and keep custody of what a kill leaves: the work directory with its
+# cids/ (each container's id and name, owner-labelled with the run's token) for removal by hand.
 EMERGENCY_CLEANUP_S = 10.0
 TERMINATION_MARGIN_S = 5.0
 # The only container paths a --ro-mount may target. /work/src/.git is the one path under /work/src
@@ -965,7 +970,7 @@ class Runner:
         self.cleanup_end = args.deadline_at + EMERGENCY_CLEANUP_S if args.deadline_at else None
         # Every mutation target's live content, read before the tree was copied.
         self.live = {m.file: file_digest(args.tree / m.file) for m in live_targets}
-        # (name, cidfile) of every container started whose docker client has not returned.
+        # (name, cidfile) of every container started and not yet confirmed gone (owner-checked).
         self.pending: dict[str, Path] = {}
         # label -> (cidfile, name) of every container started, for checks after the run.
         self.containers: dict[str, tuple[Path, str]] = {}
@@ -1074,6 +1079,25 @@ class Runner:
             if outcome.endswith(": removed") or outcome.endswith(": absent"):
                 del self.pending[name]
         return not self.pending
+
+    def settle(self, result: "Result") -> tuple[bool, bool]:
+        """Confirm the container of a finished run removed or absent, owner-checked, drawing on the
+        active deadline. Returns (confirmed, late): late when the deadline was reached. Until it is
+        confirmed the container stays pending, for the finalizer."""
+        cidfile, name = self.containers[result.name]
+        self.pending[name] = cidfile
+        confirmed = self.remove_pending()
+        return confirmed, self.hard_end is not None and time.monotonic() >= self.hard_end
+
+    def settle_or_stop(self, result: "Result") -> None:
+        """settle, for mutation mode: no further run starts, and no run directory is read or
+        discarded, until the container is confirmed gone; a settlement that is late or cannot be
+        confirmed is Stopped (6), the container left to the finalizer."""
+        confirmed, late = self.settle(result)
+        if late:
+            raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed during the settlement of {result.name}")
+        if not confirmed:
+            raise Stopped(f"the container of {result.name} could not be confirmed removed: " + ", ".join(self.pending))
 
     def clear_pending(self) -> None:
         """After a run that stopped abnormally: no further run starts while one of its
@@ -1202,8 +1226,10 @@ class Runner:
             # The docker client died by a signal: nothing shows the container finished.
             self.clear_pending()
             outcome = "ERROR"
-        else:
-            del self.pending[name]
+        # A client that returned normally proves nothing about its container (--rm is not taken on
+        # trust): it STAYS pending through the checks below, so an exception there leaves it to the
+        # finalizer's owner-checked emergency removal, and it leaves pending only on an owner-checked
+        # confirmation of removal or absence (settle, or the finalizer).
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
@@ -1337,8 +1363,12 @@ def parse(argv: list[str]):
     p.add_argument("--deadline", type=int, default=0,
                    help="D: seconds for every run, settlement and integrity check (the last min(45, D/3) s are "
                         "the reserve for settlement and integrity); 0 means none. Past it the run stops (exit 6) "
-                        f"and removes its containers within {EMERGENCY_CLEANUP_S:.0f} s more; the process exits by "
-                        f"D + {EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s (D is not a process-exit bound). "
+                        f"and removes its containers within {EMERGENCY_CLEANUP_S:.0f} s more. These bounds are "
+                        "cooperative: the end-of-run host check, report writes and the work directory's removal "
+                        "have none, and the finalizer ignores signals, so the runner guarantees no process exit "
+                        "time; a caller that needs one bounds the process from outside, at D + "
+                        f"{EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s or later, and keeps the work "
+                        "directory's cids/ for removal by hand after a kill. "
                         "A stop in the end-of-run check reports 6 even after an earlier 2, 4 or 5 (stderr may "
                         "already have said so); the report keeps the earlier findings and containers_left")
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
@@ -1385,6 +1415,11 @@ def parse(argv: list[str]):
     if args.ro_manifest is not None:
         if args.command or args.mutants or args.diagnostic or args.ro_mount or args.image:
             p.error("--ro-manifest DIR prints a manifest digest and takes no run options")
+        if args.deadline:
+            # No deadline is honoured here, so none is accepted: the walk is bounded by the
+            # --ro-max-* limits, and a caller that needs a time bound wraps the command (TXE-8053).
+            p.error("--ro-manifest takes no --deadline: its walk is bounded by --ro-max-files, --ro-max-depth, "
+                    "--ro-max-mib and --ro-max-file-mib; bound it in time from outside")
         return args
     if not args.command:
         p.error("give the test command after --")
@@ -1413,6 +1448,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
     report["results"].append(base.__dict__)
     out(f"baseline: {base.outcome} ({base.seconds}s)")
     if base.outcome != "PASSED":
+        runner.settle_or_stop(base)
         err(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}")
         return EXIT_BASELINE
     if args.warm_gocache:
@@ -1425,14 +1461,17 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
             raise Refused("the baseline left no build cache directory to warm from")
         runner.room("the warm build cache", (cache,))
         clone_dir(cache, runner.work.path / "warm-gocache", runner.deadline)
+    runner.settle_or_stop(base)  # after the stopped-check and the cache read, before anything is removed
     runner.discard(base)
 
     findings = []
     for mu in mutants:
         r = runner.run(mu.name, pristine, mu)
+        runner.settle_or_stop(r)
         line = f"{mu.name}: {r.outcome} ({r.seconds}s)"
         if r.outcome == "KILLED" and args.confirm_kills:
             again = runner.run(f"{mu.name} (again)", pristine, mu)
+            runner.settle_or_stop(again)
             r.__dict__["confirm"] = again.__dict__
             runner.discard(again)
             if again.outcome != "KILLED":
@@ -1446,6 +1485,7 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
         out(line)
 
     final = runner.run("baseline (after)", pristine, None)
+    runner.settle_or_stop(final)
     report["results"].append(final.__dict__)
     runner.discard(final)
     out(f"baseline after: {final.outcome}")
@@ -1502,10 +1542,9 @@ def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
     # call before the run's directory is touched, and BY THE ACTIVE DEADLINE (every call draws on
     # hard_end; the emergency budget after it is the finalizer's alone). A settlement that cannot
     # finish by the deadline, or that ends past it, is Stopped: exit 6, never 7.
-    cidfile, name = runner.containers[r.name]
-    runner.pending[name] = cidfile
-    settled = runner.remove_pending()
-    if runner.hard_end is not None and time.monotonic() >= runner.hard_end:
+    _cidfile, name = runner.containers[r.name]
+    settled, late = runner.settle(r)
+    if late:
         diag["settlement"] = "confirmed after the deadline" if settled else "not confirmed by the deadline"
         raise Stopped(f"the whole-run deadline ({runner.args.deadline}s) passed during the diagnostic's settlement")
     if not settled:
@@ -1738,10 +1777,13 @@ def main(argv: list[str]) -> int:
 
 
 def budgets(deadline: int) -> dict:
-    """The process's bounds for --deadline D, in seconds (see EMERGENCY_CLEANUP_S)."""
+    """The runner's cooperative bounds for --deadline D, in seconds, and the least hard deadline a
+    caller must enforce from outside to bound the process (see EMERGENCY_CLEANUP_S): no process exit
+    time is guaranteed by the runner itself."""
     return {"active_and_integrity_deadline_s": deadline, "reserve_s": min(45.0, deadline / 3),
             "emergency_cleanup_s": EMERGENCY_CLEANUP_S, "termination_margin_s": TERMINATION_MARGIN_S,
-            "outer_process_bound_s": deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S}
+            "cooperative_only": True,
+            "least_external_hard_deadline_s": deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S}
 
 
 def mark_diagnostic(report: dict, code: int) -> None:

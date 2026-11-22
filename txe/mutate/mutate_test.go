@@ -1485,7 +1485,7 @@ func TestCleanupInsideDeadline(t *testing.T) {
 	// D = 6 s, reserve 2 s: the hung run is stopped at 4 s; clearing it during the run draws on the
 	// active deadline, so its hung inspect is cut at D = 6 s; the finalizer's emergency retry draws
 	// on the one budget ending at D + 10 = 16 s and is cut there. Expected end: about 16 s, with up
-	// to 3 s of margin for process start and the local steps (the documented bound is D + 15 = 21 s).
+	// to 3 s of margin for process start and the local steps (the least external hard deadline a caller adds, D + 15 = 21 s).
 	elapsed := time.Since(start)
 	assert.GreaterOrEqual(t, elapsed, 14*time.Second, "the emergency retry used its budget")
 	assert.Less(t, elapsed, 19*time.Second)
@@ -2818,7 +2818,8 @@ func TestEndCheckReserveExhaustedIsSix(t *testing.T) {
 	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
 	b := o.report["budgets"].(map[string]any)
 	assert.EqualValues(t, 6, b["active_and_integrity_deadline_s"])
-	assert.EqualValues(t, 21, b["outer_process_bound_s"])
+	assert.EqualValues(t, 21, b["least_external_hard_deadline_s"])
+	assert.Equal(t, true, b["cooperative_only"], "the runner guarantees no exit time")
 }
 
 // Every cleanup call consumes ONE budget: a call's timeout is what is left of it, and once it is
@@ -2850,7 +2851,7 @@ func TestDiagnosticSettlementPastDeadlineIsSix(t *testing.T) {
 	require.NoError(t, os.WriteFile(f.log+".slowrm", []byte("7"), 0o644))
 	start := time.Now()
 	o := f.diag(t, "--image", "staysup", "--deadline", "6")
-	assert.Less(t, time.Since(start), 21*time.Second, "inside D + 15 s")
+	assert.Less(t, time.Since(start), 21*time.Second, "inside D + 15 s, the least external hard deadline")
 	require.Equal(t, 6, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.report["stopped"], "settlement")
 	d := o.report["diagnostic"].(map[string]any)
@@ -2927,4 +2928,102 @@ print("emergency", runner.remove_pending(emergency=True), calls() > n, time.mono
 	// cut: the slow rm ends at the budget, well before its 3 s; refused: nothing started past it;
 	// active: past hard_end nothing starts; emergency: it draws on cleanup_end, starts, and is cut.
 	assert.Equal(t, "cut True\nrefused True\nactive False True\nemergency False True True\n", string(out))
+}
+
+// A normal client exit proves nothing about the container: it stays pending through the after-run
+// checks, so when one of them raises (here an integrity incident, the fake sentinel changed during
+// the run) the finalizer still confirms it, owner-checked. Still present ("staysup"): removed;
+// removal failing: reported as not confirmed (containers_left), exit 3 kept; gone already: absent.
+func TestAfterRunIntegrityErrorKeepsContainerPending(t *testing.T) {
+	cases := map[string]struct {
+		image, flag, want string
+		left              bool
+	}{
+		"still present, removed":  {"staysup", "", ": removed", false},
+		"still present, rm fails": {"staysup", ".rmfail", "rm failed", true},
+		"gone, absence confirmed": {"fixture-image", "", ": absent", false},
+	}
+	for name, c := range cases {
+		for _, mode := range []string{"diagnostic", "mutation"} {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
+				if c.flag != "" {
+					require.NoError(t, os.WriteFile(f.log+c.flag, nil, 0o644))
+				}
+				var o outcome
+				if mode == "diagnostic" {
+					o = f.diag(t, "--image", c.image)
+				} else {
+					o = f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", c.image)
+				}
+				require.Equal(t, 3, o.code, o.stdout+o.stderr)
+				assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+				assert.Contains(t, o.stderr, c.want)
+				if c.left {
+					assert.NotEmpty(t, o.report["containers_left"])
+					assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
+				} else {
+					assert.NotContains(t, o.report, "containers_left")
+					assert.Empty(t, registry(t, f.log))
+				}
+			})
+		}
+	}
+}
+
+// The same after an after-run DEADLINE: the read-only re-hash after a normally exited run is
+// Stopped at hard_end, and the container is still pending for the emergency removal, which
+// confirms it (removed when still present, absent when gone). Runner.run driven directly.
+func TestAfterRunDeadlineKeepsContainerPending(t *testing.T) {
+	for image, want := range map[string]string{"staysup": ": removed", "fixture-image": ": absent"} {
+		t.Run(image, func(t *testing.T) {
+			root := t.TempDir()
+			log := filepath.Join(root, "docker.log")
+			docker := fakeDocker(t, root, log)
+			view := gitView(t, root)
+			tree := filepath.Join(root, "tree")
+			require.NoError(t, os.MkdirAll(filepath.Join(tree, "sub"), 0o755))
+			prog := `
+import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+docker, image, view, digest, tree, root = sys.argv[2:8]
+args = ms.parse(["--diagnostic", "--image", image, "--tree", tree, "--docker", docker, "--", "true"])
+work = ms.WorkDir(Path(root))
+runner = ms.Runner(args, ms.Watch({}), {}, work, docker, [])
+m = ms.parse_ro_mounts([view + ":/work/src/.git:" + digest])[0]
+ms.prepare_ro_mount(m, work.path, 0, {}, runner.ro_limits)
+runner.ro_mounts = [m]
+pristine = work.path / "pristine"; ms.copy_tree(Path(tree), pristine, ms.DEFAULT_EXCLUDES)
+runner.hard_end = time.monotonic() - 1  # the after-run check starts past the deadline
+try:
+    runner.run("diagnostic", pristine, None); print("returned")
+except ms.Stopped:
+    print("stopped")
+print("pending", len(runner.pending))
+runner.cleanup_end = time.monotonic() + 10
+print("confirmed", runner.remove_pending(emergency=True), runner.cleanup_log[-1].split(":")[-1].strip())
+`
+			out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, image, view,
+				goManifest(t, view), tree, root).CombinedOutput()
+			require.NoError(t, err, string(out))
+			assert.Equal(t, "stopped\npending 1\nconfirmed True "+strings.TrimPrefix(want, ": ")+"\n", string(out))
+		})
+	}
+}
+
+// --ro-manifest honours no deadline, so it accepts none: --deadline is refused (exit 2) before any
+// walk; the walk itself is bounded by the --ro-max-* limits.
+func TestRoManifestRefusesDeadline(t *testing.T) {
+	view := gitView(t, t.TempDir())
+	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", view, "--deadline", "5")
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	ee, ok := err.(*exec.ExitError)
+	require.True(t, ok, "accepted: %v", err)
+	assert.Equal(t, 2, ee.ExitCode())
+	assert.Contains(t, errb.String(), "--ro-manifest takes no --deadline")
+	assert.Empty(t, out.String(), "no digest is printed")
 }
