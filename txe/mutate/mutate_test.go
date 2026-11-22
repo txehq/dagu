@@ -860,6 +860,11 @@ var guardRefused = []string{
 	`python3 -I -c $'import json, sys\x3b print(json.load(open(sys.argv[1])))' mutants.json`,
 	"python3 -I - <<EOF\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 	`python3 -I <<< "import json; print(json.load(open('mutants.json')))$TAIL"`,
+	// ... also when the variable sits inside a Python string literal, so the unexpanded text parses.
+	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])), '${X}')" mutants.json`,
+	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])), '$X')" mutants.json`,
+	`python3 -I -c "import json, sys; print(json.load(open(sys.argv[1])), '$1')" mutants.json`,
+	`python3 -I <<< "import json; print(json.load(open('mutants.json')), '$X')"`,
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3

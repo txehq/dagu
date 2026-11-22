@@ -467,6 +467,10 @@ class Parser:
             elif c == "`" or s.startswith("$(", self.i):
                 text += self.substitution()
             else:
+                if c == "$":
+                    # "$NAME", "${X}", "$1", "$@" are copied as text but the shell replaces them:
+                    # every unescaped $ counts as an expansion (TXE-8183).
+                    self.expansions += 1
                 text += c
                 self.i += 1
         return text
