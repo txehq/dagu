@@ -333,9 +333,13 @@ There are no wildcard rows. A ticket id alone classifies nothing.
 - the demonstration's outer container intentionally runs with a writable root and the image's user. That is a
   demonstration boundary, not enforcement.
 
-The evidence for both rows:
-- `review_evidence` is the independent review that accepted both rows, `msg_f5d1db2e4e66`;
-- `owner_ack` is the current custodian's acknowledgment, `msg_e244f71997d3`.
+The evidence for both rows (TXE-8053, the bytes with `--diagnostic` and `--ro-mount`):
+- `review_evidence` is root's scoped exact-byte source review of those two files' hashes, `msg_8aa61a2eb4f7`. It
+  accepts the classifications and the declared partial guards only: it is not a fixed-argv floor attestation, not
+  behavioural acceptance (no test had run on these bytes) and not adoption or a global pin;
+- `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same, `msg_47e1330eb699`.
+The rows' earlier evidence (`msg_f5d1db2e4e66`, `msg_e244f71997d3`) covered the TXE-7549 bytes, which no longer exist on
+this branch; the TXE-7549 acceptance the rows cite is historical. Any executable change to either file voids its row.
 
 **Provenance:** TXE-7549's tools were written by cc7, then held by cc4-s246524. That contact is currently unreachable,
 so the acknowledgment is the current custodian's.

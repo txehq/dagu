@@ -925,7 +925,7 @@ class Repository(unittest.TestCase):
         self.assertEqual([str(p) for p in problems], [])
         self.assertEqual(classified, {"txe/mutate/fixture-demo.py", "txe/mutate/mutate-sandboxed.py"})
         for r in [x.split("\t") for x in reg.splitlines()[1:]]:
-            self.assertEqual((r[8], r[9]), ("msg_e244f71997d3", "msg_f5d1db2e4e66"), r[1])
+            self.assertEqual((r[8], r[9]), ("msg_47e1330eb699", "msg_8aa61a2eb4f7"), r[1])
 
     def test_the_repository_passes_the_consumer_check(self):
         """The gate: every launcher validates its argv or carries a complete reviewed, hash-bound registry row."""
