@@ -69,7 +69,9 @@ OTHER_SERVER = "https://127.0.0.1:10"
 def kubeconfig(server=SERVER, ca=CA, ctx_cluster="ci", insecure=False, extra_cluster="", users=None, head=""):
     b64 = base64.b64encode(ca).decode()
     other = base64.b64encode(OTHER_CA).decode()
-    ins = "    insecure-skip-tls-verify: true\n" if insecure else ""
+    # insecure: False (no key), True (`true`), or the value's exact source text (a str, quotes kept; "" = empty).
+    ins = ("" if insecure is False else "    insecure-skip-tls-verify: true\n" if insecure is True
+           else f"    insecure-skip-tls-verify:{' ' + insecure if insecure else ''}\n")
     users = users if users is not None else (
         "users:\n"
         "- name: ci-user\n"
@@ -319,6 +321,20 @@ class PreContactPinsRefuseWithoutAProbe(Base):
     def test_tls_verification_disabled(self):
         F.kc.write_text(kubeconfig(insecure=True))
         self.refused(ARGS, "KR14")
+        # Connector security review of ad2765b4: YAML 1.1 truthy spellings (y, Y, ...) disable TLS in kubectl. Only an
+        # unquoted false/False/FALSE is admissible; everything else is KR14 before any probe (calls=0), including
+        # values kubectl would read as false (n, no, off), quoted values and an empty value.
+        for value in ("y", "Y", "yes", "YES", "Yes", "on", "On", "ON", "1", "TRUE", "True",
+                      '"true"', "'true'", '"false"', "'false'", '"y"', "n", "N", "no", "off", "0", "", "fAlse",
+                      "false x"):
+            F.kc.write_text(kubeconfig(insecure=value))
+            self.refused(ARGS, "KR14")
+        # The accepted controls: the key absent, or an unquoted false spelling (a trailing comment is allowed).
+        for value in ("false", "False", "FALSE", "false # verified"):
+            F.kc.write_text(kubeconfig(insecure=value))
+            rc, _, e, t = call(ARGS)
+            self.assertEqual(rc, 0, f"{value}: {e}")
+            self.assertEqual(len(t.calls), 2, value)
 
     def test_ca_from_a_file(self):
         ca_file = F.root / "ca.crt"

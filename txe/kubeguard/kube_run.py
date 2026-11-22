@@ -60,7 +60,8 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     subset of YAML block syntax (no PyYAML; stdlib only). It refuses anchors, aliases, tags, flow
     collections, block scalars, multiple documents, JSON and tabs inside the sections it parses, and any
     top-level line it cannot place. The context must resolve to exactly one cluster, whose server must equal
-    the pinned server and whose CA must hash to the pinned SHA-256. TLS verification must not be disabled.
+    the pinned server and whose CA must hash to the pinned SHA-256. TLS verification must not be disabled:
+    insecure-skip-tls-verify is absent or an unquoted false/False/FALSE, and anything else is KR14.
     The server must be an https:// URL, in the registry entry (load_entry) and in the kubeconfig (KR27).
     A mismatch here refuses with NO contact: no probe and no request.
  5. IDENTITY PROBE. kubectl, with the pinned --kubeconfig and --context, reads the kube-system Namespace
@@ -686,6 +687,15 @@ def _key_value(text):
     return m.group(1), (m.group(2) or "")
 
 
+class _Mapping(dict):
+    """A block mapping. .raw keeps each scalar value's source text, quotes included, for a check that must not
+    decide on the quote-stripped value (insecure-skip-tls-verify)."""
+
+    def __init__(self):
+        super().__init__()
+        self.raw = {}
+
+
 def _block(lines, i, indent):
     """Parse a block mapping or sequence at exactly `indent`. Returns (value, next index)."""
     if i >= len(lines) or lines[i][0] != indent:
@@ -716,7 +726,7 @@ def _block(lines, i, indent):
         if i < len(lines) and lines[i][0] > indent:
             raise Unsupported("indentation after a sequence")
         return seq, i
-    mapping = {}
+    mapping = _Mapping()
     while i < len(lines) and lines[i][0] == indent:
         if lines[i][1].startswith("-"):
             raise Unsupported("a sequence item inside a mapping")
@@ -726,6 +736,7 @@ def _block(lines, i, indent):
         i += 1
         if raw.strip() and not raw.strip().startswith("#"):
             mapping[key] = _scalar(raw)
+            mapping.raw[key] = raw.strip()
         elif i < len(lines) and lines[i][0] > indent:
             mapping[key], i = _block(lines, i, lines[i][0])
         elif i < len(lines) and lines[i][0] == indent and (lines[i][1] == "-" or lines[i][1].startswith("- ")):
@@ -799,6 +810,25 @@ def _one(items, name, field):
     return found[0][field]
 
 
+# insecure-skip-tls-verify (connector security review of ad2765b4): kubectl reads a kubeconfig through YAML 1.1
+# booleans, so y, Y, yes, on and more are true. kube-run does not try to decode that set. When the key is present,
+# it is admissible ONLY as an unquoted YAML false spelled false, False or FALSE, read from the value's SOURCE text
+# (quotes kept): a quoted "false" is a string, not a boolean. Any other value (a truthy form, n/no/off, a quoted or
+# empty value, a nested block) is refused as KR14. That is conservative: some values kubectl reads as false are
+# refused too.
+TLS_VERIFY_FALSE = ("false", "False", "FALSE")
+
+
+def tls_verify_explicitly_false(cluster):
+    raw = getattr(cluster, "raw", {}).get("insecure-skip-tls-verify")
+    if not isinstance(raw, str):
+        return False
+    m = re.search(r"\s#", raw)
+    if m and raw[:1] not in ("'", '"'):
+        raw = raw[:m.start()].rstrip()
+    return raw in TLS_VERIFY_FALSE
+
+
 def check_pins(entry, data, kubeconfig_dir):
     """Raises Refused unless the pinned context resolves to the pinned server and CA. Returns the context's
     namespace (or None). Uses only the clusters and contexts sections."""
@@ -811,8 +841,9 @@ def check_pins(entry, data, kubeconfig_dir):
     if not isinstance(cluster_name, str) or not cluster_name:
         raise Refused("KR11", "the pinned context names no cluster")
     cluster = _one(sec["clusters"], cluster_name, "cluster")
-    if str(cluster.get("insecure-skip-tls-verify", "")).lower() in ("true", "yes", "on", "1"):
-        raise Refused("KR14", "the pinned cluster disables TLS verification")
+    if "insecure-skip-tls-verify" in cluster and not tls_verify_explicitly_false(cluster):
+        raise Refused("KR14", "the pinned cluster disables TLS verification, or sets it in a form kube-run does not "
+                              "accept (only an unquoted false, False or FALSE is accepted)")
     if not isinstance(cluster.get("server"), str) or not HTTPS_SERVER.fullmatch(cluster["server"]):
         raise Refused("KR27", "the pinned cluster's server is not an https:// URL")
     if cluster.get("server") != entry["server"]:

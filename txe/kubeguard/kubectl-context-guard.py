@@ -585,8 +585,13 @@ ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n":
                  "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
 
 
-def _ansi_c(body):
-    """The text Bash makes of the body of $'...' (bash(1), QUOTING)."""
+def _ansi_c(body, nul_ends=False):
+    """The text Bash makes of the body of $'...' (bash(1), QUOTING). nul_ends=True applies Bash's C-string rule: the
+    quoted string ends at its first decoded NUL (\\0, \\x00, \\u0000, \\c@ and the rest), so
+    `$'kubectl\\0ignored'` is `kubectl` (connector review of ad2765b4)."""
+    if nul_ends:
+        decoded = _ansi_c(body)
+        return decoded.split("\0", 1)[0]
     def one(m):
         octal, hx, u4, u8, ctl, other = m.groups()
         try:
@@ -826,7 +831,8 @@ def mention_forms(text):
       - the text with backslashes removed (`kube\\ctl` runs kubectl);
       - QUOTE-DECODED: line continuations removed, then every quote character and backslash removed, so quote
         removal cannot split a name (`kube''ctl`, `kube"c"tl`, `'kube'ctl`, `kube$""ctl`);
-      - the same after every $'...' is ANSI-C decoded (`$'\\x6bubectl'`, `kube$'\\x63'tl`);
+      - the same after every $'...' is ANSI-C decoded (`$'\\x6bubectl'`, `kube$'\\x63'tl`), once as decoded and
+        once with each quoted segment ended at its first decoded NUL, as Bash does (`$'kubectl\\0ignored'`);
       - BRACE-EXPANDED (brace_expanded): each of those bases with its brace words expanded, first honouring the
         quotes (Bash's own order: braces, then quote removal), then once more with the quotes already removed, so
         braces inside a quoted string that a nested shell later reads (`bash -c 'echo kube{ctl,x} | bash'`)
@@ -842,6 +848,9 @@ def mention_forms(text):
     bases = [joined]
     if "$'" in joined:
         bases.append(ANSI_C.sub(lambda m: _ansi_c(m.group(1)), joined))
+        # And with each quoted segment ended at its first decoded NUL, as Bash does (`$'kube\0x'$'ctl'` is
+        # `kubectl`). The untruncated form above is kept, so the forms stay a superset.
+        bases.append(ANSI_C.sub(lambda m: _ansi_c(m.group(1), nul_ends=True), joined))
     for base in bases:
         stripped = _strip_quotes(base) if quoted else base
         if quoted:

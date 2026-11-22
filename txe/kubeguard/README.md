@@ -12,7 +12,9 @@ a context can be repointed inside its file. This directory holds the source of t
   - no target, identity or TLS override (KR04);
   - an authorization policy (KR06 to KR09);
   - server and CA sha256 pins before any contact (KR10 to KR14), and an `https://` server only, in the
-    registry entry and in the kubeconfig (KR27);
+    registry entry and in the kubeconfig (KR27). A cluster's `insecure-skip-tls-verify` must be absent or an
+    unquoted `false`/`False`/`FALSE`; every other value is KR14. That is conservative: kubectl reads YAML 1.1
+    booleans (`y`, `on`, ...), and kube-run refuses even the other false spellings (`n`, `no`, `off`, `"false"`);
   - static credentials only (KR23);
   - a TLS-verified kube-system Namespace UID probe (KR15, KR16);
   - a kubeconfig re-hash (KR17).
@@ -290,7 +292,8 @@ form the lexer reads. The extra raw-text check is a second line only, never the 
 
 **Mentions are read quote-decoded.** Every mention check (`mentions`, through `mention_forms`) reads the text
 as it is, with backslashes removed (`kube\ctl`), and QUOTE-DECODED: line continuations removed, `$'...'`
-ANSI-C decoded, `$"..."` read as `"..."`, then every quote and backslash removed. So a name that quote removal
+ANSI-C decoded (both as decoded and with each quoted segment ended at its first decoded NUL, as Bash does:
+`$'kubectl\0ignored'` is `kubectl`), `$"..."` read as `"..."`, then every quote and backslash removed. So a name that quote removal
 assembles (`echo kube''ctl get secrets | bash`, `cat <<'EOF' | bash` over `kube"c"tl`, `$'\x6bubectl'`) marks
 the line client-relevant, and the pipe receiver is refused (H03). The decoding parses nothing, so it also covers
 text the lexer cannot read, such as here-document bodies and raw event JSON. Deleting every quote

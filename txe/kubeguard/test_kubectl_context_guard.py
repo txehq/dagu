@@ -183,7 +183,11 @@ class Refused(unittest.TestCase):
         # the raw text, so the receiver skipped H03. Every quote-removal spelling now marks the line.
         for name in ("kube''ctl", 'kube""ctl', "'kube'ctl", 'kube"c"tl', "k\\ubectl", "kube$''ctl", 'kube$""ctl',
                      "$'kubectl'", "$'\\x6bubectl'", "kube$'\\x63'tl", "$'\\153ubectl'", "$'\\u006bubectl'",
-                     "kube\\\nctl", "he''lm", "fl''ux"):
+                     "kube\\\nctl", "he''lm", "fl''ux",
+                     # Connector review of ad2765b4: Bash ends a $'...' string at its first decoded NUL, for every
+                     # NUL escape, per quoted segment.
+                     "$'kubectl\\0ignored'", "$'kubectl\\x00x'", "$'kubectl\\u0000x'", "$'kubectl\\c@x'",
+                     "kube$'ctl\\0zz'", "$'kube\\0x'$'ctl'"):
             for cmd in (f"echo {name} get secrets | bash", f"printf '%s\\n' {name} | sh",
                         f"echo {name} get ns > >(bash)", f"bash <(echo {name} get ns)",
                         f"echo {name} get ns | python3"):
@@ -194,6 +198,9 @@ class Refused(unittest.TestCase):
             self.deny(f"ssh host <<'EOF'\n{body}\nEOF", "H03")
         # The direct spellings stay H01 (Allowed.test_quote_decoded_data_without_a_code_receiver has the data side).
         self.deny("kube''ctl get pods", "H01")
+        # A NUL-ended $'...' as the command word: a run-time command word in a client line (H02).
+        for cmd in ("$'kubectl\\0x' get pods", "$'kubectl\\x00' get secrets"):
+            self.deny(cmd, "H02")
 
     def test_brace_alternatives_mark_the_line_for_pipe_receivers(self):
         # Root msg_205b648bd468: deterministic brace alternatives are expanded structurally (not by deleting braces,
