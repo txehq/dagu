@@ -778,7 +778,7 @@ class BraceBudget(unittest.TestCase):
 
     def test_cost_is_computed_without_expanding(self):
         self.assertEqual(GUARD._brace_cost(["kube", [["ctl"], ["x"]]], 256, 1 << 20), (2, 12))   # kubectl kubex
-        self.assertEqual(GUARD._brace_cost([["a", [["b"], ["c"]]], ["d"]], 256, 1 << 20), (3, 5))  # ab ac d
+        self.assertEqual(GUARD._brace_cost([[["a", [["b"], ["c"]]], ["d"]]], 256, 1 << 20), (3, 5))  # ab ac d
         self.assertEqual(GUARD._brace_cost(["p", [["a"], ["b"]], [["c"], ["d"]], "s"], 256, 1 << 20), (4, 16))
         self.assertEqual(GUARD._brace_cost(["x", [["a"]] * 257], 256, 1 << 20), (257, (1 << 20) + 1))
         self.assertEqual(GUARD._brace_cost(["x" * 100, [["a"], ["b"]]], 256, 150), (257, 151))
