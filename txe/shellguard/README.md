@@ -43,7 +43,14 @@ under invented CLIs.
   is not parsed again.
 
 **Allowed:** `'…'`, `$'…'`, `"\$(x)"`, a quoted heredoc delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`,
-`<<E'O'F`), and comments.
+`<<E'O'F`, `<<$'EOF'`, `<<$"EOF"`), and comments.
+
+**Where a comment starts:** a comment begins only at a `#` that starts a shell word. After an
+escaped space (`word\ #`), a backslash-newline that joins a word, or a closing `$( )` or backtick,
+the `#` continues the word, so the text after it is scanned.
+
+**A `$'…'` or `$"…"` delimiter:** the delimiter is the inner text. One containing a backslash
+escape is not modelled, so it is refused as X1.
 
 **Refused visibly, because the scanner cannot follow the input:**
 - X1: a construct left open at the end of the input.

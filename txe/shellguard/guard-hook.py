@@ -97,6 +97,7 @@ class Scanner:
         self.stack = [_Frame(start_kind)]
         self.findings = []
         self.pending = []  # heredocs waiting for the end of the current line: (delim, quoted, strip_tabs)
+        self.ws = True  # at a word start in unquoted code (see step_code)
 
     # -- bookkeeping -------------------------------------------------------------------------
     def find(self, rule, at):
@@ -159,19 +160,27 @@ class Scanner:
         """At a '$'. Returns True when it opened something."""
         s, i = self.s, self.i
         if s.startswith("$((", i):
+            self.ws = False
             self.push(ARITH)
             self.i = i + 3
             return True
         if s.startswith("$(", i):
             self.substitution(False, i)
             self.push(CMDSUB)
+            self.ws = True  # a new command starts inside $( )
             self.i = i + 2
             return True
         if s.startswith("${", i):
+            self.ws = False
             self.push(PARAM)
             self.i = i + 2
             return True
         return False
+
+    def open_backtick(self):
+        """Enter a backtick substitution: a new command starts inside it."""
+        self.push(BQ)
+        self.ws = True
 
     def skip_single(self):
         j = self.s.find("'", self.i + 1)
@@ -204,55 +213,73 @@ class Scanner:
 
     # -- contexts ----------------------------------------------------------------------------
     def step_code(self):
+        """Unquoted code. self.ws is True when the next character would start a shell word: only
+        there does '#' begin a comment. An escaped character (`\\ `) continues the word; a
+        backslash-newline is removed by the shell, so it leaves self.ws as it was."""
         s, i, f = self.s, self.i, self.top()
         c = s[i]
         if c == "\\":
+            if not s.startswith("\\\n", i):
+                self.ws = False
             self.i = i + 2
         elif c == "'":
+            self.ws = False
             self.skip_single()
         elif c == "$" and s.startswith("$'", i):
+            self.ws = False
             self.skip_ansi_c()
         elif c == "$" and s.startswith('$"', i):
+            self.ws = False
             self.push(DQ)
             self.i = i + 2
         elif c == '"':
+            self.ws = False
             self.push(DQ)
             self.i = i + 1
         elif c == "`":
             if f.kind == BQ:
                 self.pop()
+                self.ws = False
             else:
                 self.substitution(True, i)
-                self.push(BQ)
+                self.open_backtick()
             self.i = i + 1
         elif c == "$" and self.dollar():
             pass
         elif c == "(" and f.kind != BQ and s.startswith("((", i) and self.at_command_start():
+            self.ws = False
             self.push(ARITH)  # closes on '))' at depth 0, as $(( does
             self.i = i + 2
         elif c == "(":
             if f.kind == CMDSUB:
                 f.depth += 1
+            self.ws = True
             self.i = i + 1
         elif c == ")":
-            if f.kind == CMDSUB:
-                if f.depth:
+            if f.kind == CMDSUB and not f.depth:
+                self.pop()
+                self.ws = False  # `$(x)#y` is one word: the '#' does not start a comment
+            else:
+                if f.kind == CMDSUB:
                     f.depth -= 1
-                else:
-                    self.pop()
+                self.ws = True
             self.i = i + 1
-        elif c == "#" and (i == 0 or s[i - 1] in WORD_BREAK):
+        elif c == "#" and self.ws:
             j = s.find("\n", i)
             self.i = self.n if j < 0 else j
         elif c == "<" and s.startswith("<<<", i):
+            self.ws = True
             self.i = i + 3
         elif c == "<" and s.startswith("<<", i):
+            self.ws = False
             self.heredoc_operator()
         elif c == "\n":
+            self.ws = True
             self.i = i + 1
             if self.pending:
                 self.read_heredoc_bodies()
         else:
+            self.ws = c in WORD_BREAK
             self.i = i + 1
 
     def step_dq(self):
@@ -265,7 +292,7 @@ class Scanner:
             self.i = i + 1
         elif c == "`":
             self.substitution(True, i)
-            self.push(BQ)
+            self.open_backtick()
             self.i = i + 1
         elif c == "$" and self.dollar():
             pass
@@ -280,7 +307,7 @@ class Scanner:
             self.i = i + (2 if i + 1 < self.n and s[i + 1] in "$`\\\n" else 1)
         elif c == "`":
             self.substitution(True, i)
-            self.push(BQ)
+            self.open_backtick()
             self.i = i + 1
         elif c == "$" and self.dollar():
             pass
@@ -299,7 +326,7 @@ class Scanner:
             self.i = i + 1
         elif c == "`":
             self.substitution(True, i)
-            self.push(BQ)
+            self.open_backtick()
             self.i = i + 1
         elif c == "$" and self.dollar():
             pass
@@ -320,7 +347,7 @@ class Scanner:
         c = s[i]
         if c == "`":
             self.substitution(True, i)
-            self.push(BQ)
+            self.open_backtick()
             self.i = i + 1
         elif c == '"':
             self.push(DQ)
@@ -352,7 +379,18 @@ class Scanner:
         delim, quoted = [], False
         while j < self.n and s[j] not in WORD_BREAK:
             c = s[j]
-            if c in "'\"":
+            if c == "$" and s.startswith(("$'", '$"'), j):
+                # $'...' (ANSI-C) or $"..." (locale): quote removal leaves the inner text, and the
+                # delimiter counts as quoted. A backslash escape inside is not modelled: refuse.
+                quoted = True
+                k = s.find(s[j + 1], j + 2)
+                if k < 0 or "\\" in s[j + 2:k]:
+                    self.find("X1", j)
+                    self.i = self.n
+                    return
+                delim.append(s[j + 2:k])
+                j = k + 1
+            elif c in "'\"":
                 quoted = True
                 k = s.find(c, j + 1)
                 if k < 0:

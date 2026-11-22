@@ -94,6 +94,32 @@ class Rules(unittest.TestCase):
     def test_u1_unquoted_backtick(self):
         self.assertEqual(rules("V=" + BT + "date" + BT), ["U1"])
 
+    def test_hash_inside_a_word_is_not_a_comment(self):
+        """PR 301 review: '#' starts a comment only at a word start. An escaped space, a
+        backslash-newline or a closing $( ) continues the word, so the text after it is scanned."""
+        for cmd in ["printf '%s\\n' word\\ # \"$(step-one)\"",
+                    "printf '%s\\n' word\\\n# \"$(step-one)\"",
+                    "V=$(step-one)#\"$(step-two)\"",
+                    "e " + BT + "step-one" + BT + "#\"$(step-two)\""]:
+            with self.subTest(cmd=cmd):
+                self.assertIn("T2", rules(cmd))
+
+    def test_hash_at_a_word_start_is_a_comment(self):
+        for cmd in ["printf x # \"$(step-one)\"", "printf x \\\n# \"$(step-one)\"", "# \"$(step-one)\"",
+                    "e $(step-one # c\n)"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(G.check(cmd), [])
+
+    def test_ansi_c_and_locale_heredoc_delimiters(self):
+        """PR 301 review: <<$'EOF' ends at a line EOF, and its body is quoted (not expanded)."""
+        hidden = "cat <<$'EOF'\ntext\nEOF\nprintf '%s\\n' \"$(step-one)\"\n$EOF\n"
+        self.assertEqual(rules(hidden), ["T2"])
+        self.assertEqual(rules(hidden.replace("$'EOF'", '$"EOF"')), ["T2"])
+        self.assertEqual(G.check("cat <<$'EOF'\n$(step-one) " + BT + "x" + BT + "\nEOF\n"), [])
+        self.assertEqual(G.check('cat <<$"EOF"\n$(step-one)\nEOF\n'), [])
+        self.assertIn("X1", rules("cat <<$'E\\tOF'\nx\nE\tOF\n"))  # an escape inside: not modelled
+        self.assertIn("X1", rules("cat <<$'EOF\nx\n"))  # unterminated quote
+
     def test_double_quotes_nested_in_a_substitution_are_their_own_context(self):
         cmd = 'V=$(acmectl "' + BT + "x" + BT + '")'
         self.assertEqual(rules(cmd), ["D1"])
@@ -309,7 +335,7 @@ class Structure(unittest.TestCase):
         # Scanner methods
         "scan", "find", "push", "pop", "top", "has_dq_ancestor", "substitution", "dollar",
         "skip_single", "skip_ansi_c", "at_command_start", "step_code", "step_dq", "step_hdoc",
-        "step_param", "step_arith", "heredoc_operator", "read_heredoc_bodies", "__init__",
+        "step_param", "step_arith", "heredoc_operator", "read_heredoc_bodies", "open_backtick", "__init__",
         # str / bytes / list / dict methods
         "startswith", "lstrip", "rstrip", "rsplit", "join", "isalpha", "isalnum", "encode",
         "decode", "count", "append", "extend", "get",
