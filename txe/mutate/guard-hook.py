@@ -27,11 +27,13 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
 - a non-shell interpreter given code (`python3 -c`, `node -e`, `perl -e`, a here-document on
   python3's stdin) that imports a mutant module, or names a mutant script or mutation tool and
   calls something that runs a file or a process (runpy, exec, subprocess, os.system, require,
-  child_process, ...). Python code is also parsed (TXE-8183): code proven, within a small
-  supported grammar, to only read and print data (json.load, open in a read mode, print, ...)
-  is data whatever its arguments name; any other Python code that may run something is refused
-  when any input it is given names a mutant in any path component, whatever the extension
-  (`exec(open("mutants.json").read())`, a file under a mutate-sandboxed work directory).
+  child_process, ...). Python code is also parsed (TXE-8183): in one supported form (isolated
+  `python3 -I -c` or `-I` with stdin, not interactive, top level, no PYTHON* variable), code
+  proven within a small grammar to only read, parse and print data (json.load, ast.parse, open
+  in a read mode, print) is data whatever its arguments name; other Python code that may run
+  something is refused when any input it is given names a mutant in any path component, whatever
+  the extension (`exec(open("mutants.json").read())`, a file under a mutate-sandboxed work
+  directory). With -i, the stdin read after the code is judged as a program.
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
 `--body` or `--text` message, a path given to cat or shasum, the body of a here-document written
 to a file, a comment, and code that only mentions the names (prints them, edits text containing
@@ -43,6 +45,7 @@ tool it does not know. It is defence in depth that catches the habit that caused
 AGENTS.md rule is the policy.
 """
 import ast
+import builtins
 import json
 import os
 import re
@@ -529,7 +532,7 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0, la
 def runs_evidence(code: str, lang: str) -> bool:
     """Whether code may run a file or a process. Python code that python_reads_only() could not
     clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before."""
-    return bool(CODE_RUNS.search(code) or (lang == "python" and PY_EXTRA_RUNS.search(code)))
+    return bool(CODE_RUNS.search(code) or (lang.startswith("python") and PY_EXTRA_RUNS.search(code)))
 
 
 def mutant_in_path(text: str) -> bool:
@@ -553,7 +556,7 @@ def code_runs_mutant(code: str, lang: str = "other") -> bool:
         return True  # an import statement, not import text inside a string or a comment
     if not runs_evidence(code, lang):
         return False
-    if lang == "python":
+    if lang.startswith("python"):
         return any(mutant_in_path(t) or TOOLS.match(base(t)) for t in CODE_TOKEN.findall(code))
     return any(mutant_named(t, need_ext=True) or TOOLS.match(base(t)) for t in CODE_TOKEN.findall(code))
 
@@ -561,43 +564,43 @@ def code_runs_mutant(code: str, lang: str = "other") -> bool:
 # ------------------------------------------------- Python code proven not to execute (TXE-8183)
 # A shared bare-word regex cannot tell `json.load(f)` (data) from `pickle.load(f)` or `exec(...)`
 # (execution). Python code is therefore parsed (ast.parse only builds a tree; nothing runs) and
-# cleared as data only when every construct is in this small supported grammar: imports only of the
-# modules below, attributes of a module only from its list, any other attribute only as a listed
-# method being called, calls only to the listed builtins (open() in a read mode only), the listed
-# methods and functions the code defines itself, no *args or **kwargs, no coding declaration, no
-# name or attribute starting with "_", no class, async or dangerous builtin name anywhere. Anything
-# else, including code that does not parse, is not cleared and is judged as before, with the
-# additions above: an unsupported or ambiguous path is refused when it names a mutant.
+# cleared as data only in one supported form (Judge.python decides the form): an isolated
+# interpreter (`-I`, optionally with -B/-u, and no other flag), not interactive, at the top level of
+# the command or behind timeout/nice/nohup/command/env without -S, with no PYTHON* variable set.
+# The code must then fit this deliberately small read/parse/print grammar, one module scope only:
+# - statements: `import M[, M2]` of the modules below (no alias that shadows a builtin, a module or
+#   another binding), `NAME = expr`, `with open(...) as NAME:` and expression statements;
+# - expressions: constants, f-strings, tuples, lists, dicts, subscripts, comparisons and
+#   arithmetic, names bound above, `module.attr` from the module's list, calls of the listed
+#   builtins (open() in a literal read mode) and of the listed methods, with only the keywords
+#   listed per callee;
+# - nothing else: no def, lambda, class, comprehension, decorator, loop, del, global, attribute or
+#   subscript assignment, rebinding of a module or builtin, *args/**kwargs, `_` name or attribute,
+#   coding declaration, \r or BOM.
+# Anything else, including code that does not parse, is not cleared and is judged by the run-call
+# rule with the Python additions above. Trusted, not checked: the python3 found on PATH is CPython
+# with an unmodified standard library, and its site-packages .pth files (which -I does not disable)
+# are system state outside the command.
 PY_READ_MODULES = {
-    "json": {"load", "loads", "dumps", "JSONDecodeError"},
-    # Parsing source is data: ast.parse builds a tree, and compile/exec stay unsafe names.
-    "ast": {"parse", "dump", "walk", "literal_eval", "get_docstring", "unparse"},
-    "sys": {"argv", "stdin", "stdout", "stderr", "exit"},
-    "re": {"search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split", "compile",
-           "escape", "I", "M", "S", "IGNORECASE", "MULTILINE", "DOTALL"},
-    "hashlib": {"sha256", "sha1", "sha512", "md5"},
-    "pprint": {"pprint", "pformat"},
-    "collections": {"Counter", "OrderedDict", "defaultdict"},
-    "csv": {"reader", "DictReader"},
-    "base64": {"b64decode", "b64encode"},
+    "json": {"load", "loads", "dumps"},
+    # Parsing source is data: ast.parse builds a tree, and compile/exec are not in the grammar.
+    "ast": {"parse", "dump", "literal_eval"},
+    "sys": {"argv", "stdin", "stderr"},
 }
-PY_READ_BUILTINS = {"print", "len", "sorted", "reversed", "list", "dict", "set", "frozenset", "tuple", "str",
-                    "int", "float", "bool", "bytes", "repr", "min", "max", "sum", "any", "all", "enumerate",
-                    "zip", "range", "map", "filter", "isinstance", "abs", "round", "format", "hex", "ord",
-                    "chr", "next", "iter", "open"}
-PY_READ_METHODS = {"read", "readline", "readlines", "close", "get", "keys", "values", "items", "split",
-                   "rsplit", "splitlines", "partition", "rpartition", "strip", "lstrip", "rstrip",
-                   "startswith", "endswith", "join", "count", "index", "find", "rfind", "lower", "upper",
-                   "title", "replace", "format", "encode", "decode", "zfill", "ljust", "rjust", "center",
-                   "isdigit", "isalpha", "isspace", "hexdigest", "digest", "update", "append", "extend",
-                   "sort", "copy", "pop", "setdefault", "most_common", "group", "groups", "groupdict",
-                   "search", "match", "fullmatch", "findall", "finditer", "sub"}
-# No write or flush: a cleared program has no writable file (open() is read-only), and output goes
-# through print().
-# Names that reach execution or the interpreter's internals: never cleared, wherever they appear.
-PY_UNSAFE_NAMES = {"exec", "eval", "compile", "getattr", "setattr", "delattr", "globals", "locals", "vars",
-                   "breakpoint", "input", "help", "memoryview", "type", "object", "super", "classmethod",
-                   "staticmethod", "property", "builtins", "exit", "quit"}
+PY_READ_BUILTINS = {"print", "len", "str", "int", "float", "bool", "repr", "list", "dict", "tuple",
+                    "sorted", "min", "max", "sum", "any", "all", "open"}
+PY_READ_METHODS = {"read", "get", "keys", "values", "items", "split", "strip", "splitlines",
+                   "startswith", "endswith", "join", "count", "lower"}
+# Keywords a cleared call may pass, per callee; none for any other call. No callable-taking keyword
+# (key=, default=, object_hook=, cls=, opener=, ...).
+PY_READ_KEYWORDS = {"print": {"sep", "end", "file"}, "open": {"mode", "encoding", "errors", "newline"},
+                    "json.dumps": {"indent", "sort_keys", "ensure_ascii"}, "sorted": {"reverse"}}
+# Every builtin name: none may be bound as a variable or used as an import alias.
+BUILTIN_NAMES = set(dir(builtins))
+# The flags of the supported isolated form.
+PY_CLEAR_FLAGS = {"I", "B", "u"}
+# Wrappers a cleared command may sit behind (env without -S: -S recurses and is not a clearance form).
+PY_CLEAR_WRAPPERS = {"timeout", "gtimeout", "nice", "nohup", "command", "env"}
 # Run evidence for Python code that was not cleared, on top of CODE_RUNS: dynamic access to
 # builtins, executable deserialization (pickle.load is execution; json.load is not), loaders,
 # interpreters and process pools.
@@ -611,7 +614,7 @@ PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|
 # Python's lines end at \r, \n or \r\n, str.splitlines() also splits at \f, \x1c-\x1e, \x85 and
 # others, so "line 1 or 2" is not located here at all: a coding comment ANYWHERE, a \r, or a BOM
 # keeps code from being cleared.
-PY_CODING_COOKIE = re.compile(r"#.*?coding[:=]|\r|﻿")
+PY_CODING_COOKIE = re.compile(r"#.*?coding[:=]|\r|\ufeff")  # re reads \ufeff as U+FEFF (BOM)
 _read_only_cache: dict = {}
 
 
@@ -629,81 +632,107 @@ def _python_reads_only(code: str) -> bool:
     if PY_CODING_COOKIE.search(code):
         return False
     tree = ast.parse(code)
-    modules, functions, parents = {}, set(), {}
+    if not isinstance(tree, ast.Module):
+        return False
+    # Bindings, in one module scope (the grammar has no def, lambda, class or comprehension).
+    modules, variables = {}, set()
+
+    def bind(name: str) -> bool:
+        """A new or repeated plain variable; never a module or any builtin name (exec, open, print,
+        ...), and never `_`-prefixed."""
+        if name in modules or name in PY_READ_MODULES or name in BUILTIN_NAMES or name.startswith("_"):
+            return False
+        variables.add(name)
+        return True
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Import):
+            for a in stmt.names:
+                name = a.asname or a.name
+                if a.name not in PY_READ_MODULES or name in BUILTIN_NAMES or name in variables \
+                        or modules.get(name, a.name) != a.name or name.startswith("_"):
+                    return False
+                modules[name] = a.name
+        elif isinstance(stmt, ast.Assign):
+            if not all(isinstance(t, ast.Name) and bind(t.id) for t in stmt.targets):
+                return False  # no attribute, subscript, tuple or starred target
+        elif isinstance(stmt, ast.With):
+            for item in stmt.items:
+                ctx = item.context_expr
+                if not (isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name) and ctx.func.id == "open"):
+                    return False
+                if item.optional_vars is not None and not (
+                        isinstance(item.optional_vars, ast.Name) and bind(item.optional_vars.id)):
+                    return False
+            if not all(isinstance(s, (ast.Expr, ast.Assign)) for s in stmt.body):
+                return False
+            for s in stmt.body:
+                if isinstance(s, ast.Assign) and not all(isinstance(t, ast.Name) and bind(t.id) for t in s.targets):
+                    return False
+        elif not isinstance(stmt, ast.Expr):
+            return False
+    parents = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
             parents[child] = node
-        if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef, ast.Await, ast.AsyncFor, ast.AsyncWith)):
-            return False
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if a.name not in PY_READ_MODULES:
-                    return False
-                modules[a.asname or a.name] = a.name
-        elif isinstance(node, ast.ImportFrom):
-            if node.level or node.module not in PY_READ_MODULES:
-                return False
-            for a in node.names:
-                if a.name not in PY_READ_MODULES[node.module]:
-                    return False  # also refuses `from json import *`
-                functions.add(a.asname or a.name)
-        elif isinstance(node, ast.FunctionDef):
-            functions.add(node.name)
-        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Lambda):
-            functions.update(t.id for t in node.targets if isinstance(t, ast.Name))
+    allowed = (ast.Module, ast.Expr, ast.Assign, ast.With, ast.withitem, ast.Import, ast.alias, ast.Call,
+               ast.keyword, ast.Name, ast.Attribute, ast.Subscript, ast.Slice, ast.Constant, ast.JoinedStr,
+               ast.FormattedValue, ast.Tuple, ast.List, ast.Dict, ast.Compare, ast.BoolOp, ast.BinOp,
+               ast.UnaryOp, ast.IfExp, ast.Load, ast.Store, ast.operator, ast.boolop, ast.cmpop, ast.unaryop)
     for node in ast.walk(tree):
+        if not isinstance(node, allowed):
+            return False  # def, lambda, comprehension, loop, del, global, starred, await, ...
         if isinstance(node, ast.Name):
-            if node.id in PY_UNSAFE_NAMES or node.id.startswith("_"):
-                return False
-            # A module may only be used as `module.attribute`, never passed on or rebound.
-            if node.id in modules and not isinstance(parents.get(node), ast.Attribute):
-                return False
-            # open only as the function of a call, where its mode is checked (never map(open, ...)).
             parent = parents.get(node)
-            if node.id == "open" and not (isinstance(parent, ast.Call) and parent.func is node):
-                return False
+            if isinstance(node.ctx, ast.Store):
+                continue  # checked by bind() above
+            if node.id in modules:
+                if not isinstance(parent, ast.Attribute):
+                    return False  # a module only as `module.attr`, never passed on
+            elif node.id in PY_READ_BUILTINS:
+                if not (isinstance(parent, ast.Call) and parent.func is node):
+                    return False  # a builtin only called, never passed as a callback
+            elif node.id not in variables:
+                return False  # an unbound or unknown name
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("_"):
-                return False
+            if not isinstance(node.ctx, ast.Load) or node.attr.startswith("_"):
+                return False  # no attribute assignment or deletion (json.load = ...)
+            parent = parents.get(node)
             if isinstance(node.value, ast.Name) and node.value.id in modules:
                 if node.attr not in PY_READ_MODULES[modules[node.value.id]]:
                     return False
-            else:
-                # Any other attribute only as a listed method being called: never a bare value
-                # (gi_frame, f_globals, co_code, d.get passed to map, ...).
-                parent = parents.get(node)
-                if not (isinstance(parent, ast.Call) and parent.func is node and node.attr in PY_READ_METHODS):
-                    return False
+            elif not (isinstance(parent, ast.Call) and parent.func is node and node.attr in PY_READ_METHODS):
+                return False  # any other attribute only as a listed method being called
+        elif isinstance(node, (ast.Subscript, ast.Tuple, ast.List)) and not isinstance(node.ctx, ast.Load):
+            return False
         elif isinstance(node, ast.Call):
-            # *args and **kwargs hide which argument is which (open(*["f", "w"])): not judged.
-            if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+            if any(isinstance(a, ast.Starred) for a in node.args):
                 return False
             f = node.func
-            if isinstance(f, ast.Name):
-                if f.id not in PY_READ_BUILTINS and f.id not in functions:
-                    return False
-                if f.id == "open" and not _open_reads_only(node):
-                    return False
-            elif isinstance(f, ast.Attribute):
-                on_module = isinstance(f.value, ast.Name) and f.value.id in modules
-                if not on_module and f.attr not in PY_READ_METHODS:
-                    return False
+            if isinstance(f, ast.Name) and f.id in PY_READ_BUILTINS:
+                callee = f.id
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in modules:
+                callee = modules[f.value.id] + "." + f.attr
+            elif isinstance(f, ast.Attribute) and f.attr in PY_READ_METHODS:
+                callee = "." + f.attr
             else:
-                return False  # a call of a call's result, a subscript, ...: not judged
+                return False  # a call of a call's result, a subscript, a variable, ...: not judged
+            if any(k.arg is None or k.arg not in PY_READ_KEYWORDS.get(callee, ()) for k in node.keywords):
+                return False
+            if callee == "open" and not _open_reads_only(node):
+                return False
     return True
 
 
 def _open_reads_only(node) -> bool:
     """open() with no mode, or a literal mode that neither writes, appends, creates nor updates,
     and no opener."""
+    if len(node.args) > 2:
+        return False  # buffering, encoding, ... and the opener only by keyword, if at all
     mode = node.args[1] if len(node.args) > 1 else None
     for k in node.keywords:
         if k.arg == "mode":
             mode = k.value
-        elif k.arg is None or k.arg == "opener":
-            return False
-    if len(node.args) > 7:
-        return False  # the opener given by position
     if mode is None:
         return True
     return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set("wax+")
@@ -737,26 +766,39 @@ def code_and_args_run_mutant(code: str, rest: list, env=(), lang: str = "other")
         return True
     if not runs_evidence(code, lang):
         return False
-    named = mutant_in_path if lang == "python" else mutant_named
+    named = mutant_in_path if lang.startswith("python") else mutant_named
     return any(named(w.text) for w in rest) or any(named(v) for v in env)
 
 
 class Judge:
-    def __init__(self, depth: int):
+    def __init__(self, depth: int, outer=None):
         self.depth = depth
         self.vars = {}
+        # Assignments of the command this one is nested in (eval, env -S, bash -c, go -exec): read
+        # as values its code may see and for PYTHON* detection, never to resolve a program, since
+        # an unexported variable is empty in a child shell.
+        self.outer = dict(outer or {})
         self.env_assigned = []
         self.env_assigned_names = []
+        self.via = []  # wrappers and runners the current command was reached through
         self.nest = 0
 
     def env_values(self) -> list:
         """Values a command's code may read from its environment: shell assignments made so far
-        (conservatively, exported or not) and this command's own `env NAME=value` assignments."""
-        return list(self.vars.values()) + self.env_assigned
+        (conservatively, exported or not), the enclosing command's, and this command's own
+        `env NAME=value` assignments."""
+        return list(self.vars.values()) + list(self.outer.values()) + self.env_assigned
+
+    def context(self) -> dict:
+        """Assignments a nested command inherits as values (see `outer`)."""
+        ctx = {**self.outer, **self.vars}
+        ctx.update(n.partition("=")[::2] for n in self.env_assigned_names)
+        return ctx
 
     def runs_mutation(self, cmd: Cmd) -> bool:
         self.env_assigned = []  # per command; never used to resolve a program
         self.env_assigned_names = []
+        self.via = []
         words = list(cmd.words)
         if words and words[0].text in DECLARERS:  # export NAME=value, declare -x NAME=value, ...
             for w in words[1:]:
@@ -797,6 +839,7 @@ class Judge:
             if var and (var.group(1) or var.group(2)) in self.vars:
                 prog = base(self.vars[var.group(1) or var.group(2)].split(" ")[0])
             if prog in WRAPPERS:
+                self.via.append(prog)
                 nxt = self.past_wrapper(prog, words, i + 1)
                 if isinstance(nxt, bool):
                     return nxt
@@ -823,7 +866,7 @@ class Judge:
                 else:
                     payload, after = t.split("=", 1)[1] if t.startswith("--") else t[2:], i + 1
                 rest = " ".join(shlex.quote(w.text) for w in words[after:])
-                return refuses(payload + " " + rest, self.depth + 1)
+                return refuses(payload + " " + rest, self.depth + 1, self.context())
             if t.startswith("-") and len(t) > 1:
                 i += 2 if t in value_opts else 1
             elif prog == "env" and ASSIGN.match(t):
@@ -842,7 +885,7 @@ class Judge:
         if prog in ("source", "."):
             return bool(args) and mutant_named(args[0].text)
         if prog == "eval":
-            return refuses(" ".join(a.text for a in args), self.depth + 1)
+            return refuses(" ".join(a.text for a in args), self.depth + 1, self.context())
         if w0.procsub is None and mutant_named(prog):
             return True
         if SHELLS.match(prog):
@@ -892,22 +935,31 @@ class Judge:
             else:
                 break
         if code:
-            return j < len(args) and refuses(args[j].text, self.depth + 1)
+            return j < len(args) and refuses(args[j].text, self.depth + 1, self.context())
         if from_stdin:  # bash -s [args]: the program is stdin, the words are its arguments
             return stdin_is_mutant(cmd, True, self.depth)
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             return operand_is_mutant(args[j], cmd, True, self.depth)
         return stdin_is_mutant(cmd, True, self.depth)
 
-    def python_lang(self) -> str:
-        """"python" when Python code here may be cleared by python_reads_only(); "other" (the
-        language-neutral rule) when the command sets any PYTHON* variable (PYTHONPATH,
-        PYTHONSTARTUP, PYTHONHOME, ...), which can change what `import json` loads."""
-        names = list(self.vars) + [n.partition("=")[0] for n in self.env_assigned_names]
-        return "other" if any(n.startswith("PYTHON") for n in names) else "python"
+    def python_names(self) -> list:
+        """Variable names this command's interpreter may see: shell, enclosing and env ones."""
+        return list(self.vars) + list(self.outer) + [n.partition("=")[0] for n in self.env_assigned_names]
+
+    def python_lang(self, flags: set, unsupported: bool) -> str:
+        """"python" when Python code here may be cleared by python_reads_only(), which is only in
+        the supported form: isolated (-I, plus only -B/-u), at the top level of the command (not
+        inside eval, env -S, bash -c or go -exec), reached directly or through PY_CLEAR_WRAPPERS
+        only, with no PYTHON* variable set. Anything else is "python-strict": the Python run-call
+        and path rules, never clearance (TXE-8183 review F1, F2)."""
+        if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
+                or not set(self.via) <= PY_CLEAR_WRAPPERS
+                or any(n.startswith("PYTHON") for n in self.python_names())):
+            return "python-strict"
+        return "python"
 
     def python(self, args: list, cmd) -> bool:
-        lang = self.python_lang()
+        flags, unsupported = set(), False
         j = 0
         while j < len(args):
             t = args[j].text
@@ -915,6 +967,7 @@ class Judge:
                 j += 1
                 break
             if t.startswith("--"):
+                unsupported = True  # a long option is not part of the supported form
                 j += 2 if t == "--check-hash-based-pycs" else 1
                 continue
             if not t.startswith("-") or t == "-":
@@ -923,7 +976,9 @@ class Judge:
                 ch = t[k]
                 if ch == "c":
                     code = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
-                    return code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
+                    lang = self.python_lang(flags, unsupported)
+                    return (code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
+                            or self.interactive_stdin(flags, cmd))
                 if ch == "m":
                     attached = bool(t[k + 1:])
                     mod = t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else "")
@@ -931,14 +986,26 @@ class Judge:
                         return True
                     # python3 -m runpy|pdb|cProfile|coverage ... runs a script named later.
                     rest = args[j + (1 if attached else 2):]
-                    return mod.split(".")[0] in SCRIPT_RUNNER_MODULES and names_mutant_script(rest)
+                    return ((mod.split(".")[0] in SCRIPT_RUNNER_MODULES and names_mutant_script(rest))
+                            or self.interactive_stdin(flags, cmd))
+                flags.add(ch)
                 if ch in "WXQ":
+                    unsupported = True
                     j += 0 if t[k + 1:] else 1
                     break
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
-            return operand_is_mutant(args[j], cmd, False, self.depth, lang)
-        return stdin_is_mutant(cmd, False, self.depth, lang)
+            # A script operand (or a descriptor holding the program) is never a clearance form.
+            return (operand_is_mutant(args[j], cmd, False, self.depth, "python-strict")
+                    or self.interactive_stdin(flags, cmd))
+        return stdin_is_mutant(cmd, False, self.depth, self.python_lang(flags, unsupported))
+
+    def interactive_stdin(self, flags: set, cmd) -> bool:
+        """-i (or PYTHONINSPECT in the command's variables) reads more program from stdin after the
+        code, module or script: that stdin is judged as a program too (TXE-8183 review F1)."""
+        if "i" not in flags and "PYTHONINSPECT" not in self.python_names():
+            return False
+        return stdin_is_mutant(cmd, False, self.depth, "python-strict")
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0
@@ -1080,7 +1147,7 @@ class Judge:
             value = m.group(1) if m.group(1) is not None else (tokens[n + 1] if n + 1 < len(tokens) else "")
             if "$" in value or "`" in value:
                 return True  # a variable or substitution in the program go runs cannot be judged
-            if refuses(value, self.depth + 1) or mutant_named(value.split(" ")[0]):
+            if refuses(value, self.depth + 1, self.context()) or mutant_named(value.split(" ")[0]):
                 return True
         return False
 
@@ -1110,6 +1177,7 @@ class Judge:
         return any(operand_is_mutant(o) for o in ops)
 
     def runner(self, prog: str, args: list, cmd) -> bool:
+        self.via.append(prog)
         sub, j = RUNNERS[prog], 0
         if sub is not None:
             while j < len(args) and args[j].text != sub:
@@ -1127,6 +1195,7 @@ class Judge:
         return self.program(args[j:], cmd)
 
     def find_exec(self, args: list) -> bool:
+        self.via.append("find")
         for j, a in enumerate(args):
             if a.text in FIND_EXEC:
                 rest = []
@@ -1139,10 +1208,10 @@ class Judge:
         return False
 
 
-def refuses(command: str, depth: int = 0) -> bool:
+def refuses(command: str, depth: int = 0, outer=None) -> bool:
     if depth > MAX_DEPTH:
         return True  # shell code nested this deep is not read: refused rather than let through
-    judge = Judge(depth)
+    judge = Judge(depth, outer)
     parser = Parser(command, depth)
     cmds = parser.parse()
     if parser.too_deep:

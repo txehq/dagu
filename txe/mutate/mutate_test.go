@@ -800,6 +800,58 @@ var guardRefused = []string{
 	`python3 -c 'import json, sys; json.load(open(sys.argv[1])); list(map((x for x in ()).gi_frame.f_globals["__builtins__"]["exec"], ["print(1)"]))' mutants.json`,
 	// A data read whose imports a PYTHON* variable can redirect is judged by the language-neutral rule.
 	`PYTHONPATH=/tmp/x python3 -c 'import json, sys; print(json.load(open(sys.argv[1])))' mutants.json`,
+	// TXE-8183 independent review of c6e39841 (msg_ff5d58c07a39). All inert: none is executed.
+	// F1: interactive forms are never cleared, and -i's stdin continuation is judged as a program.
+	`python3 -i -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -Ii -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -i -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -i -c 'import json' < mutants.py`,
+	`cat mutants.py | python3 -Ii -c 'print(1)'`,
+	`PYTHONINSPECT=1 python3 -c 'print(1)' < mutants.py`,
+	`python3 -i app.py < mutants.py`,
+	`python3 -i -m json.tool data.json < mutants.py`,
+	// F1: flags and options outside the supported isolated form are not cleared.
+	`python3 -I -X dev -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -W ignore -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I --check-hash-based-pycs never -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -IS -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	// F2: the non-isolated forms of the synthetic reads (documented false positives: a json.load of a
+	// mutant-named input without -I is refused, pending explicit review, as before TXE-8183).
+	`python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
+	`M=mutants.json python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$M"`,
+	`python3 -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' mutants`,
+	// F2: PYTHON* variables, unsupported wrappers and runners, and nested contexts are not cleared.
+	`PYTHONPATH=/tmp/x python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])))' mutants.json`,
+	`env PYTHONSAFEPATH= python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`sudo -u nobody python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`uv run python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json`,
+	`eval "python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json"`,
+	`bash -c "python3 -I -c 'import json, sys; json.load(open(sys.argv[1]))' mutants.json"`,
+	`env -S 'python3 -I -c "import json, sys; json.load(open(sys.argv[1]))" mutants.json'`,
+	// F2: env -S carries the enclosing assignments as values (allowed before: the nested judge
+	// started empty, so W was unknown inside).
+	`W=/tmp/mutate-sandboxed-1_y5j3xh; env -S 'python3 -c "import json, sys; exec(json.load(open(sys.argv[1]))[0])" $W/r.json'`,
+	// F3: module attribute writes and deletes, rebinding a builtin, an alias that shadows one, a
+	// module passed on, and callback keywords are outside the grammar.
+	`python3 -I -c 'import json, sys; json.load = print; json.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -c 'import json, sys; del json.load; print(json.load(open(sys.argv[1])))' mutants.json`,
+	`python3 -I -c 'import json, sys; open = json.load; print(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -c 'import json as print, sys; print.load(open(sys.argv[1]))' mutants.json`,
+	`python3 -I -c 'import json, sys; j = json; print(j.load(open(sys.argv[1])))' mutants.json`,
+	`python3 -I -c 'import json, sys; print(sorted(json.load(open(sys.argv[1])), key=len))' mutants.json`,
+	`python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]), object_hook=print))' mutants.json`,
+	`python3 -I -c 'import json, sys; f = lambda p: json.load(open(p)); print(f(sys.argv[1]))' mutants.json`,
+	`python3 -I -c 'import json, sys; print([json.load(open(p)) for p in sys.argv[1:]])' mutants.json`,
+	// The security-review shapes in the isolated form, so they exercise the grammar itself.
+	`python3 -I -c 'import json, sys; json.load(open(sys.argv[1])); open(*[sys.argv[1], "w"])' mutants.json`,
+	`python3 -I -c 'import json, sys; json.load(open(sys.argv[1])); list(map(open, [sys.argv[1]], ["w"]))' mutants.json`,
+	`python3 -I -c 'import json, sys; json.load(open(sys.argv[1])); list(map((x for x in ()).gi_frame.f_globals["__builtins__"]["exec"], ["print(1)"]))' mutants.json`,
+	`python3 -I -c 'import json, sys; json.load(open(sys.argv[1], "r", -1, None, None, None, True, print))' mutants.json`,
+	// Encoding: an active line-2 declaration after a first-line comment holding a form feed, a
+	// declaration led by a form feed (valid per PEP 263), and a BOM.
+	"python3 -I - <<'EOF'\n# first line\f\n# -*- coding: utf-7 -*-\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	"python3 -I - <<'EOF'\n\f# coding: utf-7\nimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
+	"python3 -I - <<'EOF'\n\ufeffimport json\nprint(json.load(open(\"mutants.json\")))\nEOF",
 }
 
 // guardAllowed are commands in which the words appear only as data. The first block is the v3
@@ -924,10 +976,15 @@ var guardAllowed = []string{
 	// The same parse that passed earlier that day, with the file as its argument.
 	`python3 -I -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' tests/scripts/test_mutant_consumers.py`,
 	`python3 -c 'import ast, sys; print(ast.dump(ast.parse(open(sys.argv[1]).read())))' mutants.py`,
-	`python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
-	`M=mutants.json python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$M"`,
+	// Review F2 (c6e39841): clearance needs the isolated form, so these three synthetic reads carry
+	// -I; their non-isolated forms moved to guardRefused as documented false positives.
+	`python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
+	`M=mutants.json python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["name"])' "$M"`,
 	`python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["container_cleanup"])' /tmp/mutate-sandboxed-1_y5j3xh/report.json`,
-	`python3 -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' mutants`,
+	`python3 -I -c 'import json, sys; json.load(open(sys.argv[1], "rb"))' mutants`,
+	// The supported form's flag and wrapper variants.
+	`python3 -IB -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2))' mutants.json`,
+	`timeout 60 python3 -I -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' mutants.json`,
 	"python3 -I - <<'EOF'\nimport json\nwith open(\"mutants.json\") as f:\n    r = json.load(f)\nprint(r[\"container_cleanup\"])\nEOF",
 	`python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' /tmp/mutate-sandboxed-1_y5j3xh/.mutate-sandboxed-owned`,
 }
