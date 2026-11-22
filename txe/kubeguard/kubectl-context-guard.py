@@ -855,9 +855,15 @@ class Guard:
                 break
             if base == "command" and a in ("-v", "-V"):
                 return None
-            if base == "env" and (a in ("-S", "--split-string") or a.startswith("--split-string=")):
+            if base == "env" and (a in ("-S", "--split-string") or a.startswith("--split-string=")
+                                  or (a.startswith("-S") and len(a) > 2)):
+                # All three spellings carry a split-string payload: `-S <text>`, `--split-string=<text>`, and the
+                # attached `-S<text>` (connector security review of 77689338). Each is checked as shell text.
                 separate = a in ("-S", "--split-string")
-                text = (rest[1][0] if len(rest) > 1 else "") if separate else a.partition("=")[2]
+                if separate:
+                    text = rest[1][0] if len(rest) > 1 else ""
+                else:
+                    text = a.partition("=")[2] if a.startswith("--") else a[2:]
                 # env splits only S; the words after it keep their boundaries, so they are re-quoted, not joined
                 # (`env -S bash -c 'kubectl get secrets'` runs bash with ONE -c argument).
                 after = rest[2:] if separate else rest[1:]
@@ -867,6 +873,15 @@ class Guard:
                 break
             if base == "watch" and a in ("-x", "--exec"):
                 watch_exec = True
+            if a.startswith("--") and "=" in a:
+                # CLOSED: `--name=value` is accepted only for a listed value-taking (or optional-value) option, and
+                # its attached value is inspected before it is skipped. Any other `--name=...` is unknown, below.
+                name, _, val = a.partition("=")
+                if name in valued or name in OPTIONAL_VALUE.get(base, set()):
+                    if not val or mentions(val):
+                        raise Refusal("H03")
+                    rest = rest[1:]
+                    continue
             if a in valued:
                 # The word an option consumes as its value is never a command: if it names a cluster client, the
                 # option table is wrong for this use or the value hides the command (`watch -n kubectl ...`), so
@@ -876,12 +891,14 @@ class Guard:
                 rest = rest[2:]
             elif a in OPTIONAL_VALUE.get(base, set()):
                 rest = rest[1:]           # bare: no value, so the next word is the command (or another option)
-            elif (a.startswith("--") and "=" in a) or a in WRAPPER_FLAGS.get(base, set()):
+            elif a in WRAPPER_FLAGS.get(base, set()):
                 rest = rest[1:]
             else:
-                # An option this hook does not know may take the next word as its value, so the command word
-                # cannot be placed. Fail closed when a cluster client follows anywhere in the rest.
-                if any(mentions(w[0]) for w in rest[1:]):
+                # An option this hook does not know, an unknown `--name=value`, or an ATTACHED short value
+                # (`-uroot`, `-S'...'` on a wrapper that is not env): its arity and payload are not modelled.
+                # Closed grammar: refused in a line that names a cluster client, and whenever the word itself (its
+                # attached payload) or anything after it names one. Otherwise it is skipped.
+                if self.whole_mentions or mentions(a) or any(mentions(w[0]) for w in rest[1:]):
                     raise Refusal("H03")
                 rest = rest[1:]
         if base == "watch" and not watch_exec:

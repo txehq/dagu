@@ -381,7 +381,7 @@ class Authorization(Base):
         self.refused(ARGS, "KR09")
 
     def test_request_outside_scope(self):
-        self.refused(["txe-onprem-ci", "--", "top", "pods", "-n", "arc-runners"], "KR08")   # a read verb not granted
+        self.refused(["txe-onprem-ci", "--", "events", "-n", "arc-runners"], "KR08")   # a read verb not granted
         self.refused(["txe-onprem-ci", "--", "get", "secrets", "-n", "arc-runners"], "KR08")
         self.refused(["txe-onprem-ci", "--", "get", "pods,secrets", "-n", "arc-runners"], "KR08")
         self.refused(["txe-onprem-ci", "--", "get", "pods", "-n", "kube-system"], "KR08")
@@ -489,6 +489,29 @@ class RequestScope(Base):
                       ["cp", "pod-a:/etc/x", "/tmp/y"], ["rollout", "restart", "deploy/x"]):
             self.refused(["txe-onprem-ci", "--"] + kargs, "KR05")
 
+    def test_read_verbs_with_implicit_reads_are_refused(self):
+        # Connector review of 77689338: `describe nodes/node-a` also lists pods, so a record granting nodes
+        # exposed pods. Audit at kubectl v1.34.9 (README): every read verb whose implementation reads a resource
+        # type the request does not name is refused, not modelled. One negative per implicit-access case.
+        for args in (["describe", "nodes/node-a"], ["describe", "pods", "x"], ["top", "pods"], ["top", "node"],
+                     ["cluster-info"], ["cluster-info", "dump"], ["rollout", "history", "deploy/x"],
+                     ["rollout", "history", "statefulset/x", "--revision", "2"], ["logs", "deploy/x"],
+                     ["logs", "job/x"], ["logs", "pod-a", "--", "secrets/b"], ["get", "all"], ["get", "pods,all"],
+                     ["get", "all/x"]):
+            self.refused_by_parser(args)
+        self.assertFalse(set(kr.VERBS) & kr.IMPLICIT_READ_VERBS)
+        self.assertNotIn("history", kr.SUBCOMMANDS["rollout"])
+        # The pod forms of logs, and get on named types, still authorize exactly what they name.
+        for args, want in ((["logs", "pod-a"], ["pods"]), (["logs", "pod/a"], ["pods"]), (["logs", "po/a"], ["pods"]),
+                           (["logs", "-l", "app=x"], ["pods"]), (["get", "pods,services"], ["pods", "services"])):
+            self.assertEqual(self.scope(args)["resources"], want, args)
+        # End to end, under a record that grants everything: refused, and nothing contacted.
+        F.write_record(verbs=["*"], resources=["*"], namespaces=["*"])
+        for kargs in (["describe", "nodes/node-a", "-n", "arc-runners"], ["top", "pods", "-n", "arc-runners"],
+                      ["cluster-info"], ["rollout", "history", "deploy/x", "-n", "arc-runners"],
+                      ["logs", "deploy/x", "-n", "arc-runners"], ["get", "all", "-n", "arc-runners"]):
+            self.refused(["txe-onprem-ci", "--"] + kargs, "KR05")
+
     def test_every_true_spelling_of_all_namespaces(self):
         for a in ("-A", "--all-namespaces", "--all-namespaces=true", "--all-namespaces=TRUE", "--all-namespaces=True",
                   "--all-namespaces=1", "--all-namespaces=t", "--all-namespaces=T", "-A=true", "-A=1"):
@@ -504,7 +527,9 @@ class RequestScope(Base):
         self.assertEqual(self.scope(["get", "pods/a", "--", "secrets/b"])["resources"], ["pods", "secrets"])
         self.refused_by_parser(["get", "pods", "--", "secrets/b"])
         self.refused_by_parser(["--", "get", "pods"])
-        r = self.scope(["logs", "pod-a", "--", "secrets/b"])     # a fixed-resource verb: still pods only
+        # logs takes pods only: a non-pod TYPE/NAME operand, after `--` too, is refused (it would read that type).
+        self.refused_by_parser(["logs", "pod-a", "--", "secrets/b"])
+        r = self.scope(["logs", "pod-a", "--", "pod/b"])
         self.assertEqual((r["verb"], r["resources"]), ("logs", ["pods"]))
         self.refused(["txe-onprem-ci", "--", "get", "pods/a", "-n", "arc-runners", "--", "secrets/b"], "KR08")
 
@@ -531,10 +556,10 @@ class RequestScope(Base):
 
     # A valid request per supported verb, which each option case below extends.
     VERB_SAMPLES = {
-        "get": ["get", "pods"], "describe": ["describe", "pods"], "top": ["top", "pods"], "logs": ["logs", "pod-a"],
+        "get": ["get", "pods"], "logs": ["logs", "pod-a"],
         "events": ["events"], "rollout": ["rollout", "status", "deploy/x"], "auth": ["auth", "can-i", "get", "pods"],
         "api-resources": ["api-resources"], "api-versions": ["api-versions"], "explain": ["explain", "pods"],
-        "version": ["version"], "cluster-info": ["cluster-info"],
+        "version": ["version"],
     }
 
     def test_every_verb_and_option_follows_the_arity_table(self):
@@ -610,7 +635,7 @@ class RequestScope(Base):
         for args in (["cluster-info", "dump"], ["api-resources", "x"], ["version", "x"],
                      ["get", "pods", "--subresource=a/b"], ["get", "pods", "--subresource", "a", "--subresource=b"]):
             self.refused_by_parser(args)
-        self.assertEqual(self.scope(["cluster-info"])["resources"], ["<discovery>"])
+        self.assertEqual(self.scope(["version"])["resources"], ["<discovery>"])
         self.assertEqual(self.scope(["get", "pods/victim", "--subresource=ephemeralcontainers"])["resources"],
                          ["pods/ephemeralcontainers"])
         self.assertEqual(self.scope(["get", "pods", "x", "--subresource", "status"])["resources"], ["pods/status"])
@@ -625,8 +650,6 @@ class RequestScope(Base):
         self.assertEqual((r["verb"], r["resources"]), ("auth whoami", ["selfsubjectreviews"]))
         r = self.scope(["rollout", "status", "deploy/x"])
         self.assertEqual((r["verb"], r["resources"]), ("rollout status", ["deploy"]))
-        r = self.scope(["rollout", "history", "deploy/x", "--revision", "2"])
-        self.assertEqual((r["verb"], r["resources"]), ("rollout history", ["deploy"]))
         for args in (["auth", "reconcile", "-f", "rbac.yaml"], ["auth"], ["auth", "--bogus", "can-i"],
                      ["rollout", "frobnicate", "deploy/x"], ["rollout"], ["rollout", "restart", "deploy/x"]):
             self.refused_by_parser(args)

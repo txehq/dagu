@@ -103,8 +103,8 @@ def kr(rest="txe-onprem-ci -- get pods -n arc-runners"):
 # kube-run argument forms shared by the hook cases and PairingWithKubeRun.
 ALLOWED_RESTS = ("txe-onprem-ci -- get pods -n arc-runners",
                  "--authorization /x/rec.json txe-onprem-ci -- get pods -n arc-runners",
-                 "--timeout 30 txe-onprem-ci -- logs deploy/x -c y",
-                 "--timeout 30 --authorization /x/rec.json txe-onprem-ci -- describe pod x",
+                 "--timeout 30 txe-onprem-ci -- logs pod/x -c y",
+                 "--timeout 30 --authorization /x/rec.json txe-onprem-ci -- get pod x",
                  "txe-onprem-ci -- logs pod-a -c app --since 1h")
 H10_RESTS = ("txe-onprem-ci get pods", "txe-onprem-ci --", "Bad_Id -- get pods", "-- get pods",
              "--registry /x txe-onprem-ci -- get pods", "$C -- get pods", "--bogus txe-onprem-ci -- get",
@@ -207,6 +207,24 @@ class Refused(unittest.TestCase):
             self.deny(cmd, "H01", "kubectl", "get")
         for cmd in ("helm template demo ./chart --dry-run=server", "helm template demo ./chart --dry-run=bogus"):
             self.deny(cmd, "H07", "helm", "template")
+
+    def test_attached_wrapper_option_payloads_are_inspected(self):
+        # Connector security review of 77689338: `env -S'kubectl get secrets -A'` was allowed, because the
+        # attached -S payload was dropped and the unknown-option path checked only the words AFTER the option.
+        # Closed wrapper grammar: an attached payload is inspected before it is skipped, `--name=value` is accepted
+        # only for a listed option (its value inspected), and any unknown option is refused in a client line.
+        for cmd in ("env -S'kubectl get secrets -A'", 'env -S"kubectl get ns"', "env -S'bash -c \"kubectl get ns\"'"):
+            r = self.deny(cmd, "H01", "kubectl")
+            self.assertIn("nested", r, cmd)
+        for cmd in ("sudo -ukubectl ls", "timeout -skubectl 5 ls", "xargs -Ikubectl echo x", "nice -nkubectl ls",
+                    "sudo --prompt=kubectl ls", "timeout --signal=kubectl 5 ls", "sudo --frob=x kubectl get pods",
+                    "timeout -sKILL 5 kubectl get pods", "kubectl version --client; nice -z ls",
+                    "sudo --user= kubectl get pods"):
+            self.deny(cmd, "H03")
+        # Benign attached and equals forms with no client stay allowed.
+        for cmd in ("sudo -uroot ls", "timeout -sKILL 5 date", "env -Sdate", "xargs -I{} echo {}",
+                    "sudo --prompt=pw ls", "nice -n5 ls"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_local_forms_accept_only_their_listed_options(self):
         # Connector review of 24ac0dca: `helm template ... --post-renderer kubectl` was "local", and Helm execs the

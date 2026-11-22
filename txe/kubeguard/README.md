@@ -18,11 +18,33 @@ a context can be repointed inside its file. This directory holds the source of t
   Only then does it make the request, under B5 host custody. Diagnostics are stable codes with values
   withheld. The full contract is in its docstring.
   **kube-run is read-only.** It runs only these verbs:
-  - `get`, `describe`, `top`, `logs` and `events`;
-  - `rollout status` and `rollout history`;
+  - `get` (not the category `all`), `logs` (on a pod only) and `events`;
+  - `rollout status`;
   - `auth can-i` and `auth whoami`;
-  - the discovery verbs `api-resources`, `api-versions`, `explain`, `version` and `cluster-info` (with no
-    operand, so `cluster-info dump` is refused).
+  - the discovery verbs `api-resources`, `api-versions`, `explain` and `version` (with no operand).
+
+  **Functional reduction, read verbs with implicit reads.** `describe`, `top`, `cluster-info`, `rollout history`,
+  `logs` on a non-pod `TYPE/NAME`, and `get all` are refused (KR05). Their kubectl implementation reads resource
+  types the request does not name, so an authorization record could not scope them from the arguments. Use `get`
+  with the exact types instead. The audit, at the pinned kubectl v1.34.9 (kubernetes/kubernetes@v1.34.9
+  `staging/src/k8s.io/kubectl` and `staging/src/k8s.io/cli-runtime`, which are k8s.io/kubectl and
+  k8s.io/cli-runtime v0.34.9):
+
+  | Verb | (1) Discovery and version metadata | (2) Resource reads | (3) Subresource reads | Verdict, and what a grant authorizes |
+  |---|---|---|---|---|
+  | `get` | RESTMapper and discovery to resolve names; a category name expands through discovery (`cli-runtime/pkg/resource/builder.go:642-654`) | the named types only (`cmd/get/get.go:470`, `:616`) | `--subresource=<s>` | KEEP. A grant on `<type>` authorizes reading that type in the namespace. `<type>/<s>` must be granted for a subresource. `all` is refused. Other categories (defined by CRDs) are a reviewed prerequisite: a record must name resource types, never a category |
+  | `logs` | RESTMapper | the pod (a NAME, `pod/NAME`, or pods by `-l`) | `pods/log` | KEEP for pods only. A `logs` grant on `pods` authorizes reading the pods and their `pods/log`. Any other `TYPE/NAME` reads that object and then its pods (`polymorphichelpers/logsforobject.go:169-175`), so it is refused |
+  | `events` | RESTMapper for `--for` (`cmd/events/events.go:165-171`) | `events` only, filtered by field selector (`:231-233`, list and watch `:239-248`) | none | KEEP. A grant on `events` authorizes listing events |
+  | `rollout status` | RESTMapper | the named object, list and watch (`cmd/rollout/rollout_status.go:187-192`); the status viewers read only that object (`polymorphichelpers/rollout_status.go:59-120`) | none | KEEP. A grant on the object's type authorizes it |
+  | `auth can-i` | RESTMapper and discovery for the resource argument | none: it CREATES a SelfSubjectAccessReview (`cmd/auth/cani.go:269-272`). `--list`, which would create a SelfSubjectRulesReview (`:148`, `:254-259`), is not forwarded | none | KEEP. A grant authorizes `selfsubjectaccessreviews` |
+  | `auth whoami` | none | none: it CREATES a SelfSubjectReview (`cmd/auth/whoami.go:177-178`) | none | KEEP. A grant authorizes `selfsubjectreviews` |
+  | `api-resources`, `api-versions`, `explain`, `version` | discovery groups and resources (`cmd/apiresources/apiversions.go:86`), OpenAPI (`cmd/explain/explain.go`), `/version` | none | none | KEEP. Metadata only (`<discovery>`) |
+  | `describe` | RESTMapper | the named object, AND related objects: the node describer lists the node's pods (`describe/describe.go:3725-3772`), and describers read events and controllers | varies | REMOVE (KR05). The implicit set differs per describer and is not modelled |
+  | `top` | RESTMapper | nodes or pods, AND metrics API objects (`cmd/top/top_node.go:180-220`; `top_pod.go:233-262`) | none | REMOVE (KR05) |
+  | `cluster-info` | `/version`, the API host | Services in kube-system by label (`cmd/clusterinfo/clusterinfo.go:98-100`) | none | REMOVE (KR05) |
+  | `rollout history` | RESTMapper | the object, AND ReplicaSets (`polymorphichelpers/history.go:313-319`) or ControllerRevisions (`:338`, `:359`) | none | REMOVE (KR05) |
+
+  Every verb also reads cached discovery metadata. That is metadata, not a resource grant.
   Every mutating, interactive or tunnelling verb is refused before contact: `delete`, `edit`, `patch`, `label`,
   `annotate`, `scale`, `wait`, `apply`, `create`, `replace`, `diff`, `exec`, `cp`, `attach`, `port-forward`,
   `run`, `debug`, `proxy`, `expose`, `autoscale`, `set`, `drain`, `cordon`, `uncordon`, `taint`, `certificate`,

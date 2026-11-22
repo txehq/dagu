@@ -15,9 +15,11 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
  1. ARGUMENTS. The caller names a registry cluster id, never a kubeconfig or context. Arguments that pick
     or change the target, the identity or TLS (--kubeconfig, --context, --server/-s, --cluster, --user,
     --token, --as*, --username, --password, --certificate-authority, --client-*, --tls-server-name,
-    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get, describe,
-    top, logs, events, rollout status|history, auth can-i|whoami and the discovery verbs (api-resources,
-    api-versions, explain, version, cluster-info, with no operand). Every mutating, interactive or tunnelling
+    --insecure-skip-tls-verify, --kuberc) are refused. kube-run is READ-ONLY. It runs only get (not the
+    category `all`), logs (on a pod), events, rollout status, auth can-i|whoami and the discovery verbs
+    (api-resources, api-versions, explain, version, with no operand). describe, top, cluster-info and
+    rollout history are refused: their implementations read resource types the request does not name
+    (IMPLICIT_READ_VERBS). Every mutating, interactive or tunnelling
     verb (delete, patch, edit, apply, create, exec, cp, port-forward, rollout restart, ...) is refused before
     contact, and so are plugins and unknown verbs. A read is still authorized by cluster, resources and
     namespace:
@@ -138,10 +140,22 @@ OVERRIDE_FLAGS = ("--kubeconfig", "--context", "--server", "-s", "--cluster", "-
 # kube-run is READ-ONLY. These are the only verbs it runs; every other verb is refused before contact.
 # verb -> how to find its resources: an index into the positionals, or a fixed resource name.
 VERBS = {
-    "get": 1, "describe": 1, "top": 1, "rollout": 2, "logs": "pods", "events": "events", "auth": "<subcommand>",
+    "get": 1, "rollout": 2, "logs": "pods", "events": "events", "auth": "<subcommand>",
     "api-resources": "<discovery>", "api-versions": "<discovery>", "explain": "<discovery>",
-    "version": "<discovery>", "cluster-info": "<discovery>",
+    "version": "<discovery>",
 }
+# Read verbs whose kubectl implementation reads resource types the request does not name. An authorization
+# record cannot scope them from the arguments, so they are refused (connector review of 77689338; audit against
+# kubernetes/kubernetes@v1.34.9 staging/src/k8s.io/kubectl/pkg, table in the README):
+# - describe: describers read related resources (NodeDescriber lists pods; events and controllers in general);
+# - top: reads the metrics API (cmd/top/top_node.go:216-220, top_pod.go:233-239) besides nodes and pods;
+# - cluster-info: lists Services in kube-system by label (cmd/clusterinfo/clusterinfo.go:98-100);
+# - rollout history (a subcommand, below): reads ReplicaSets and ControllerRevisions
+#   (polymorphichelpers/history.go:313-319, 338, 359).
+IMPLICIT_READ_VERBS = {"describe", "top", "cluster-info"}
+# logs reads the pod's log (pods/log). For any other TYPE/NAME it first reads that object and then its pods
+# (polymorphichelpers/logsforobject.go:169-175), so only pod operands are accepted.
+LOG_POD_TYPES = {"pod", "pods", "po"}
 # Mutating, interactive and tunnelling verbs: refused with a read-only message, before any file is read.
 MUTATING_VERBS = {"delete", "edit", "patch", "label", "annotate", "scale", "wait", "apply", "create", "replace",
                   "diff", "exec", "cp", "attach", "port-forward", "run", "debug", "proxy", "expose", "autoscale",
@@ -151,7 +165,7 @@ MUTATING_VERBS = {"delete", "edit", "patch", "label", "annotate", "scale", "wait
 # Only read subcommands are listed; any other is refused (rollout restart/undo/pause/resume included).
 SUBCOMMANDS = {
     "auth": {"can-i": ["selfsubjectaccessreviews"], "whoami": ["selfsubjectreviews"]},
-    "rollout": {"status": None, "history": None},
+    "rollout": {"status": None},       # status watches only the named object (cmd/rollout/rollout_status.go:187-192)
 }
 NAMESPACE_FLAGS = ("-n", "--namespace")
 ALL_NS_FLAGS = ("-A", "--all-namespaces")
@@ -168,8 +182,6 @@ VERB_OPTIONS = {
                       "--label-columns", "--chunk-size", "--subresource"},
             "bool": {"-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--ignore-not-found",
                      "--show-kind", "--output-watch-events"}},
-    "describe": {"value": {"-l", "--selector", "--chunk-size"}, "bool": set()},
-    "top": {"value": {"-l", "--selector", "--sort-by"}, "bool": {"--no-headers", "--containers"}},
     "logs": {"value": {"-c", "--container", "-l", "--selector", "--since", "--since-time", "--tail",
                        "--limit-bytes"},
              "bool": {"-f", "--follow", "-p", "--previous", "--timestamps", "--all-containers", "--prefix"}},
@@ -180,7 +192,6 @@ VERB_OPTIONS = {
     "api-versions": {"value": set(), "bool": set()},
     "explain": {"value": {"--api-version", "--output"}, "bool": {"--recursive"}},
     "version": {"value": {"-o", "--output"}, "bool": set()},
-    "cluster-info": {"value": set(), "bool": set()},
 }
 # Options that read objects from files or kustomizations. No verb accepts them (logs -f is --follow above); they
 # are named here only so that the refusal can say why.
@@ -197,7 +208,7 @@ def option_arity(verb, name):
     return None
 # Fixed-resource verbs that take no operand in kube-run. An operand there is a subcommand kube-run does not
 # model (`cluster-info dump` reads nodes, pods and logs across namespaces), so it is refused.
-NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "cluster-info", "events"}
+NO_OPERAND_VERBS = {"api-resources", "api-versions", "version", "events"}
 
 
 # kubectl's short options that take a value. In a pflag shorthand cluster (`-it`, `-ojson`), every letter up to
@@ -304,6 +315,9 @@ def parse_request(args, default_namespace):
             if not pos and a in MUTATING_VERBS:
                 raise Refused("KR05", "kube-run is read-only: mutating, interactive and tunnelling verbs are "
                                       "refused")
+            if not pos and a in IMPLICIT_READ_VERBS:
+                raise Refused("KR05", "this read verb reads resources the request does not name, so its scope "
+                                      "cannot be authorized from the arguments (use get)")
             pos.append(a)
         i += 1
     if not pos:
@@ -342,11 +356,20 @@ def parse_request(args, default_namespace):
             elif "/" in extra:
                 raise Refused("KR05", "an operand names a resource type after a bare type; name every operand as "
                                       "TYPE/NAME, or one type and its names")
+        if "all" in resources:
+            # `all` is a category: kubectl expands it to several resource types through discovery
+            # (cli-runtime pkg/resource/builder.go:642-654), so the request would read types it does not name.
+            raise Refused("KR05", "the category `all` expands to resource types the request does not name; name "
+                                  "each resource type")
     elif isinstance(how, str):
         if verb in NO_OPERAND_VERBS and len(pos) > 1:
             # e.g. `cluster-info dump`, which reads nodes, pods and logs across namespaces.
             raise Refused("KR05", "this verb takes no operand in kube-run (subcommands such as cluster-info dump "
                                   "are refused)")
+        if verb == "logs" and any("/" in o and o.split("/", 1)[0] not in LOG_POD_TYPES for o in pos[1:]):
+            # logs TYPE/NAME for anything but a pod reads that object and then its pods (logsforobject.go:169-175).
+            raise Refused("KR05", "logs takes a pod (NAME or pod/NAME) or -l; another TYPE/NAME reads resources the "
+                                  "request does not name")
         resources = [how]
     if not resources:
         raise Refused("KR05", "the request's resources could not be determined")
