@@ -94,6 +94,27 @@ a context can be repointed inside its file. This directory holds the source of t
       (`pkg/registry/events/rest/storage_events.go:54`) and is not reachable through kube-run. HPAs are pinned to
       `autoscaling/v2`. A cluster that disables a version (`--runtime-config`) makes kubectl fail on that exact
       GVR, rather than remapping it.
+    - **Scope: namespaced or cluster-wide.** kubectl ignores `-n` for a cluster-scoped type and reads the whole
+      cluster's collection, so the record's `namespaces` is checked PER RESOURCE SCOPE:
+      - A namespaced resource is covered by the request's namespace (`*` with `--all-namespaces`).
+      - A cluster-scoped resource needs the record's explicit global grant, `namespaces: ["*"]`. A named
+        namespace never grants it, with or without `-n`.
+      - A mixed request (`get pods,nodes -n x`) needs both, so a cluster grant never widens the namespaced part.
+      - Unknown or missing scope metadata refuses.
+
+      Each entry's scope is its registry strategy's `NamespaceScoped()` at kubernetes@v1.34.9
+      (`pkg/registry/<group>/<resource>/strategy.go`, cited per entry in `kube_run.py`, pinned by a test). The
+      cluster-scoped entries are namespaces (`core/namespace/strategy.go:48`), nodes (`core/node/strategy.go:58`),
+      persistentvolumes (`core/persistentvolume/strategy.go:49`), ingressclasses
+      (`networking/ingressclass/strategy.go:44`), storageclasses (`storage/storageclass/strategy.go:41`),
+      clusterroles (`rbac/clusterrole/strategy.go:49`), clusterrolebindings (`rbac/clusterrolebinding/strategy.go:48`)
+      and customresourcedefinitions (apiextensions-apiserver `pkg/registry/customresourcedefinition/strategy.go:54`).
+      The other 26 are namespaced. The fixed resources are cluster-scoped too:
+      - `auth can-i`: selfsubjectaccessreviews (`authorization/selfsubjectaccessreview/rest.go:44`);
+      - `auth whoami`: selfsubjectreviews (`authentication/selfsubjectreview/rest.go:49`);
+      - the discovery verbs: `<discovery>`, which are non-resource paths.
+
+      Records for those need `namespaces: ["*"]`.
   - **Discovery metadata.** Every verb reads API discovery (`/api`, `/apis`, cached) through the RESTMapper.
     `explain` also reads the OpenAPI document, and `version` reads `/version`. Records do NOT authorize or scope
     this metadata: it is read with the cluster credential and is not limited by kube-run. It reveals the

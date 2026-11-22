@@ -39,7 +39,9 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     UNCONFIGURED. This file sets no deployment policy and no grant classes, and treats production like any
     other entry: its authorization is whatever the deployed registry says. The one implemented policy,
     "task-record", checks a task authorization record (ticket, cluster, verbs, resources, namespaces, expiry,
-    authorized_by) against the request AND against the identity probe. The probe is itself an API read, so
+    authorized_by) against the request AND against the identity probe. Namespaces are checked per resource
+    scope: a cluster-scoped resource needs the explicit global grant "*", never a named namespace (resource_scope,
+    _task_record). The probe is itself an API read, so
     it must be authorized explicitly (allow_identity_probe). A record is a declaration of scope, not proof
     of authority: who may issue one is deployment policy, and is not decided here. Ordering: the "is a
     policy configured" check runs before the kubeconfig is opened. The scope check runs right after step 4,
@@ -262,32 +264,73 @@ def is_override(arg):
 # default-enabled version list; README table). A change needs the same verification, and the test pins the table.
 # A version that a cluster has disabled (--runtime-config) makes kubectl fail on that exact GVR; it is not
 # remapped.
+# SCOPE (Codex security review of 64fc3ec4): each entry records whether the resource is NAMESPACED or CLUSTER-wide,
+# from its pinned v1.34.9 registry strategy's NamespaceScoped() (pkg/registry/<group>/<resource>/strategy.go; the
+# CRD strategy in apiextensions-apiserver pkg/registry/customresourcedefinition/strategy.go:54). kubectl ignores
+# -n for a cluster-scoped type and reads the whole cluster's collection, so a namespace grant must never cover it
+# (see resource_scope and _task_record).
+NAMESPACED, CLUSTER = "namespaced", "cluster"
+SCOPES = (NAMESPACED, CLUSTER)
 _BUILTIN_RESOURCES = {
-    # plural: (singular, version, group)
-    "pods": ("pod", "v1", ""), "services": ("service", "v1", ""), "configmaps": ("configmap", "v1", ""),
-    "secrets": ("secret", "v1", ""), "namespaces": ("namespace", "v1", ""), "nodes": ("node", "v1", ""),
-    "events": ("event", "v1", ""), "endpoints": ("endpoints", "v1", ""),
-    "persistentvolumeclaims": ("persistentvolumeclaim", "v1", ""), "persistentvolumes": ("persistentvolume", "v1", ""),
-    "serviceaccounts": ("serviceaccount", "v1", ""), "replicationcontrollers": ("replicationcontroller", "v1", ""),
-    "resourcequotas": ("resourcequota", "v1", ""), "limitranges": ("limitrange", "v1", ""),
-    "deployments": ("deployment", "v1", "apps"), "replicasets": ("replicaset", "v1", "apps"),
-    "statefulsets": ("statefulset", "v1", "apps"), "daemonsets": ("daemonset", "v1", "apps"),
-    "controllerrevisions": ("controllerrevision", "v1", "apps"),
-    "jobs": ("job", "v1", "batch"), "cronjobs": ("cronjob", "v1", "batch"),
-    "ingresses": ("ingress", "v1", "networking.k8s.io"), "networkpolicies": ("networkpolicy", "v1", "networking.k8s.io"),
-    "ingressclasses": ("ingressclass", "v1", "networking.k8s.io"),
-    "poddisruptionbudgets": ("poddisruptionbudget", "v1", "policy"),
-    "storageclasses": ("storageclass", "v1", "storage.k8s.io"),
-    "roles": ("role", "v1", "rbac.authorization.k8s.io"), "rolebindings": ("rolebinding", "v1", "rbac.authorization.k8s.io"),
-    "clusterroles": ("clusterrole", "v1", "rbac.authorization.k8s.io"),
-    "clusterrolebindings": ("clusterrolebinding", "v1", "rbac.authorization.k8s.io"),
-    "leases": ("lease", "v1", "coordination.k8s.io"), "endpointslices": ("endpointslice", "v1", "discovery.k8s.io"),
-    "horizontalpodautoscalers": ("horizontalpodautoscaler", "v2", "autoscaling"),
-    "customresourcedefinitions": ("customresourcedefinition", "v1", "apiextensions.k8s.io"),
+    # plural: (singular, version, group, scope)   scope: NamespaceScoped() at kubernetes@v1.34.9, file:line
+    "pods": ("pod", "v1", "", NAMESPACED),                                 # core/pod/strategy.go:70
+    "services": ("service", "v1", "", NAMESPACED),                         # core/service/strategy.go:54
+    "configmaps": ("configmap", "v1", "", NAMESPACED),                     # core/configmap/strategy.go:52
+    "secrets": ("secret", "v1", "", NAMESPACED),                           # core/secret/strategy.go:51
+    "namespaces": ("namespace", "v1", "", CLUSTER),                        # core/namespace/strategy.go:48
+    "nodes": ("node", "v1", "", CLUSTER),                                  # core/node/strategy.go:58
+    "events": ("event", "v1", "", NAMESPACED),                             # core/event/strategy.go:51
+    "endpoints": ("endpoints", "v1", "", NAMESPACED),                      # core/endpoint/strategy.go:43
+    "persistentvolumeclaims": ("persistentvolumeclaim", "v1", "", NAMESPACED),   # core/persistentvolumeclaim/strategy.go:48
+    "persistentvolumes": ("persistentvolume", "v1", "", CLUSTER),          # core/persistentvolume/strategy.go:49
+    "serviceaccounts": ("serviceaccount", "v1", "", NAMESPACED),           # core/serviceaccount/strategy.go:42
+    "replicationcontrollers": ("replicationcontroller", "v1", "", NAMESPACED),   # core/replicationcontroller/strategy.go:77
+    "resourcequotas": ("resourcequota", "v1", "", NAMESPACED),             # core/resourcequota/strategy.go:42
+    "limitranges": ("limitrange", "v1", "", NAMESPACED),                   # core/limitrange/strategy.go:40
+    "deployments": ("deployment", "v1", "apps", NAMESPACED),               # apps/deployment/strategy.go:57
+    "replicasets": ("replicaset", "v1", "apps", NAMESPACED),               # apps/replicaset/strategy.go:63
+    "statefulsets": ("statefulset", "v1", "apps", NAMESPACED),             # apps/statefulset/strategy.go:55
+    "daemonsets": ("daemonset", "v1", "apps", NAMESPACED),                 # apps/daemonset/strategy.go:53
+    "controllerrevisions": ("controllerrevision", "v1", "apps", NAMESPACED),     # apps/controllerrevision/strategy.go:47
+    "jobs": ("job", "v1", "batch", NAMESPACED),                            # batch/job/strategy.go:77
+    "cronjobs": ("cronjob", "v1", "batch", NAMESPACED),                    # batch/cronjob/strategy.go:67
+    "ingresses": ("ingress", "v1", "networking.k8s.io", NAMESPACED),       # networking/ingress/strategy.go:48
+    "networkpolicies": ("networkpolicy", "v1", "networking.k8s.io", NAMESPACED),  # networking/networkpolicy/strategy.go:42
+    "ingressclasses": ("ingressclass", "v1", "networking.k8s.io", CLUSTER),       # networking/ingressclass/strategy.go:44
+    "poddisruptionbudgets": ("poddisruptionbudget", "v1", "policy", NAMESPACED),  # policy/poddisruptionbudget/strategy.go:45
+    "storageclasses": ("storageclass", "v1", "storage.k8s.io", CLUSTER),          # storage/storageclass/strategy.go:41
+    "roles": ("role", "v1", "rbac.authorization.k8s.io", NAMESPACED),             # rbac/role/strategy.go:48
+    "rolebindings": ("rolebinding", "v1", "rbac.authorization.k8s.io", NAMESPACED),   # rbac/rolebinding/strategy.go:48
+    "clusterroles": ("clusterrole", "v1", "rbac.authorization.k8s.io", CLUSTER),      # rbac/clusterrole/strategy.go:49
+    "clusterrolebindings": ("clusterrolebinding", "v1", "rbac.authorization.k8s.io", CLUSTER),  # rbac/clusterrolebinding/strategy.go:48
+    "leases": ("lease", "v1", "coordination.k8s.io", NAMESPACED),                 # coordination/lease/strategy.go:42
+    "endpointslices": ("endpointslice", "v1", "discovery.k8s.io", NAMESPACED),    # discovery/endpointslice/strategy.go:55
+    "horizontalpodautoscalers": ("horizontalpodautoscaler", "v2", "autoscaling", NAMESPACED),  # autoscaling/horizontalpodautoscaler/strategy.go:44
+    "customresourcedefinitions": ("customresourcedefinition", "v1", "apiextensions.k8s.io", CLUSTER),  # apiextensions .../customresourcedefinition/strategy.go:54
 }
+# The fixed resources some verbs read that are not table types, with their scope:
+# - selfsubjectaccessreviews (auth can-i): authorization/selfsubjectaccessreview/rest.go:44, NamespaceScoped false;
+# - selfsubjectreviews (auth whoami): authentication/selfsubjectreview/rest.go:49, NamespaceScoped false;
+# - <discovery> (api-resources, api-versions, explain, version): non-resource paths (/api, /apis, /version,
+#   /openapi), which have no namespace.
+FIXED_RESOURCE_SCOPES = {"selfsubjectaccessreviews": CLUSTER, "selfsubjectreviews": CLUSTER, "<discovery>": CLUSTER}
+
+
+def resource_scope(resource):
+    """NAMESPACED or CLUSTER for a request resource (a table plural, `plural/subresource`, or a fixed resource).
+    Unknown or missing scope metadata REFUSES: no request is authorized without a known scope."""
+    base = resource.split("/", 1)[0]
+    entry = _BUILTIN_RESOURCES.get(base)
+    scope = entry[3] if entry is not None and len(entry) == 4 else FIXED_RESOURCE_SCOPES.get(base)
+    if scope not in SCOPES:
+        raise Refused("KR08", "a resource's scope (namespaced or cluster-wide) is not known, so the request cannot "
+                              "be authorized")
+    return scope
+
+
 # Every accepted spelling (plural, singular, canonical) -> (canonical forwarded form, plural authorization name).
 RESOURCE_SPELLINGS = {}
-for _plural, (_singular, _version, _group) in _BUILTIN_RESOURCES.items():
+for _plural, (_singular, _version, _group, _scope) in _BUILTIN_RESOURCES.items():
     _canon = f"{_plural}.{_version}.{_group}"
     for _spelling in (_plural, _singular, _canon):
         RESOURCE_SPELLINGS[_spelling] = (_canon, _plural)
@@ -558,8 +601,20 @@ def _task_record(entry, cluster_id, record_path, request, probe, now):
         raise Refused("KR08", "the verb is outside the authorized scope")
     if not all(covers(rec["resources"], r) for r in request["resources"]):
         raise Refused("KR08", "a resource is outside the authorized scope")
-    if not covers(rec["namespaces"], request["namespace"]):
-        raise Refused("KR08", "the namespace is outside the authorized scope")
+    # Every scope the request actually reads must be covered, per resource (Codex security review of 64fc3ec4).
+    # A namespaced resource is read in the request's namespace (`*` with --all-namespaces). A cluster-scoped one
+    # is read cluster-wide whatever -n says, so it needs the record's explicit global grant, namespaces ["*"]:
+    # a namespace flag never grants cluster access. A mixed request needs both, so a cluster grant never widens
+    # the namespaced part. Unknown scope metadata refuses (resource_scope).
+    if not request["resources"]:
+        raise Refused("KR08", "the request names no resource to authorize")
+    for r in request["resources"]:
+        if resource_scope(r) == CLUSTER:
+            if "*" not in rec["namespaces"]:
+                raise Refused("KR08", "a cluster-scoped resource is read cluster-wide, so it needs a record that "
+                                      "grants every namespace (\"*\"); a namespace does not grant it")
+        elif not covers(rec["namespaces"], request["namespace"]):
+            raise Refused("KR08", "the namespace is outside the authorized scope")
 
 
 POLICIES = {"task-record": _task_record}

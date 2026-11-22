@@ -391,6 +391,71 @@ class Authorization(Base):
         rc, _, e, _ = call(["txe-onprem-ci", "--", "get", "pods", "-A"])
         self.assertEqual(rc, 0, e)
 
+    def test_cluster_scoped_resources_need_an_explicit_global_grant(self):
+        # Codex security review of 64fc3ec4 (P2): a record granting nodes only in arc-runners approved
+        # `get nodes -n arc-runners`, but kubectl reads cluster-scoped types cluster-wide whatever -n says.
+        # The scope of every table entry is pinned here (NamespaceScoped() at kubernetes@v1.34.9, kube_run.py).
+        cluster = sorted(p for p, e in kr._BUILTIN_RESOURCES.items() if e[3] == kr.CLUSTER)
+        self.assertEqual(cluster, ["clusterrolebindings", "clusterroles", "customresourcedefinitions",
+                                   "ingressclasses", "namespaces", "nodes", "persistentvolumes", "storageclasses"])
+        self.assertTrue(all(e[3] in kr.SCOPES for e in kr._BUILTIN_RESOURCES.values()))
+        self.assertEqual(len(kr._BUILTIN_RESOURCES) - len(cluster), 26)
+        for plural in cluster:
+            singular, canon = kr._BUILTIN_RESOURCES[plural][0], kr.RESOURCE_SPELLINGS[plural][0]
+            # A namespace-limited record never covers it: with -n, with the context's namespace, or -A.
+            F.write_record(resources=[plural], namespaces=["arc-runners"])
+            for spelling in (plural, singular, canon):
+                for extra in (["-n", "arc-runners"], [], ["-A"]):
+                    self.refused(["txe-onprem-ci", "--", "get", spelling] + extra, "KR08")
+            # Nor does a namespace list naming every namespace one by one.
+            F.write_record(resources=[plural], namespaces=["arc-runners", "kube-system", "default", "ctx-ns"])
+            self.refused(["txe-onprem-ci", "--", "get", plural], "KR08")
+            # The explicit global grant covers it, in every spelling, with or without -n.
+            F.write_record(resources=[plural], namespaces=["*"])
+            for spelling in (plural, singular, canon):
+                for extra in (["-n", "arc-runners"], []):
+                    rc, _, e, _ = call(["txe-onprem-ci", "--", "get", spelling] + extra)
+                    self.assertEqual(rc, 0, (plural, spelling, extra, e))
+        # A cluster-scoped subresource is cluster-scoped too.
+        F.write_record(resources=["nodes/status"], namespaces=["arc-runners"])
+        self.refused(["txe-onprem-ci", "--", "get", "nodes", "a", "--subresource", "status", "-n", "arc-runners"],
+                     "KR08")
+
+    def test_mixed_requests_cover_every_scope_without_widening(self):
+        # A mixed request needs the namespace for its namespaced part AND the global grant for its cluster part.
+        F.write_record(resources=["pods", "nodes"], namespaces=["arc-runners"])
+        rc, _, e, _ = call(["txe-onprem-ci", "--", "get", "pods", "-n", "arc-runners"])
+        self.assertEqual(rc, 0, e)   # the namespaced part alone is unchanged
+        for args in (["get", "pods,nodes", "-n", "arc-runners"], ["get", "node,pod", "-n", "arc-runners"],
+                     ["get", "pods.v1.,nodes.v1.", "-n", "arc-runners"],
+                     ["get", "pods/a", "nodes/b", "-n", "arc-runners"], ["get", "nodes", "-n", "arc-runners"]):
+            self.refused(["txe-onprem-ci", "--"] + args, "KR08")
+        # A cluster grant elsewhere in the record never widens namespaced access to another namespace.
+        self.refused(["txe-onprem-ci", "--", "get", "pods", "-n", "kube-system"], "KR08")
+        F.write_record(resources=["pods", "nodes"], namespaces=["*"])
+        for args in (["get", "pods,nodes", "-n", "arc-runners"], ["get", "pod/a", "node/b"]):
+            rc, _, e, _ = call(["txe-onprem-ci", "--"] + args)
+            self.assertEqual(rc, 0, (args, e))
+        # The fixed cluster-scoped resources (auth reviews and discovery) follow the same rule.
+        for verbs, resources, args in ((["auth can-i"], ["selfsubjectaccessreviews"], ["auth", "can-i", "get", "pods"]),
+                                       (["auth whoami"], ["selfsubjectreviews"], ["auth", "whoami"]),
+                                       (["version"], ["<discovery>"], ["version"]),
+                                       (["api-resources"], ["<discovery>"], ["api-resources"])):
+            F.write_record(verbs=verbs, resources=resources, namespaces=["arc-runners"])
+            self.refused(["txe-onprem-ci", "--"] + args, "KR08")
+            F.write_record(verbs=verbs, resources=resources, namespaces=["*"])
+            rc, _, e, _ = call(["txe-onprem-ci", "--"] + args)
+            self.assertEqual(rc, 0, (args, e))
+
+    def test_unknown_scope_metadata_refuses(self):
+        self.assertEqual(kr.resource_scope("pods/log"), kr.NAMESPACED)
+        self.assertEqual(kr.resource_scope("nodes"), kr.CLUSTER)
+        self.assertEqual(kr.resource_scope("<discovery>"), kr.CLUSTER)
+        for unknown in ("widgets", "<files>", "pod", "", "/x"):
+            with self.assertRaises(kr.Refused) as cm:
+                kr.resource_scope(unknown)
+            self.assertEqual(cm.exception.code, "KR08", unknown)
+
 
 class Arguments(Base):
     def test_overrides_are_refused_before_any_file_is_read(self):
@@ -517,7 +582,7 @@ class RequestScope(Base):
             self.assertEqual((r["resources"], r["argv"]), (resources, argv), args)
         # The table is security-critical reviewed data (a wrong but existing GVR would name another resource): it is
         # pinned here to the 34 entries verified against Kubernetes v1.34.9 API registration (README table).
-        self.assertEqual(sorted(f"{p}.{v}.{g}" for p, (_, v, g) in kr._BUILTIN_RESOURCES.items()), sorted([
+        self.assertEqual(sorted(f"{p}.{v}.{g}" for p, (_, v, g, _s) in kr._BUILTIN_RESOURCES.items()), sorted([
             "pods.v1.", "services.v1.", "configmaps.v1.", "secrets.v1.", "namespaces.v1.", "nodes.v1.", "events.v1.",
             "endpoints.v1.", "persistentvolumeclaims.v1.", "persistentvolumes.v1.", "serviceaccounts.v1.",
             "replicationcontrollers.v1.", "resourcequotas.v1.", "limitranges.v1.",
@@ -712,8 +777,9 @@ class RequestScope(Base):
         for args in (["auth", "reconcile", "-f", "rbac.yaml"], ["auth"], ["auth", "--bogus", "can-i"],
                      ["rollout", "frobnicate", "deploy/x"], ["rollout"], ["rollout", "restart", "deploy/x"]):
             self.refused_by_parser(args)
-        # End to end: a record granting "auth can-i" covers it, and never "auth reconcile".
-        F.write_record(verbs=["auth can-i"], resources=["selfsubjectaccessreviews"])
+        # End to end: a record granting "auth can-i" covers it, and never "auth reconcile". Its review resource is
+        # cluster-scoped, so the record grants namespaces ["*"] (Codex security review of 64fc3ec4).
+        F.write_record(verbs=["auth can-i"], resources=["selfsubjectaccessreviews"], namespaces=["*"])
         rc, _, e, t = call(["txe-onprem-ci", "--", "auth", "can-i", "get", "pods"])
         self.assertEqual((rc, len(t.calls)), (0, 2), e)
         self.refused(["txe-onprem-ci", "--", "auth", "reconcile", "-f", "rbac.yaml"], "KR05")
