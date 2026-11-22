@@ -5,6 +5,31 @@ entries:
       artifacthub.io/license: GPL-3.0-or-later
     apiVersion: v2
     appVersion: 2.25.2
+    created: "2026-11-22T12:23:21.072758409Z"
+    description: A compact, self-contained workflow engine with a web UI
+    digest: 9ddbfeab25378800973a1533f42786eeb9ce846359d2633ab905973d87ca8edf
+    home: https://dagu.sh
+    icon: https://raw.githubusercontent.com/dagucloud/dagu/3742177d7210d6a1978bb5aa93f4de203bee2b8f/assets/images/brand-mark.png
+    keywords:
+    - workflow
+    - scheduler
+    - dag
+    - automation
+    kubeVersion: '>=1.19.0-0'
+    maintainers:
+    - name: Dagu
+      url: https://github.com/dagucloud
+    name: dagu
+    sources:
+    - https://github.com/dagucloud/dagu
+    type: application
+    urls:
+    - https://github.com/txehq/dagu/releases/download/helm-dagu-2.0.7/dagu-2.0.7.tgz
+    version: 2.0.7
+  - annotations:
+      artifacthub.io/license: GPL-3.0-or-later
+    apiVersion: v2
+    appVersion: 2.25.2
     created: "2026-11-07T22:30:54.508136402Z"
     description: A compact, self-contained workflow engine with a web UI
     digest: 04056982abacfdec0ac9d93427a235e189f3cb0038e83bde124d98f0b0ddaf45
@@ -223,4 +248,4 @@ entries:
     urls:
     - https://dagucloud.github.io/dagu/dagu-1.0.2.tgz
     version: 1.0.2
-generated: "2026-11-07T22:30:54.508216563Z"
+generated: "2026-11-22T12:23:21.072848063Z"
