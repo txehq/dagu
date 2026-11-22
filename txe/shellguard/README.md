@@ -49,8 +49,16 @@ under invented CLIs.
 escaped space (`word\ #`), a backslash-newline that joins a word, or a closing `$( )` or backtick,
 the `#` continues the word, so the text after it is scanned.
 
-**A `$'…'` or `$"…"` delimiter:** the delimiter is the inner text. One containing a backslash
-escape is not modelled, so it is refused as X1.
+**A `$'…'` delimiter:** the delimiter is the inner text. One containing a backslash escape is not
+modelled, so it is refused as X1.
+
+**A `"…"` or `$"…"` delimiter** follows double-quote rules: a backslash before `$`, a backtick,
+`"` or `\` is removed, and a backslash-newline disappears. So `<<"E\$OF"` ends at a line `E$OF`.
+
+**Line continuations:** a backslash-newline is removed by the shell wherever this guard skips
+it. One placed directly after a `$`, or after a `<` in code, would join a token the guard does
+not read across (`$(`, `${`, `<<`), so it is refused (**L1**). Continuations inside a heredoc
+operator (`<<\`, newline, `-EOF`) are removed before the delimiter is read.
 
 **Refused visibly, because the scanner cannot follow the input:**
 - X1: a construct left open at the end of the input.

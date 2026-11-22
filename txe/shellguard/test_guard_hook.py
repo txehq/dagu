@@ -120,6 +120,36 @@ class Rules(unittest.TestCase):
         self.assertIn("X1", rules("cat <<$'E\\tOF'\nx\nE\tOF\n"))  # an escape inside: not modelled
         self.assertIn("X1", rules("cat <<$'EOF\nx\n"))  # unterminated quote
 
+    def test_a_continuation_splitting_a_token_refuses(self):
+        """PR 301 review: the shell removes backslash-newline, so `$\\<nl>(` is $( and `<\\<nl><`
+        is <<. Splits the guard cannot read across are refused (L1), in every context."""
+        for cmd in ["printf '%s\\n' \"$\\\n(step-one)\"",
+                    "cat <\\\n<EOF\n$(step-one)\nEOF\n",
+                    "e $\\\n(step-one)",
+                    "e \"${V:-$\\\n(step-one)}\"",
+                    "cat <<EOF\n$\\\n(step-one)\nEOF\n",
+                    "e $(( 1 + $\\\n(step-one) ))"]:
+            with self.subTest(cmd=cmd):
+                self.assertIn("L1", rules(cmd))
+
+    def test_harmless_continuations_are_allowed(self):
+        for cmd in ["git commit \\\n  -F /abs/msg.txt", 'e "a \\\n b"', "e 'a \\\n b'", "a=1 \\\n b=2 cmd"]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(G.check(cmd), [])
+
+    def test_continuations_inside_a_heredoc_operator_are_removed(self):
+        # `<<\<nl>EOF` is <<EOF (unquoted): its body is expanded, so H1 applies.
+        self.assertEqual(rules("cat <<\\\nEOF\n$(step-one)\nEOF\n"), ["H1"])
+        self.assertEqual(rules("cat <<\\\n-EOF\n\t$(step-one)\n\tEOF\n"), ["H1"])
+
+    def test_double_quoted_delimiter_uses_double_quote_rules(self):
+        """PR 301 review: <<"E\\$OF" ends at a line E$OF; text after it is code and is scanned."""
+        hidden = "cat <<\"E\\$OF\"\nE$OF\nprintf '%s\\n' \"$(step-one)\"\nE\\$OF\n"
+        self.assertEqual(rules(hidden), ["T2"])
+        self.assertEqual(rules(hidden.replace('<<"', '<<$"')), ["T2"])
+        self.assertEqual(G.check('cat <<"E\\"F"\n$(step-one)\nE"F\n'), [])  # \" removed; body quoted
+        self.assertIn("X1", rules('cat <<"EOF\n$(x)\n'))  # never closed
+
     def test_double_quotes_nested_in_a_substitution_are_their_own_context(self):
         cmd = 'V=$(acmectl "' + BT + "x" + BT + '")'
         self.assertEqual(rules(cmd), ["D1"])
@@ -336,6 +366,7 @@ class Structure(unittest.TestCase):
         "scan", "find", "push", "pop", "top", "has_dq_ancestor", "substitution", "dollar",
         "skip_single", "skip_ansi_c", "at_command_start", "step_code", "step_dq", "step_hdoc",
         "step_param", "step_arith", "heredoc_operator", "read_heredoc_bodies", "open_backtick", "__init__",
+        "skip_continuations", "dq_delimiter", "continuation_split",
         # str / bytes / list / dict methods
         "startswith", "lstrip", "rstrip", "rsplit", "join", "isalpha", "isalnum", "encode",
         "decode", "count", "append", "extend", "get",

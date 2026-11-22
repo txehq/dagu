@@ -23,6 +23,8 @@ Rewrite for an intended substitution: V=$(cmd), then pass "$V". Prose goes in a 
 
 Refused because the scanner cannot follow the input, visibly:
   X1  a construct still open at end of input (quote, $(, backtick, ${, heredoc without delimiter)
+  L1  a line continuation (backslash-newline) right after a '$', or after a '<' in code: the
+      shell joins it to what follows ($( ${ <<), and this guard does not read tokens across it
   B1  input larger than MAX_BYTES        B2  nesting deeper than MAX_DEPTH
 Every size bound counts BYTES (UTF-8), never characters.
 Payload routes (tool_input read as data; argv is never joined into a synthetic shell string):
@@ -68,6 +70,7 @@ RULES = {
     "H1": "a backtick or $( ) inside an unquoted heredoc (<<EOF) runs as a command",
     "U1": "an unquoted backtick runs as a command",
     "X1": "a quote, substitution or heredoc is still open at the end of the command",
+    "L1": "a line continuation splits a $ or < token, which this guard does not read across",
     "B1": "the command is larger than the guard's bound",
     "B2": "the command nests deeper than the guard's bound",
 }
@@ -219,7 +222,9 @@ class Scanner:
         s, i, f = self.s, self.i, self.top()
         c = s[i]
         if c == "\\":
-            if not s.startswith("\\\n", i):
+            if s.startswith("\\\n", i):
+                self.continuation_split(i, "$<")
+            else:
                 self.ws = False
             self.i = i + 2
         elif c == "'":
@@ -286,6 +291,8 @@ class Scanner:
         s, i = self.s, self.i
         c = s[i]
         if c == "\\":
+            if s.startswith("\\\n", i):
+                self.continuation_split(i, "$")
             self.i = i + (2 if i + 1 < self.n and s[i + 1] in '$`"\\\n' else 1)
         elif c == '"':
             self.pop()
@@ -304,6 +311,8 @@ class Scanner:
         s, i = self.s, self.i
         c = s[i]
         if c == "\\":
+            if s.startswith("\\\n", i):
+                self.continuation_split(i, "$")
             self.i = i + (2 if i + 1 < self.n and s[i + 1] in "$`\\\n" else 1)
         elif c == "`":
             self.substitution(True, i)
@@ -318,6 +327,8 @@ class Scanner:
         s, i, f = self.s, self.i, self.top()
         c = s[i]
         if c == "\\":
+            if s.startswith("\\\n", i):
+                self.continuation_split(i, "$")
             self.i = i + 2
         elif c == "'" and not self.has_dq_ancestor():
             self.skip_single()
@@ -345,7 +356,11 @@ class Scanner:
     def step_arith(self):
         s, i, f = self.s, self.i, self.top()
         c = s[i]
-        if c == "`":
+        if c == "\\":
+            if s.startswith("\\\n", i):
+                self.continuation_split(i, "$")
+            self.i = i + 2
+        elif c == "`":
             self.substitution(True, i)
             self.open_backtick()
             self.i = i + 1
@@ -368,29 +383,70 @@ class Scanner:
             self.i = i + 1
 
     # -- heredocs ----------------------------------------------------------------------------
+    def skip_continuations(self, j):
+        while self.s.startswith("\\\n", j):
+            j += 2
+        return j
+
+    def dq_delimiter(self, j):
+        """A double-quoted delimiter word starting at the '"' at j: (text after quote removal,
+        index after the closing quote), or (None, end) when it is never closed."""
+        s, k, out = self.s, j + 1, []
+        while k < self.n:
+            ch = s[k]
+            if ch == "\\" and k + 1 < self.n and s[k + 1] in '$`"\\\n':
+                if s[k + 1] != "\n":
+                    out.append(s[k + 1])
+                k += 2
+            elif ch == '"':
+                return "".join(out), k + 1
+            else:
+                out.append(ch)
+                k += 1
+        return None, k
+
+    def continuation_split(self, i, openers):
+        """At a backslash-newline: the shell removes it, so a '$' or '<' before it joins whatever
+        follows ($( ${ $(( << ...). Token recognition across a continuation is not modelled, so
+        such a split is refused (L1) rather than read as two harmless halves."""
+        if i > 0 and self.s[i - 1] in openers:
+            self.find("L1", i)
+
     def heredoc_operator(self):
         s = self.s
-        j = self.i + 2
+        j = self.skip_continuations(self.i + 2)
         strip = j < self.n and s[j] == "-"
         if strip:
-            j += 1
-        while j < self.n and s[j] in " \t":
-            j += 1
+            j = self.skip_continuations(j + 1)
+        while j < self.n and (s[j] in " \t" or s.startswith("\\\n", j)):
+            j += 2 if s[j] == "\\" else 1
         delim, quoted = [], False
         while j < self.n and s[j] not in WORD_BREAK:
             c = s[j]
-            if c == "$" and s.startswith(("$'", '$"'), j):
-                # $'...' (ANSI-C) or $"..." (locale): quote removal leaves the inner text, and the
-                # delimiter counts as quoted. A backslash escape inside is not modelled: refuse.
+            if s.startswith("\\\n", j):  # a line continuation is removed, not an escape
+                j += 2
+            elif c == "$" and s.startswith("$'", j):
+                # $'...' (ANSI-C): quote removal leaves the inner text, and the delimiter counts
+                # as quoted. A backslash escape inside is not modelled: refuse.
                 quoted = True
-                k = s.find(s[j + 1], j + 2)
+                k = s.find("'", j + 2)
                 if k < 0 or "\\" in s[j + 2:k]:
                     self.find("X1", j)
                     self.i = self.n
                     return
                 delim.append(s[j + 2:k])
                 j = k + 1
-            elif c in "'\"":
+            elif c == '"' or s.startswith('$"', j):
+                # "..." or $"..." (locale): double-quote rules, so a backslash before $ ` " \ is
+                # removed and a backslash-newline disappears (<<"E\$OF" waits for E$OF).
+                quoted = True
+                text, j = self.dq_delimiter(j + (1 if c == "$" else 0))
+                if text is None:
+                    self.find("X1", self.i)
+                    self.i = self.n
+                    return
+                delim.append(text)
+            elif c == "'":
                 quoted = True
                 k = s.find(c, j + 1)
                 if k < 0:
