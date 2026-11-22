@@ -1107,8 +1107,8 @@ def classify(fam, p):
 #   cmd.go} and staging/src/k8s.io/cli-runtime/pkg/genericclioptions/config_flags.go.
 # - helm v4.2.3: pinned in ops/sentry-platform/ci-check.sh. Source: helm/helm@v4.2.3 pkg/cmd/{template,install,lint,
 #   repo_list,version,completion,env,root,flags,load_plugins}.go and pkg/cli/environment.go.
-# - flux v2.9.4: pinned in .github/workflows/ci.yml and others. The v2.9.5 mention (ops/ci/prod-release.py) is a
-#   measurement note, not a pin, and the v2.9.5 sources of every retained command are byte-identical to v2.9.4.
+# - flux v2.9.4: pinned in .github/workflows/ci.yml and others. The v2.9.5 mention (ops/ci/prod-release.py:2105)
+#   is a code comment recording a measurement, not a pin. v2.9.5 is not part of the supported contract.
 #   Source: fluxcd/flux2@v2.9.4 cmd/flux/{version,completion,build,build_artifact,install,version_utils,
 #   plugin,main}.go.
 # - kustomize v5.8.1: pinned in .github/workflows/ci.yml and others. Source:

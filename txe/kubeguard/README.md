@@ -98,8 +98,8 @@ a context can be repointed inside its file. This directory holds the source of t
     values all make it an API call (H01/H07). The forms:
 
     **Supported versions are the ones txehq/txe pins**: kubectl v1.34.9, helm v4.2.3, flux v2.9.4, kustomize v5.8.1
-    (the pin locations are in the source above `LOCAL_FORMS`). The flux v2.9.5 mention in txe is a measurement note;
-    every retained flux command's source is byte-identical at v2.9.5. Helm 3 and other versions are NOT modelled.
+    (the pin locations are in the source above `LOCAL_FORMS`). The flux v2.9.5 mention in txe (a code comment in
+    `ops/ci/prod-release.py`) records a measurement and is not a pin. v2.9.5, Helm 3 and other versions are NOT modelled.
     **An install prerequisite is not runtime enforcement:** the hook cannot learn the installed version without
     executing it, so it does NOT detect or refuse an incompatible binary by version. Any adoption needs a verified,
     pinned executable identity and environment; none is done here.
