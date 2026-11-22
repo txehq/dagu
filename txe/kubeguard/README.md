@@ -295,6 +295,14 @@ lexer cannot read would be refused as well, for example a partly quoted here-doc
 other constructs outside the forms above. Such a refusal says H05; the remedy is to write the command in a
 form the lexer reads. The extra raw-text check is a second line only, never the parser.
 
+**Every execution-bearing channel of a simple command is kept and inspected:** its words, its stdin
+(here-documents and here-strings) and its redirection targets. A command made only of redirections is still a
+command, so `> "$(kubectl get secrets)"`, `2> "$(...)"` and a standalone `> >(...)` or `< <(...)` are inspected.
+An opaque executor's or interpreter's input from a redirection target counts as input
+(`ssh host < <(echo kubectl ...)` is H03). Effect on H16: a redirection-only command counts toward the
+single-command rule, so `kube-run ...; > f` is two commands and refused. It was refused already, for its
+separator.
+
 **Mentions are read quote-decoded.** Every mention check (`mentions`, through `mention_forms`) reads the text
 as it is, with backslashes removed (`kube\ctl`), and QUOTE-DECODED: line continuations removed, `$'...'`
 ANSI-C decoded (both as decoded and with each quoted segment ended at its first decoded NUL, as Bash does:

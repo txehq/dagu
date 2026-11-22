@@ -575,9 +575,20 @@ class Refused(unittest.TestCase):
                     "cat notes.txt <<< 'kubectl get ns' | bash"):
             self.deny(cmd, "H03")
         for cmd in ("echo $(kubectl get ns)", "echo `kubectl get ns`", "cat <(kubectl get ns)",
-                    "grep x <(kubectl get pods)", "echo x > >(kubectl apply -f -)"):
+                    "grep x <(kubectl get pods)", "echo x > >(kubectl apply -f -)",
+                    # Connector review of 24dadc0f: a command made only of redirections still runs the
+                    # substitutions in its targets, so it is kept and inspected like any other.
+                    '> "$(kubectl get secrets)"', ">> $(kubectl get ns)", '2> "$(kubectl get pods)"',
+                    "> >(kubectl apply -f -)", "< <(kubectl get ns)", 'echo a; > "$(kubectl get secrets)"',
+                    "> `kubectl get secrets`"):
             r = self.deny(cmd, "H01", "kubectl")
             self.assertIn("nested", r, cmd)
+        # The filter audit: an opaque executor's input from a redirection target counts as its input too.
+        for cmd in ("ssh host < <(echo kubectl get secrets)", "docker run -i x < <(echo kubectl get ns)"):
+            self.deny(cmd, "H03")
+        # Harmless plain redirections stay allowed.
+        for cmd in ("> out.txt", ": > out.txt", "< /dev/null", ">> log.txt", "2> err.txt"):
+            self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_documented_false_refusals(self):
         # Expected and documented (README): commands that may send or run text are not data contexts, so text

@@ -551,7 +551,12 @@ def simple_commands(s):
         ws = c["words"]
         c["raw"] = s[ws[0][2]:ws[-1][3]] if ws else ""
         c["src"] = s                      # the text the word positions index, for per-word literal checks
-    return [c for c in cmds if c["words"] or c["stdin"]]
+    # A simple command is kept whenever it has ANY execution-bearing channel: words, stdin (here-documents and
+    # here-strings) or redirection targets (connector review of 24dadc0f: `> "$(kubectl get secrets)"` has no
+    # words, but Bash runs the substitution in its target). check_cmd then inspects every channel's
+    # substitutions. Only a command with none of the three is empty. Effect: a redirection-only command counts as a
+    # command, so H16's single-command rule (single_kube_run) counts it too (`kube-run ...; > f` is two commands).
+    return [c for c in cmds if c["words"] or c["stdin"] or c.get("redirect_targets")]
 
 
 def substitutions(text):
@@ -1102,11 +1107,13 @@ class Guard:
         if INTERPRETERS.match(base):
             # Its code (-c/-e or a script), its arguments and its input are all opaque to the hook: a client
             # named in any of them is refused (`python3 -c ...`, `node x.js kubectl get ns`).
-            if any(mentions(t) for t in args + cmd["stdin"]):
+            if any(mentions(t) for t in args + cmd["stdin"] + cmd.get("redirect_targets", [])):
                 raise Refusal("H03")
             return
         if base in OPAQUE:
-            if any(mentions(t) for t in args + cmd["stdin"]):
+            # Every input channel counts, redirection targets included (filter audit after 24dadc0f:
+            # `ssh host < <(echo kubectl get secrets)` feeds the process substitution's text to the remote shell).
+            if any(mentions(t) for t in args + cmd["stdin"] + cmd.get("redirect_targets", [])):
                 raise Refusal("H03")
             return
         if base in GLOBAL_MUTATORS:
