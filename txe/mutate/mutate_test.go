@@ -322,7 +322,7 @@ func (f fixture) invoke(t *testing.T, mode []string, extra ...string) outcome {
 	t.Helper()
 	report := filepath.Join(f.root, "report.json")
 	_ = os.Remove(report)
-	args := append([]string{"-I", script(t, "mutate-sandboxed.py")}, mode...)
+	args := append([]string{"-I", "-B", script(t, "mutate-sandboxed.py")}, mode...)
 	args = append(append(args, "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
 		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"), extra...)
@@ -576,14 +576,14 @@ print(verdict(lambda: ms.check_mounts([(root, "/work", False)], root, {"HOME": r
 print(verdict(lambda: ms.check_workdir(root / "home" / "go" / "x", forbidden)))
 print(verdict(lambda: ms.check_workdir(work, forbidden)))
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "ok\nrefused\nrefused\nrefused\nrefused\nok\n", string(out))
 }
 
 func hook(t *testing.T, input string) (int, string, string) {
 	t.Helper()
-	cmd := exec.Command(python(t), "-I", script(t, "guard-hook.py"))
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "guard-hook.py"))
 	cmd.Stdin = strings.NewReader(input)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -1085,7 +1085,7 @@ elif sys.argv[1:3] == ["mod", "download"]:
 	t.Setenv("MUTATE_TEST_CANARY", "host-only-value")
 
 	report := filepath.Join(f.root, "report.json")
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--mutants",
 		f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--workdir-root", f.workRoot,
 		"--docker", f.docker, "--report", report, "--image", "fixture-image", "--", "sh", "check.sh")
 	out, err := cmd.CombinedOutput()
@@ -1188,7 +1188,7 @@ for noise in ["echo '", 'echo "', "cat <<EOF", "x=$(", "# "]:
     assert g.refuses("python3 mutants.py; " + noise) is True, noise
 print("ok", round(time.monotonic() - start, 1) < 60)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "guard-hook.py")).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "guard-hook.py")).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "ok True\n", string(out))
 }
@@ -1271,7 +1271,7 @@ func TestSignalStopsRun(t *testing.T) {
 			f := newFixture(t, passingCheck)
 			foreignContainer(t, f.log)
 			report := filepath.Join(f.root, "report.json")
-			cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
+			cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--mutants",
 				f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--shared-modcache", f.modcache,
 				"--shared-gocache", f.gocache, "--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed",
 				"--report", report, "--image", "hang", "--timeout", "60", "--", "sh", "check.sh")
@@ -1317,7 +1317,7 @@ print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxe
 print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
 print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, cidfile).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, cidfile).CombinedOutput()
 	require.NoError(t, err, string(out))
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	require.Len(t, lines, 3)
@@ -1330,7 +1330,7 @@ print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxe
 // "noexec" images run no command at all, so no fixture mutant executes on this host.
 func demo(t *testing.T, docker string, args ...string) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
-	cmd := exec.Command(python(t), append([]string{"-I", script(t, "fixture-demo.py"), "--docker", docker}, args...)...)
+	cmd := exec.Command(python(t), append([]string{"-I", "-B", script(t, "fixture-demo.py"), "--docker", docker}, args...)...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	return cmd, &out
@@ -1435,7 +1435,7 @@ w = ms.WorkDir(root); (w.path / ms.OWNER_FILE).write_text("someone else"); print
 w = ms.WorkDir(root); os.rename(w.path, str(w.path) + ".moved"); w.path.mkdir(); (w.path / ms.OWNER_FILE).write_text(w.token); print(verdict(w), w.path.exists())
 w = ms.WorkDir(root); print(verdict(w), w.path.exists())
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "refused True\nrefused True\nremoved False\n", string(out))
 }
@@ -1645,7 +1645,7 @@ copied = sum(1 for _ in (root / "cut" / "big").iterdir()) if (root / "cut" / "bi
 gone, _ = attempt(lambda: ms.clone_dir(src, root / "late", time.monotonic() - 1))
 print(full, cut, gone, copied < 20000, cut_secs < full_secs, (root / "late").exists())
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "completed stopped stopped True True False\n", string(out))
 }
@@ -1791,7 +1791,7 @@ used, n, problem = ms.dir_usage(linked, 100, 60.0); print(n, problem, used < (1 
 used, n, problem = ms.dir_usage(deep, 100, 60.0, max_depth=5); print(problem)
 used, n, problem = ms.dir_usage(root / "absent", 100, 60.0); print(n, problem)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "11 run directory over 10 entries\n1 None True\nrun directory nested over 5 levels\n0 None\n", string(out))
 }
@@ -1844,7 +1844,7 @@ try:
 except ValueError as e:
     print("refused:", e)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, filepath.Join("testdata", "leaky-docker.py")), string(raw)).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, filepath.Join("testdata", "leaky-docker.py")), string(raw)).CombinedOutput()
 	require.NoError(t, err, string(out))
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	require.Len(t, lines, len(runs)+1)
@@ -1938,7 +1938,7 @@ func goManifest(t *testing.T, root string) string {
 
 func roManifest(t *testing.T, dir string) (int, string, string) {
 	t.Helper()
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", dir)
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", dir)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
@@ -2340,7 +2340,7 @@ print(verdict(lambda: ms.check_mounts([(w, "/work", False), (w / "inner", "/work
 s = work.path / "sib"; s.mkdir()
 print(verdict(lambda: ms.check_mounts([(w, "/work", False), (s, "/work/src/.git", True)], work.path, {})))
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root, view,
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root, view,
 		goManifest(t, view), tree).CombinedOutput()
 	require.NoError(t, err, string(out))
 	// ok; non-empty mountpoint; a mode changed (alarm); restored (ok); a deadline already passed
@@ -2575,7 +2575,7 @@ func TestDiagnosticClosedStdout(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Close())
 	report := filepath.Join(f.root, "report.json")
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--diagnostic", "--tree", f.tree,
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--diagnostic", "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
 		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image",
 		"--", "sh", "check.sh")
@@ -2672,7 +2672,7 @@ func (f fixture) runnerWith(t *testing.T, stdout, stderr *os.File, mode []string
 	t.Helper()
 	report := filepath.Join(f.root, "report.json")
 	_ = os.Remove(report)
-	args := append([]string{"-I", script(t, "mutate-sandboxed.py")}, mode...)
+	args := append([]string{"-I", "-B", script(t, "mutate-sandboxed.py")}, mode...)
 	args = append(append(args, "--tree", f.tree, "--shared-modcache", f.modcache, "--shared-gocache", f.gocache,
 		"--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60",
 		"--image", "fixture-image"), extra...)
@@ -2837,7 +2837,7 @@ try:
 except subprocess.TimeoutExpired:
     print("refused")
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py")).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py")).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "30\nTrue\nrefused\n", string(out))
 }
@@ -2871,7 +2871,7 @@ func TestRoManifestFullStdoutIsFinding(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = full.Close() })
 	view := gitView(t, t.TempDir())
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", view)
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", view)
 	var errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = full, &errb
 	err = cmd.Run()
@@ -2923,7 +2923,7 @@ print("active", runner.remove_pending(), calls() == n)
 t1 = time.monotonic()
 print("emergency", runner.remove_pending(emergency=True), calls() > n, time.monotonic() - t1 < 2.5)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, log, root, tree).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, log, root, tree).CombinedOutput()
 	require.NoError(t, err, string(out))
 	// cut: the slow rm ends at the budget, well before its 3 s; refused: nothing started past it;
 	// active: past hard_end nothing starts; emergency: it draws on cleanup_end, starts, and is cut.
@@ -3005,7 +3005,7 @@ print("pending", len(runner.pending))
 runner.cleanup_end = time.monotonic() + 10
 print("confirmed", runner.remove_pending(emergency=True), runner.cleanup_log[-1].split(":")[-1].strip())
 `
-			out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, image, view,
+			out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, image, view,
 				goManifest(t, view), tree, root).CombinedOutput()
 			require.NoError(t, err, string(out))
 			assert.Equal(t, "stopped\npending 1\nconfirmed True "+strings.TrimPrefix(want, ": ")+"\n", string(out))
@@ -3017,7 +3017,7 @@ print("confirmed", runner.remove_pending(emergency=True), runner.cleanup_log[-1]
 // walk; the walk itself is bounded by the --ro-max-* limits.
 func TestRoManifestRefusesDeadline(t *testing.T) {
 	view := gitView(t, t.TempDir())
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--ro-manifest", view, "--deadline", "5")
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", view, "--deadline", "5")
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	err := cmd.Run()
