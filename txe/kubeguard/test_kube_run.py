@@ -289,6 +289,25 @@ class PreContactPinsRefuseWithoutAProbe(Base):
         F.kc.write_text(kubeconfig(server=OTHER_SERVER))
         self.refused(ARGS, "KR12")
 
+    def test_plaintext_or_malformed_server_is_refused(self):
+        # Connector security review of 77f1bac3: an http:// server sends the credential in the probe itself.
+        # In the registry entry, refused when it is loaded, before the kubeconfig is opened:
+        for server in ("http://127.0.0.1:9", "HTTPS://127.0.0.1:9", "https://", "https://u:p@127.0.0.1:9",
+                       "https://127.0.0.1:9?x=1", "https://127.0.0.1:9#f", " https://127.0.0.1:9", "127.0.0.1:9",
+                       "unix:///run/k.sock"):
+            F.write_registry(server=server)
+            self.refused(ARGS, "KR27")
+        # In the kubeconfig: its cluster's server is checked before the pin comparison, so an http:// server
+        # there is KR27 (not KR12), with no contact.
+        F.write_registry()
+        F.kc.write_text(kubeconfig(server="http://127.0.0.1:9"))
+        self.refused(ARGS, "KR27")
+        # https with a path is accepted as before (the pin must still match exactly).
+        F.write_registry(server="https://127.0.0.1:9/k8s")
+        F.kc.write_text(kubeconfig(server="https://127.0.0.1:9/k8s"))
+        rc, _, e, _ = call(ARGS)
+        self.assertEqual(rc, 0, e)
+
     def test_ca_mismatch(self):
         F.kc.write_text(kubeconfig(ca=OTHER_CA))
         self.refused(ARGS, "KR13")

@@ -61,6 +61,7 @@ What it does, in order. Each step fails closed, and no step contacts a cluster u
     collections, block scalars, multiple documents, JSON and tabs inside the sections it parses, and any
     top-level line it cannot place. The context must resolve to exactly one cluster, whose server must equal
     the pinned server and whose CA must hash to the pinned SHA-256. TLS verification must not be disabled.
+    The server must be an https:// URL, in the registry entry (load_entry) and in the kubeconfig (KR27).
     A mismatch here refuses with NO contact: no probe and no request.
  5. IDENTITY PROBE. kubectl, with the pinned --kubeconfig and --context, reads the kube-system Namespace
     UID. TLS is verified by kubectl against the CA that step 4 pinned, so the read can only reach that
@@ -125,7 +126,13 @@ CODES = {
     "KR18": "request-timed-out", "KR19": "kubectl-not-found", "KR20": "output-over-bound",
     "KR21": "stopped-by-signal", "KR22": "settlement-or-capture-not-proven", "KR23": "credential-helper-refused",
     "KR25": "custody-module-not-pinned", "KR26": "custody-unsupported-on-this-platform",
+    "KR27": "server-not-https",
 }
+# The only server URL kube-run accepts (connector security review of 77f1bac3): lowercase https, a host, no
+# userinfo, query or fragment. A plaintext http:// server would send the credential, in the probe itself, to any
+# on-path observer before any identity check could help. Checked on the registry entry (load_entry) and again on
+# the kubeconfig's cluster (check_pins), both before contact.
+HTTPS_SERVER = re.compile(r"https://[^\s/?#@]+(?:/[^\s?#]*)?")
 
 
 class Refused(Exception):
@@ -552,6 +559,8 @@ def load_entry(registry_path, cluster_id):
         raise Refused("KR02", "the registry entry lacks one of " + ", ".join(REQUIRED_ENTRY))
     if not os.path.isabs(e["kubeconfig"]) or not re.fullmatch(r"[0-9a-f]{64}", e["ca_sha256"]):
         raise Refused("KR02", "the registry entry's kubeconfig is not absolute or its ca_sha256 is not hex")
+    if not HTTPS_SERVER.fullmatch(e["server"]):
+        raise Refused("KR27", "the registry entry's server is not an https:// URL")
     if "kubectl" in e and (not isinstance(e["kubectl"], str) or not os.path.isabs(e["kubectl"])):
         raise Refused("KR02", "the registry entry's kubectl is not an absolute path")
     return e
@@ -804,6 +813,8 @@ def check_pins(entry, data, kubeconfig_dir):
     cluster = _one(sec["clusters"], cluster_name, "cluster")
     if str(cluster.get("insecure-skip-tls-verify", "")).lower() in ("true", "yes", "on", "1"):
         raise Refused("KR14", "the pinned cluster disables TLS verification")
+    if not isinstance(cluster.get("server"), str) or not HTTPS_SERVER.fullmatch(cluster["server"]):
+        raise Refused("KR27", "the pinned cluster's server is not an https:// URL")
     if cluster.get("server") != entry["server"]:
         raise Refused("KR12", "the pinned context's server is not the registry's server")
     data_field, path_field = cluster.get("certificate-authority-data"), cluster.get("certificate-authority")

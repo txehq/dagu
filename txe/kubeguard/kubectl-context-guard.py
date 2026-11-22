@@ -572,10 +572,61 @@ MENTION_ATTACHED = re.compile(r"(?:^|(?<=[\s'\"`(;|&=\[,{!]))-[A-Za-z]{1,4}(?:[\
                               + "|".join(map(re.escape, CLIENT_NAMES)) + r")(?=$|[\s'\"`);|&,\]}:@])")
 
 
+# Quote removal for the mention check (connector review of 77f1bac3: `echo kube''ctl get secrets | bash` ran
+# kubectl downstream, because the line-level check read only the raw text). ANSI-C quoting is decoded by Bash at
+# parse time, without evaluation, so it is decoded here too.
+ANSI_C = re.compile(r"\$'((?:\\.|[^'\\])*)'", re.S)
+ANSI_C_ESCAPE = re.compile(r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|c(.)|(.))",
+                           re.S)
+ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                 "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c(body):
+    """The text Bash makes of the body of $'...' (bash(1), QUOTING)."""
+    def one(m):
+        octal, hx, u4, u8, ctl, other = m.groups()
+        try:
+            if octal:
+                return chr(int(octal, 8) & 0xFF)
+            if hx or u4 or u8:
+                return chr(int(hx or u4 or u8, 16))
+        except (ValueError, OverflowError):
+            return ""
+        if ctl is not None:
+            return chr(ord(ctl) & 0x1F)
+        other = other or ""
+        return ANSI_C_SIMPLE.get(other, "\\" + other)
+    return ANSI_C_ESCAPE.sub(one, body)
+
+
+def mention_forms(text):
+    """The forms of a text the mention check reads. It parses nothing, so it also covers text the lexer cannot read
+    (a here-document body, a raw JSON event), and each form only ADDS matches:
+      - the text itself;
+      - the text with backslashes removed (`kube\\ctl` runs kubectl);
+      - QUOTE-DECODED: line continuations removed, then every quote character and backslash removed, so quote
+        removal cannot split a name (`kube''ctl`, `kube"c"tl`, `'kube'ctl`, `kube$""ctl`);
+      - the same after every $'...' is ANSI-C decoded (`$'\\x6bubectl'`, `kube$'\\x63'tl`).
+    Deleting every quote over-approximates quote removal: a quote that is itself data (`"it's"`) joins the text
+    around it too. That direction can only refuse more."""
+    forms = [text]
+    if "\\" in text:
+        forms.append(text.replace("\\", ""))
+    if any(c in text for c in "'\"\\"):
+        # $"..." is locale quoting: with no translation it is "...", so its `$` goes too.
+        joined = text.replace("\\\r\n", "").replace("\\\n", "").replace('$"', '"')
+        forms.append(re.sub(r"[\\'\"]", "", joined))
+        if "$'" in joined:
+            decoded = ANSI_C.sub(lambda m: _ansi_c(m.group(1)), joined)
+            forms.append(re.sub(r"[\\'\"]", "", decoded))
+    return forms
+
+
 def mentions(text):
-    # Also on a copy without backslashes: bash removes them (`kube\ctl` runs kubectl).
-    texts = (text, text.replace("\\", "")) if "\\" in text else (text,)
-    return any(MENTION.search(t) or MENTION_ATTACHED.search(t) for t in texts)
+    """True when any form of the text (mention_forms) names a cluster client. A superset of the raw-text check, so
+    every caller refuses at least what it refused before."""
+    return any(MENTION.search(t) or MENTION_ATTACHED.search(t) for t in mention_forms(text))
 
 
 class Refusal(Exception):
@@ -597,6 +648,8 @@ class Guard:
     def __init__(self, kube_run, cwd, whole):
         self.kube_run = kube_run
         self.cwd = cwd
+        # Read through mention_forms: a name split by quote removal (`echo kube''ctl ... | bash`) still marks the
+        # line client-relevant, so pipe receivers and code-running commands are inspected (H03).
         self.whole_mentions = mentions(whole)
         # H16: the top-level command index of the first installed kube-run invocation the hook accepted, at any
         # depth. When it is set, the whole command must match the kube-run exception's grammar (single_kube_run).

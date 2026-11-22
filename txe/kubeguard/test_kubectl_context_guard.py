@@ -177,6 +177,24 @@ class Refused(unittest.TestCase):
         for cmd in ('kube""ctl get pods', "k\\ubectl get pods", '"kubectl" get pods', "kubectl \\\n  get pods"):
             self.deny(cmd, "H01")
 
+    def test_quote_decoded_names_mark_the_line_for_pipe_receivers(self):
+        # Connector review of 77f1bac3: `echo kube''ctl get secrets | bash` was allowed. Bash's quote removal
+        # makes echo print `kubectl get secrets`, which the downstream shell runs; the line-level check read only
+        # the raw text, so the receiver skipped H03. Every quote-removal spelling now marks the line.
+        for name in ("kube''ctl", 'kube""ctl', "'kube'ctl", 'kube"c"tl', "k\\ubectl", "kube$''ctl", 'kube$""ctl',
+                     "$'kubectl'", "$'\\x6bubectl'", "kube$'\\x63'tl", "$'\\153ubectl'", "$'\\u006bubectl'",
+                     "kube\\\nctl", "he''lm", "fl''ux"):
+            for cmd in (f"echo {name} get secrets | bash", f"printf '%s\\n' {name} | sh",
+                        f"echo {name} get ns > >(bash)", f"bash <(echo {name} get ns)",
+                        f"echo {name} get ns | python3"):
+                self.deny(cmd, "H03")
+        # A here-document body is decoded as text, without parsing it.
+        for body in ("kube''ctl get secrets", 'kube"c"tl get ns', "$'\\x6bubectl' get ns"):
+            self.deny(f"cat <<'EOF' | bash\n{body}\nEOF", "H03")
+            self.deny(f"ssh host <<'EOF'\n{body}\nEOF", "H03")
+        # The direct spellings stay H01 (Allowed.test_quote_decoded_data_without_a_code_receiver has the data side).
+        self.deny("kube''ctl get pods", "H01")
+
     def test_nested_shells_and_substitutions(self):
         for cmd in ("bash -c 'kubectl get pods'", 'zsh -lc "kubectl get pods"', 'eval "kubectl get pods"',
                     "sh <<'EOF'\nkubectl get pods\nEOF", "bash <<< 'kubectl get pods'", "X=$(kubectl get ns)",
@@ -629,6 +647,13 @@ class Allowed(unittest.TestCase):
         for cmd in ("command -v kubectl", "which kubectl helm flux", "grep -rn kubectl ops", "echo kubectl get pods",
                     "cat ops/flux/prod.sh", "python3 ops/flux/classify-diff.py x", "bash ops/flux/staging.sh --help",
                     "cat > notes.md <<'EOF'\nkubectl get pods\nEOF"):
+            self.allow(cmd)
+
+    def test_quote_decoded_data_without_a_code_receiver(self):
+        # The quote-decoded mention check (mention_forms) adds refusals only where a client-relevant line reaches
+        # code. A decoded name in plain data is still data, and quoting that assembles no name is not a mention.
+        for cmd in ("echo kube''ctl get pods", "echo kube''ctl get pods > notes.txt", "echo 'it''s' | bash",
+                    "echo \"don't\" | sh", "echo 'kube' ctl | bash", "printf '%s\\n' kube ctl | sh"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):
