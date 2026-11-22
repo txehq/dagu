@@ -234,7 +234,11 @@ class Refused(unittest.TestCase):
                     "echo kubectl > f; xargs env < f", "xargs env < <(echo kubectl get secrets)",   # input redirection
                     "xargs env <<< 'kubectl get secrets'", "xargs env <<'EOF'\nkubectl get secrets\nEOF",
                     "echo kubectl > f; xargs -a f env", "echo kubectl > f; xargs --arg-file=f env",
-                    "echo kubectl > f; xargs -n 1 -a f env"):
+                    "echo kubectl > f; xargs -n 1 -a f env",
+                    # Clustered and abbreviated argument-file spellings: not exact table entries, so _unwrap's closed
+                    # option grammar refuses them in a client line before the command is located.
+                    "echo kubectl > f; xargs -0a f env", "echo kubectl > f; xargs -ra f env",
+                    "echo kubectl > f; xargs --arg f env"):
             self.deny(cmd, "H03")
         # A cluster client named in the text is still classified: an API call stays H01, and a local form is not
         # local when xargs appends its input to the arguments.
