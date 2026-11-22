@@ -7,11 +7,26 @@ reaches any ConfigMap the Dagu chart renders.
 
 | file | role |
 |---|---|
-| `check_configmap_secrets.py` | the checker: `derive`, `check`, `values` subcommands; exit 0 clean, 1 finding, 2 incomplete |
+| `check_configmap_secrets.py` | the checker: `derive`, `check`, `values`, `aliases` subcommands; exit 0 clean, 1 finding, 2 incomplete |
 | `test_check_configmap_secrets.py` | its tests, including every fail-closed derivation case |
-| `render-check.sh WORKDIR` | renders the chart for each `values/*.yaml`, checks every render, asserts the template-time refusals, and plants each `planted/*.yaml` into a copy of the chart to prove a leak fails |
+| `render-check.sh WORKDIR` | renders the chart for each `values/*.yaml`, checks every render, asserts the template-time refusals, renders each fixture again with every `extraEnv` alias of its Secret-backed variables and expects a refusal, and plants each `planted/*.yaml` into a copy of the chart to prove a leak fails |
 | `values/` | the value combinations, with REFERENCE canaries (`fake-ref-*`, Secret names, allowed) and SECRET-VALUE canaries (`FAKE-SECRET-VALUE-*`, never allowed in a ConfigMap) |
-| `planted/` | inert fake leaks: the old token shape, base64 `binaryData`, an env-style key, a nested YAML document |
+| `planted/` | inert fake leaks: the old token shape, base64 `binaryData`, an env-style key, a nested YAML document, credential keys holding YAML bools, and non-UTF-8 `binaryData` |
+
+## Secret references cannot be overridden from `extraEnv`
+
+Dagu reads a setting from its bound variable (`DAGU_AUTH_TOKEN_SECRET`), from
+its `_FILE` sibling, and, through Viper's AutomaticEnv, from `DAGU_` plus the
+YAML key with its dots kept (`DAGU_AUTH.BUILTIN.TOKEN.SECRET`), which wins over
+the bound name. A chart guard that lists only the bound names lets an
+`extraEnv` entry replace the referenced Secret. Every guard in
+`templates/configmap.yaml` therefore compares `dagu.envConfigName` (upper-case,
+dots as underscores) against its list, and a unit test fails when a guard
+compares the raw name. `aliases` lists, for every `secretKeyRef` `DAGU_`
+variable a render contains, each such name, derived from `envBindings`;
+`render-check.sh` renders the fixture with each in `extraEnv` and fails when
+the chart does not refuse it. A new Secret-backed variable is covered with no
+edit here.
 
 CI: HelmChartCI "Validate Helm chart" runs `render-check.sh` on every change to
 the chart, this directory or `internal/cmn/config`; the CI workflow's Cleanup

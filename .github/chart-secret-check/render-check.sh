@@ -118,6 +118,34 @@ expect_refusal token-file-extra-env-conflict \
   --set-string auth.builtin.token.existingSecret=fake-ref-token \
   --set-string 'extraEnv[0].name=DAGU_AUTH_TOKEN_SECRET_FILE' \
   --set-string 'extraEnv[0].value=/etc/dagu-token/token'
+expect_refusal proxy-dotted-alias \
+  "must not configure proxy authentication" \
+  --set-string 'extraEnv[0].name=DAGU_AUTH.PROXY.ENABLED' \
+  --set-string 'extraEnv[0].value=true'
+refusals=5
+
+# Every Secret-backed DAGU_ variable a fixture renders must be impossible to
+# override from extraEnv: the checker lists its bound names, their _FILE
+# siblings and Viper's dotted automatic aliases (DAGU_AUTH.BUILTIN.TOKEN.SECRET,
+# which wins over the bound name), derived from Dagu's source, and the chart
+# must refuse each. A new secretKeyRef variable without a guard fails here.
+echo "== extraEnv aliases of Secret-backed variables"
+aliases=0
+for values in "${here}"/values/*.yaml; do
+  name="$(basename "${values}" .yaml)"
+  "${checker[@]}" aliases --config-dir "${config_dir}" "${work}/${name}.yaml" >"${work}/aliases-${name}.txt"
+  while IFS= read -r env; do
+    expect_refusal "alias-${name}-${env}" "extraEnv entry" -f "${values}" \
+      --set-string "extraEnv[0].name=${env}" \
+      --set-string 'extraEnv[0].value=FAKE-SECRET-VALUE-alias'
+    assert_no_value "${work}/refusal-alias-${name}-${env}.log" FAKE-SECRET-VALUE-alias
+    aliases=$((aliases + 1))
+  done <"${work}/aliases-${name}.txt"
+done
+if [[ "${aliases}" -lt 26 ]]; then
+  echo "::error::expected at least 26 alias refusals, ran ${aliases}"
+  exit 1
+fi
 
 echo "== planted leaks through the chart must fail the check"
 planted=0
@@ -142,9 +170,9 @@ for plant in "${here}"/planted/*.yaml; do
   echo "-- ${name}: caught"
   planted=$((planted + 1))
 done
-if [[ "${planted}" -lt 4 ]]; then
-  echo "::error::expected at least 4 planted leaks, ran ${planted}"
+if [[ "${planted}" -lt 6 ]]; then
+  echo "::error::expected at least 6 planted leaks, ran ${planted}"
   exit 1
 fi
 
-echo "render check passed: ${count} value fixtures clean, 4 refusals, ${planted} planted leaks caught"
+echo "render check passed: ${count} value fixtures clean, ${refusals} refusals, ${aliases} alias refusals, ${planted} planted leaks caught"

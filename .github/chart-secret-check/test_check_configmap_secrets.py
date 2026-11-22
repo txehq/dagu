@@ -12,6 +12,7 @@ import contextlib
 import importlib.util
 import io
 import pathlib
+import re
 import sys
 import tempfile
 import textwrap
@@ -389,6 +390,48 @@ class CheckManifest(unittest.TestCase):
     def test_list_of_credentials(self):
         self.assertFinds(cm({"a.yaml": f"tokens:\n  - {FAKE}\n"}))
 
+    def test_boolean_at_credential_key(self):
+        # A YAML bool at a credential key is still a non-empty credential
+        # value; unquoted yes/on resolve to bools too.
+        for body in (
+            "auth:\n  basic:\n    password: true\n",
+            "auth:\n  basic:\n    password: false\n",
+            "auth:\n  basic:\n    password: yes\n",
+            "license:\n  key: on\n",
+            "DAGU_AUTH_BASIC_PASSWORD: true\n",
+            "db:\n  token: true\n",
+        ):
+            with self.subTest(body=body):
+                self.assertFinds(self.dagu_yaml(body))
+
+    def test_boolean_flags_stay_clean(self):
+        self.assertClean(
+            self.dagu_yaml(
+                """\
+                auth:
+                  proxy:
+                    enabled: true
+                    auto_signup: on
+                  builtin:
+                    password_disabled: true
+                  basic:
+                    password_file: true
+                refs:
+                  existingSecret: false
+                """
+            )
+        )
+
+    def test_non_utf8_binary_credential(self):
+        not_utf8 = base64.b64encode(b"\xff").decode()  # inert single byte 0xff
+        for key in ("token", "DAGU_AUTH_BASIC_PASSWORD", "existingSecret", "password_file"):
+            with self.subTest(key=key):
+                found = self.findings(cm(binary={key: not_utf8}))
+                self.assertEqual(len(found), 1, found)
+                self.assertIn("1 bytes", found[0])
+        self.assertClean(cm(binary={"logo.png": not_utf8}))
+        self.assertClean(cm(binary={"token": ""}))
+
     def test_no_configmap_is_incomplete(self):
         with self.assertRaises(c.Incomplete):
             self.findings({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "s"}})
@@ -440,6 +483,95 @@ class CheckValues(unittest.TestCase):
         v = self.base()
         v["extraThing"] = {"existingSecret": "fake-ref-x"}
         self.assertTrue(self.run_values(v))
+
+
+def deployment(*env):
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "ui"},
+        "spec": {"template": {"spec": {"containers": [{"name": "ui", "env": list(env)}]}}},
+    }
+
+
+def secret_env(name):
+    return {"name": name, "valueFrom": {"secretKeyRef": {"name": "fake-ref-x", "key": "k"}}}
+
+
+class EnvAliases(unittest.TestCase):
+    """Names an extraEnv entry could use to override a Secret-backed variable.
+    render-check.sh renders the chart with each and expects a refusal."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.real = c.derive(REPO / "internal" / "cmn" / "config")
+        cls.fake = derive_fake()
+
+    def test_real_token_secret(self):
+        self.assertEqual(
+            c.conflict_names(self.real, "DAGU_AUTH_TOKEN_SECRET"),
+            [
+                "DAGU_AUTH_TOKEN_SECRET",
+                "DAGU_AUTH.BUILTIN.TOKEN.SECRET",
+                "DAGU_AUTH_TOKEN_SECRET_FILE",
+                "DAGU_AUTH.BUILTIN.TOKEN.SECRET_FILE",
+            ],
+        )
+
+    def test_real_chart_references(self):
+        expected = {
+            "DAGU_AUTH_BASIC_USERNAME": 2,
+            "DAGU_AUTH_BASIC_PASSWORD": 4,
+            "DAGU_LICENSE_KEY": 2,
+            "DAGU_AUTH_OIDC_CLIENT_SECRET": 4,
+        }
+        for env, count in expected.items():
+            with self.subTest(env=env):
+                names = c.conflict_names(self.real, env)
+                self.assertEqual(len(names), count, names)
+                self.assertEqual(names[0], env)
+                self.assertIn(c.APP_ENV_PREFIX + self.real.bindings[env].upper(), names)
+
+    def test_direct_credential_env_stands_alone(self):
+        self.assertEqual(c.conflict_names(self.fake, "DAGU_ENCRYPTION_KEY"), ["DAGU_ENCRYPTION_KEY"])
+
+    def test_unknown_name_is_incomplete(self):
+        with self.assertRaises(c.Incomplete):
+            c.conflict_names(self.fake, "DAGU_NOT_A_SETTING")
+
+    def test_manifest_secret_backed_only(self):
+        text = manifest(
+            cm({"dagu.yaml": "auth:\n  mode: basic\n"}),
+            deployment(
+                {"name": "DAGU_HOME", "value": "/data"},
+                secret_env("DAGU_AUTH_BASIC_PASSWORD"),
+                secret_env("OTHER_SECRET"),
+                {"name": "DAGU_LICENSE_KEY", "valueFrom": {"configMapKeyRef": {"name": "x", "key": "k"}}},
+            ),
+        )
+        self.assertEqual(
+            c.env_aliases(self.fake, text),
+            [
+                "DAGU_AUTH_BASIC_PASSWORD",
+                "DAGU_AUTH.BASIC.PASSWORD",
+                "DAGU_AUTH_BASIC_PASSWORD_FILE",
+                "DAGU_AUTH.BASIC.PASSWORD_FILE",
+            ],
+        )
+
+    def test_chart_guards_fold_aliases(self):
+        # Every extraEnv guard in configmap.yaml compares dagu.envConfigName,
+        # so a new guard written against the raw name fails here.
+        text = (REPO / "charts" / "dagu" / "templates" / "configmap.yaml").read_text(encoding="utf-8")
+        guards = [
+            line
+            for line in text.splitlines()
+            if re.search(r"\{\{-?\s*if\b.*\b(has|hasPrefix|hasSuffix|eq|contains)\b.*\.name\b", line)
+        ]
+        self.assertTrue(guards, "no extraEnv guard found in configmap.yaml")
+        for line in guards:
+            with self.subTest(line=line.strip()):
+                self.assertIn('(include "dagu.envConfigName" .name)', line)
 
 
 class Cli(unittest.TestCase):

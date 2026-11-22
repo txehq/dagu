@@ -1,5 +1,8 @@
+{{- /* Every extraEnv guard below compares dagu.envConfigName, which folds
+       Viper's dotted automatic aliases (DAGU_AUTH.PROXY.ENABLED) onto the
+       names listed; see _helpers.tpl (TXE-8035). */}}
 {{- range .Values.extraEnv }}
-{{- if hasPrefix "DAGU_AUTH_PROXY_" .name }}
+{{- if hasPrefix "DAGU_AUTH_PROXY_" (include "dagu.envConfigName" .name) }}
 {{- fail (printf "extraEnv entry %q must not configure proxy authentication; use auth.proxy values" .name) }}
 {{- end }}
 {{- end }}
@@ -8,7 +11,7 @@
 {{- fail "auth.basic.existingSecret is required when auth.mode=basic" }}
 {{- end }}
 {{- range .Values.extraEnv }}
-{{- if has .name (list "DAGU_AUTH_BASIC_USERNAME" "DAGU_AUTH_BASIC_PASSWORD") }}
+{{- if has (include "dagu.envConfigName" .name) (list "DAGU_AUTH_BASIC_USERNAME" "DAGU_AUTH_BASIC_PASSWORD" "DAGU_AUTH_BASIC_PASSWORD_FILE") }}
 {{- fail (printf "extraEnv entry %q conflicts with auth.basic; use the configured Secret keys" .name) }}
 {{- end }}
 {{- end }}
@@ -18,7 +21,7 @@
 {{- end }}
 {{- if .Values.license.existingSecret }}
 {{- range .Values.extraEnv }}
-{{- if has .name (list "DAGU_LICENSE" "DAGU_LICENSE_KEY" "DAGU_LICENSE_FILE") }}
+{{- if has (include "dagu.envConfigName" .name) (list "DAGU_LICENSE" "DAGU_LICENSE_KEY" "DAGU_LICENSE_FILE") }}
 {{- fail (printf "extraEnv entry %q must not configure licensing when license.existingSecret is set" .name) }}
 {{- end }}
 {{- end }}
@@ -31,7 +34,9 @@
 {{- fail "auth.builtin.token.secretKey is required when auth.builtin.token.existingSecret is set" }}
 {{- end }}
 {{- range .Values.extraEnv }}
-{{- if has .name (list "DAGU_AUTH_TOKEN_SECRET" "DAGU_AUTH_TOKEN_SECRET_FILE") }}
+{{- /* The bound names, then the automatic aliases of auth.builtin.token.secret
+       and secret_file (DAGU_AUTH.BUILTIN.TOKEN.SECRET wins over the Secret). */}}
+{{- if has (include "dagu.envConfigName" .name) (list "DAGU_AUTH_TOKEN_SECRET" "DAGU_AUTH_TOKEN_SECRET_FILE" "DAGU_AUTH_BUILTIN_TOKEN_SECRET" "DAGU_AUTH_BUILTIN_TOKEN_SECRET_FILE") }}
 {{- fail (printf "extraEnv entry %q conflicts with auth.builtin.token.existingSecret; use the configured Secret key" .name) }}
 {{- end }}
 {{- end }}
@@ -62,7 +67,7 @@
 {{- fail "auth.oidc.clientSecret.secretKey is required when auth.oidc.enabled=true" }}
 {{- end }}
 {{- range .Values.extraEnv }}
-{{- if hasPrefix "DAGU_AUTH_OIDC_" .name }}
+{{- if hasPrefix "DAGU_AUTH_OIDC_" (include "dagu.envConfigName" .name) }}
 {{- fail (printf "extraEnv entry %q must not configure OIDC when auth.oidc.enabled=true" .name) }}
 {{- end }}
 {{- end }}

@@ -1,0 +1,9 @@
+# Planted leak (inert fake data): binaryData under a credential key whose
+# decoded bytes are not UTF-8 (/w== is the single byte 0xff). No text rule can
+# see it; the key rule must still fail the check.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-planted-binary-raw
+binaryData:
+  token: /w==

@@ -10,6 +10,11 @@ Subcommands:
   derive  --config-dir DIR             print the credential keys derived from Dagu
   check   --config-dir DIR MANIFEST    check every ConfigMap in MANIFEST
   values  VALUES_YAML                  check the chart's values.yaml inputs
+  aliases --config-dir DIR MANIFEST    print every environment name that would
+                                       override a Secret-backed DAGU_ variable in
+                                       MANIFEST's workloads (render-check.sh
+                                       renders each with extraEnv and expects
+                                       the chart to refuse it)
 
 Exit codes: 0 clean, 1 a finding, 2 incomplete input (a derivation or manifest
 that could not be read completely). A derivation that finds nothing, or meets a
@@ -49,6 +54,11 @@ are parsed again, up to a fixed depth):
      passphrase, token, api_key, private_key, credential, client_secret, ...),
      except the explicit reference keys below, whose value must be a Kubernetes
      object name; a <credential>_file key must hold an absolute path;
+     rules 1 and 2 count a YAML bool (true, false, unquoted yes/on) at a
+     credential key as non-empty, since weakly typed config decoding turns
+     it into a non-empty string; a bool anywhere else is an ordinary flag. A binaryData key is checked
+     against its decoded bytes before any text decoding, so a value that is
+     not UTF-8 is still held to rules 1 and 2;
   3. a value shaped like a credential (PEM private key, GitHub or AWS token);
   4. any SECRET-VALUE canary (FAKE-SECRET-VALUE-...) planted by the fixtures.
      REFERENCE canaries (fake-ref-...) are names of Secrets and are allowed.
@@ -327,6 +337,8 @@ class Derived:
     keys: set[str] = field(default_factory=set)  # dotted, lowercase, [] for list items
     envs: set[str] = field(default_factory=set)  # upper-case, with DAGU_ prefix
     path_keys: set[str] = field(default_factory=set)
+    # Every envBindings entry, secret or not: DAGU_ environment name -> YAML key.
+    bindings: dict[str, str] = field(default_factory=dict)
     secret_bindings: int = 0
     secret_files: int = 0
     direct_envs: int = 0
@@ -397,6 +409,7 @@ def derive(config_dir: pathlib.Path) -> Derived:
         is_path = _bool(fields["isPath"], "envBindings isPath") if "isPath" in fields else False
         key = _resolve(fields["key"], consts, "envBindings key")
         env = _resolve(fields["env"], consts, "envBindings env")
+        d.bindings[APP_ENV_PREFIX + env.upper()] = key.lower()
         if is_secret:
             d.secret_bindings += 1
             if is_path or key.endswith("_file") or env.endswith("_FILE"):
@@ -483,11 +496,27 @@ def _segments(dotted: str) -> list[str]:
 
 
 def _non_empty(value: object) -> bool:
-    if value is None or isinstance(value, bool):
+    """Whether a leaf holds something. A bool is non-empty here: at a
+    credential key, `password: true` (or unquoted yes/on, which YAML resolves
+    to a bool) is a value weakly typed config decoding turns into a
+    non-empty string, so check_leaf applies the credential-key rules to it and
+    nothing else. Bytes (non-UTF-8 binaryData) are non-empty when they have
+    any length."""
+    if value is None:
         return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (bytes, bytearray)):
+        return len(value) > 0
     if isinstance(value, (dict, list)):
         return False
     return str(value).strip() != ""
+
+
+def _size(value: object) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return f"{len(value)} bytes"
+    return f"{len(str(value))} chars"
 
 
 @dataclass
@@ -499,7 +528,7 @@ class Checker:
         self.deny_paths = [_segments(k) for k in sorted(self.derived.keys)]
 
     def report(self, where: str, path: list[str], rule: str, value: object = None) -> None:
-        size = f", {len(str(value))} chars" if value is not None else ""
+        size = f", {_size(value)}" if value is not None else ""
         self.findings.append(f"{where} {_path_text(path)}: {rule} (value withheld{size})")
 
     def scan_text(self, where: str, text: str) -> None:
@@ -528,6 +557,13 @@ class Checker:
             self.report(where, path, "is a Dagu credential environment variable", value)
             return
         name = normalise_name(key)
+        if isinstance(value, bool):
+            # Only a credential key makes a bool a finding; ordinary flags
+            # (enabled: true) stay clean, and a bool at a reference or
+            # <credential>_file key holds no credential.
+            if name not in REFERENCE_KEYS and not name.endswith("_file") and CREDENTIAL_NAME.search(name):
+                self.report(where, path, "has a credential-bearing key name", value)
+            return
         if name in REFERENCE_KEYS:
             if not K8S_NAME.match(str(value)) or len(str(value)) > 253:
                 self.report(where, path, "is a reference key whose value is not a Kubernetes object name", value)
@@ -583,11 +619,16 @@ class Checker:
             except (binascii.Error, ValueError) as exc:
                 raise Incomplete(f"{where}: not valid base64") from exc
             try:
-                text = raw.decode("utf-8")
+                text: str | None = raw.decode("utf-8")
             except UnicodeDecodeError:
+                text = None
+            # The key rules run on the decoded value before choosing a text
+            # decoder, so a non-UTF-8 credential under a credential key is
+            # still a finding (binaryData: {token: /w==}).
+            self.check_leaf(where, [], str(key), raw if text is None else text)
+            if text is None:
                 self.scan_text(where, raw.decode("latin-1"))
                 continue
-            self.check_leaf(where, [], str(key), text)
             self.check_document(where, text)
 
 
@@ -618,6 +659,70 @@ def check_manifest(derived: Derived, text: str) -> list[str]:
     for cm in found:
         checker.check_configmap(cm)
     return checker.findings
+
+
+# ---------------------------------------------------------------- env aliases
+
+
+def conflict_names(derived: Derived, env_name: str) -> list[str]:
+    """Every environment name that sets the same Dagu setting as env_name.
+
+    For a bound name: the name, every other name bound to the same YAML key
+    (envBindings binds some keys twice, for legacy names), DAGU_ plus the key
+    upper-cased with its dots kept (Viper's AutomaticEnv alias, which wins over
+    the bound names), and the same for its <key>_file sibling when Dagu binds
+    one. A direct credential name (directCredentialEnv) has no YAML key and
+    stands alone. A DAGU_ name that is neither is not something Dagu reads:
+    exit 2.
+    """
+    key = derived.bindings.get(env_name)
+    if key is None:
+        if env_name in derived.envs:
+            return [env_name]
+        raise Incomplete(f"{env_name}: not a Dagu environment binding")
+    names = [env_name]
+    for k in (key, key + "_file"):
+        bound = sorted(env for env, bound_key in derived.bindings.items() if bound_key == k)
+        if bound:
+            names += bound + [APP_ENV_PREFIX + k.upper()]
+    return list(dict.fromkeys(names))
+
+
+def _secret_backed_envs(node: object) -> list[str]:
+    """DAGU_ names of container env entries filled from a secretKeyRef."""
+    out: list[str] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("containers", "initContainers") and isinstance(v, list):
+                for container in v:
+                    for entry in (container.get("env") or []) if isinstance(container, dict) else []:
+                        if not isinstance(entry, dict):
+                            continue
+                        name = str(entry.get("name", ""))
+                        source = entry.get("valueFrom")
+                        if name.startswith(APP_ENV_PREFIX) and isinstance(source, dict) and source.get("secretKeyRef"):
+                            out.append(name)
+            else:
+                out.extend(_secret_backed_envs(v))
+    elif isinstance(node, list):
+        for v in node:
+            out.extend(_secret_backed_envs(v))
+    return out
+
+
+def env_aliases(derived: Derived, text: str) -> list[str]:
+    """Every name an extraEnv entry could use to override a Secret-backed
+    DAGU_ variable in the rendered workloads; the chart must refuse each."""
+    import yaml
+
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except yaml.YAMLError as exc:
+        raise Incomplete(f"manifest is not valid YAML: {exc.__class__.__name__}") from exc
+    names: list[str] = []
+    for env in sorted(set(_secret_backed_envs(docs))):
+        names.extend(conflict_names(derived, env))
+    return list(dict.fromkeys(names))
 
 
 # ---------------------------------------------------------------- values.yaml
@@ -682,6 +787,9 @@ def main(argv: list[str]) -> int:
     p_check.add_argument("manifest", type=pathlib.Path)
     p_values = sub.add_parser("values")
     p_values.add_argument("values_file", type=pathlib.Path)
+    p_aliases = sub.add_parser("aliases")
+    p_aliases.add_argument("--config-dir", required=True, type=pathlib.Path)
+    p_aliases.add_argument("manifest", type=pathlib.Path)
     args = parser.parse_args(argv)
 
     try:
@@ -703,6 +811,10 @@ def main(argv: list[str]) -> int:
                 print(f"  env  {e}")
             for k in sorted(d.path_keys):
                 print(f"  file {k}")
+            return 0
+        if args.cmd == "aliases":
+            for name in env_aliases(derive(args.config_dir), args.manifest.read_text(encoding="utf-8")):
+                print(name)
             return 0
         if args.cmd == "check":
             d = derive(args.config_dir)

@@ -392,6 +392,8 @@ auth:
 
 The chart exposes the key only to the server container, as `DAGU_AUTH_TOKEN_SECRET`; it is never written to the chart-managed ConfigMap. Restart the UI Deployment after rotating the Secret. A new key invalidates every existing session.
 
+The chart refuses an `extraEnv` entry that would override the key: `DAGU_AUTH_TOKEN_SECRET`, `DAGU_AUTH_TOKEN_SECRET_FILE`, or a dotted name Dagu also reads, such as `DAGU_AUTH.BUILTIN.TOKEN.SECRET`, which would take priority over the Secret. The basic, license, OIDC and proxy guards refuse the dotted names in the same way.
+
 ##### Migrating from `auth.builtin.token.secret`
 
 Chart 2.0.6 and earlier rendered `auth.builtin.token.secret` into the config ConfigMap. Chart 2.0.7 refuses to render while that value is non-empty and prints these steps. Create a Secret holding the same value you had set, set `auth.builtin.token.existingSecret` to its name, and remove `auth.builtin.token.secret` from your values. With the same value, existing sessions stay valid. A release that never set the value needs no change.
