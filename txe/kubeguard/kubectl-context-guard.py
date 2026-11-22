@@ -155,8 +155,8 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 #     builtin, time, stdbuf, caffeinate, unbuffer (WRAPPERS, closed option tables), and k3s/microk8s/minikube
 #     before kubectl (VENDOR_WRAPPERS). EXCEPT sudo/doas shell modes (SHELL_MODE_OPTIONS: -s, -i, --shell,
 #     --login), which are code receivers and are refused in a client-relevant line.
-#   An OPAQUE executor or interpreter reading a pipe or an input redirection in a client-relevant line is refused,
-#   as a shell reading one is.
+#   In a client-relevant line: EVERY OPAQUE executor is refused (inherited stdin cannot be ruled out), and when the
+#   line carries input anywhere, every unclassified non-DATA_OPTIONS command is refused (Guard.line_input).
 UNMODELLED_SHELLS = {"fish"}
 KEYWORDS = {"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}", "time", "coproc"}
 OPAQUE = {"ssh", "find", "parallel", "su", "script", "expect", "tmux", "screen", "docker", "podman", "nsenter",
@@ -566,6 +566,11 @@ def simple_commands(s):
     return [c for c in cmds if c["words"] or c["stdin"] or c.get("redirect_targets")]
 
 
+def has_input_channel(cmd):
+    """True when a simple command reads input: a pipe, a here-document or here-string, or an input redirection."""
+    return bool(cmd.get("piped") or cmd["stdin"] or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", [])))
+
+
 def substitutions(text):
     """The inner text of every $(...), `...` and <(...)/>(...) in a word."""
     out, i, n = [], 0, len(text)
@@ -930,6 +935,11 @@ class Guard:
         # depth. When it is set, the whole command must match the kube-run exception's grammar (single_kube_run).
         self.kube_run_at = None
         self._top_k = 0
+        # INPUT-BEARING LINE (root msg_5bee06ed72f4): True once any simple command of the line (or of a nested text)
+        # reads a pipe, an input redirection, a here-document or a here-string. Grouping (`( ... )`, `{ ...; }`,
+        # loop bodies, `done < f`) lets a later command inherit that input without carrying the flag itself, so
+        # the receiver rules below use this line-wide fact rather than each simple command's own flags.
+        self.line_input = False
 
     # Top level: locate a refusal by simple-command index and character span.
     def check_top(self, text):
@@ -939,6 +949,7 @@ class Guard:
             # A command the hook cannot parse is ambiguous: refused whether or not its raw text names a client,
             # because bash may unquote what the text hides (`kube\ctl ... <<\EOF`).
             raise Refusal("H05")
+        self.line_input = self.line_input or any(has_input_channel(c) for c in cmds)
         for k, cmd in enumerate(cmds, 1):
             self._top_k = k
             try:
@@ -993,6 +1004,7 @@ class Guard:
             raise r
         if piped and cmds:
             cmds[0]["piped"] = True
+        self.line_input = self.line_input or any(has_input_channel(c) for c in cmds)
         for cmd in cmds:
             try:
                 self.check_cmd(cmd, depth)
@@ -1122,11 +1134,12 @@ class Guard:
             # `ssh host < <(echo kubectl get secrets)` feeds the process substitution's text to the remote shell).
             if any(mentions(t) for t in args + cmd["stdin"] + cmd.get("redirect_targets", [])):
                 raise Refusal("H03")
-            # The PIPE and an input redirection are channels too (connector review of b0e344e3:
-            # `echo 'kubectl get secrets' | su -s /bin/bash root`). In a client-relevant line an opaque executor
-            # reading either is refused (H03), the same rule as a shell or interpreter reading a pipe.
-            if self.whole_mentions and (
-                    cmd.get("piped") or any(op in INPUT_REDIRECTS for op, _ in cmd.get("redirects", []))):
+            # An opaque executor runs input the hook cannot place: its pipe, an input redirection, or stdin it
+            # INHERITS through a subshell, group or loop body (connector review of b0e344e3, `echo 'kubectl get
+            # secrets' | su -s /bin/bash root`; plugin review of a3f9e20f, `... | ( ssh host )`). Its own
+            # simple-command flags cannot rule that out, so in a client-relevant line EVERY opaque executor is
+            # refused (H03), as every xargs is (root msg_5bee06ed72f4).
+            if self.whole_mentions:
                 raise Refusal("H03")
             return
         if base in GLOBAL_MUTATORS:
@@ -1153,6 +1166,13 @@ class Guard:
                 data = False     # a redirection into a process substitution feeds another program
             if not data and (any(mentions(t) for t in args + targets + cmd["stdin"]) or mentions(cmd.get("raw", ""))):
                 raise Refusal("H15")
+            if not data and self.whole_mentions and self.line_input:
+                # An unclassified command may be a code receiver the hook does not list (`busybox sh`, `ash`, `pwsh`,
+                # a versioned `bash5.2`), and in a line that carries input it may read that input, directly or by
+                # inheritance through a group or loop (root msg_5bee06ed72f4). Fail closed: in a client-relevant,
+                # input-bearing line, only the DATA_OPTIONS set (with its listed options) and classified commands
+                # may run. Every other command is refused (H03), wherever it sits in the line.
+                raise Refusal("H03")
             return
         p = parse_flags(args, VALUE_FLAGS[fam])
         kind = classify(fam, p)

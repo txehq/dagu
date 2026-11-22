@@ -419,6 +419,33 @@ of four ways (the inventory is in the source, above `UNMODELLED_SHELLS`):
   sudo's and doas's shell modes (`-s`, `-i`, `--shell`, `--login`). They start a shell that reads the pipe or
   stdin, so they are code receivers, and in a client line they are refused (H03).
 
+**Input inherited across grouping boundaries (one audit, root msg_5bee06ed72f4).** The lexer splits simple
+commands at `(`, `)`, `;`, `&&`, `||` and newlines, so a command inside a subshell, group or loop does not carry
+the pipe or redirection that feeds the group (`... | ( cmd )`, `{ a; cmd; }`, `while ...; do cmd; done < f`).
+The smallest uniform rule does not depend on that per-command flag: in a client-relevant line, a receiver is
+judged by what it is, or by whether the line carries input anywhere.
+
+| Receiver in a client-relevant line | Rule | Grouped or inherited input |
+|---|---|---|
+| shell (`sh`, `bash`, `zsh`, `dash`, `ksh`) | exactly one literal inline channel (inline_program); a pipe or redirect is refused | supported: with no inline channel it is refused (H03) |
+| interpreter, `source`/`.` | always refused (H03) | supported |
+| `xargs` | always refused (H03) | supported |
+| OPAQUE executor (`ssh`, `su`, `docker`, `find`, ...) | always refused (H03) | supported |
+| sudo/doas shell mode | refused (H03) | supported |
+| fish | only a literal script path; any input refused | supported for the visible channels |
+| unclassified command (not DATA_OPTIONS) | refused (H03) when the LINE carries input anywhere (a pipe, an input redirection, a here-document or here-string) | supported: the line-wide test does not need the command's own flag |
+| DATA_OPTIONS command (`echo`, `printf`, `cat`, `grep`, `which`, `test`, `[`, `true`, `false`, `:`) with its listed options | may consume input | n/a: it runs nothing |
+| a script file (`bash x.sh`, `fish x.fish`) | opaque, as before | known limit: what the script reads is not visible |
+
+Known limits that remain: the tool's own stdin is not a line input and carries no line text. A script file's
+behaviour and run-time construction are the documented limits above.
+
+Expected false refusals from the receiver rules, in a client-relevant line:
+- any opaque executor (`ssh host uptime; echo kubectl`);
+- an unclassified command when the line carries input, including `tee`, `sort`, `read`, `jq` and `ls`.
+  Examples: `echo kubectl get pods | tee notes.txt` and `echo kubectl | while read x; do ...; done`.
+Write such lines without the client's name, or with a data command only.
+
 Expected false refusals from this rule: `fish -c 'echo hi'`, `echo x | fish`, and `env -S 'date\tx'` or
 `env -S '$HOME/bin/tool'`.
 

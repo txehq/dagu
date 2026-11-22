@@ -317,8 +317,23 @@ class Refused(unittest.TestCase):
                     "echo kubectl get ns | doas -s", "sudo -s <<< 'kubectl get ns'", "echo kubectl get ns | sudo -ns",
                     "echo kubectl get ns | timeout 5 sudo -s"):
             self.deny(cmd, "H03")
-        # Without a client in the line, these are unchanged.
-        for cmd in ("echo hi | sudo -s", "ls | ssh host cat", "sudo -n true", "echo x | su -s /bin/sh u"):
+        # Root msg_5bee06ed72f4. (1) Inherited stdin through a subshell, group or loop cannot be ruled out, so EVERY
+        # opaque executor in a client-relevant line is refused. (2) In a client-relevant line that carries input
+        # anywhere (pipe, input redirection, here-document or here-string), an unclassified command outside
+        # DATA_OPTIONS is refused wherever it sits: it may be an unlisted shell reading that input.
+        for cmd in ("echo 'kubectl get secrets' | ( ssh host )", "echo kubectl get ns | while read x; do ssh host; done",
+                    "echo kubectl > f; ( ssh host ) < f", "ssh host uptime; echo kubectl",    # the last: documented
+                    "echo 'kubectl get secrets' | busybox sh", "echo kubectl get ns | toybox sh", "echo kubectl | ash",
+                    "echo kubectl get ns | pwsh", "echo kubectl get ns | bash5.2",
+                    "( busybox sh ) < <(echo kubectl get ns)", "echo kubectl get ns | { true; busybox sh; }",
+                    "echo kubectl get ns | while read x; do busybox sh; done",
+                    "echo kubectl get pods | tee notes.txt", "echo kubectl | sort"):           # documented false refusals
+            self.deny(cmd, "H03")
+        # Without a client in the line, these are unchanged; and in a client line with input, the DATA_OPTIONS set
+        # may still consume it.
+        for cmd in ("echo hi | sudo -s", "ls | ssh host cat", "sudo -n true", "echo x | su -s /bin/sh u",
+                    "ls | busybox sh", "ssh host uptime", "echo kubectl get pods | grep pods", "echo kubectl get ns | cat",
+                    "cat > notes.md <<'EOF'\nkubectl get pods\nEOF"):
             self.assertIsNone(F.run(cmd)[0], cmd)
 
     def test_help_is_its_final_value_and_server_side_template_is_an_api_call(self):
@@ -741,7 +756,7 @@ class Allowed(unittest.TestCase):
             self.allow(cmd)
 
     def test_data_only_commands_and_pipes_without_a_client(self):
-        for cmd in ("echo kubectl get pods | tee notes.txt", "printf x | python3 -", "cat f | bash", "watch -n 5 date",
+        for cmd in ("echo kubectl get pods | grep pods", "printf x | python3 -", "cat f | bash", "watch -n 5 date",
                     "jq '.items' pods.json", "sort f | uniq -c", "cat <(echo hello)", "echo kubectl > notes.txt",
                     "grep -c kubectl README.md", "source ./env.sh", "git log --oneline", "man ls"):
             self.allow(cmd)
