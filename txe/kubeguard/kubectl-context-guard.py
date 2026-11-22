@@ -606,11 +606,15 @@ def _ansi_c(body):
 # hide the alternative. The expansion is BOUNDED and fails closed: a word with more than BRACE_WORD_BUDGET
 # expansions, a text with more than BRACE_TEXT_BUDGET in all or more than BRACE_CHAR_BUDGET expanded
 # characters, nesting deeper than BRACE_MAX_DEPTH, or a sequence it cannot bound counts as naming a client
-# (BraceOverBudget). Nothing is expanded combinatorially past the budget: the count is computed first.
+# (BraceOverBudget). Nothing is expanded past the budget: the word count AND the expanded length are computed from
+# the parsed groups first (_brace_cost), and only a word within every budget is built.
 BRACE_WORD_BUDGET = 256
 BRACE_TEXT_BUDGET = 4096
 BRACE_CHAR_BUDGET = 1 << 20
 BRACE_MAX_DEPTH = 16
+# Units examined by sequence checks in one text. A literal group (no comma) is not recursed into, but its inner
+# units are read as a possible sequence, so deeply nested literal braces would cost the square of their length.
+BRACE_WORK_BUDGET = 1 << 20
 # Characters that end a word for brace expansion: blanks, operators, and the delimiters of a substitution, whose
 # inner text holds words of its own.
 BRACE_BREAK = set(" \t\r\n;|&<>()`")
@@ -700,52 +704,74 @@ def _brace_sequence(inner):
     return None
 
 
-def _brace_parse(units, lo, hi, match, commas, depth):
+def _brace_parse(units, lo, hi, match, commas, depth, work):
     """units[lo:hi] as nodes: a str is literal, a list holds the alternatives (each a node list) of one group."""
     if depth > BRACE_MAX_DEPTH:
         raise BraceOverBudget
-    out, i = [], lo
+    out, lit, i = [], [], lo
+
+    def group(node):
+        if lit:                   # adjacent literal units become ONE string, so expansion copies runs, not chars
+            out.append("".join(lit))
+            lit.clear()
+        out.append(node)
+
     while i < hi:
         j = match.get(i) if units[i] == "{" else None
         if j is not None and j < hi:
             if commas[i]:
                 bounds = [i] + commas[i] + [j]
-                out.append([_brace_parse(units, a + 1, b, match, commas, depth + 1) for a, b in zip(bounds, bounds[1:])])
+                group([_brace_parse(units, a + 1, b, match, commas, depth + 1, work) for a, b in zip(bounds, bounds[1:])])
                 i = j + 1
                 continue
+            work[0] += j - i
+            if work[0] > BRACE_WORK_BUDGET:
+                raise BraceOverBudget
             seq = _brace_sequence(units[i + 1:j])
             if seq is not None:
-                out.append([[v] for v in seq])
+                group([[v] for v in seq])
                 i = j + 1
                 continue
-        out.append(units[i])      # literal, including a `{` that opens no group; groups inside it still expand
+        lit.append(units[i])      # literal, including a `{` that opens no group; groups inside it still expand
         i += 1
+    if lit:
+        out.append("".join(lit))
     return out
 
 
-def _brace_count(nodes, cap):
-    """How many words the nodes expand to, or cap + 1 once it is over cap."""
-    total = 1
+def _brace_cost(nodes, cap_words, cap_chars):
+    """(words, characters) the nodes expand to, COMPUTED WITHOUT EXPANDING (root's r29 review: the byte bound must
+    hold before anything is built). A prefix set of W words and C characters followed by a group whose alternatives
+    total w words and c characters gives W*w words and C*w + W*c characters. Past either cap it returns
+    (cap_words + 1, cap_chars + 1) at once."""
+    over = (cap_words + 1, cap_chars + 1)
+    words, chars = 1, 0
     for x in nodes:
-        if isinstance(x, list):
-            s = 0
+        if isinstance(x, str):
+            chars += words * len(x)
+        else:
+            w = c = 0
             for alt in x:
-                s += _brace_count(alt, cap)
-                if s > cap:
-                    return cap + 1
-            total *= s
-            if total > cap:
-                return cap + 1
-    return total
+                aw, ac = _brace_cost(alt, cap_words, cap_chars)
+                w, c = w + aw, c + ac
+                if w > cap_words or c > cap_chars:
+                    return over
+            words, chars = words * w, chars * w + words * c
+        if words > cap_words or chars > cap_chars:
+            return over
+    return words, chars
 
 
 def _brace_expand(nodes):
+    """Called only after _brace_cost has bounded the result. Every alternative yields at least one word, so no
+    partial list is larger than the result; each alternative is expanded once."""
     outs = [""]
     for x in nodes:
         if isinstance(x, str):
             outs = [o + x for o in outs]
         else:
-            outs = [o + e for o in outs for alt in x for e in _brace_expand(alt)]
+            alts = [e for alt in x for e in _brace_expand(alt)]
+            outs = [o + e for o in outs for e in alts]
     return outs
 
 
@@ -756,7 +782,7 @@ def brace_expanded(text):
     bound (see BRACE_WORD_BUDGET)."""
     if "{" not in text:
         return None
-    out, total, chars, changed = [], 0, 0, False
+    out, total, chars, changed, work = [], 0, 0, False, [0]
     for kind, val in _brace_words(text):
         if kind == "sep" or "{" not in val:
             out.append(val if kind == "sep" else "".join(val))
@@ -770,19 +796,18 @@ def brace_expanded(text):
                 match[stack.pop()] = k
             elif u == "," and stack:
                 commas[stack[-1]].append(k)
-        nodes = _brace_parse(val, 0, len(val), match, commas, 0)
+        nodes = _brace_parse(val, 0, len(val), match, commas, 0, work)
         if all(isinstance(x, str) for x in nodes):
             out.append("".join(val))
             continue
-        count = _brace_count(nodes, BRACE_WORD_BUDGET)
+        # Preflight: the word count and the expanded length (plus one separator per word) are checked against every
+        # budget BEFORE _brace_expand builds a single string.
+        count, length = _brace_cost(nodes, BRACE_WORD_BUDGET, BRACE_CHAR_BUDGET - chars)
         total += count
-        if count > BRACE_WORD_BUDGET or total > BRACE_TEXT_BUDGET:
+        chars += length + count
+        if count > BRACE_WORD_BUDGET or total > BRACE_TEXT_BUDGET or chars > BRACE_CHAR_BUDGET:
             raise BraceOverBudget
-        words = _brace_expand(nodes)
-        chars += sum(map(len, words)) + len(words)
-        if chars > BRACE_CHAR_BUDGET:
-            raise BraceOverBudget
-        out.append(" ".join(words))
+        out.append(" ".join(_brace_expand(nodes)))
         changed = True
     return "".join(out) if changed else None
 

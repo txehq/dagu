@@ -772,6 +772,45 @@ class PairingWithKubeRun(unittest.TestCase):
             self.assertEqual(cm.exception.code, "KR04", extra)
 
 
+class BraceBudget(unittest.TestCase):
+    """Root's r29 review: the byte bound must hold BEFORE any expansion is built. Pure, inert strings: the mention
+    check is called directly, and the expansion builder is replaced by one that fails the test if it is entered."""
+
+    def test_cost_is_computed_without_expanding(self):
+        self.assertEqual(GUARD._brace_cost(["kube", [["ctl"], ["x"]]], 256, 1 << 20), (2, 12))   # kubectl kubex
+        self.assertEqual(GUARD._brace_cost([["a", [["b"], ["c"]]], ["d"]], 256, 1 << 20), (3, 5))  # ab ac d
+        self.assertEqual(GUARD._brace_cost(["p", [["a"], ["b"]], [["c"], ["d"]], "s"], 256, 1 << 20), (4, 16))
+        self.assertEqual(GUARD._brace_cost(["x", [["a"]] * 257], 256, 1 << 20), (257, (1 << 20) + 1))
+        self.assertEqual(GUARD._brace_cost(["x" * 100, [["a"], ["b"]]], 256, 150), (257, 151))
+        self.assertEqual(GUARD.brace_expanded("echo p{a,b}{c,d}s"), "echo pacs pads pbcs pbds")
+
+    def test_over_budget_words_are_refused_before_the_builder_is_entered(self):
+        entered = []
+
+        def builder(nodes):
+            entered.append(len(nodes))
+            raise AssertionError("_brace_expand entered for an over-budget word")
+
+        cases = (
+            "echo " + "x" * 5000 + "{" + ",".join("a" * 256) + "} | bash",   # 256 words x 5001 chars > 1 MiB
+            "echo x{" + ",".join("a" * 257) + "} | bash",                     # 257 words > 256
+            "echo " + "{a,b}" * 9 + " | bash",                                # 512 words
+            "echo " + "{" * 3000 + "x" + "}" * 3000 + " | bash",              # nested literal braces: work bound
+        )
+        saved = GUARD._brace_expand
+        GUARD._brace_expand = builder
+        try:
+            for text in cases:
+                self.assertTrue(GUARD.mentions(text), text[:40])
+                with self.assertRaises(GUARD.BraceOverBudget):
+                    GUARD.brace_expanded(text)
+        finally:
+            GUARD._brace_expand = saved
+        self.assertEqual(entered, [])
+        # Within budget, the builder is used and the result is exact.
+        self.assertEqual(GUARD.brace_expanded("echo kube{ctl,x}"), "echo kubectl kubex")
+
+
 class ShortOptionPairing(unittest.TestCase):
     """The hook and kube-run each keep a copy of the shorthand rule, because the hook must run standalone. This
     pins the copies to each other for every value-taking letter and every recognised boolean letter, in every

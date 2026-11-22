@@ -308,8 +308,10 @@ expanded STRUCTURALLY (`brace_expanded`). Deleting the braces instead would read
   bash'`).
 - A numeric sequence contributes only its single unpadded digits, plus one inert sentinel, because no client name
   holds two adjacent digits. So `k{1..500}s` is 10 alternatives, not 500.
-- **Fail closed past a bound.** The count is computed before anything is expanded. These count as naming a
-  client:
+- **Fail closed past a bound.** The word count AND the expanded length are computed from the parsed groups
+  (`_brace_cost`) before any string is built, so an over-budget word never reaches the builder. These count as
+  naming a client:
+  - more than 1 Mi units examined by sequence checks in one text (deeply nested literal braces);
   - a word with more than 256 expansions, or a text with more than 4096 in all;
   - more than 1 MiB of expanded text;
   - nesting deeper than 16;
