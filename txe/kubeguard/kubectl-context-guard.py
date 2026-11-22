@@ -600,33 +600,244 @@ def _ansi_c(body):
     return ANSI_C_ESCAPE.sub(one, body)
 
 
+# BRACE EXPANSION for the mention check (root msg_205b648bd468). Bash expands `kube{ctl,x}` to `kubectl kubex`
+# before it runs anything, with no variable and no file involved, so a name can be assembled from deterministic
+# brace alternatives. The words are expanded structurally: deleting braces and commas would give `kubectlx` and
+# hide the alternative. The expansion is BOUNDED and fails closed: a word with more than BRACE_WORD_BUDGET
+# expansions, a text with more than BRACE_TEXT_BUDGET in all or more than BRACE_CHAR_BUDGET expanded
+# characters, nesting deeper than BRACE_MAX_DEPTH, or a sequence it cannot bound counts as naming a client
+# (BraceOverBudget). Nothing is expanded combinatorially past the budget: the count is computed first.
+BRACE_WORD_BUDGET = 256
+BRACE_TEXT_BUDGET = 4096
+BRACE_CHAR_BUDGET = 1 << 20
+BRACE_MAX_DEPTH = 16
+# Characters that end a word for brace expansion: blanks, operators, and the delimiters of a substitution, whose
+# inner text holds words of its own.
+BRACE_BREAK = set(" \t\r\n;|&<>()`")
+# {x..y[..incr]}: integers, or single characters. A mixed or other form is literal in Bash; reading it as a
+# character sequence only adds forms.
+BRACE_NUMERIC_SEQ = re.compile(r"([-+]?\d+)\.\.([-+]?\d+)(?:\.\.([-+]?\d+))?")
+BRACE_CHAR_SEQ = re.compile(r"(\S)\.\.(\S)(?:\.\.([-+]?\d+))?")
+# A numeric sequence contributes only digits and signs. No client name holds two adjacent digits, so a member
+# other than a single unpadded digit stands as this sentinel, which can be part of no name.
+BRACE_NUMERIC_OTHER = "00"
+
+
+class BraceOverBudget(Exception):
+    pass
+
+
+def _brace_words(text):
+    """The text as ("sep", char) and ("word", units) items for brace expansion. A unit is one unquoted character,
+    or a whole quoted string, escape or ${...} with its quoting kept, so only an UNQUOTED `{`, `,` or `}` is a
+    one-character unit (Bash does not expand quoted or escaped braces, nor ${...})."""
+    items, word, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in BRACE_BREAK:
+            if word:
+                items.append(("word", word))
+                word = []
+            items.append(("sep", c))
+            i += 1
+        elif c == "\\":
+            word.append(text[i:i + 2])
+            i += 2
+        elif c == "'" or text.startswith("$'", i):
+            ansi = c == "$"
+            j = i + (2 if ansi else 1)
+            while j < n and text[j] != "'":
+                j += 2 if ansi and text[j] == "\\" else 1
+            word.append(text[i:j + 1])
+            i = j + 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            word.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("${", i):
+            j, d = i + 2, 1
+            while j < n and d:
+                d += {"{": 1, "}": -1}.get(text[j], 0)
+                j += 1
+            word.append(text[i:j])
+            i = j
+        else:
+            word.append(c)
+            i += 1
+    if word:
+        items.append(("word", word))
+    return items
+
+
+def _brace_sequence(inner):
+    """The members of a sequence expression {x..y[..incr]} as alternatives, or None when it is not one."""
+    if not inner or any(len(u) != 1 for u in inner):
+        return None
+    s = "".join(inner)
+    try:
+        m = BRACE_NUMERIC_SEQ.fullmatch(s)
+        if m:
+            a, b = int(m[1]), int(m[2])
+            step = abs(int(m[3])) if m[3] else 1
+            step = step or 1
+            lo, hi = min(a, b), max(a, b)
+            padded = any(re.match(r"[-+]?0\d", x) for x in (m[1], m[2]))
+            singles = [] if padded else [str(d) for d in range(10) if lo <= d <= hi and (d - a) % step == 0]
+            return singles + ([BRACE_NUMERIC_OTHER] if (hi - lo) // step + 1 > len(singles) else [])
+        m = BRACE_CHAR_SEQ.fullmatch(s)
+        if m:
+            a, b = ord(m[1]), ord(m[2])
+            step = abs(int(m[3])) if m[3] else 1
+            step = step or 1
+            lo, hi = min(a, b), max(a, b)
+            if (hi - lo) // step + 1 > BRACE_WORD_BUDGET:
+                raise BraceOverBudget
+            return [chr(c) for c in range(lo, hi + 1) if (c - a) % step == 0]
+    except ValueError:            # an integer too long to convert: not bounded here
+        raise BraceOverBudget
+    return None
+
+
+def _brace_parse(units, lo, hi, match, commas, depth):
+    """units[lo:hi] as nodes: a str is literal, a list holds the alternatives (each a node list) of one group."""
+    if depth > BRACE_MAX_DEPTH:
+        raise BraceOverBudget
+    out, i = [], lo
+    while i < hi:
+        j = match.get(i) if units[i] == "{" else None
+        if j is not None and j < hi:
+            if commas[i]:
+                bounds = [i] + commas[i] + [j]
+                out.append([_brace_parse(units, a + 1, b, match, commas, depth + 1) for a, b in zip(bounds, bounds[1:])])
+                i = j + 1
+                continue
+            seq = _brace_sequence(units[i + 1:j])
+            if seq is not None:
+                out.append([[v] for v in seq])
+                i = j + 1
+                continue
+        out.append(units[i])      # literal, including a `{` that opens no group; groups inside it still expand
+        i += 1
+    return out
+
+
+def _brace_count(nodes, cap):
+    """How many words the nodes expand to, or cap + 1 once it is over cap."""
+    total = 1
+    for x in nodes:
+        if isinstance(x, list):
+            s = 0
+            for alt in x:
+                s += _brace_count(alt, cap)
+                if s > cap:
+                    return cap + 1
+            total *= s
+            if total > cap:
+                return cap + 1
+    return total
+
+
+def _brace_expand(nodes):
+    outs = [""]
+    for x in nodes:
+        if isinstance(x, str):
+            outs = [o + x for o in outs]
+        else:
+            outs = [o + e for o in outs for alt in x for e in _brace_expand(alt)]
+    return outs
+
+
+def brace_expanded(text):
+    """The text with each brace-expanded word replaced by its expansions, separated by spaces, or None when no word
+    expands. Bash's matching: a `{` opens a group at its matching unquoted `}` when it has a top-level comma or is a
+    sequence expression; otherwise it is literal and scanning goes on inside it. Raises BraceOverBudget past a
+    bound (see BRACE_WORD_BUDGET)."""
+    if "{" not in text:
+        return None
+    out, total, chars, changed = [], 0, 0, False
+    for kind, val in _brace_words(text):
+        if kind == "sep" or "{" not in val:
+            out.append(val if kind == "sep" else "".join(val))
+            continue
+        match, commas, stack = {}, {}, []
+        for k, u in enumerate(val):           # one pass: Bash's nesting count, and each group's top-level commas
+            if u == "{":
+                stack.append(k)
+                commas[k] = []
+            elif u == "}" and stack:
+                match[stack.pop()] = k
+            elif u == "," and stack:
+                commas[stack[-1]].append(k)
+        nodes = _brace_parse(val, 0, len(val), match, commas, 0)
+        if all(isinstance(x, str) for x in nodes):
+            out.append("".join(val))
+            continue
+        count = _brace_count(nodes, BRACE_WORD_BUDGET)
+        total += count
+        if count > BRACE_WORD_BUDGET or total > BRACE_TEXT_BUDGET:
+            raise BraceOverBudget
+        words = _brace_expand(nodes)
+        chars += sum(map(len, words)) + len(words)
+        if chars > BRACE_CHAR_BUDGET:
+            raise BraceOverBudget
+        out.append(" ".join(words))
+        changed = True
+    return "".join(out) if changed else None
+
+
+def _strip_quotes(text):
+    return re.sub(r"[\\'\"]", "", text)
+
+
 def mention_forms(text):
-    """The forms of a text the mention check reads. It parses nothing, so it also covers text the lexer cannot read
-    (a here-document body, a raw JSON event), and each form only ADDS matches:
+    """The forms of a text the mention check reads. It parses no command structure, so it also covers text the lexer
+    cannot read (a here-document body, a raw JSON event), and each form only ADDS matches:
       - the text itself;
       - the text with backslashes removed (`kube\\ctl` runs kubectl);
       - QUOTE-DECODED: line continuations removed, then every quote character and backslash removed, so quote
         removal cannot split a name (`kube''ctl`, `kube"c"tl`, `'kube'ctl`, `kube$""ctl`);
-      - the same after every $'...' is ANSI-C decoded (`$'\\x6bubectl'`, `kube$'\\x63'tl`).
+      - the same after every $'...' is ANSI-C decoded (`$'\\x6bubectl'`, `kube$'\\x63'tl`);
+      - BRACE-EXPANDED (brace_expanded): each of those bases with its brace words expanded, first honouring the
+        quotes (Bash's own order: braces, then quote removal), then once more with the quotes already removed, so
+        braces inside a quoted string that a nested shell later reads (`bash -c 'echo kube{ctl,x} | bash'`)
+        count too.
     Deleting every quote over-approximates quote removal: a quote that is itself data (`"it's"`) joins the text
-    around it too. That direction can only refuse more."""
+    around it too. That direction can only refuse more. Raises BraceOverBudget past a brace bound."""
     forms = [text]
     if "\\" in text:
         forms.append(text.replace("\\", ""))
-    if any(c in text for c in "'\"\\"):
-        # $"..." is locale quoting: with no translation it is "...", so its `$` goes too.
-        joined = text.replace("\\\r\n", "").replace("\\\n", "").replace('$"', '"')
-        forms.append(re.sub(r"[\\'\"]", "", joined))
-        if "$'" in joined:
-            decoded = ANSI_C.sub(lambda m: _ansi_c(m.group(1)), joined)
-            forms.append(re.sub(r"[\\'\"]", "", decoded))
+    quoted = any(c in text for c in "'\"\\")
+    # $"..." is locale quoting: with no translation it is "...", so its `$` goes too.
+    joined = text.replace("\\\r\n", "").replace("\\\n", "").replace('$"', '"') if quoted else text
+    bases = [joined]
+    if "$'" in joined:
+        bases.append(ANSI_C.sub(lambda m: _ansi_c(m.group(1)), joined))
+    for base in bases:
+        stripped = _strip_quotes(base) if quoted else base
+        if quoted:
+            forms.append(stripped)
+        if "{" in base:
+            expanded = brace_expanded(base)
+            if expanded is not None:
+                forms.append(_strip_quotes(expanded))
+            if quoted:
+                expanded = brace_expanded(stripped)
+                if expanded is not None:
+                    forms.append(expanded)
     return forms
 
 
 def mentions(text):
-    """True when any form of the text (mention_forms) names a cluster client. A superset of the raw-text check, so
-    every caller refuses at least what it refused before."""
-    return any(MENTION.search(t) or MENTION_ATTACHED.search(t) for t in mention_forms(text))
+    """True when any form of the text (mention_forms) names a cluster client, or when its brace expansion is over a
+    bound (fail closed). A superset of the raw-text check, so every caller refuses at least what it refused
+    before."""
+    try:
+        forms = mention_forms(text)
+    except BraceOverBudget:
+        return True
+    return any(MENTION.search(t) or MENTION_ATTACHED.search(t) for t in forms)
 
 
 class Refusal(Exception):

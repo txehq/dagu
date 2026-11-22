@@ -294,8 +294,34 @@ ANSI-C decoded, `$"..."` read as `"..."`, then every quote and backslash removed
 assembles (`echo kube''ctl get secrets | bash`, `cat <<'EOF' | bash` over `kube"c"tl`, `$'\x6bubectl'`) marks
 the line client-relevant, and the pipe receiver is refused (H03). The decoding parses nothing, so it also covers
 text the lexer cannot read, such as here-document bodies and raw event JSON. Deleting every quote
-over-approximates quote removal; that can only refuse more. A name built at RUN TIME (`printf %s%s kube ctl`,
-`kube${x}ctl`, `$(echo kube)ctl`) is not quote removal and is not claimed to be caught.
+over-approximates quote removal; that can only refuse more.
+
+**Brace alternatives are expanded, bounded.** Bash expands `kube{ctl,x}` to `kubectl kubex` before it runs
+anything, with no variable or file involved. So `mention_forms` also reads each base with its brace words
+expanded STRUCTURALLY (`brace_expanded`). Deleting the braces instead would read `kubectlx`.
+- The expansion follows Bash's matching. A `{` opens a group at its matching unquoted `}` when it has a
+  top-level comma or is a sequence `{x..y[..incr]}`. Otherwise it is literal, and the groups inside it still
+  expand.
+- Alternatives may be empty, nested or adjacent, and they compose with any prefix and suffix.
+- Quoted and escaped braces and `${...}` are literal for this shell. They are expanded once more with the quotes
+  removed, because a downstream shell may expand them (`echo kube\{ctl,x\} | bash`, `bash -c 'echo kube{ctl,x} |
+  bash'`).
+- A numeric sequence contributes only its single unpadded digits, plus one inert sentinel, because no client name
+  holds two adjacent digits. So `k{1..500}s` is 10 alternatives, not 500.
+- **Fail closed past a bound.** The count is computed before anything is expanded. These count as naming a
+  client:
+  - a word with more than 256 expansions, or a text with more than 4096 in all;
+  - more than 1 MiB of expanded text;
+  - nesting deeper than 16;
+  - a character sequence of more than 256 members;
+  - an integer endpoint too long to convert.
+- **Expected false refusals from the bound:** an over-budget brace word in a line where a mention matters is
+  refused. Examples: `touch {a..z}{a..z}` (676 words; an unclassified command, H15), `echo {a,b}{a,b}... | bash`,
+  and an inline JSON object with more than 256 top-level keys passed to an unclassified command. In a data
+  command with no code receiver (`echo {a..z}{a..z}`), nothing changes.
+
+A name built at RUN TIME (`printf %s%s kube ctl`, `kube${x}ctl`, `$(echo kube)ctl`, a glob) is not quote
+removal or brace expansion, and is not claimed to be caught.
 
 **The parser boundary is a limit.** The input-channel classifier refuses the shapes it models: script and file
 operands, input redirections, pipes, startup-file and unknown options, more than one channel, and non-literal

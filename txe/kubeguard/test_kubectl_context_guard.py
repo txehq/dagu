@@ -195,6 +195,33 @@ class Refused(unittest.TestCase):
         # The direct spellings stay H01 (Allowed.test_quote_decoded_data_without_a_code_receiver has the data side).
         self.deny("kube''ctl get pods", "H01")
 
+    def test_brace_alternatives_mark_the_line_for_pipe_receivers(self):
+        # Root msg_205b648bd468: deterministic brace alternatives are expanded structurally (not by deleting braces,
+        # which would read `kube{ctl,x}` as `kubectlx`), bounded, and fail closed past the bound.
+        for name in ("kube{ctl,x}", "kube{ctl,}", "{kubectl,x}", "{x,kubectl}", "{ku,x}be{ctl,y}",    # suffix, prefix
+                     "ku{b{e,x},y}ctl", "k{u,x}{b,y}{e,z}ctl",                                        # nested, adjacent
+                     "kub{e..e}ctl", "k{8..9}s", "k{1..500}s", "k{9..1..2}s", "kube{c..d}tl",          # sequences
+                     "kube{\"ctl\",x}", "kube{'c'tl,x}", "{he,x}lm", "{fl,x}ux", "kube{ctl,x}{,}"):
+            for cmd in (f"echo {name} get secrets | bash", f"printf '%s\\n' {name} | sh",
+                        f"echo {name} get ns > >(bash)", f"bash <(echo {name} get ns)",
+                        f"echo {name} get ns | python3"):
+                self.deny(cmd, "H03")
+        # Braces inside a quoted string that a nested shell reads, and braces quoted or escaped for THIS shell that
+        # the downstream shell then expands (`echo kube\{ctl,x\}` prints `kube{ctl,x}`, which `bash` expands).
+        r = self.deny("bash -c 'echo kube{ctl,x} get secrets | bash'", "H03")
+        self.assertIn("nested", r)
+        for cmd in ("echo kube\\{ctl,x\\} get secrets | bash", "echo 'kube{ctl,x}' get secrets | bash",
+                    'echo "{kube,x}ctl get secrets" | sh'):
+            self.deny(cmd, "H03")
+        self.deny("cat <<'EOF' | bash\necho kube{ctl,x} get secrets\nEOF", "H03")
+        # Over a bound: refused as if it named a client (the line reaches a shell).
+        self.deny("echo " + "{a,b}" * 9 + " | bash", "H03")                         # 512 > 256 words
+        self.deny("echo " + "{a," * 17 + "b" + "}" * 17 + " | bash", "H03")          # nesting 17 > 16
+        self.deny("echo {a..z}{a..z} | sh", "H03")                                   # 676 > 256 words
+        self.deny("echo {0.." + "9" * 5000 + "} | sh", "H03")                       # an endpoint int() refuses
+        # As a command word, the word itself is not a client name, so it is an unclassified command naming one.
+        self.deny("kube{ctl,x} get pods", "H15")
+
     def test_nested_shells_and_substitutions(self):
         for cmd in ("bash -c 'kubectl get pods'", 'zsh -lc "kubectl get pods"', 'eval "kubectl get pods"',
                     "sh <<'EOF'\nkubectl get pods\nEOF", "bash <<< 'kubectl get pods'", "X=$(kubectl get ns)",
@@ -654,6 +681,16 @@ class Allowed(unittest.TestCase):
         # code. A decoded name in plain data is still data, and quoting that assembles no name is not a mention.
         for cmd in ("echo kube''ctl get pods", "echo kube''ctl get pods > notes.txt", "echo 'it''s' | bash",
                     "echo \"don't\" | sh", "echo 'kube' ctl | bash", "printf '%s\\n' kube ctl | sh"):
+            self.allow(cmd)
+
+    def test_brace_forms_that_assemble_no_client_name(self):
+        # Literal braces (no comma, not a sequence), unmatched braces, quoted or escaped braces, ${...}, braces
+        # split across words, and alternatives that form no name stay allowed. Over-budget forms in plain data
+        # are allowed too: the bound refuses only where a mention would.
+        for cmd in ("echo kube{ctl} | bash", "echo kube{ctl,x | bash", "echo {kube,x} ctl | bash",
+                    "echo ${HOME} | bash", "echo {1..3} | sh", "echo {a..z} | sh", "echo {1..5000} | sh",
+                    "mkdir -p a/{b,c}", "echo " + "{a,b}" * 9,
+                    "find . -name x -exec echo {} \\;"):
             self.allow(cmd)
 
     def test_input_with_no_command_is_ignored(self):
