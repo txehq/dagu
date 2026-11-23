@@ -46,6 +46,10 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   documentation, not observed here). A mount
   that would be, contain or lie inside the shared caches, GOPATH, HOME, the Docker socket or the
   live tree is refused before docker runs.
+- **Mount paths must be plain enough for docker's `--mount`.** Its value is comma-separated fields, and the runner
+  does not quote them. A `--workdir-root` (or any mount source or target) containing a comma, a double quote, or a
+  line break (LF or CR) is refused with exit 2 before any docker call, never passed to docker split or corrupted.
+  Every other path character, spaces included, is passed as is.
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod
   download` fills an owned cache from the unmutated copy with
   `GOPROXY=file://<shared GOMODCACHE>/cache/download,<your GOPROXY>`. Go never writes to a file

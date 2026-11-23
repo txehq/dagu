@@ -67,7 +67,7 @@ func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 		effect = sideEffect[0]
 	}
 	src := `#!/usr/bin/env python3
-import hashlib, json, os, subprocess, sys, time
+import csv, hashlib, json, os, subprocess, sys, time
 LOG = ` + fmt.Sprintf("%q", log) + `
 REG = LOG + ".containers"
 SECRET_DIR = os.path.join(os.path.dirname(LOG), "host-private")
@@ -140,8 +140,9 @@ while i < len(args) and args[i].startswith("--"):
     if flag in VALUED:
         val = args[i + 1]
         i += 2
-        if flag == "--mount":
-            kv = dict(p.split("=", 1) for p in val.split(",") if "=" in p)
+        if flag == "--mount":  # CSV, as docker parses it: an unquoted comma splits a field
+            fields = next(csv.reader([val]))
+            kv = dict(p.split("=", 1) for p in fields if "=" in p)
             mounts[kv["target"]] = kv["source"]
         elif flag == "--env":
             k, v = val.split("=", 1)
@@ -277,7 +278,7 @@ const keptReadCap, keptMaxFiles = 8192, 16
 func logKeptEvidence(t *testing.T, stderr, log string) {
 	t.Helper()
 	const kept = "work directory kept: "
-	for _, line := range strings.Split(stderr, "\n") {
+	for line := range strings.SplitSeq(stderr, "\n") {
 		dir, ok := strings.CutPrefix(line, kept)
 		if !ok {
 			continue
@@ -610,6 +611,37 @@ func TestMutantListRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// docker reads --mount as comma-separated fields, and the runner does not quote. A work root whose
+// path holds a comma, a double quote or a line break is refused (exit 2) before any docker call,
+// so no container is ever created with a corrupted mount. An ordinary path with a space still runs,
+// mounted as given. (Found when a test's temporary directory held a comma: the mount was split.)
+func TestMountFieldsRefuseCSVCharacters(t *testing.T) {
+	for name, bad := range map[string]string{"comma": ",", "double quote": `"`, "line feed": "\n", "carriage return": "\r"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			root := filepath.Join(f.root, "work"+bad+"root")
+			require.NoError(t, os.MkdirAll(root, 0o755))
+			o := f.diag(t, "--workdir-root", root)
+			assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "refused")
+			assert.Contains(t, o.stderr, "cannot carry unquoted")
+			_, err := os.Stat(f.log)
+			assert.True(t, os.IsNotExist(err), "no docker call at all, not even the image check")
+			assert.Empty(t, registry(t, f.log), "no container was created")
+		})
+	}
+	t.Run("a space is ordinary", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		root := filepath.Join(f.root, "work root")
+		require.NoError(t, os.MkdirAll(root, 0o755))
+		o := f.diag(t, "--workdir-root", root)
+		require.Equal(t, 7, o.code, o.stdout+o.stderr)
+		runs := dockerRuns(t, f.log)
+		require.Len(t, runs, 1)
+		assert.Contains(t, strings.Join(mountArgs(runs[0]), "\n"), "/work root/", "the spaced path is mounted as given")
+	})
 }
 
 // check_mounts and check_workdir refuse any source that is, contains or lies inside protected state.
@@ -3031,9 +3063,11 @@ func TestAfterRunIntegrityErrorKeepsContainerPending(t *testing.T) {
 		image, flag, want string
 		left              bool
 	}{
-		"still present, removed":  {"staysup", "", ": removed", false},
-		"still present, rm fails": {"staysup", ".rmfail", "rm failed", true},
-		"gone, absence confirmed": {"fixture-image", "", ": absent", false},
+		// No comma in these names: t.TempDir keeps it in the work path, which the runner now refuses
+		// (TestMountFieldsRefuseCSVCharacters is that path's own regression).
+		"still present - removed":  {"staysup", "", ": removed", false},
+		"still present - rm fails": {"staysup", ".rmfail", "rm failed", true},
+		"gone - absence confirmed": {"fixture-image", "", ": absent", false},
 	}
 	for name, c := range cases {
 		for _, mode := range []string{"diagnostic", "mutation"} {

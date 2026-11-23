@@ -231,14 +231,31 @@ def within(child: Path, parent: Path) -> bool:
     return child == parent or parent in child.parents
 
 
+MOUNT_FIELD_FORBIDDEN = {",": "a comma", '"': "a double quote", "\n": "a line feed", "\r": "a carriage return"}
+
+
+def check_mount_field(what: str, value: str) -> None:
+    """Refuse a path that docker's --mount cannot carry as written. The value is comma-separated
+    key=value fields (CSV), and this runner does not quote, so a comma, a double quote or a line
+    break would split or corrupt a field. Every other character (spaces included) is passed as is."""
+    for ch, desc in MOUNT_FIELD_FORBIDDEN.items():
+        if ch in value:
+            raise Refused(f"{what} {value!r} contains {desc}, which docker's comma-separated --mount value cannot "
+                          "carry unquoted; use a path without commas, double quotes or line breaks "
+                          "(for the work directory: pass --workdir-root elsewhere)")
+
+
 def check_mounts(mounts: list[tuple[Path, str, bool]], owned: Path, forbidden: dict[str, Path]) -> None:
-    """Refuse any bind mount that could expose host state.
+    """Refuse any bind mount that could expose host state, or that docker's --mount cannot carry.
 
     Every source must lie inside the run's own work directory, and must neither contain nor lie
     inside a forbidden path (the shared caches, GOPATH, HOME, the Docker socket, the live tree).
+    Every source and target is exactly what docker_argv writes (check_mount_field).
     """
     owned = real(owned)
-    for src, _dst, _ro in mounts:
+    for src, dst, _ro in mounts:
+        check_mount_field("mount source", str(real(src)))
+        check_mount_field("mount target", dst)
         r = real(src)
         if not within(r, owned) or r == owned:
             raise Refused(f"mount source {r} is not inside this run's work directory {owned}")
@@ -261,7 +278,10 @@ def check_mounts(mounts: list[tuple[Path, str, bool]], owned: Path, forbidden: d
 
 
 def check_workdir(work: Path, forbidden: dict[str, Path]) -> None:
+    """main checks --workdir-root here before its first docker call, so a root whose run directory
+    could never be mounted is refused with no docker call at all."""
     w = real(work)
+    check_mount_field("work directory", str(w))
     for name, f in forbidden.items():
         fr = real(f)
         if within(fr, w) or within(w, fr):
