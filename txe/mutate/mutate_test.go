@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Copyright (C) 2026 TXE
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -20,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -33,11 +34,10 @@ import (
 
 const sentinel = ".mutate-sandboxed-fixture-sentinel"
 
+// python is the host's python3. The runner targets macOS and Linux hosts only, so this file is
+// built only where it can run (the build constraint above), not skipped at run time on Windows.
 func python(t *testing.T) string {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("the runner targets macOS and Linux hosts")
-	}
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
 	return py
@@ -1990,6 +1990,7 @@ func TestRoMountShapesRefused(t *testing.T) {
 		require.NoError(t, err)
 		return r
 	}
+	//nolint:revive // every setup shares one signature; most cases use only some of its arguments
 	cases := map[string]struct {
 		setup setup
 		want  string
