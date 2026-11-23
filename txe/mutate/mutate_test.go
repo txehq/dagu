@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Copyright (C) 2026 TXE
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -13,12 +15,15 @@ package mutate_test
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
@@ -30,11 +35,10 @@ import (
 
 const sentinel = ".mutate-sandboxed-fixture-sentinel"
 
+// python is the host's python3. The runner targets macOS and Linux hosts only, so this file is
+// built only where it can run (the build constraint above), not skipped at run time on Windows.
 func python(t *testing.T) string {
 	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("the runner targets macOS and Linux hosts")
-	}
 	py, err := exec.LookPath("python3")
 	require.NoError(t, err)
 	return py
@@ -63,7 +67,7 @@ func fakeDocker(t *testing.T, dir, log string, sideEffect ...string) string {
 		effect = sideEffect[0]
 	}
 	src := `#!/usr/bin/env python3
-import hashlib, json, os, subprocess, sys, time
+import csv, hashlib, json, os, subprocess, sys, time
 LOG = ` + fmt.Sprintf("%q", log) + `
 REG = LOG + ".containers"
 SECRET_DIR = os.path.join(os.path.dirname(LOG), "host-private")
@@ -103,6 +107,20 @@ if args[:1] == ["inspect"]:
         print("/%s %s" % tuple(r[args[-1]]))
     sys.exit(0)
 if args[:2] == ["rm", "-f"]:
+    if os.path.exists(LOG + ".slowrm"):  # a slow removal that uses up the reserve
+        time.sleep(float(open(LOG + ".slowrm").read()))
+    if os.path.exists(LOG + ".rmtamper"):  # the stand-in for a boundary failing during cleanup
+        with open(open(LOG + ".rmtamper").read().strip(), "a") as fh:
+            fh.write("tampered during rm\n")
+    if os.path.exists(LOG + ".rmrace"):  # docker's own --rm finishing first: rm fails, the container goes
+        r = reg()
+        r.pop(args[2], None)
+        save(r)
+        print("Error response from daemon: removal of container is already in progress", file=sys.stderr)
+        sys.exit(1)
+    if os.path.exists(LOG + ".rmrace-stays"):  # "in progress", but the container is still there
+        print("Error response from daemon: removal of container is already in progress", file=sys.stderr)
+        sys.exit(1)
     if os.path.exists(LOG + ".rmfail"):
         print("Error response from daemon: removal failed", file=sys.stderr)
         sys.exit(1)
@@ -122,8 +140,9 @@ while i < len(args) and args[i].startswith("--"):
     if flag in VALUED:
         val = args[i + 1]
         i += 2
-        if flag == "--mount":
-            kv = dict(p.split("=", 1) for p in val.split(",") if "=" in p)
+        if flag == "--mount":  # CSV, as docker parses it: an unquoted comma splits a field
+            fields = next(csv.reader([val]))
+            kv = dict(p.split("=", 1) for p in fields if "=" in p)
             mounts[kv["target"]] = kv["source"]
         elif flag == "--env":
             k, v = val.split("=", 1)
@@ -248,6 +267,64 @@ func registry(t *testing.T, log string) map[string][]string {
 	return r
 }
 
+// logKeptEvidence logs what a failed lifecycle assertion needs to be explained: the files under the
+// kept work directory's logs (the fake client's own stderr, a traceback included), the fake docker's
+// log and its container registry. These are fixture-owned fake-client files only. Every read is
+// bounded on the open file (at most keptReadCap bytes, truncation stated), at most keptMaxFiles log
+// files are read, and every walk, open and read error is logged. Diagnostic output only; it asserts
+// nothing.
+const keptReadCap, keptMaxFiles = 8192, 16
+
+func logKeptEvidence(t *testing.T, stderr, log string) {
+	t.Helper()
+	const kept = "work directory kept: "
+	for line := range strings.SplitSeq(stderr, "\n") {
+		dir, ok := strings.CutPrefix(line, kept)
+		if !ok {
+			continue
+		}
+		n := 0
+		werr := filepath.WalkDir(filepath.Join(dir, "logs"), func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				t.Logf("kept walk %s: %v", p, err)
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if n++; n > keptMaxFiles {
+				t.Logf("kept: more than %d log files; %s and later not read", keptMaxFiles, p)
+				return fs.SkipAll
+			}
+			logBounded(t, "kept "+p, p)
+			return nil
+		})
+		if werr != nil {
+			t.Logf("kept walk %s: %v", dir, werr)
+		}
+	}
+	logBounded(t, "fake docker log", log)
+	logBounded(t, "fake docker registry", log+".containers")
+}
+
+// logBounded logs at most keptReadCap bytes of p, read through a limit on the open file, and says
+// whether more followed; an open or read error is logged, never dropped.
+func logBounded(t *testing.T, label, p string) {
+	t.Helper()
+	fh, err := os.Open(p)
+	if err != nil {
+		t.Logf("%s: open: %v", label, err)
+		return
+	}
+	defer func() { _ = fh.Close() }()
+	b, err := io.ReadAll(io.LimitReader(fh, keptReadCap+1))
+	more := len(b) > keptReadCap
+	if more {
+		b = b[:keptReadCap]
+	}
+	t.Logf("%s (%d bytes shown, truncated: %v, read error: %v):\n%s", label, len(b), more, err, b)
+}
+
 type fixture struct {
 	root, tree, modcache, gocache, workRoot, log, docker string
 }
@@ -292,11 +369,23 @@ type outcome struct {
 
 func (f fixture) run(t *testing.T, mutants string, extra ...string) outcome {
 	t.Helper()
+	return f.invoke(t, []string{"--mutants", mutants}, extra...)
+}
+
+// diag runs the fixture in --diagnostic mode: no mutant list.
+func (f fixture) diag(t *testing.T, extra ...string) outcome {
+	t.Helper()
+	return f.invoke(t, []string{"--diagnostic"}, extra...)
+}
+
+func (f fixture) invoke(t *testing.T, mode []string, extra ...string) outcome {
+	t.Helper()
 	report := filepath.Join(f.root, "report.json")
 	_ = os.Remove(report)
-	args := append([]string{"-I", script(t, "mutate-sandboxed.py"), "--mutants", mutants, "--tree", f.tree,
+	args := append([]string{"-I", "-B", script(t, "mutate-sandboxed.py")}, mode...)
+	args = append(append(args, "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
-		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"}, extra...)
+		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image"), extra...)
 	args = append(args, "--", "sh", "check.sh")
 	cmd := exec.Command(python(t), args...)
 	cmd.Env = append(os.Environ(), "MUTATE_TEST_CANARY=host-only-value")
@@ -524,6 +613,37 @@ func TestMutantListRefusals(t *testing.T) {
 	}
 }
 
+// docker reads --mount as comma-separated fields, and the runner does not quote. A work root whose
+// path holds a comma, a double quote or a line break is refused (exit 2) before any docker call,
+// so no container is ever created with a corrupted mount. An ordinary path with a space still runs,
+// mounted as given. (Found when a test's temporary directory held a comma: the mount was split.)
+func TestMountFieldsRefuseCSVCharacters(t *testing.T) {
+	for name, bad := range map[string]string{"comma": ",", "double quote": `"`, "line feed": "\n", "carriage return": "\r"} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			root := filepath.Join(f.root, "work"+bad+"root")
+			require.NoError(t, os.MkdirAll(root, 0o755))
+			o := f.diag(t, "--workdir-root", root)
+			assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "refused")
+			assert.Contains(t, o.stderr, "cannot carry unquoted")
+			_, err := os.Stat(f.log)
+			assert.True(t, os.IsNotExist(err), "no docker call at all, not even the image check")
+			assert.Empty(t, registry(t, f.log), "no container was created")
+		})
+	}
+	t.Run("a space is ordinary", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		root := filepath.Join(f.root, "work root")
+		require.NoError(t, os.MkdirAll(root, 0o755))
+		o := f.diag(t, "--workdir-root", root)
+		require.Equal(t, 7, o.code, o.stdout+o.stderr)
+		runs := dockerRuns(t, f.log)
+		require.Len(t, runs, 1)
+		assert.Contains(t, strings.Join(mountArgs(runs[0]), "\n"), "/work root/", "the spaced path is mounted as given")
+	})
+}
+
 // check_mounts and check_workdir refuse any source that is, contains or lies inside protected state.
 func TestMountChecks(t *testing.T) {
 	root := t.TempDir()
@@ -547,14 +667,14 @@ print(verdict(lambda: ms.check_mounts([(root, "/work", False)], root, {"HOME": r
 print(verdict(lambda: ms.check_workdir(root / "home" / "go" / "x", forbidden)))
 print(verdict(lambda: ms.check_workdir(work, forbidden)))
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "ok\nrefused\nrefused\nrefused\nrefused\nok\n", string(out))
 }
 
 func hook(t *testing.T, input string) (int, string, string) {
 	t.Helper()
-	cmd := exec.Command(python(t), "-I", script(t, "guard-hook.py"))
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "guard-hook.py"))
 	cmd.Stdin = strings.NewReader(input)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -1056,7 +1176,7 @@ elif sys.argv[1:3] == ["mod", "download"]:
 	t.Setenv("MUTATE_TEST_CANARY", "host-only-value")
 
 	report := filepath.Join(f.root, "report.json")
-	cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--mutants",
 		f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--workdir-root", f.workRoot,
 		"--docker", f.docker, "--report", report, "--image", "fixture-image", "--", "sh", "check.sh")
 	out, err := cmd.CombinedOutput()
@@ -1159,7 +1279,7 @@ for noise in ["echo '", 'echo "', "cat <<EOF", "x=$(", "# "]:
     assert g.refuses("python3 mutants.py; " + noise) is True, noise
 print("ok", round(time.monotonic() - start, 1) < 60)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "guard-hook.py")).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "guard-hook.py")).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "ok True\n", string(out))
 }
@@ -1242,7 +1362,7 @@ func TestSignalStopsRun(t *testing.T) {
 			f := newFixture(t, passingCheck)
 			foreignContainer(t, f.log)
 			report := filepath.Join(f.root, "report.json")
-			cmd := exec.Command(python(t), "-I", script(t, "mutate-sandboxed.py"), "--mutants",
+			cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--mutants",
 				f.mutants(t, []map[string]any{cleanupMutant}), "--tree", f.tree, "--shared-modcache", f.modcache,
 				"--shared-gocache", f.gocache, "--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed",
 				"--report", report, "--image", "hang", "--timeout", "60", "--", "sh", "check.sh")
@@ -1288,7 +1408,7 @@ print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxe
 print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
 print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxed-x-001", "another-token", ms.docker_client_env()))
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), docker, cidfile).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, cidfile).CombinedOutput()
 	require.NoError(t, err, string(out))
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	require.Len(t, lines, 3)
@@ -1301,7 +1421,7 @@ print(ms.remove_owned_container(sys.argv[2], Path(sys.argv[3]), "mutate-sandboxe
 // "noexec" images run no command at all, so no fixture mutant executes on this host.
 func demo(t *testing.T, docker string, args ...string) (*exec.Cmd, *bytes.Buffer) {
 	t.Helper()
-	cmd := exec.Command(python(t), append([]string{"-I", script(t, "fixture-demo.py"), "--docker", docker}, args...)...)
+	cmd := exec.Command(python(t), append([]string{"-I", "-B", script(t, "fixture-demo.py"), "--docker", docker}, args...)...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	return cmd, &out
@@ -1352,7 +1472,7 @@ func TestDemoDeadlineRemovesOnlyRecorded(t *testing.T) {
 	docker := fakeDocker(t, root, log)
 	foreignContainer(t, log)
 	start := time.Now()
-	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "30")
+	cmd, out := demo(t, docker, "sandboxed", filepath.Join(root, "evidence"), "sha256:hang", "--deadline", "60")
 	require.Equal(t, 1, exitCode(t, cmd.Run()), out.String())
 	assert.Less(t, time.Since(start), 30*time.Second)
 	dir := demoRoot(t, out.String())
@@ -1406,9 +1526,41 @@ w = ms.WorkDir(root); (w.path / ms.OWNER_FILE).write_text("someone else"); print
 w = ms.WorkDir(root); os.rename(w.path, str(w.path) + ".moved"); w.path.mkdir(); (w.path / ms.OWNER_FILE).write_text(w.token); print(verdict(w), w.path.exists())
 w = ms.WorkDir(root); print(verdict(w), w.path.exists())
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "refused True\nrefused True\nremoved False\n", string(out))
+}
+
+// file_digest reads in bounded chunks: a log far over its output bound (a diagnostic's evidence
+// digest included) is never loaded whole. The digest is exact, read_bytes is never used, no read
+// asks for more than 1 MiB, and the missing (None) and unreadable (errno) results are unchanged.
+func TestFileDigestIsChunked(t *testing.T) {
+	prog := `
+import hashlib, importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+d = pathlib.Path(sys.argv[2])
+data = os.urandom(3 << 20)
+(d / "big").write_bytes(data)
+def whole(*a, **k):
+    raise AssertionError("read_bytes used")
+pathlib.Path.read_bytes = whole
+sizes, real_open = [], open
+class Counted:
+    def __init__(self, f): self.f = f
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.f.close()
+    def read(self, n=-1):
+        sizes.append(n)
+        return self.f.read(n)
+ms.open = lambda p, mode: Counted(real_open(p, mode))
+print(ms.file_digest(d / "big") == hashlib.sha256(data).hexdigest(), max(sizes) == 1 << 20, min(sizes) > 0)
+print(ms.file_digest(d / "missing"))
+print(ms.file_digest(d))
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "True True True\nNone\nunreadable: errno 21\n", string(out))
 }
 
 // The deadline clock starts before preflight: a docker that hangs on the image check is stopped.
@@ -1453,9 +1605,15 @@ func TestCleanupInsideDeadline(t *testing.T) {
 	start := time.Now()
 	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", "hang", "--timeout", "60", "--deadline", "6")
 	assert.Equal(t, 6, o.code, o.stdout+o.stderr)
-	// 6 s deadline, 2 s cleanup reserve, inspect cut to the 2 s left (floor 1 s).
-	assert.Less(t, time.Since(start), 12*time.Second)
+	// D = 6 s, reserve 2 s: the hung run is stopped at 4 s; clearing it during the run draws on the
+	// active deadline, so its hung inspect is cut at D = 6 s; the finalizer's emergency retry draws
+	// on the one budget ending at D + 10 = 16 s and is cut there. Expected end: about 16 s, with up
+	// to 3 s of margin for process start and the local steps (the least external hard deadline a caller adds, D + 15 = 21 s).
+	elapsed := time.Since(start)
+	assert.GreaterOrEqual(t, elapsed, 14*time.Second, "the emergency retry used its budget")
+	assert.Less(t, elapsed, 19*time.Second)
 	assert.Contains(t, o.stderr, "cleanup error")
+	assert.NotEmpty(t, o.report["containers_left"])
 }
 
 // A symlink in the tree that leads outside it (here an absolute go.sum link back into the live
@@ -1610,7 +1768,7 @@ copied = sum(1 for _ in (root / "cut" / "big").iterdir()) if (root / "cut" / "bi
 gone, _ = attempt(lambda: ms.clone_dir(src, root / "late", time.monotonic() - 1))
 print(full, cut, gone, copied < 20000, cut_secs < full_secs, (root / "late").exists())
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "completed stopped stopped True True False\n", string(out))
 }
@@ -1756,7 +1914,7 @@ used, n, problem = ms.dir_usage(linked, 100, 60.0); print(n, problem, used < (1 
 used, n, problem = ms.dir_usage(deep, 100, 60.0, max_depth=5); print(problem)
 used, n, problem = ms.dir_usage(root / "absent", 100, 60.0); print(n, problem)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "11 run directory over 10 entries\n1 None True\nrun directory nested over 5 levels\n0 None\n", string(out))
 }
@@ -1809,7 +1967,7 @@ try:
 except ValueError as e:
     print("refused:", e)
 `
-	out, err := exec.Command(python(t), "-I", "-c", prog, script(t, filepath.Join("testdata", "leaky-docker.py")), string(raw)).CombinedOutput()
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, filepath.Join("testdata", "leaky-docker.py")), string(raw)).CombinedOutput()
 	require.NoError(t, err, string(out))
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	require.Len(t, lines, len(runs)+1)
@@ -1844,4 +2002,1156 @@ func TestTreeCheckedBeforeFirstCopy(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(g.tree, ".git", "pack"), make([]byte, 2<<20), 0o644))
 	o = g.run(t, g.mutants(t, []map[string]any{cleanupMutant}), "--max-work-mib", "1", "--no-warm-gocache")
 	assert.Equal(t, 0, o.code, "an excluded .git is not counted: %s", o.stdout+o.stderr)
+}
+
+// ---------------------------------------------------------------- TXE-8053: --diagnostic and --ro-mount
+
+const viewOID = "0123456789abcdef0123456789abcdef01234567"
+
+// gitView writes a directory in the TXE-8047 view shape (commit objects, shallow, a detached HEAD,
+// an index, a core-only config, empty refs) under parent and returns its real path.
+func gitView(t *testing.T, parent string) string {
+	t.Helper()
+	dir := filepath.Join(parent, "view")
+	for _, d := range []string{"objects/pack", "objects/info", "objects/01", "refs/heads", "refs/tags"} {
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, d), 0o755))
+	}
+	for rel, body := range map[string]string{
+		"HEAD":                                   viewOID + "\n",
+		"shallow":                                viewOID + "\n",
+		"config":                                 "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n",
+		"index":                                  "DIRC\x00\x00\x00\x02\x00\x00\x00\x00",
+		"objects/pack/pack-" + viewOID + ".pack": "PACK\x00\x00\x00\x02",
+		"objects/pack/pack-" + viewOID + ".idx":  "\xfftOc",
+		"objects/01/" + viewOID[2:]:              "loose object",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, rel), []byte(body), 0o644))
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	require.NoError(t, err)
+	return real
+}
+
+// goManifest is the --ro-manifest rule written independently: "D <rel>" per directory and
+// "F <size> <sha256> <rel>" per file, sorted by rel as bytes, hashed together.
+func goManifest(t *testing.T, root string) string {
+	t.Helper()
+	var lines []string
+	require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		if p == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		require.NoError(t, err)
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			lines = append(lines, "D "+rel+"\n")
+			return nil
+		}
+		raw, err := os.ReadFile(p)
+		require.NoError(t, err)
+		lines = append(lines, fmt.Sprintf("F %d %x %s\n", len(raw), sha256.Sum256(raw), rel))
+		return nil
+	}))
+	last := func(s string) string { f := strings.Fields(s); return f[len(f)-1] }
+	sort.Slice(lines, func(i, j int) bool { return last(lines[i]) < last(lines[j]) })
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(lines, ""))))
+}
+
+func roManifest(t *testing.T, dir string) (int, string, string) {
+	t.Helper()
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", dir)
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode(), out.String(), errb.String()
+	}
+	require.NoError(t, err)
+	return 0, strings.TrimSpace(out.String()), errb.String()
+}
+
+// The runner's manifest equals the rule computed independently, includes empty directories, and
+// changes when one file's content, one name or one empty directory changes.
+func TestRoManifest(t *testing.T) {
+	view := gitView(t, t.TempDir())
+	code, got, stderr := roManifest(t, view)
+	require.Equal(t, 0, code, stderr)
+	assert.Equal(t, goManifest(t, view), got)
+	seen := map[string]bool{got: true}
+	for name, change := range map[string]func(){
+		"content":   func() { require.NoError(t, os.WriteFile(filepath.Join(view, "index"), []byte("DIRC-other"), 0o644)) },
+		"name":      func() { require.NoError(t, os.Rename(filepath.Join(view, "shallow"), filepath.Join(view, "shallow2"))) },
+		"empty dir": func() { require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "remotes"), 0o755)) },
+	} {
+		change()
+		code, next, stderr := roManifest(t, view)
+		require.Equal(t, 0, code, stderr)
+		assert.False(t, seen[next], "%s: the manifest did not change", name)
+		assert.Equal(t, goManifest(t, view), next, name)
+		seen[next] = true
+	}
+}
+
+// Every --ro-mount shape outside the contract is refused (exit 2) before any container runs:
+// source shapes, protected-state overlap, destinations, the hash, a writable form, the git view's
+// contents, and the bounds. Nothing here needs privileged host access.
+func TestRoMountShapesRefused(t *testing.T) {
+	home, err := filepath.EvalSymlinks(os.Getenv("HOME"))
+	require.NoError(t, err)
+	type setup func(t *testing.T, f fixture, view, sum string) []string
+	spec := func(src, dst, sum string) []string { return []string{"--ro-mount", src + ":" + dst + ":" + sum} }
+	git := "/work/src/.git"
+	write := func(t *testing.T, p, body string) {
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
+	}
+	realDir := func(t *testing.T, p string) string {
+		require.NoError(t, os.MkdirAll(p, 0o755))
+		r, err := filepath.EvalSymlinks(p)
+		require.NoError(t, err)
+		return r
+	}
+	//nolint:revive // every setup shares one signature; most cases use only some of its arguments
+	cases := map[string]struct {
+		setup setup
+		want  string
+	}{
+		"relative source": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec("view", git, sum)
+		}, "absolute path equal to its own realpath"},
+		"dot-dot source": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view+"/../view", git, sum)
+		}, "own realpath"},
+		"trailing slash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view+"/", git, sum)
+		}, "own realpath"},
+		"symlinked parent": {func(t *testing.T, f fixture, view, sum string) []string {
+			link := filepath.Join(filepath.Dir(filepath.Dir(view)), "linked-parent")
+			require.NoError(t, os.Symlink(filepath.Dir(view), link))
+			return spec(link+"/view", git, sum)
+		}, "own realpath"},
+		"source is a symlink": {func(t *testing.T, f fixture, view, sum string) []string {
+			link := filepath.Join(filepath.Dir(view), "view-link")
+			require.NoError(t, os.Symlink(view, link))
+			return spec(link, git, sum)
+		}, "own realpath"},
+		"source is a file": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(filepath.Join(view, "HEAD"), git, sum)
+		}, "not a plain directory"},
+		"symlink inside": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Symlink(f.modcache, filepath.Join(view, "refs", "heads", "main")))
+			return spec(view, git, sum)
+		}, "is a symlink"},
+		"fifo inside": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, syscall.Mkfifo(filepath.Join(view, "objects", "info", "pipe"), 0o644))
+			return spec(view, git, sum)
+		}, "special file"},
+		"name outside the portable set": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "café"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"name with a trailing newline": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "x\n"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"hash with a trailing newline": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, sum+"\n")
+		}, "64 lowercase hex"},
+		"name with a space": {func(t *testing.T, f fixture, view, sum string) []string {
+			require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "a b"), 0o755))
+			return spec(view, git, sum)
+		}, "names must use only"},
+		"source is the live tree": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, f.tree), git, sum)
+		}, "overlaps live tree"},
+		"source inside the live tree": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.tree, "sub")), git, sum)
+		}, "overlaps live tree"},
+		"source contains the shared module cache": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.root, "fake-gopath")), git, sum)
+		}, "overlaps shared GOMODCACHE"},
+		"source inside the shared build cache": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(realDir(t, filepath.Join(f.gocache, "sub")), git, sum)
+		}, "overlaps shared GOCACHE"},
+		"source contains HOME": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(filepath.Dir(home), git, sum)
+		}, "overlaps"}, // GOPATH (under HOME) may be named first: the order is the forbidden map's
+		"destination /":           {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/", sum) }, "is not one of"},
+		"destination /etc":        {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/etc", sum) }, "is not one of"},
+		"destination /work":       {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work", sum) }, "is not one of"},
+		"destination /work/src":   {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work/src", sum) }, "is not one of"},
+		"destination in the tree": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/work/src/x", sum) }, "is not one of"},
+		"destination in sandbox": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, "/work/sandbox/gocache", sum)
+		}, "is not one of"},
+		"destination /goproxy": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/goproxy", sum) }, "is not one of"},
+		"destination /tmp":     {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "/tmp", sum) }, "is not one of"},
+		"destination with dot-dot": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, "/work/src/../src/.git", sum)
+		}, "is not one of"},
+		"relative destination":       {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, "work/src/.git", sum) }, "is not one of"},
+		"destination trailing slash": {func(t *testing.T, f fixture, view, sum string) []string { return spec(view, git+"/", sum) }, "is not one of"},
+		"destination twice": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), spec(view, git, sum)...)
+		}, "given twice"},
+		"wrong hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, strings.Repeat("0", 64))
+		}, "the copy's manifest is"},
+		"uppercase hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return spec(view, git, strings.ToUpper(sum))
+		}, "64 lowercase hex"},
+		"missing hash": {func(t *testing.T, f fixture, view, sum string) []string {
+			return []string{"--ro-mount", view + ":" + git}
+		}, "expected SRC:DST:SHA256"},
+		"writable option": {func(t *testing.T, f fixture, view, sum string) []string {
+			return []string{"--ro-mount", view + ":" + git + ":rw:" + sum}
+		}, "is not one of"},
+		"hooks": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "hooks", "post-checkout"), "#!/bin/sh\n")
+			return spec(view, git, goManifest(t, view))
+		}, "git view: hooks is not part of the view"},
+		"alternates": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "objects", "info", "alternates"), "/elsewhere/objects\n")
+			return spec(view, git, goManifest(t, view))
+		}, "no alternates"},
+		"a ref": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "refs", "heads", "main"), viewOID+"\n")
+			return spec(view, git, goManifest(t, view))
+		}, "holds no refs"},
+		"packed refs": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "packed-refs"), viewOID+" refs/remotes/origin/main\n")
+			return spec(view, git, goManifest(t, view))
+		}, "packed-refs is not part of the view"},
+		"reflog": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "logs", "HEAD"), "x\n")
+			return spec(view, git, goManifest(t, view))
+		}, "logs is not part of the view"},
+		"remote in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://example.invalid/x\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"credential helper in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[credential]\n\thelper = store\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"hooksPath in core": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[core]\n\thooksPath = /elsewhere\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only core."},
+		"include in config": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "config"), "[include]\n\tpath = /elsewhere/config\n")
+			return spec(view, git, goManifest(t, view))
+		}, "only [core] is allowed"},
+		"symbolic HEAD": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "HEAD"), "ref: refs/heads/main\n")
+			return spec(view, git, goManifest(t, view))
+		}, "HEAD must be a detached object id"},
+		"no HEAD": {func(t *testing.T, f fixture, view, _ string) []string {
+			require.NoError(t, os.Remove(filepath.Join(view, "HEAD")))
+			return spec(view, git, goManifest(t, view))
+		}, "HEAD is missing"},
+		"worktree link": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "commondir"), "/elsewhere/.git\n")
+			return spec(view, git, goManifest(t, view))
+		}, "commondir is not part of the view"},
+		"file count bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-files", "3")
+		}, "holds over 3 entries"},
+		"depth bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-depth", "1")
+		}, "nested over 1 levels"},
+		"file size bound": {func(t *testing.T, f fixture, view, _ string) []string {
+			write(t, filepath.Join(view, "index"), strings.Repeat("x", 1<<20+1))
+			return append(spec(view, git, goManifest(t, view)), "--ro-max-file-mib", "1")
+		}, "over 1048576 bytes"},
+		"total size bound": {func(t *testing.T, f fixture, view, sum string) []string {
+			return append(spec(view, git, sum), "--ro-max-mib", "0")
+		}, "pass 0 bytes"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			view := gitView(t, f.root)
+			o := f.diag(t, c.setup(t, f, view, goManifest(t, view))...)
+			assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "refused")
+			assert.Contains(t, o.stderr, c.want)
+			if _, err := os.Stat(f.log); err == nil {
+				assert.Empty(t, dockerRuns(t, f.log), "no container runs on a refused mount")
+			}
+		})
+	}
+	// Two names that differ only in case, where the file system keeps both.
+	t.Run("names differing in case", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		view := gitView(t, f.root)
+		require.NoError(t, os.Mkdir(filepath.Join(view, "refs", "heads", "A"), 0o755))
+		if err := os.Mkdir(filepath.Join(view, "refs", "heads", "a"), 0o755); err != nil {
+			t.Skip("this file system folds case, so the two names cannot coexist")
+		}
+		o := f.diag(t, spec(view, git, goManifest(t, view))...)
+		assert.Equal(t, 2, o.code, o.stdout+o.stderr)
+		assert.Contains(t, o.stderr, "differs only in case")
+	})
+}
+
+func mountArgs(argv []string) []string {
+	var out []string
+	for i, a := range argv {
+		if a == "--mount" {
+			out = append(out, argv[i+1])
+		}
+	}
+	return out
+}
+
+// An accepted view is copied, never mounted itself: the one extra mount is a read-only bind of
+// the runner's copy inside its work directory, outside the run's read-write directory, at
+// /work/src/.git, with GIT_OPTIONAL_LOCKS=0. The copy has the manifest, and no file in it has a
+// second link. Without --ro-mount the argv carries no extra mount and no git variable.
+func TestRoMountArgv(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	view := gitView(t, f.root)
+	// The live tree's own .git is never copied (excluded at every depth), so the mount at
+	// /work/src/.git shadows no source data.
+	require.NoError(t, os.MkdirAll(filepath.Join(f.tree, ".git"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, ".git", "config"), []byte("[remote \"live\"]\n"), 0o644))
+	// Restrictive source modes and umask: the copy's modes are set by the runner, not inherited.
+	require.NoError(t, filepath.WalkDir(view, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		if d.IsDir() {
+			return os.Chmod(p, 0o700)
+		}
+		return os.Chmod(p, 0o600)
+	}))
+	old := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(old) })
+	sum := goManifest(t, view)
+	o := f.diag(t, "--ro-mount", view+":/work/src/.git:"+sum)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	runs := dockerRuns(t, f.log)
+	require.Len(t, runs, 1)
+	mounts := mountArgs(runs[0])
+	require.Len(t, mounts, 2, "the run's directory and the read-only copy (no seed)")
+	work := o.report["workdir"].(string)
+	realWork, err := filepath.EvalSymlinks(work)
+	require.NoError(t, err)
+	var rw, ro string
+	for _, m := range mounts {
+		if strings.HasSuffix(m, ",target=/work/src/.git,readonly") {
+			ro = strings.TrimSuffix(strings.TrimPrefix(m, "type=bind,source="), ",target=/work/src/.git,readonly")
+		} else {
+			require.True(t, strings.HasSuffix(m, ",target=/work"), m)
+			rw = strings.TrimSuffix(strings.TrimPrefix(m, "type=bind,source="), ",target=/work")
+		}
+	}
+	require.NotEmpty(t, ro, "the read-only mount: %v", mounts)
+	assert.Equal(t, filepath.Join(realWork, "ro", "00"), ro, "the runner's copy, never the caller's directory")
+	assert.NotEqual(t, view, ro)
+	assert.False(t, strings.HasPrefix(ro+"/", rw+"/") || strings.HasPrefix(rw+"/", ro+"/"), "no writable alias: %s vs %s", ro, rw)
+	assert.Contains(t, strings.Join(runs[0], " "), "--env GIT_OPTIONAL_LOCKS=0")
+	assert.Equal(t, sum, goManifest(t, ro))
+	require.NoError(t, filepath.WalkDir(ro, func(p string, d fs.DirEntry, err error) error {
+		require.NoError(t, err)
+		fi, err := os.Lstat(p)
+		require.NoError(t, err)
+		st := fi.Sys().(*syscall.Stat_t)
+		assert.EqualValues(t, os.Getuid(), st.Uid, "owned by the runner's uid, the container's --user: %s", p)
+		if d.IsDir() {
+			assert.Equal(t, os.FileMode(0o755), fi.Mode().Perm(), "directory modes are normalised: %s", p)
+			return nil
+		}
+		assert.EqualValues(t, 1, st.Nlink, p)
+		assert.Equal(t, os.FileMode(0o644), fi.Mode().Perm(), "file modes are normalised: %s", p)
+		return nil
+	}))
+	assert.NoDirExists(t, filepath.Join(work, "pristine", ".git"), "the tree copy holds no .git to shadow")
+	mountsReport := o.report["ro_mounts"].([]any)
+	require.Len(t, mountsReport, 1)
+	assert.Equal(t, filepath.Join(work, "ro", "00"), mountsReport[0].(map[string]any)["copy"])
+
+	t.Run("without --ro-mount", func(t *testing.T) {
+		g := newFixture(t, passingCheck)
+		o := g.run(t, g.mutants(t, []map[string]any{cleanupMutant}))
+		require.Equal(t, 0, o.code, o.stderr)
+		for _, argv := range dockerRuns(t, g.log) {
+			assert.Len(t, mountArgs(argv), 1)
+			assert.NotContains(t, strings.Join(argv, " "), "GIT_")
+		}
+	})
+}
+
+// The read-only boundary failing (the fake docker writing into the mounted copy, or giving one of
+// its files a second link from the writable run directory) is exit 3 with no verdict: never a
+// refusal, never a recorded diagnostic.
+func TestRoMountChangeAlarms(t *testing.T) {
+	cases := map[string]struct{ effect, want string }{
+		"content written": {`open(os.path.join(mounts["/work/src/.git"], "HEAD"), "w").write("tampered\n")`, "manifest is"},
+		"file added":      {`open(os.path.join(mounts["/work/src/.git"], "objects", "info", "x"), "w").close()`, "manifest is"},
+		"writable alias":  {`os.link(os.path.join(mounts["/work/src/.git"], "index"), os.path.join(mounts["/work"], "alias"))`, "links: a writable alias"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			f.docker = fakeDocker(t, f.root, f.log, c.effect)
+			view := gitView(t, f.root)
+			o := f.diag(t, "--ro-mount", view+":/work/src/.git:"+goManifest(t, view))
+			require.Equal(t, 3, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+			assert.Contains(t, o.stderr, "the read-only mount /work/src/.git")
+			assert.Contains(t, o.stderr, c.want)
+			assert.Empty(t, o.outcomes(), "a run whose read-only mount changed has no verdict")
+			assert.NotContains(t, o.report, "diagnostic")
+			assert.DirExists(t, o.report["workdir"].(string))
+		})
+	}
+}
+
+// The copy is checked again immediately before every mount: a change made on the host between
+// runs is the boundary failing (SharedStateChanged), and a mountpoint that is not an empty plain
+// directory is refused. check_mounts refuses a read-only source that a read-write mount reaches,
+// and two mounts on one target.
+func TestRoCopyRevalidatedBeforeMount(t *testing.T) {
+	root := t.TempDir()
+	view := gitView(t, root)
+	tree := filepath.Join(root, "tree")
+	require.NoError(t, os.Mkdir(tree, 0o755))
+	prog := `
+import importlib.util, sys, os, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root, view, digest, tree = Path(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+def verdict(f):
+    try:
+        f(); return "ok"
+    except ms.Stopped:
+        return "stopped"
+    except ms.SharedStateChanged:
+        return "alarm"
+    except ms.Refused:
+        return "refused"
+args = ms.parse(["--diagnostic", "--image", "img", "--tree", tree, "--", "true"])
+work = ms.WorkDir(root)
+runner = ms.Runner(args, ms.Watch({}), {}, work, "docker", [])
+m = ms.parse_ro_mounts([view + ":/work/src/.git:" + digest])[0]
+ms.prepare_ro_mount(m, work.path, 0, {}, runner.ro_limits)
+runner.ro_mounts = [m]
+d = work.path / "001-x"
+(d / "src" / ".git").mkdir(parents=True)
+cid = work.path / "c.cid"
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+(d / "src" / ".git" / "stray").write_text("x")
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+os.remove(d / "src" / ".git" / "stray")
+os.chmod(m.copy / "config", 0o600)
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+os.chmod(m.copy / "config", 0o644)
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+past = time.monotonic() - 1
+print(verdict(lambda: ms.verify_ro_copy(m, runner.ro_limits, past)))
+print(verdict(lambda: runner.verify_ro_mounts("late", past)))
+shadow = work.path / "pristine-with-git"; (shadow / ".git").mkdir(parents=True); (shadow / ".git" / "x").write_text("x")
+print(verdict(lambda: runner.prepare("shadow", shadow, None)))
+(m.copy / "HEAD").write_text("tampered\n")
+print(verdict(lambda: runner.docker_argv(d, "n", cid)))
+w = work.path / "rw"; w.mkdir(); (w / "inner").mkdir()
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (w / "inner", "/work/src/.git", True)], work.path, {})))
+print(verdict(lambda: ms.check_mounts([(w / "inner", "/work", False), (w, "/work/src/.git", True)], work.path, {})))
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (w / "inner", "/work", True)], work.path, {})))
+s = work.path / "sib"; s.mkdir()
+print(verdict(lambda: ms.check_mounts([(w, "/work", False), (s, "/work/src/.git", True)], work.path, {})))
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root, view,
+		goManifest(t, view), tree).CombinedOutput()
+	require.NoError(t, err, string(out))
+	// ok; non-empty mountpoint; a mode changed (alarm); restored (ok); a deadline already passed
+	// stops the re-hash, directly and through the runner (stopped, never ok); a tree copy holding
+	// .git (refused: source data would be shadowed); content changed (alarm); the check_mounts rules.
+	assert.Equal(t, "ok\nrefused\nalarm\nok\nstopped\nstopped\nrefused\nalarm\nrefused\nrefused\nrefused\nok\n", string(out))
+}
+
+// A diagnostic whose command exits non-zero is recorded as evidence and is not a pass: the runner
+// exits 7 (never 0), the report says mode diagnostic, gate never and outcome DIAGNOSTIC, the
+// command's status is only in diagnostic.command_exit, and the two raw streams are kept apart in
+// files outside every mount with their exact bytes, sizes and sha256.
+func TestDiagnosticNonzeroNotPass(t *testing.T) {
+	f := newFixture(t, "#!/bin/sh\nprintf 'out-line\\n'\nprintf 'err-line\\n' >&2\nexit 1\n")
+	o := f.diag(t)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stdout, "DIAGNOSTIC: command exit 1 (evidence only, never a pass; runner exit 7)")
+	assert.Equal(t, "diagnostic", o.report["mode"])
+	assert.Equal(t, "never", o.report["gate"])
+	assert.EqualValues(t, 7, o.report["exit"])
+	assert.Equal(t, map[string]string{"diagnostic": "DIAGNOSTIC"}, o.outcomes())
+	diag := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "completed", diag["status"])
+	assert.EqualValues(t, 1, diag["command_exit"])
+	assert.Equal(t, "command", diag["command_exit_attribution"])
+	assert.Equal(t, "confirmed", diag["settlement"])
+	assert.Equal(t, "held", diag["integrity"])
+	assert.Equal(t, "complete", diag["evidence"])
+	work := o.report["workdir"].(string)
+	for stream, want := range map[string]string{"stdout": "out-line\n", "stderr": "err-line\n"} {
+		ev := diag[stream].(map[string]any)
+		p := ev["path"].(string)
+		assert.Equal(t, filepath.Join(work, "logs", "001."+stream), p, "outside every mount")
+		raw, err := os.ReadFile(p)
+		require.NoError(t, err)
+		assert.Equal(t, want, string(raw), stream)
+		assert.EqualValues(t, len(want), ev["bytes"])
+		assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte(want))), ev["sha256"])
+	}
+	raw, err := os.ReadFile(filepath.Join(work, "report.json"))
+	require.NoError(t, err)
+	for _, verdict := range []string{"PASSED", "SURVIVED", "KILLED", "FAILED"} {
+		assert.NotContains(t, string(raw), `"`+verdict+`"`, "a diagnostic carries no mutation verdict")
+	}
+	assert.Len(t, dockerRuns(t, f.log), 1, "one run: no baseline, no mutant")
+}
+
+// A command that exits 0 is still only a recorded diagnostic: exit 7, never 0.
+func TestDiagnosticZeroNotPass(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.diag(t)
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 0, o.report["diagnostic"].(map[string]any)["command_exit"])
+	assert.Equal(t, "DIAGNOSTIC", o.outcomes()["diagnostic"])
+}
+
+// --diagnostic takes no mutant list (no dummy mutant, no empty list), and outside diagnostic mode
+// a mutant list is still required.
+func TestDiagnosticRefusesMutants(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	o := f.invoke(t, []string{"--diagnostic", "--mutants", f.mutants(t, []map[string]any{cleanupMutant})})
+	assert.Equal(t, 2, o.code)
+	assert.Contains(t, o.stderr, "--mutants is refused with it")
+	o = f.invoke(t, nil)
+	assert.Equal(t, 2, o.code)
+	assert.Contains(t, o.stderr, "--mutants (or --diagnostic)")
+	if _, err := os.Stat(f.log); err == nil {
+		assert.Empty(t, dockerRuns(t, f.log))
+	}
+}
+
+// A diagnostic that did not complete (docker's own exit, a timeout, an output bound) is a finding,
+// exit 5, evidence incomplete: never 7 and never 0. The raw docker client exit is kept as recorded,
+// and a 125 is attributed to neither side: the API cannot tell docker's from the command's.
+func TestDiagnosticNotCompleted(t *testing.T) {
+	cases := map[string]struct {
+		extra       []string
+		outcome     string
+		exit        any
+		attribution string
+	}{
+		"docker 125": {[]string{"--image", "infra-125"}, "ERROR", float64(125), "ambiguous: docker-or-command"},
+		"timeout":    {[]string{"--image", "hang", "--timeout", "1"}, "TIMEOUT", nil, "none: the docker client was stopped before it returned"},
+		"output":     {[]string{"--image", "flood", "--max-output-mib", "1"}, "ERROR", nil, "none: the docker client was stopped before it returned"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			o := f.diag(t, c.extra...)
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			assert.Equal(t, c.outcome, o.outcomes()["diagnostic"])
+			diag := o.report["diagnostic"].(map[string]any)
+			assert.Equal(t, "not-completed: "+c.outcome, diag["status"])
+			assert.Equal(t, c.exit, diag["command_exit"])
+			assert.Equal(t, c.attribution, diag["command_exit_attribution"])
+			assert.Equal(t, "incomplete", diag["evidence"])
+			assert.Equal(t, "confirmed", diag["settlement"])
+			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete")
+			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+		})
+	}
+}
+
+// A diagnostic during which shared state changed is exit 3 with no recorded result: an integrity
+// failure is never masked by 7.
+func TestDiagnosticAlarm(t *testing.T) {
+	f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
+	o := f.diag(t)
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Empty(t, o.outcomes())
+	assert.NotContains(t, o.report, "diagnostic")
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A completed diagnostic is evidence only once its container is confirmed gone. The fake
+// "staysup" image exits as a client but leaves its container registered; with removal failing, or
+// the daemon unreachable for the owner check, the diagnostic is not complete: exit 5, never 7,
+// with the raw command_exit kept, settlement unconfirmed, evidence incomplete and the run directory
+// kept. With removal working it is 7.
+func TestDiagnosticUnconfirmedContainerIsFinding(t *testing.T) {
+	cases := map[string]string{"removal fails": ".rmfail", "daemon unreachable": ".daemondown"}
+	for name, flag := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, passingCheck)
+			require.NoError(t, os.WriteFile(f.log+flag, nil, 0o644))
+			o := f.diag(t, "--image", "staysup")
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			diag := o.report["diagnostic"].(map[string]any)
+			assert.Equal(t, "not-completed: container not confirmed removed", diag["status"])
+			assert.EqualValues(t, 0, diag["command_exit"], "the raw command result is kept as evidence")
+			assert.Equal(t, "unconfirmed", diag["settlement"])
+			assert.Equal(t, "incomplete", diag["evidence"])
+			assert.Contains(t, o.stderr, "FINDING: diagnostic did not complete: container")
+			assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
+			assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+			assert.NotEmpty(t, o.report["containers_left"])
+			entries, err := filepath.Glob(filepath.Join(o.report["workdir"].(string), "001-*"))
+			require.NoError(t, err)
+			assert.Len(t, entries, 1, "the run directory a container may still mount is kept")
+		})
+	}
+	t.Run("removal confirmed", func(t *testing.T) {
+		f := newFixture(t, passingCheck)
+		o := f.diag(t, "--image", "staysup")
+		require.Equal(t, 7, o.code, o.stdout+o.stderr)
+		assert.Len(t, removals(t, f.log), 1, "the lingering container was removed, owner-checked")
+		assert.Empty(t, registry(t, f.log))
+		assert.Contains(t, o.stdout, "DIAGNOSTIC: command exit 0")
+	})
+}
+
+// An integrity failure found after the diagnostic was recorded (here the fake docker changes the
+// fake shared cache's sentinel while removing the container, after the run's own checks) wins:
+// exit 3, the diagnostic marked invalid with integrity failed, its raw command_exit kept, and no DIAGNOSTIC line.
+func TestDiagnosticIntegrityOverridesSeven(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmtamper", []byte(filepath.Join(f.modcache, sentinel)), 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 3, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+	assert.Contains(t, o.stderr, "after the end of the run")
+	diag := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "invalid: shared state changed", diag["status"])
+	assert.EqualValues(t, 0, diag["command_exit"], "the raw command result is kept as evidence")
+	assert.Equal(t, "failed", diag["integrity"])
+	assert.Equal(t, "incomplete", diag["evidence"])
+	assert.Equal(t, "confirmed", diag["settlement"])
+	assert.EqualValues(t, 3, o.report["exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// An exception the runner does not expect is a finding, never a pass: the sandboxed command leaves
+// a directory the host cannot empty (0500 with a file in it, readable, so the disk bound still
+// measures it), and the runner's discard of the run directory raises. The run exits 5, the report
+// says exit 5 and names the error, and a diagnostic is marked incomplete.
+func TestUnexpectedErrorIsFinding(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root removes through permissions")
+	}
+	check := "#!/bin/sh\n: CLEANUP\nmkdir -p ../x && touch ../x/f && chmod 500 ../x\nexit 0\n"
+	for name, diagnostic := range map[string]bool{"diagnostic": true, "mutation": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, check)
+			t.Cleanup(func() {
+				_ = filepath.Walk(f.root, func(p string, _ os.FileInfo, _ error) error { _ = os.Chmod(p, 0o755); return nil })
+			})
+			var o outcome
+			if diagnostic {
+				o = f.diag(t)
+			} else {
+				o = f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+			}
+			require.Equal(t, 5, o.code, o.stdout+o.stderr)
+			assert.EqualValues(t, 5, o.report["exit"], "the report's exit is the process's")
+			assert.Contains(t, o.report["error"], "Error")
+			assert.Contains(t, o.stderr, "mutate-sandboxed: error:")
+			if diagnostic {
+				d := o.report["diagnostic"].(map[string]any)
+				assert.EqualValues(t, 0, d["command_exit"], "the raw command result is kept as evidence")
+				assert.Equal(t, "incomplete", d["evidence"])
+				assert.True(t, strings.HasPrefix(d["status"].(string), "not-completed"), d["status"])
+				assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+			}
+		})
+	}
+}
+
+// A pass whose work directory cannot be removed (its ownership token changed under it, here by the
+// fake docker) is a finding, and BOTH reports say so: the removal is attempted before either report
+// is written, so <work>/report.json and --report carry the process's own exit, 5.
+func TestCleanupFailureInBothReports(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	f.docker = fakeDocker(t, f.root, f.log,
+		`open(os.path.join(os.path.dirname(mounts["/work"]), ".mutate-sandboxed-owned"), "w").write("someone else")`)
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}))
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 5, o.report["exit"])
+	assert.Contains(t, o.report["cleanup_error"], "ownership token")
+	raw, err := os.ReadFile(filepath.Join(o.report["workdir"].(string), "report.json"))
+	require.NoError(t, err, "the kept work directory receives the report")
+	var inner map[string]any
+	require.NoError(t, json.Unmarshal(raw, &inner))
+	assert.EqualValues(t, 5, inner["exit"], "<work>/report.json carries the final exit too")
+}
+
+// A closed stdout (`| head`) neither loses the reports nor changes the exit: both reports are written
+// before the DIAGNOSTIC line, and a broken pipe on that line is absorbed.
+func TestDiagnosticClosedStdout(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	report := filepath.Join(f.root, "report.json")
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--diagnostic", "--tree", f.tree,
+		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
+		"--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60", "--image", "fixture-image",
+		"--", "sh", "check.sh")
+	cmd.Stdout = w
+	var errb bytes.Buffer
+	cmd.Stderr = &errb
+	err = cmd.Run()
+	require.NoError(t, w.Close())
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 7, code, errb.String())
+	assert.NotContains(t, errb.String(), "Traceback")
+	raw, err := os.ReadFile(report)
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 7, rep["exit"])
+	inner, err := os.ReadFile(filepath.Join(rep["workdir"].(string), "report.json"))
+	require.NoError(t, err)
+	assert.Equal(t, raw, inner)
+}
+
+// docker's own --rm can finish while the runner's rm -f is refused ("removal already in
+// progress"); one more inspect that finds it gone counts as absent, so the diagnostic settles: 7.
+func TestRemovalInProgressCountsAbsent(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmrace", nil, 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 7, o.code, o.stdout+o.stderr)
+	assert.Equal(t, "confirmed", o.report["diagnostic"].(map[string]any)["settlement"])
+	assert.Contains(t, o.stderr, ": absent")
+	assert.Empty(t, registry(t, f.log))
+}
+
+// "Removal already in progress" with the container still there is not absence: settlement is
+// unconfirmed and the diagnostic is 5, with its raw command_exit kept.
+func TestRemovalInProgressStillPresentIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".rmrace-stays", nil, 0o644))
+	o := f.diag(t, "--image", "staysup")
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "unconfirmed", d["settlement"])
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A --report that cannot be written (here a directory) is missing evidence: the diagnostic is 5,
+// never 7, and the kept work directory's report says so, with no DIAGNOSTIC line.
+func TestReportWriteFailureIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	dir := filepath.Join(f.root, "report-is-a-directory")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	o := f.diag(t, "--report", dir) // the later --report wins
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "cannot write the report")
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	inner, err := filepath.Glob(filepath.Join(f.workRoot, "mutate-sandboxed-*", "report.json"))
+	require.NoError(t, err)
+	require.Len(t, inner, 1)
+	raw, err := os.ReadFile(inner[0])
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.Contains(t, rep["report_error"], "Error")
+	d := rep["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.Equal(t, "not-completed: report not written", d["status"])
+	assert.EqualValues(t, 0, d["command_exit"], "the raw command result is kept as evidence")
+}
+
+// A diagnostic whose command uses up the whole budget is exit 6 (the deadline), never a
+// manufactured 7: nothing is extended past --deadline.
+func TestDiagnosticDeadlineExhaustedIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	start := time.Now()
+	o := f.diag(t, "--image", "hang", "--deadline", "6")
+	assert.Less(t, time.Since(start), 30*time.Second)
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 6, o.report["exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	assert.Contains(t, o.report["stopped"], "deadline")
+}
+
+// runnerWith runs the runner with the fixture's usual arguments plus extra, and the given stdout
+// and stderr (an *os.File, so a closed pipe or /dev/full can stand in for a failing terminal).
+func (f fixture) runnerWith(t *testing.T, stdout, stderr *os.File, mode []string, extra ...string) (int, map[string]any) {
+	t.Helper()
+	report := filepath.Join(f.root, "report.json")
+	_ = os.Remove(report)
+	args := append([]string{"-I", "-B", script(t, "mutate-sandboxed.py")}, mode...)
+	args = append(append(args, "--tree", f.tree, "--shared-modcache", f.modcache, "--shared-gocache", f.gocache,
+		"--workdir-root", f.workRoot, "--docker", f.docker, "--no-seed", "--report", report, "--timeout", "60",
+		"--image", "fixture-image"), extra...)
+	cmd := exec.Command(python(t), append(args, "--", "sh", "check.sh")...)
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else {
+		require.NoError(t, err)
+	}
+	var rep map[string]any
+	if raw, err := os.ReadFile(report); err == nil {
+		require.NoError(t, json.Unmarshal(raw, &rep))
+	}
+	return code, rep
+}
+
+// closedPipe is the write end of a pipe whose reader has gone: every write is a broken pipe.
+func closedPipe(t *testing.T) *os.File {
+	t.Helper()
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	t.Cleanup(func() { _ = w.Close() })
+	return w
+}
+
+func captureFile(t *testing.T, name string) *os.File {
+	t.Helper()
+	fh, err := os.Create(filepath.Join(t.TempDir(), name))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fh.Close() })
+	return fh
+}
+
+func fileText(t *testing.T, fh *os.File) string {
+	t.Helper()
+	raw, err := os.ReadFile(fh.Name())
+	require.NoError(t, err)
+	return string(raw)
+}
+
+// A mutation run with stdout gone (`| head`) is still a pass: the progress lines' broken pipe is
+// the expected case, absorbed and noted; the report says 0, as the process does, with no traceback.
+func TestMutationClosedStdout(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	stderr := captureFile(t, "stderr")
+	code, rep := f.runnerWith(t, closedPipe(t), stderr, []string{"--mutants", f.mutants(t, []map[string]any{cleanupMutant})})
+	require.Equal(t, 0, code, fileText(t, stderr))
+	assert.NotContains(t, fileText(t, stderr), "Traceback")
+	assert.EqualValues(t, 0, rep["exit"])
+	assert.Contains(t, rep["broken_streams"], "stdout: broken pipe")
+	assert.NotContains(t, rep, "stream_errors")
+}
+
+// A closed stderr neither blocks the reports nor changes the result: a diagnostic is still 7 with
+// both reports written, the broken stream noted.
+func TestDiagnosticClosedStderr(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	stdout := captureFile(t, "stdout")
+	code, rep := f.runnerWith(t, stdout, closedPipe(t), []string{"--diagnostic"})
+	require.Equal(t, 7, code, fileText(t, stdout))
+	assert.EqualValues(t, 7, rep["exit"])
+	assert.Contains(t, rep["broken_streams"], "stderr: broken pipe")
+	inner, err := os.ReadFile(filepath.Join(rep["workdir"].(string), "report.json"))
+	require.NoError(t, err)
+	var in map[string]any
+	require.NoError(t, json.Unmarshal(inner, &in))
+	assert.EqualValues(t, 7, in["exit"])
+	assert.Contains(t, fileText(t, stdout), "DIAGNOSTIC: command exit 0")
+}
+
+// A terminal write that fails for another reason (a full device: /dev/full, Linux only) is not
+// the expected broken stream: the DIAGNOSTIC line not written turns 7 into 5, recorded in the report.
+func TestDiagnosticFullStdoutIsFinding(t *testing.T) {
+	full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/full on this system")
+	}
+	t.Cleanup(func() { _ = full.Close() })
+	f := newFixture(t, passingCheck)
+	stderr := captureFile(t, "stderr")
+	code, rep := f.runnerWith(t, full, stderr, []string{"--diagnostic"})
+	require.Equal(t, 5, code, fileText(t, stderr))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.NotEmpty(t, rep["stream_errors"])
+	assert.Contains(t, fileText(t, stderr), "the DIAGNOSTIC line could not be written")
+	d := rep["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+}
+
+// The kept <work>/report.json cannot be written (the fake docker made a directory of that name):
+// a diagnostic is then 5, and --report, the evidence that survives, says 5 and names the failure.
+func TestKeptReportWriteFailureIsFinding(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	f.docker = fakeDocker(t, f.root, f.log, `os.makedirs(os.path.join(os.path.dirname(mounts["/work"]), "report.json"), exist_ok=True)`)
+	o := f.diag(t)
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	assert.EqualValues(t, 5, o.report["exit"])
+	assert.Contains(t, o.report["report_error"], "report.json")
+	assert.Equal(t, "not-completed: report not written", o.report["diagnostic"].(map[string]any)["status"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+}
+
+// A clean pass whose --report cannot be written does not leave nothing behind: the work directory
+// is kept (removed only after the reports) and its report.json says 5, as the process does.
+func TestCleanPassReportFailureKeepsWorkDir(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	dir := filepath.Join(f.root, "report-is-a-directory")
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	o := f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--report", dir)
+	require.Equal(t, 5, o.code, o.stdout+o.stderr)
+	inner, err := filepath.Glob(filepath.Join(f.workRoot, "mutate-sandboxed-*", "report.json"))
+	require.NoError(t, err)
+	require.Len(t, inner, 1, "the work directory is kept as the evidence that survives")
+	raw, err := os.ReadFile(inner[0])
+	require.NoError(t, err)
+	var rep map[string]any
+	require.NoError(t, json.Unmarshal(raw, &rep))
+	assert.EqualValues(t, 5, rep["exit"])
+	assert.Contains(t, rep["report_error"], "report-is-a-directory")
+}
+
+// The reserve used up after the run (a slow, still-bounded removal during settlement) leaves the
+// end-of-run read-only check no time: exit 6 with integrity incomplete, never 7, the raw
+// command_exit kept; nothing is extended past --deadline.
+func TestEndCheckReserveExhaustedIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	view := gitView(t, f.root)
+	require.NoError(t, os.WriteFile(f.log+".slowrm", []byte("7"), 0o644))
+	start := time.Now()
+	o := f.diag(t, "--image", "staysup", "--deadline", "6", "--ro-mount", view+":/work/src/.git:"+goManifest(t, view))
+	assert.Less(t, time.Since(start), 30*time.Second)
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.report["final_check"], "incomplete")
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["integrity"])
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	b := o.report["budgets"].(map[string]any)
+	assert.EqualValues(t, 6, b["active_and_integrity_deadline_s"])
+	assert.EqualValues(t, 21, b["least_external_hard_deadline_s"])
+	assert.Equal(t, true, b["cooperative_only"], "the runner guarantees no exit time")
+}
+
+// Every cleanup call consumes ONE budget: a call's timeout is what is left of it, and once it is
+// spent no call starts (TimeoutExpired), so a container stays pending; none restarts its own floor.
+func TestCleanupBudgetIsShared(t *testing.T) {
+	prog := `
+import importlib.util, subprocess, sys, time
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+print(ms.call_limit(30, None))
+print(ms.call_limit(30, time.monotonic() + 3) <= 3)
+try:
+    ms.call_limit(30, time.monotonic() - 0.01)
+    print("started")
+except subprocess.TimeoutExpired:
+    print("refused")
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py")).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "30\nTrue\nrefused\n", string(out))
+}
+
+// Settlement is part of the active budget, view or no view: a removal still running at D (a slow,
+// bounded fake rm under --deadline 6, no --ro-mount, so no end-of-run re-hash can stop the run
+// instead) is cut at D and the diagnostic is 6, never 7. The finalizer's emergency removal, inside
+// its own 10 s, then confirms the container gone; the raw command_exit is kept.
+func TestDiagnosticSettlementPastDeadlineIsSix(t *testing.T) {
+	f := newFixture(t, passingCheck)
+	require.NoError(t, os.WriteFile(f.log+".slowrm", []byte("7"), 0o644))
+	start := time.Now()
+	o := f.diag(t, "--image", "staysup", "--deadline", "6")
+	assert.Less(t, time.Since(start), 21*time.Second, "inside D + 15 s, the least external hard deadline")
+	require.Equal(t, 6, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.report["stopped"], "settlement")
+	d := o.report["diagnostic"].(map[string]any)
+	assert.Equal(t, "incomplete", d["evidence"])
+	assert.EqualValues(t, 0, d["command_exit"])
+	assert.NotContains(t, o.stdout, "DIAGNOSTIC: command exit")
+	assert.NotContains(t, o.report, "containers_left", "the emergency removal confirmed it")
+	assert.Empty(t, registry(t, f.log))
+}
+
+// --ro-manifest's digest is the mode's only output: a stdout that cannot take it (/dev/full, Linux
+// only) is exit 5, never 0.
+func TestRoManifestFullStdoutIsFinding(t *testing.T) {
+	full, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/full on this system")
+	}
+	t.Cleanup(func() { _ = full.Close() })
+	view := gitView(t, t.TempDir())
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", view)
+	var errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = full, &errb
+	err = cmd.Run()
+	ee, ok := err.(*exec.ExitError)
+	require.True(t, ok, "exit 0 with the digest lost: %v %s", err, errb.String())
+	assert.Equal(t, 5, ee.ExitCode())
+	assert.Contains(t, errb.String(), "the digest could not be written")
+}
+
+// The cleanup budget is threaded, not only computed: one removal whose inspect and slow rm together
+// pass its end is cut there, and a second call against the same spent end starts no docker call.
+// Runner.remove_pending draws on hard_end during the run and on cleanup_end only in an emergency.
+func TestCleanupBudgetPlumbing(t *testing.T) {
+	root := t.TempDir()
+	log := filepath.Join(root, "docker.log")
+	docker := fakeDocker(t, root, log)
+	tree := filepath.Join(root, "tree")
+	require.NoError(t, os.Mkdir(tree, 0o755))
+	prog := `
+import importlib.util, json, subprocess, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+docker, log, root, tree = sys.argv[2], sys.argv[3], Path(sys.argv[4]), sys.argv[5]
+def calls():
+    return sum(1 for _ in open(log)) if Path(log).exists() else 0
+args = ms.parse(["--diagnostic", "--image", "img", "--tree", tree, "--docker", docker, "--deadline", "100", "--", "true"])
+runner = ms.Runner(args, ms.Watch({}), {}, ms.WorkDir(root), docker, [])
+cid, name = "a" * 64, "mutate-sandboxed-plumb-001"
+json.dump({cid: [name, runner.work.token]}, open(log + ".containers", "w"))
+cidfile = root / "c.cid"; cidfile.write_text(cid)
+open(log + ".slowrm", "w").write("3")
+env = ms.docker_client_env()
+t0 = time.monotonic(); end = t0 + 1.5
+try:
+    ms.remove_owned_container(docker, cidfile, name, runner.work.token, env, end); print("finished")
+except subprocess.TimeoutExpired:
+    print("cut", time.monotonic() - t0 < 2.5)
+n = calls()
+try:
+    ms.remove_owned_container(docker, cidfile, name, runner.work.token, env, end); print("started")
+except subprocess.TimeoutExpired:
+    print("refused", calls() == n)
+runner.pending[name] = cidfile
+runner.hard_end = time.monotonic() - 1      # the active deadline has passed
+runner.cleanup_end = time.monotonic() + 1.5  # the emergency budget has not
+n = calls()
+print("active", runner.remove_pending(), calls() == n)
+t1 = time.monotonic()
+print("emergency", runner.remove_pending(emergency=True), calls() > n, time.monotonic() - t1 < 2.5)
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, log, root, tree).CombinedOutput()
+	require.NoError(t, err, string(out))
+	// cut: the slow rm ends at the budget, well before its 3 s; refused: nothing started past it;
+	// active: past hard_end nothing starts; emergency: it draws on cleanup_end, starts, and is cut.
+	assert.Equal(t, "cut True\nrefused True\nactive False True\nemergency False True True\n", string(out))
+}
+
+// A normal client exit proves nothing about the container: it stays pending through the after-run
+// checks, so when one of them raises (here an integrity incident, the fake sentinel changed during
+// the run) the finalizer still confirms it, owner-checked. Still present ("staysup"): removed;
+// removal failing: reported as not confirmed (containers_left), exit 3 kept; gone already: absent.
+func TestAfterRunIntegrityErrorKeepsContainerPending(t *testing.T) {
+	cases := map[string]struct {
+		image, flag, want string
+		left              bool
+	}{
+		// No comma in these names: t.TempDir keeps it in the work path, which the runner now refuses
+		// (TestMountFieldsRefuseCSVCharacters is that path's own regression).
+		"still present - removed":  {"staysup", "", ": removed", false},
+		"still present - rm fails": {"staysup", ".rmfail", "rm failed", true},
+		"gone - absence confirmed": {"fixture-image", "", ": absent", false},
+	}
+	for name, c := range cases {
+		for _, mode := range []string{"diagnostic", "mutation"} {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				f := alarmFixture(t, `open(os.path.join(modcache, sentinel), "w").write("changed\n")`)
+				if c.flag != "" {
+					require.NoError(t, os.WriteFile(f.log+c.flag, nil, 0o644))
+				}
+				var o outcome
+				if mode == "diagnostic" {
+					o = f.diag(t, "--image", c.image)
+				} else {
+					o = f.run(t, f.mutants(t, []map[string]any{cleanupMutant}), "--image", c.image)
+				}
+				require.Equal(t, 3, o.code, o.stdout+o.stderr)
+				assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
+				if !assert.Contains(t, o.stderr, c.want) {
+					logKeptEvidence(t, o.stderr, f.log) // diagnostic only: the assertion is unchanged
+				}
+				if c.left {
+					assert.NotEmpty(t, o.report["containers_left"])
+					assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")
+				} else {
+					assert.NotContains(t, o.report, "containers_left")
+					assert.Empty(t, registry(t, f.log))
+				}
+			})
+		}
+	}
+}
+
+// The same after an after-run DEADLINE: the read-only re-hash after a normally exited run is
+// Stopped at hard_end, and the container is still pending for the emergency removal, which
+// confirms it (removed when still present, absent when gone). Runner.run driven directly.
+func TestAfterRunDeadlineKeepsContainerPending(t *testing.T) {
+	for image, want := range map[string]string{"staysup": ": removed", "fixture-image": ": absent"} {
+		t.Run(image, func(t *testing.T) {
+			root := t.TempDir()
+			log := filepath.Join(root, "docker.log")
+			docker := fakeDocker(t, root, log)
+			view := gitView(t, root)
+			tree := filepath.Join(root, "tree")
+			require.NoError(t, os.MkdirAll(filepath.Join(tree, "sub"), 0o755))
+			prog := `
+import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+docker, image, view, digest, tree, root = sys.argv[2:8]
+args = ms.parse(["--diagnostic", "--image", image, "--tree", tree, "--docker", docker, "--", "true"])
+work = ms.WorkDir(Path(root))
+runner = ms.Runner(args, ms.Watch({}), {}, work, docker, [])
+m = ms.parse_ro_mounts([view + ":/work/src/.git:" + digest])[0]
+ms.prepare_ro_mount(m, work.path, 0, {}, runner.ro_limits)
+runner.ro_mounts = [m]
+pristine = work.path / "pristine"; ms.copy_tree(Path(tree), pristine, ms.DEFAULT_EXCLUDES)
+runner.hard_end = time.monotonic() - 1  # the after-run check starts past the deadline
+try:
+    runner.run("diagnostic", pristine, None); print("returned")
+except ms.Stopped:
+    print("stopped")
+print("pending", len(runner.pending))
+runner.cleanup_end = time.monotonic() + 10
+print("confirmed", runner.remove_pending(emergency=True), runner.cleanup_log[-1].split(":")[-1].strip())
+`
+			out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), docker, image, view,
+				goManifest(t, view), tree, root).CombinedOutput()
+			require.NoError(t, err, string(out))
+			assert.Equal(t, "stopped\npending 1\nconfirmed True "+strings.TrimPrefix(want, ": ")+"\n", string(out))
+		})
+	}
+}
+
+// --ro-manifest honours no deadline, so it accepts none: --deadline is refused (exit 2) before any
+// walk; the walk itself is bounded by the --ro-max-* limits.
+func TestRoManifestRefusesDeadline(t *testing.T) {
+	view := gitView(t, t.TempDir())
+	cmd := exec.Command(python(t), "-I", "-B", script(t, "mutate-sandboxed.py"), "--ro-manifest", view, "--deadline", "5")
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err := cmd.Run()
+	ee, ok := err.(*exec.ExitError)
+	require.True(t, ok, "accepted: %v", err)
+	assert.Equal(t, 2, ee.ExitCode())
+	assert.Contains(t, errb.String(), "--ro-manifest takes no --deadline")
+	assert.Empty(t, out.String(), "no digest is printed")
 }

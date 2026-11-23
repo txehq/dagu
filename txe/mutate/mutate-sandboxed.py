@@ -7,9 +7,10 @@ the session's real environment and the code under test deleted the Mac's shared 
 runner owns the boundary, so no single test has to:
 
 - Every mutant runs in a fresh copy of the tree, inside a container (`--pull never`, so an image
-  is never fetched). The container gets exactly two mounts, both inside a work directory this run
+  is never fetched). The container gets two mounts, both inside a work directory this run
   created: the mutant's own directory (read-write) and the module proxy seeded from the shared
-  cache (read-only). It gets no network, no Docker socket, no capabilities, bounded memory, CPU
+  cache (read-only), plus, per --ro-mount, a read-only copy the runner made inside that work
+  directory, hash-checked, at an allowlisted path (TXE-8053). It gets no network, no Docker socket, no capabilities, bounded memory, CPU
   and processes, and no variable from the caller's environment. GOPATH, GOMODCACHE, GOCACHE,
   TMPDIR, XDG_CACHE_HOME and XDG_CONFIG_HOME point inside the mutant's directory. HOME is never
   set, here or anywhere in this runner: the container keeps its image user's default.
@@ -31,6 +32,17 @@ runner owns the boundary, so no single test has to:
 
 Usage:
   mutate-sandboxed.py --mutants mutants.json [--tree DIR] --image IMAGE -- go test ./pkg/...
+  mutate-sandboxed.py --diagnostic [--tree DIR] --image IMAGE [--ro-mount SRC:DST:SHA256] -- CMD...
+  mutate-sandboxed.py --ro-manifest DIR
+
+--diagnostic runs the unmutated tree once, with the same boundary and checks, and records the
+command's raw stdout, stderr (two files outside every mount) and exit status in the report as
+evidence. It never yields a pass: a completed diagnostic exits 7 whatever the command's status,
+which a reader takes only from report["diagnostic"]["command_exit"].
+
+--ro-mount SRC:DST:SHA256 copies directory SRC (read on the host, never mounted) into this run's
+work directory and mounts the copy read-only at DST, one of RO_MOUNT_DESTS. SHA256 is the copy's
+--ro-manifest digest; the copy is re-checked after every run.
 
 mutants.json is a list of {"name", "file", "old", "new"} objects, with an optional "count"
 (default 1): `old` must occur exactly `count` times in `file` (relative to the tree), and every
@@ -38,8 +50,9 @@ occurrence is replaced by `new`.
 
 Exit codes: 0 done, no finding (survivors are listed, not failures); 2 refused or bad input;
 3 shared state changed (LOUD); 4 the unmutated tree failed; 5 findings (an unrepeated kill, a
-sandbox error or a timeout); 6 stopped by --deadline or a signal. On a timeout, the deadline or a
-signal, every container this run started whose client had not returned is force-removed, by the
+sandbox error or a timeout; for --diagnostic, a run that did not complete); 6 stopped by
+--deadline or a signal; 7 a --diagnostic run completed and was recorded (never 0). On a timeout, the deadline or a
+signal, every container this run started and has not confirmed gone (a client that returned proves nothing) is force-removed, by the
 id docker recorded (--cidfile, outside every mount), and only when docker reports that container's
 own name and this run's owner token on it.
 """
@@ -68,6 +81,29 @@ DEFAULT_EXCLUDES = (".git", "node_modules", ".local")
 DOCKER_INFRA_EXITS = {125, 126, 127}
 
 EXIT_OK, EXIT_REFUSED, EXIT_SHARED_CHANGED, EXIT_BASELINE, EXIT_FINDINGS, EXIT_STOPPED = 0, 2, 3, 4, 5, 6
+# A completed --diagnostic run, whatever the command's own status: never 0, so no `&&` chain and no
+# gate that reads exit 0 as "done, no finding" proceeds on a diagnostic (TXE-8053).
+EXIT_DIAGNOSTIC = 7
+# The runner's COOPERATIVE bounds under --deadline D (TXE-8053; see Runner.__init__ and the README).
+# They bound what the runner checks a clock around, not the process:
+# - D, the ACTIVE AND INTEGRITY deadline: every run, settlement after a run and every integrity
+#   check (the read-only mount re-hashes) ends by it; its last min(45, D/3) s are the reserve;
+# - EMERGENCY_CLEANUP_S after D: the one budget every container-removal call past D consumes;
+# - TERMINATION_MARGIN_S: the allowance a caller is told to add for the local steps left (the
+#   end-of-run host check, the report writes, the work directory's removal, terminal output).
+#   Those do host I/O with NO deadline of their own, and the finalizer ignores SIGTERM, SIGINT and
+#   SIGHUP, so neither the margin nor D is enforced on them.
+# The runner therefore makes NO process-exit guarantee. A caller that needs one must bound the
+# process from outside (a hard deadline it enforces, e.g. SIGKILL, at D + EMERGENCY_CLEANUP_S +
+# TERMINATION_MARGIN_S or later) and keep custody of what a kill leaves: the work directory with its
+# cids/ (each container's id and name, owner-labelled with the run's token) for removal by hand.
+EMERGENCY_CLEANUP_S = 10.0
+TERMINATION_MARGIN_S = 5.0
+# The only container paths a --ro-mount may target. /work/src/.git is the one path under /work/src
+# the tree copy can never hold (.git is excluded at every depth), so the mount shadows no tree
+# content, and git finds it with no environment change.
+RO_MOUNT_DESTS = ("/work/src/.git",)
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 OWNER_LABEL = "txe.mutate-sandboxed.owner"
 CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 # Every proxy variable Docker's automatic proxy configuration can set, cleared on the command line.
@@ -113,12 +149,18 @@ def identity(path: Path) -> dict | None:
 
 
 def file_digest(path: Path) -> str | None:
+    """sha256 of the file, read in bounded chunks (a log far over its bound is never held in memory
+    whole); None when it does not exist; "unreadable: errno N" for any other error, mid-read included."""
+    h = hashlib.sha256()
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
     except FileNotFoundError:
         return None
     except OSError as e:
         return f"unreadable: errno {e.errno}"
+    return h.hexdigest()
 
 
 @dataclass
@@ -189,14 +231,31 @@ def within(child: Path, parent: Path) -> bool:
     return child == parent or parent in child.parents
 
 
+MOUNT_FIELD_FORBIDDEN = {",": "a comma", '"': "a double quote", "\n": "a line feed", "\r": "a carriage return"}
+
+
+def check_mount_field(what: str, value: str) -> None:
+    """Refuse a path that docker's --mount cannot carry as written. The value is comma-separated
+    key=value fields (CSV), and this runner does not quote, so a comma, a double quote or a line
+    break would split or corrupt a field. Every other character (spaces included) is passed as is."""
+    for ch, desc in MOUNT_FIELD_FORBIDDEN.items():
+        if ch in value:
+            raise Refused(f"{what} {value!r} contains {desc}, which docker's comma-separated --mount value cannot "
+                          "carry unquoted; use a path without commas, double quotes or line breaks "
+                          "(for the work directory: pass --workdir-root elsewhere)")
+
+
 def check_mounts(mounts: list[tuple[Path, str, bool]], owned: Path, forbidden: dict[str, Path]) -> None:
-    """Refuse any bind mount that could expose host state.
+    """Refuse any bind mount that could expose host state, or that docker's --mount cannot carry.
 
     Every source must lie inside the run's own work directory, and must neither contain nor lie
     inside a forbidden path (the shared caches, GOPATH, HOME, the Docker socket, the live tree).
+    Every source and target is exactly what docker_argv writes (check_mount_field).
     """
     owned = real(owned)
-    for src, _dst, _ro in mounts:
+    for src, dst, _ro in mounts:
+        check_mount_field("mount source", str(real(src)))
+        check_mount_field("mount target", dst)
         r = real(src)
         if not within(r, owned) or r == owned:
             raise Refused(f"mount source {r} is not inside this run's work directory {owned}")
@@ -204,14 +263,349 @@ def check_mounts(mounts: list[tuple[Path, str, bool]], owned: Path, forbidden: d
             fr = real(f)
             if within(fr, r) or within(r, fr):
                 raise Refused(f"mount source {r} overlaps {name} ({fr})")
+    targets = [dst for _src, dst, _ro in mounts]
+    if len(set(targets)) != len(targets):
+        raise Refused(f"two mounts share a target: {targets}")
+    # A read-only source reachable through a read-write mount would be a writable alias of it.
+    writable = [real(src) for src, _dst, ro in mounts if not ro]
+    for src, _dst, ro in mounts:
+        if ro:
+            r = real(src)
+            for w in writable:
+                if within(r, w) or within(w, r):
+                    raise Refused(f"read-only mount source {r} overlaps the read-write mount source {w}: "
+                                  "a writable alias")
 
 
 def check_workdir(work: Path, forbidden: dict[str, Path]) -> None:
+    """main checks --workdir-root here before its first docker call, so a root whose run directory
+    could never be mounted is refused with no docker call at all."""
     w = real(work)
+    check_mount_field("work directory", str(w))
     for name, f in forbidden.items():
         fr = real(f)
         if within(fr, w) or within(w, fr):
             raise Refused(f"work directory {w} overlaps {name} ({fr}); pass --workdir-root elsewhere")
+
+
+# ---------------------------------------------------------------- read-only mounts (TXE-8053)
+
+
+@dataclass
+class RoMount:
+    """A --ro-mount: the caller's directory is only read on the host; the runner mounts its own copy."""
+
+    src: Path  # the caller's directory, never mounted
+    dst: str  # one of RO_MOUNT_DESTS
+    sha256: str  # the expected manifest digest of the copy
+    copy: Path | None = None  # the runner's copy inside its work directory: the only thing mounted
+
+
+def parse_ro_mounts(specs: list[str]) -> list[RoMount]:
+    """Each spec is SRC:DST:SHA256. There is no option field: a writable form does not exist."""
+    out: list[RoMount] = []
+    for spec in specs:
+        parts = spec.rsplit(":", 2)
+        if len(parts) != 3:
+            raise Refused(f"--ro-mount {spec!r}: expected SRC:DST:SHA256")
+        src, dst, digest = parts
+        if dst not in RO_MOUNT_DESTS:
+            raise Refused(f"--ro-mount {spec!r}: destination {dst!r} is not one of {', '.join(RO_MOUNT_DESTS)}")
+        if not SHA256_HEX.fullmatch(digest):
+            raise Refused(f"--ro-mount {spec!r}: SHA256 must be 64 lowercase hex digits (the --ro-manifest digest)")
+        # Exactly its own realpath: absolute, no '.', '..' or trailing slash, no symlink on the path.
+        if not os.path.isabs(src) or os.path.realpath(src) != src:
+            raise Refused(f"--ro-mount {spec!r}: source must be an absolute path equal to its own realpath "
+                          f"({os.path.realpath(src)!r})")
+        if any(m.dst == dst for m in out):
+            raise Refused(f"--ro-mount {spec!r}: destination {dst} is given twice")
+        out.append(RoMount(Path(src), dst, digest))
+    return out
+
+
+@dataclass
+class RoLimits:
+    """Bounds on a read-only mount's directory, checked on the source, while copying and on the copy."""
+
+    files: int = 100_000  # entries, directories included
+    depth: int = 32  # directory levels below the root
+    total_bytes: int = 4096 << 20  # all regular files together, as read
+    file_bytes: int = 2048 << 20  # one regular file, as read
+
+
+def ro_limits(args) -> RoLimits:
+    d = RoLimits()
+    return RoLimits(files=getattr(args, "ro_max_files", d.files), depth=getattr(args, "ro_max_depth", d.depth),
+                    total_bytes=getattr(args, "ro_max_mib", d.total_bytes >> 20) << 20,
+                    file_bytes=getattr(args, "ro_max_file_mib", d.file_bytes >> 20) << 20)
+
+
+# The portable filename set: no encoding, normalization or newline can make two names list alike.
+RO_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# The copy's modes, set explicitly (never from the umask or the source) and checked on every verify.
+RO_DIR_MODE, RO_FILE_MODE = 0o755, 0o644
+DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def ro_walk(root: Path, limits: RoLimits, deadline: float | None = None):
+    """(relative path, lstat, parent directory fd, name) for every entry below root, never following
+    a link. Each directory is opened relative to its parent's descriptor with O_NOFOLLOW, the root
+    included, so a directory replaced by a link mid-walk cannot steer the walk off the tree. Refused:
+    a root that is not a plain directory, any entry that is not a directory or a regular file, a
+    name outside RO_NAME or equal to another in the same directory ignoring case, and a bound
+    passed. Entries are counted while a directory is listed, so a huge directory is refused at
+    limits.files + 1, never listed whole. The deadline is checked per entry (Stopped). The
+    descriptor yielded is valid only until the next step."""
+    try:
+        top = os.open(root, DIR_FLAGS)
+    except OSError as e:
+        raise Refused(f"{root} is not a plain directory: {e}") from e
+    count = [0]
+
+    def walk(fd: int, prefix: str, depth: int):
+        names: list[str] = []
+        with os.scandir(fd) as it:
+            for e in it:
+                count[0] += 1
+                if count[0] > limits.files:
+                    raise Refused(f"{root} holds over {limits.files} entries")
+                check_deadline(deadline, f"walking {root}")
+                names.append(e.name)
+        names.sort()
+        folded: set[str] = set()
+        for name in names:
+            check_deadline(deadline, f"walking {root}")
+            rel = prefix + name
+            if not RO_NAME.fullmatch(name) or name in (".", ".."):
+                raise Refused(f"{rel!r} in {root}: names must use only A-Z a-z 0-9 . _ -")
+            if name.casefold() in folded:
+                raise Refused(f"{rel!r} in {root}: another name in its directory differs only in case")
+            folded.add(name.casefold())
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                if depth >= limits.depth:
+                    raise Refused(f"{rel} in {root} is nested over {limits.depth} levels")
+                yield rel, st, fd, name
+                sub = os.open(name, DIR_FLAGS, dir_fd=fd)
+                try:
+                    yield from walk(sub, rel + "/", depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(st.st_mode):
+                if st.st_size > limits.file_bytes:
+                    raise Refused(f"{rel} in {root} is over {limits.file_bytes} bytes")
+                yield rel, st, fd, name
+            else:
+                kind = "a symlink" if stat.S_ISLNK(st.st_mode) else f"a special file (mode {oct(stat.S_IFMT(st.st_mode))})"
+                raise Refused(f"{rel} in {root} is {kind}; a read-only mount holds only directories and regular files")
+
+    try:
+        yield from walk(top, "", 0)
+    except OSError as e:
+        raise Refused(f"cannot read {root}: {e}") from e
+    finally:
+        os.close(top)
+
+
+def open_regular_at(fd: int, name: str) -> int:
+    """A descriptor on name in directory fd, refused unless it is a regular file. O_NOFOLLOW: a link
+    swapped in is not followed; O_NONBLOCK: a FIFO swapped in does not block the open."""
+    try:
+        rfd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=fd)
+    except OSError as e:
+        raise Refused(f"cannot open {name} as a plain file: {e}") from e
+    if not stat.S_ISREG(os.fstat(rfd).st_mode):
+        os.close(rfd)
+        raise Refused(f"{name} is not a regular file")
+    return rfd
+
+
+def read_bounded(rfd: int, limits: RoLimits, used: list[int], rel: str, sink,
+                 deadline: float | None = None) -> int:
+    """Read rfd to its end into sink, refusing once the file passes limits.file_bytes or all files
+    together (used[0]) pass limits.total_bytes. Bytes are counted as read, not as stat says, so a
+    file that grows during the copy is still bounded. The deadline is checked per MiB (Stopped).
+    Returns the file's size."""
+    n = 0
+    try:
+        with os.fdopen(rfd, "rb") as f:
+            while chunk := f.read(1 << 20):
+                check_deadline(deadline, f"reading {rel}")
+                n += len(chunk)
+                used[0] += len(chunk)
+                if n > limits.file_bytes:
+                    raise Refused(f"{rel} is over {limits.file_bytes} bytes")
+                if used[0] > limits.total_bytes:
+                    raise Refused(f"the read-only mount's files pass {limits.total_bytes} bytes")
+                sink(chunk)
+    except OSError as e:
+        raise Refused(f"cannot copy or hash {rel}: {e}") from e
+    return n
+
+
+def ro_manifest_sha256(root: Path, limits: RoLimits | None = None, deadline: float | None = None) -> str:
+    """The manifest digest of a directory: every entry below root, sorted by its relative path as
+    bytes, '/'-separated, one line each, "D <rel>\\n" for a directory (empty ones included) and
+    "F <size> <sha256 hex> <rel>\\n" for a regular file; the sha256 of the lines joined. Names,
+    types, sizes and contents are covered. Modes, owners and times are not: the runner's copy
+    writes every directory 0755 and every file 0644 whatever the source had."""
+    limits = limits or RoLimits()
+    used = [0]
+    lines: list[str] = []
+    for rel, st, fd, name in ro_walk(root, limits, deadline):
+        if stat.S_ISDIR(st.st_mode):
+            lines.append(f"D {rel}\n")
+            continue
+        h = hashlib.sha256()
+        size = read_bounded(open_regular_at(fd, name), limits, used, rel, h.update, deadline)
+        lines.append(f"F {size} {h.hexdigest()} {rel}\n")
+    lines.sort(key=lambda line: line.split(" ")[-1].encode())
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
+
+
+# The view TXE-8047 mounts at /work/src/.git: commit C's objects, `shallow`, a detached HEAD, the
+# index, and a core-only config. Byte integrity says nothing about what the bytes are, so the copy
+# is also held to this shape: no hooks, no alternates, no remotes, refs or reflogs, no config but
+# these core keys, no include, no worktree link. Anything not listed is refused.
+GIT_VIEW_TOP = {"HEAD": "file", "config": "file", "index": "file", "shallow": "file", "objects": "dir",
+                "refs": "dir"}
+GIT_VIEW_REQUIRED = ("HEAD", "config", "objects", "refs")
+GIT_CORE_KEYS = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
+                 "precomposeunicode", "symlinks"}
+GIT_OID = r"(?:[0-9a-f]{40}|[0-9a-f]{64})"
+GIT_VIEW_PATHS = [
+    re.compile(r"^objects/(?:pack|info|[0-9a-f]{2})$"),  # directories
+    re.compile(r"^objects/pack/pack-" + GIT_OID + r"\.(?:pack|idx|rev)$"),
+    re.compile(r"^objects/[0-9a-f]{2}/(?:[0-9a-f]{38}|[0-9a-f]{62})$"),
+    re.compile(r"^refs(?:/[A-Za-z0-9._-]+)*$"),  # directories only: no ref files (checked below)
+]
+
+
+def check_git_view(copy: Path, limits: RoLimits, deadline: float | None = None) -> None:
+    """Refuse a git directory outside the TXE-8047 view contract (see GIT_VIEW_TOP)."""
+    seen: dict[str, bool] = {}
+    for rel, st, fd, name in ro_walk(copy, limits, deadline):
+        is_dir = stat.S_ISDIR(st.st_mode)
+        seen[rel] = is_dir
+        if "/" not in rel:
+            want = GIT_VIEW_TOP.get(rel)
+            if want is None or (want == "dir") != is_dir:
+                raise Refused(f"git view: {rel} is not part of the view (allowed: {', '.join(sorted(GIT_VIEW_TOP))})")
+            continue
+        if rel.startswith("refs/") and not is_dir:
+            raise Refused(f"git view: {rel}: the view holds no refs")
+        if rel.startswith("objects/info/"):
+            raise Refused(f"git view: {rel}: objects/info holds nothing (no alternates)")
+        if not any(p.fullmatch(rel) for p in GIT_VIEW_PATHS):
+            raise Refused(f"git view: {rel} is not part of the view")
+        if is_dir != (rel.count("/") == 1 or rel.startswith("refs/")):
+            raise Refused(f"git view: {rel} has the wrong type")
+    for req in GIT_VIEW_REQUIRED:
+        if req not in seen:
+            raise Refused(f"git view: {req} is missing")
+
+    def text(rel: str, cap: int = 1 << 16) -> str:
+        try:
+            with open(copy / rel, "rb") as f:  # the runner's own copy, walked link-free just above
+                raw = f.read(cap + 1)
+        except OSError as e:
+            raise Refused(f"git view: cannot read {rel}: {e}") from e
+        if len(raw) > cap:
+            raise Refused(f"git view: {rel} is over {cap} bytes")
+        try:
+            return raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise Refused(f"git view: {rel} is not ASCII") from None
+
+    if not re.fullmatch(GIT_OID + r"\n?", text("HEAD")):
+        raise Refused("git view: HEAD must be a detached object id")
+    if "shallow" in seen and not re.fullmatch(r"(?:" + GIT_OID + r"\n)+", text("shallow")):
+        raise Refused("git view: shallow must list object ids, one per line")
+    section = None
+    for line in text("config").splitlines():
+        s = line.strip()
+        if not s or s[0] in "#;":
+            continue
+        if s.startswith("["):
+            section = s.lower()
+            if section != "[core]":
+                raise Refused(f"git view: config section {s!r}: only [core] is allowed")
+            continue
+        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9-]*)\s*=\s*([A-Za-z0-9]+)", s)
+        if section != "[core]" or not m or m.group(1).lower() not in GIT_CORE_KEYS:
+            raise Refused(f"git view: config line {s!r}: only core.{{{', '.join(sorted(GIT_CORE_KEYS))}}} "
+                          "with a plain value is allowed")
+
+
+def check_ro_source(m: RoMount, forbidden: dict[str, Path], limits: RoLimits, deadline: float | None = None) -> None:
+    """Before anything runs: the source is a plain directory within the bounds, holding only
+    directories and regular files, and is not, does not contain and does not lie inside protected
+    state. Lying inside HOME is allowed (it is only read on the host); containing HOME is not."""
+    src = real(m.src)
+    for name, f in forbidden.items():
+        fr = real(f)
+        if within(fr, src) or (name != "HOME" and within(src, fr)):
+            raise Refused(f"--ro-mount source {src} overlaps {name} ({fr})")
+    for _entry in ro_walk(m.src, limits, deadline):
+        pass
+
+
+def verify_ro_copy(m: RoMount, limits: RoLimits, deadline: float | None = None) -> None:
+    """The runner's copy is still what was checked: its manifest, one link per file, owned by this
+    process's uid (the uid the container runs as, so git's ownership check holds), and, for the git
+    view, the view's shape. Called after the copy, immediately before every mount and after every
+    run; a failure after the first check is the read-only boundary failing."""
+    if m.copy is None:
+        raise Refused(f"read-only mount {m.dst} is not prepared")
+    got = ro_manifest_sha256(m.copy, limits, deadline)
+    if got != m.sha256:
+        raise Refused(f"--ro-mount {m.dst}: the copy's manifest is {got}, expected {m.sha256}")
+    entries = [("", os.lstat(m.copy))] + [(rel, st) for rel, st, _fd, _name in ro_walk(m.copy, limits, deadline)]
+    for rel, st in entries:
+        what = rel or "(root)"
+        if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+            raise Refused(f"--ro-mount copy {what} has {st.st_nlink} links: a writable alias")
+        if st.st_uid != os.getuid():
+            raise Refused(f"--ro-mount copy {what} is owned by uid {st.st_uid}, not {os.getuid()}")
+        want = RO_DIR_MODE if stat.S_ISDIR(st.st_mode) else RO_FILE_MODE
+        if stat.S_IMODE(st.st_mode) != want:
+            raise Refused(f"--ro-mount copy {what} has mode {oct(stat.S_IMODE(st.st_mode))}, not {oct(want)}")
+    if m.dst == "/work/src/.git":
+        check_git_view(m.copy, limits, deadline)
+
+
+def prepare_ro_mount(m: RoMount, work: Path, index: int, forbidden: dict[str, Path], limits: RoLimits,
+                     deadline: float | None = None) -> None:
+    """Copy m.src into a directory this run creates inside its work directory (new files, 0644, and
+    directories, 0755: no inode is shared with anything), through the same descriptor-anchored walk,
+    with every byte bounded as read; then verify_ro_copy. Hashing the copy, not the source, means
+    what is mounted is what was checked: a writer racing on the source can only cause a refusal."""
+    check_ro_source(m, forbidden, limits, deadline)
+    src, w = real(m.src), real(work)
+    if within(w, src) or within(src, w):
+        raise Refused(f"--ro-mount source {src} overlaps this run's work directory {w}")
+    base = work / "ro"
+    base.mkdir(exist_ok=True)
+    copy = base / f"{index:02d}"
+    copy.mkdir()  # exclusive: never a directory something else made
+    used = [0]
+    try:
+        os.chmod(copy, RO_DIR_MODE)  # modes are set explicitly, whatever the umask (Linux or macOS)
+        for rel, st, fd, name in ro_walk(m.src, limits, deadline):
+            check_deadline(deadline, "copying a --ro-mount source")
+            target = copy / rel
+            if stat.S_ISDIR(st.st_mode):
+                target.mkdir()
+                os.chmod(target, RO_DIR_MODE)
+                continue
+            out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), RO_FILE_MODE)
+            os.fchmod(out, RO_FILE_MODE)
+            with os.fdopen(out, "wb") as fout:
+                read_bounded(open_regular_at(fd, name), limits, used, rel, fout.write, deadline)
+    except OSError as e:
+        raise Refused(f"--ro-mount source {m.src}: copy failed: {e}") from e
+    m.copy = copy
+    verify_ro_copy(m, limits, deadline)
 
 
 # ---------------------------------------------------------------- mutants
@@ -420,22 +814,28 @@ SANDBOX_ENV_DIRS = {
 }
 
 
-def call_limit(cap: float, hard_end: float | None) -> float:
-    """A cleanup call's timeout: cap, cut to what the hard deadline leaves, never under 1 s (a
-    container is still removed when the deadline has just passed; the overrun is bounded)."""
-    if hard_end is None:
+def call_limit(cap: float, end: float | None) -> float:
+    """A cleanup call's timeout: cap, cut to what is left of the ONE cleanup budget ending at `end`.
+    Every call consumes that same budget (none restarts an allowance of its own); once it is spent
+    no further call starts: TimeoutExpired, so the container stays pending and is reported."""
+    if end is None:
         return cap
-    return max(1.0, min(cap, hard_end - time.monotonic()))
+    left = end - time.monotonic()
+    if left <= 0:
+        raise subprocess.TimeoutExpired("docker (the emergency cleanup budget is spent)", 0)
+    return min(cap, left)
 
 
 def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, env: dict[str, str],
-                           hard_end: float | None = None) -> str:
+                           end: float | None = None) -> str:
     """Force-remove one container this run started, and nothing else.
 
     The container is the one docker recorded in cidfile (kept outside every mount, so no sandboxed
     code can rewrite it), or failing that the run's unique name. It is removed only when docker
-    reports that exact name and this run's owner label on it. Returns what happened.
+    reports that exact name and this run's owner label on it. Every docker call consumes what is
+    left of the cleanup budget ending at `end` (call_limit). Returns what happened.
     """
+    hard_end = end
     target = name
     try:
         cid = cidfile.read_text().strip()
@@ -453,7 +853,15 @@ def remove_owned_container(docker: str, cidfile: Path, name: str, token: str, en
         return f"{target}: not ours ({probe.stdout.strip()!r}); left alone"
     rm = subprocess.run([docker, "rm", "-f", target], capture_output=True, text=True, env=env,
                         timeout=call_limit(30, hard_end))
-    return f"{target}: removed" if rm.returncode == 0 else f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
+    if rm.returncode == 0:
+        return f"{target}: removed"
+    # rm -f can fail while docker's own --rm is still removing it ("removal already in progress"):
+    # look once more, and count only docker's own "no such" as absent.
+    again = subprocess.run([docker, "inspect", "--format", "{{.Name}}", target], capture_output=True, text=True,
+                           env=env, timeout=call_limit(15, hard_end))
+    if again.returncode != 0 and NO_SUCH.search(again.stderr):
+        return f"{target}: absent"
+    return f"{target}: rm failed: {rm.stderr.strip()[-200:]}"
 
 
 def output_tail(log_path: Path, size: int = 8192) -> str:
@@ -572,18 +980,46 @@ class Runner:
         self.work = work
         self.docker = docker
         self.seq = 0
-        # Runs stop a cleanup reserve before the hard deadline, so removing a container whose
-        # client was killed fits inside it.
+        # The budgets under --deadline, none ever extended (TXE-8053; the sum is at EMERGENCY_CLEANUP_S):
+        # - the COMMAND budget: every run ends by `deadline` (hard_end - reserve), each at most --timeout;
+        # - the RESERVE, min(45, D/3) s between `deadline` and `hard_end`: settlement after a run and
+        #   the integrity checks (the read-only mount re-hashes, after each run and at the end). With a
+        #   view it must cover two full hashes; that it does is not measured here. Spent = Stopped = 6;
+        # - `hard_end`, the ACTIVE AND INTEGRITY deadline: no run, settlement or integrity check runs past it;
+        # - `cleanup_end` = hard_end + EMERGENCY_CLEANUP_S: the one budget every removal call consumes;
+        # - after it, the TERMINATION_MARGIN_S local steps. The end-of-run host check (watch.verify:
+        #   identities and one-level listings of the watched directories) has no deadline of its own
+        #   (pre-existing) and is counted in that margin.
         self.hard_end = args.deadline_at
         self.reserve = min(45.0, args.deadline / 3) if args.deadline else 0.0
         self.deadline = args.deadline_at - self.reserve if args.deadline_at else None
+        self.cleanup_end = args.deadline_at + EMERGENCY_CLEANUP_S if args.deadline_at else None
         # Every mutation target's live content, read before the tree was copied.
         self.live = {m.file: file_digest(args.tree / m.file) for m in live_targets}
-        # (name, cidfile) of every container started whose docker client has not returned.
+        # (name, cidfile) of every container started and not yet confirmed gone (owner-checked).
         self.pending: dict[str, Path] = {}
         # label -> (cidfile, name) of every container started, for checks after the run.
         self.containers: dict[str, tuple[Path, str]] = {}
         self.cleanup_log: list[str] = []
+        # TXE-8053: prepared read-only mounts (each with its runner-made copy), and diagnostic mode,
+        # where a run's stdout and stderr are recorded apart and its outcome is never a pass.
+        self.ro_mounts: list[RoMount] = []
+        self.ro_limits = ro_limits(args)
+        self.diagnostic = bool(getattr(args, "diagnostic", False))
+        self.err_log = None  # the open stderr file of the run in progress, in diagnostic mode
+        self.err_path: Path | None = None  # the last run's stderr file, in diagnostic mode
+
+    def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
+        """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
+        mount (by the run deadline) and after every run and at the end of the run (by hard_end, in
+        the reserve): once the copy was verified, a failure means the read-only boundary failed, so
+        it is exit 3 with no verdict, never a refusal. A deadline passed during the check raises
+        Stopped: the check did not complete, which is never a pass."""
+        for m in self.ro_mounts:
+            try:
+                verify_ro_copy(m, self.ro_limits, deadline if deadline is not None else self.deadline)
+            except (Refused, OSError) as e:
+                raise SharedStateChanged(f"{when}: the read-only mount {m.dst} (copy {m.copy}) changed: {e}") from e
 
     def room(self, what: str, sources: tuple[Path, ...] = (), skip: tuple[str, ...] = ()) -> None:
         """Before copying sources into the work directory: with the copy's full size added (sparse
@@ -652,20 +1088,42 @@ class Runner:
             raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed before {what}")
         return min(float(self.args.timeout), left)
 
-    def remove_pending(self) -> bool:
+    def remove_pending(self, emergency: bool = False) -> bool:
         """Remove every pending container. An entry leaves pending only when its removal or its
         absence is confirmed; anything else stays, for the finalizer's retry. Returns whether
-        nothing is left pending."""
+        nothing is left pending. During the run (settlement, and clearing a stopped run) every
+        call draws on the active deadline, hard_end; only the finalizer's emergency removal
+        (emergency=True) draws on the one budget that ends at cleanup_end."""
+        end = self.cleanup_end if emergency else self.hard_end
         for name, cidfile in list(self.pending.items()):
             try:
                 outcome = remove_owned_container(self.docker, cidfile, name, self.work.token,
-                                                 self.docker_env(), self.hard_end)
+                                                 self.docker_env(), end)
             except (OSError, subprocess.TimeoutExpired) as e:
                 outcome = f"{name}: cleanup error {e}"
             self.cleanup_log.append(outcome)
             if outcome.endswith(": removed") or outcome.endswith(": absent"):
                 del self.pending[name]
         return not self.pending
+
+    def settle(self, result: "Result") -> tuple[bool, bool]:
+        """Confirm the container of a finished run removed or absent, owner-checked, drawing on the
+        active deadline. Returns (confirmed, late): late when the deadline was reached. Until it is
+        confirmed the container stays pending, for the finalizer."""
+        cidfile, name = self.containers[result.name]
+        self.pending[name] = cidfile
+        confirmed = self.remove_pending()
+        return confirmed, self.hard_end is not None and time.monotonic() >= self.hard_end
+
+    def settle_or_stop(self, result: "Result") -> None:
+        """settle, for mutation mode: no further run starts, and no run directory is read or
+        discarded, until the container is confirmed gone; a settlement that is late or cannot be
+        confirmed is Stopped (6), the container left to the finalizer."""
+        confirmed, late = self.settle(result)
+        if late:
+            raise Stopped(f"the whole-run deadline ({self.args.deadline}s) passed during the settlement of {result.name}")
+        if not confirmed:
+            raise Stopped(f"the container of {result.name} could not be confirmed removed: " + ", ".join(self.pending))
 
     def clear_pending(self) -> None:
         """After a run that stopped abnormally: no further run starts while one of its
@@ -681,6 +1139,13 @@ class Runner:
         clone_dir(pristine, d / "src", self.deadline)
         if mutant:
             apply_mutant(d / "src", mutant)
+        for m in self.ro_mounts:
+            # The mountpoint is made here, as a plain directory, so docker neither creates it nor
+            # resolves it through a link. The copy never holds it (.git is excluded at every depth).
+            point = d / m.dst[len("/work/"):]
+            if os.path.lexists(point):
+                raise Refused(f"the tree copy already holds {m.dst}; a read-only mount would shadow it")
+            point.mkdir()
         sb = d / "sandbox"
         for sub in SANDBOX_ENV_DIRS.values():
             (sb / sub).mkdir(parents=True)
@@ -695,6 +1160,12 @@ class Runner:
         seed = self.work.path / "seed" / "gomodcache" / "cache" / "download"
         if seed.is_dir():
             mounts.append((seed, "/goproxy", True))
+        self.verify_ro_mounts(f"before mounting into {d.name}")
+        for m in self.ro_mounts:
+            point = plain_target(d, m.dst[len("/work/"):])  # no symlink on the path to the mountpoint
+            if m.copy is None or not point.is_dir() or any(point.iterdir()):
+                raise Refused(f"read-only mount {m.dst} has no empty plain mountpoint")
+            mounts.append((m.copy, m.dst, True))
         check_mounts(mounts, self.work.path, self.forbidden)
         env = {k: f"/work/sandbox/{v}" for k, v in SANDBOX_ENV_DIRS.items()}
         env.update({
@@ -711,6 +1182,10 @@ class Runner:
             # one) reaches sandboxed code.
             **CLEARED_PROXY_ENV,
         })
+        if any(m.dst == "/work/src/.git" for m in self.ro_mounts):
+            # git skips its optional index refresh, which would try .git/index.lock on a read-only
+            # view; a command that needs a lock fails on the read-only mount instead of half-writing.
+            env["GIT_OPTIONAL_LOCKS"] = "0"
         # --log-driver none: Docker keeps no second, unbounded copy of the output on its data root;
         # the attached stream the runner captures (and bounds) is unaffected.
         argv = [self.docker, "run", "--rm", "--pull", "never", "--log-driver", "none", "--name", name,
@@ -741,19 +1216,28 @@ class Runner:
         # Outside every mount: sandboxed code cannot truncate or replace its own output log.
         log_path = self.work.path / "logs" / f"{self.seq:03d}.log"
         log_path.parent.mkdir(exist_ok=True)
+        # Diagnostic mode records the two streams apart: <seq>.stdout and <seq>.stderr.
+        self.err_path = None
+        if self.diagnostic:
+            log_path = log_path.with_suffix(".stdout")
+            self.err_path = log_path.with_suffix(".stderr")
         start = time.monotonic()
         code, outcome = None, None
         self.pending[name] = cidfile
         self.containers[label] = (cidfile, name)
         self.overrun = None
-        with open(log_path, "wb") as log:
-            proc = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, env=self.docker_env())
+        with open(log_path, "wb") as log, open(self.err_path or os.devnull, "wb") as errf:
+            self.err_log = errf if self.err_path else None
+            proc = subprocess.Popen(argv, stdout=log, stderr=errf if self.err_path else subprocess.STDOUT,
+                                    env=self.docker_env())
             try:
                 code = self.watch_run(proc, d, log, start, limit)
             except BaseException:
                 proc.kill()
                 proc.wait()
                 raise
+            finally:
+                self.err_log = None
         if code is None:  # stopped by the watchdog: time, output or disk
             self.clear_pending()
             if self.overrun == "time":
@@ -763,24 +1247,30 @@ class Runner:
             else:
                 outcome = "ERROR"
                 self.cleanup_log.append(f"{name}: stopped: {self.overrun}")
-                print(f"mutate-sandboxed: {label}: stopped: {self.overrun}", file=sys.stderr)
+                err(f"mutate-sandboxed: {label}: stopped: {self.overrun}")
         elif code < 0:
             # The docker client died by a signal: nothing shows the container finished.
             self.clear_pending()
             outcome = "ERROR"
-        else:
-            del self.pending[name]
+        # A client that returned normally proves nothing about its container (--rm is not taken on
+        # trust): it STAYS pending through the checks below, so an exception there leaves it to the
+        # finalizer's owner-checked emergency removal, and it leaves pending only on an owner-checked
+        # confirmation of removal or absence (settle, or the finalizer).
         secs = time.monotonic() - start
         # The boundary check comes before any verdict: a run that touched host state has no result.
         self.watch.verify(before, f"{label}")
         for f, digest in self.live.items():
             if file_digest(self.args.tree / f) != digest:
                 raise SharedStateChanged(f"after {label}: the live tree's {f} changed")
+        # The after-run check is post-run work: it runs in the reserve, by the outer deadline, never past it.
+        self.verify_ro_mounts(f"after {label}", self.hard_end)
         if outcome is None:
-            if code == 0:
-                outcome = "PASSED" if mutant is None else "SURVIVED"
-            elif code in DOCKER_INFRA_EXITS:
+            if code in DOCKER_INFRA_EXITS:
                 outcome = "ERROR"
+            elif self.diagnostic:
+                outcome = "DIAGNOSTIC"  # the command's status stays in exit_code; never a pass
+            elif code == 0:
+                outcome = "PASSED" if mutant is None else "SURVIVED"
             else:
                 outcome = "FAILED" if mutant is None else "KILLED"
         return Result(label, outcome, code, round(secs, 2), str(log_path), output_tail(log_path), str(d))
@@ -789,7 +1279,10 @@ class Runner:
         return docker_client_env()
 
     def over_output(self, log) -> str | None:
-        if os.fstat(log.fileno()).st_size > self.args.max_output_mib * 2**20:
+        size = os.fstat(log.fileno()).st_size
+        if self.err_log is not None:  # diagnostic mode: the bound covers both streams together
+            size += os.fstat(self.err_log.fileno()).st_size
+        if size > self.args.max_output_mib * 2**20:
             return f"output over {self.args.max_output_mib} MiB"
         return None
 
@@ -880,15 +1373,30 @@ def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, fac
 
 def parse(argv: list[str]):
     p = argparse.ArgumentParser(description="Run mutation tests in a sandbox that cannot reach shared host state.")
-    p.add_argument("--mutants", type=Path, required=True)
+    p.add_argument("--mutants", type=Path, help="the mutant list; required unless --diagnostic")
+    p.add_argument("--diagnostic", action="store_true",
+                   help="one run of the unmutated tree, no mutants: its raw stdout, stderr and exit status are "
+                        "recorded as evidence, never as a pass (runner exit 7 when it completed)")
+    p.add_argument("--ro-mount", action="append", default=[], metavar="SRC:DST:SHA256",
+                   help=f"mount a copy the runner makes of directory SRC read-only at DST (one of "
+                        f"{', '.join(RO_MOUNT_DESTS)}); the copy's --ro-manifest digest must be SHA256")
+    p.add_argument("--ro-manifest", type=Path, metavar="DIR",
+                   help="print DIR's manifest digest (the SHA256 --ro-mount checks) and exit; runs nothing")
     p.add_argument("--tree", type=Path, default=Path.cwd())
-    p.add_argument("--image", required=True,
-                   help="an image present locally, best named by its immutable id (sha256:...); never pulled")
+    p.add_argument("--image", help="an image present locally, best named by its immutable id (sha256:...); never pulled")
     p.add_argument("--network", default="none", help="docker network for the sandbox (default none)")
     p.add_argument("--timeout", type=int, default=1800, help="seconds per sandboxed run")
     p.add_argument("--deadline", type=int, default=0,
-                   help="seconds for the whole run, every container included; 0 means none. Past it the "
-                        "run stops, removes the containers it started and exits 6")
+                   help="D: seconds for every run, settlement and integrity check (the last min(45, D/3) s are "
+                        "the reserve for settlement and integrity); 0 means none. Past it the run stops (exit 6) "
+                        f"and removes its containers within {EMERGENCY_CLEANUP_S:.0f} s more. These bounds are "
+                        "cooperative: the end-of-run host check, report writes and the work directory's removal "
+                        "have none, and the finalizer ignores signals, so the runner guarantees no process exit "
+                        "time; a caller that needs one bounds the process from outside, at D + "
+                        f"{EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S:.0f} s or later, and keeps the work "
+                        "directory's cids/ for removal by hand after a kill. "
+                        "A stop in the end-of-run check reports 6 even after an earlier 2, 4 or 5 (stderr may "
+                        "already have said so); the report keeps the earlier findings and containers_left")
     p.add_argument("--memory", default="8g", help="docker --memory per sandboxed run")
     p.add_argument("--cpus", default="4", help="docker --cpus per sandboxed run")
     p.add_argument("--pids", type=int, default=4096, help="docker --pids-limit per sandboxed run")
@@ -912,6 +1420,14 @@ def parse(argv: list[str]):
                    help="do not give each mutant a copy of the baseline's build cache")
     p.add_argument("--shared-modcache", type=Path, help="default: the caller's go env GOMODCACHE")
     p.add_argument("--shared-gocache", type=Path, help="default: the caller's go env GOCACHE")
+    p.add_argument("--ro-max-files", type=int, default=RoLimits.files,
+                   help="a --ro-mount directory may hold at most this many entries")
+    p.add_argument("--ro-max-depth", type=int, default=RoLimits.depth,
+                   help="a --ro-mount directory may nest at most this many levels")
+    p.add_argument("--ro-max-mib", type=int, default=RoLimits.total_bytes >> 20,
+                   help="a --ro-mount directory's files may total at most this many MiB")
+    p.add_argument("--ro-max-file-mib", type=int, default=RoLimits.file_bytes >> 20,
+                   help="one file in a --ro-mount directory may be at most this many MiB")
     p.add_argument("--keep", action="store_true", help="keep the work directory")
     p.add_argument("--report", type=Path, help="also write the JSON report here")
     p.add_argument("--docker", default="docker")
@@ -919,11 +1435,28 @@ def parse(argv: list[str]):
     args = p.parse_args(argv)
     if args.command[:1] == ["--"]:
         args.command = args.command[1:]
-    if not args.command:
-        p.error("give the test command after --")
     # The deadline clock starts here, before any preflight, so it bounds the whole run.
     args.deadline_at = time.monotonic() + args.deadline if args.deadline else None
     args.tree = real(args.tree)
+    if args.ro_manifest is not None:
+        if args.command or args.mutants or args.diagnostic or args.ro_mount or args.image:
+            p.error("--ro-manifest DIR prints a manifest digest and takes no run options")
+        if args.deadline:
+            # No deadline is honoured here, so none is accepted: the walk is bounded by the
+            # --ro-max-* limits, and a caller that needs a time bound wraps the command (TXE-8053).
+            p.error("--ro-manifest takes no --deadline: its walk is bounded by --ro-max-files, --ro-max-depth, "
+                    "--ro-max-mib and --ro-max-file-mib; bound it in time from outside")
+        return args
+    if not args.command:
+        p.error("give the test command after --")
+    if not args.image:
+        p.error("the following arguments are required: --image")
+    if args.diagnostic and args.mutants is not None:
+        p.error("--diagnostic runs no mutants: --mutants is refused with it (no dummy mutant, no empty list)")
+    if not args.diagnostic and args.mutants is None:
+        p.error("the following arguments are required: --mutants (or --diagnostic)")
+    if args.diagnostic:
+        args.keep = True  # the raw stdout and stderr files live in the work directory
     return args
 
 
@@ -939,9 +1472,10 @@ def resolve_shared(args) -> tuple[Path, Path, Path, dict[str, str]]:
 def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report: dict) -> int:
     base = runner.run("baseline", pristine, None)
     report["results"].append(base.__dict__)
-    print(f"baseline: {base.outcome} ({base.seconds}s)", flush=True)
+    out(f"baseline: {base.outcome} ({base.seconds}s)")
     if base.outcome != "PASSED":
-        print(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}", file=sys.stderr)
+        runner.settle_or_stop(base)
+        err(f"mutate-sandboxed: the unmutated tree did not pass; log {base.log}")
         return EXIT_BASELINE
     if args.warm_gocache:
         # The baseline's container wrote this tree: no symlink may lie on the path to it, and it
@@ -953,14 +1487,17 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
             raise Refused("the baseline left no build cache directory to warm from")
         runner.room("the warm build cache", (cache,))
         clone_dir(cache, runner.work.path / "warm-gocache", runner.deadline)
+    runner.settle_or_stop(base)  # after the stopped-check and the cache read, before anything is removed
     runner.discard(base)
 
     findings = []
     for mu in mutants:
         r = runner.run(mu.name, pristine, mu)
+        runner.settle_or_stop(r)
         line = f"{mu.name}: {r.outcome} ({r.seconds}s)"
         if r.outcome == "KILLED" and args.confirm_kills:
             again = runner.run(f"{mu.name} (again)", pristine, mu)
+            runner.settle_or_stop(again)
             r.__dict__["confirm"] = again.__dict__
             runner.discard(again)
             if again.outcome != "KILLED":
@@ -971,38 +1508,166 @@ def run_all(args, mutants: list[Mutant], runner: Runner, pristine: Path, report:
             findings.append(f"{mu.name}: {r.outcome}, log {r.log}")
         report["results"].append(r.__dict__)
         runner.discard(r)
-        print(line, flush=True)
+        out(line)
 
     final = runner.run("baseline (after)", pristine, None)
+    runner.settle_or_stop(final)
     report["results"].append(final.__dict__)
     runner.discard(final)
-    print(f"baseline after: {final.outcome}", flush=True)
+    out(f"baseline after: {final.outcome}")
     if final.outcome != "PASSED":
         findings.append(f"the unmutated tree failed after the mutants: {final.outcome}, log {final.log}")
     report["findings"] = findings
     killed = sum(1 for r in report["results"] if r["outcome"] == "KILLED")
-    print(f"mutants: {killed}/{len(mutants)} killed; findings: {len(findings)}", flush=True)
+    out(f"mutants: {killed}/{len(mutants)} killed; findings: {len(findings)}")
     for f in findings:
-        print(f"FINDING: {f}", file=sys.stderr)
+        err(f"FINDING: {f}")
     return EXIT_FINDINGS if findings else EXIT_OK
+
+
+DOCKER_STDERR_NOTE = "stderr is the docker client's: it carries the container's stderr and anything docker itself prints"
+
+
+def stream_evidence(path: Path | None) -> dict:
+    if path is None:
+        return {"path": None}
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        size = f"unreadable: {e}"
+    return {"path": str(path), "bytes": size, "sha256": file_digest(path), "tail": output_tail(path)}
+
+
+def command_attribution(code: int | None) -> str:
+    """What the docker client's exit status says about the command. docker run reports its own
+    failures as 125-127, which a command can also return: those are ambiguous, never attributed."""
+    if code is None:
+        return "none: the docker client was stopped before it returned"
+    if code < 0:
+        return "none: the docker client died by a signal"
+    if code in DOCKER_INFRA_EXITS:
+        return "ambiguous: docker-or-command"
+    return "command"
+
+
+def run_diagnostic(runner: Runner, pristine: Path, report: dict) -> int:
+    """One run of the unmutated tree, recorded as evidence. The report keeps apart the command's
+    raw result (command_exit, always kept, with its attribution), settlement (the container
+    confirmed removed or absent), integrity (the end-of-run checks, set by main) and evidence
+    completeness; the overall exit is report["exit"]. Exit EXIT_DIAGNOSTIC only when the run
+    completed and settled; never EXIT_OK, and command_exit 0 is never a gate success."""
+    r = runner.run("diagnostic", pristine, None)
+    report["results"].append(r.__dict__)
+    diag = {"command_exit": r.exit_code, "command_exit_attribution": command_attribution(r.exit_code),
+            "run_outcome": r.outcome, "settlement": "not checked", "integrity": "not checked",
+            "evidence": "incomplete", "stdout": stream_evidence(Path(r.log)),
+            "stderr": stream_evidence(runner.err_path), "stderr_note": DOCKER_STDERR_NOTE}
+    report["diagnostic"] = diag
+    # Settlement is positive and bounded: docker's --rm after the client returned is not taken on
+    # trust. The run's container must be confirmed removed or absent by the owner-checked cleanup
+    # call before the run's directory is touched, and BY THE ACTIVE DEADLINE (every call draws on
+    # hard_end; the emergency budget after it is the finalizer's alone). A settlement that cannot
+    # finish by the deadline, or that ends past it, is Stopped: exit 6, never 7.
+    _cidfile, name = runner.containers[r.name]
+    settled, late = runner.settle(r)
+    if late:
+        diag["settlement"] = "confirmed after the deadline" if settled else "not confirmed by the deadline"
+        raise Stopped(f"the whole-run deadline ({runner.args.deadline}s) passed during the diagnostic's settlement")
+    if not settled:
+        diag.update(settlement="unconfirmed", status="not-completed: container not confirmed removed")
+        report["findings"] = [f"diagnostic: container {name} not confirmed removed"]
+        err(f"FINDING: diagnostic did not complete: container {name} not confirmed removed")
+        return EXIT_FINDINGS  # the run's directory is kept: the container may still mount it
+    diag["settlement"] = "confirmed"
+    runner.discard(r)
+    if r.outcome == "DIAGNOSTIC":
+        diag["status"] = "completed"
+        return EXIT_DIAGNOSTIC  # main prints the DIAGNOSTIC line once the end-of-run checks held
+    # ERROR (docker's own 125-127, a bound, a client signal) or TIMEOUT: the run did not complete.
+    diag["status"] = f"not-completed: {r.outcome}"
+    report["findings"] = [f"diagnostic: {r.outcome} (docker client exit {r.exit_code}), log {r.log}"]
+    err(f"FINDING: diagnostic did not complete: {r.outcome} (docker client exit {r.exit_code})")
+    return EXIT_FINDINGS
+
+
+# Terminal output is best effort and never decides the result (TXE-8053). Only the EXPECTED broken
+# stream (a reader that went away: BrokenPipeError, or a stream Python could not open) is absorbed,
+# and noted in the report; any other write failure is recorded in STREAM_ERRORS, and main turns a
+# pass or a recorded diagnostic into 5 for it. Either way the stream is pointed at the null device,
+# so later writes and the interpreter's flush at exit cannot fail again.
+BROKEN_STREAMS: list[str] = []
+STREAM_ERRORS: list[str] = []
+_DEFERRED: list[str] | None = None  # while main finishes: stderr lines held until the reports are written
+
+
+def _null_out(stream) -> None:
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(fd, stream.fileno())
+    except (OSError, ValueError):
+        pass
+    finally:
+        os.close(fd)
+
+
+def _emit(stream, name: str, text: str) -> None:
+    if stream is None:  # Python started with that descriptor closed
+        if f"{name}: closed" not in BROKEN_STREAMS:
+            BROKEN_STREAMS.append(f"{name}: closed")
+        return
+    try:
+        stream.write(text + "\n")
+        stream.flush()
+    except BrokenPipeError:
+        if f"{name}: broken pipe" not in BROKEN_STREAMS:
+            BROKEN_STREAMS.append(f"{name}: broken pipe")
+        _null_out(stream)
+    except (OSError, ValueError) as e:  # not the expected case: recorded, and a finding
+        STREAM_ERRORS.append(f"{name}: {type(e).__name__}: {e}")
+        _null_out(stream)
+
+
+def out(text: str) -> None:
+    """A line to stdout, best effort (see BROKEN_STREAMS)."""
+    _emit(sys.stdout, "stdout", text)
+
+
+def err(text: str) -> None:
+    """A line to stderr, best effort; held back while main writes its reports."""
+    if _DEFERRED is not None:
+        _DEFERRED.append(text)
+        return
+    _emit(sys.stderr, "stderr", text)
 
 
 def loud(msg: str) -> None:
     bar = "!" * 72
-    print(f"\n{bar}\nMUTATE-SANDBOXED: SHARED STATE CHANGED. STOP AND TELL YOUR COORDINATOR.\n{msg}\n{bar}\n",
-          file=sys.stderr, flush=True)
+    err(f"\n{bar}\nMUTATE-SANDBOXED: SHARED STATE CHANGED. STOP AND TELL YOUR COORDINATOR.\n{msg}\n{bar}")
 
 
 def main(argv: list[str]) -> int:
     try:
         args = parse(argv)
-        mutants = load_mutants(args.mutants, args.tree)
+        if args.ro_manifest is not None:
+            try:
+                out(ro_manifest_sha256(args.ro_manifest, ro_limits(args)))
+            except OSError as e:
+                raise Refused(f"cannot read {args.ro_manifest}: {e}") from e
+            if STREAM_ERRORS or BROKEN_STREAMS:  # the digest is this mode's only output: not delivered, not done
+                err(f"mutate-sandboxed: the digest could not be written: {(STREAM_ERRORS + BROKEN_STREAMS)[-1]}")
+                return EXIT_FINDINGS
+            return EXIT_OK
+        mutants = [] if args.diagnostic else load_mutants(args.mutants, args.tree)
+        ro_mounts = parse_ro_mounts(args.ro_mount)
         modcache, gocache, gopath, go_facts = resolve_shared(args)
     except Refused as e:
-        print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: refused: {e}")
         return EXIT_REFUSED
     except Stopped as e:
-        print(f"mutate-sandboxed: stopped: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: stopped: {e}")
         return EXIT_STOPPED
     home = real(os.environ.get("HOME") or Path.home())
     forbidden = {"shared GOMODCACHE": modcache, "shared GOCACHE": gocache, "GOPATH": gopath, "HOME": home,
@@ -1016,15 +1681,22 @@ def main(argv: list[str]) -> int:
             watch.files[f"{name}/{SENTINEL}"] = root / SENTINEL
     report: dict = {"tree": str(args.tree), "image": args.image, "seeded": not args.no_seed,
                     "watched": {k: str(v) for k, v in watch.dirs.items()}, "results": []}
+    if args.diagnostic:
+        report.update(mode="diagnostic", gate="never")
+    if ro_mounts:
+        report["ro_mounts"] = [{"src": str(m.src), "dst": m.dst, "sha256": m.sha256} for m in ro_mounts]
     initial = watch.snapshot()
     report["identity_before"] = initial
     work = None
     runner = None
-    code = EXIT_OK
+    # Undecided until a path below sets it: a path that sets nothing is never reported as a pass.
+    code = EXIT_FINDINGS
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, stop_on_signal)
     try:
         check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
+        for m in ro_mounts:  # refused before anything is created or run
+            check_ro_source(m, forbidden, ro_limits(args), args.deadline_at)
         left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
         if left <= 0:
             raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
@@ -1045,39 +1717,54 @@ def main(argv: list[str]) -> int:
         pristine = work.path / "pristine"
         runner.room("copying the tree", (args.tree,), tuple(args.exclude))
         copy_tree(args.tree, pristine, tuple(args.exclude), runner.deadline)
+        for i, m in enumerate(ro_mounts):
+            runner.room(f"copying the --ro-mount for {m.dst}", (m.src,))
+            prepare_ro_mount(m, work.path, i, forbidden, runner.ro_limits, runner.deadline)
+            report["ro_mounts"][i]["copy"] = str(m.copy)
+        runner.ro_mounts = ro_mounts
         runner.room("seeding")
         if not args.no_seed:
             seed_modules(args, work, pristine, modcache, go_facts, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
-        code = run_all(args, mutants, runner, pristine, report)
+        if args.diagnostic:
+            code = run_diagnostic(runner, pristine, report)
+        else:
+            code = run_all(args, mutants, runner, pristine, report)
     except SharedStateChanged as e:
         loud(str(e))
         report["shared_state_changed"] = str(e)
         code = EXIT_SHARED_CHANGED
         args.keep = True  # evidence
     except Refused as e:
-        print(f"mutate-sandboxed: refused: {e}", file=sys.stderr)
+        err(f"mutate-sandboxed: refused: {e}")
         code = EXIT_REFUSED
     except Stopped as e:
-        print(f"mutate-sandboxed: stopped: {e}; removing the containers this run started", file=sys.stderr)
+        err(f"mutate-sandboxed: stopped: {e}; removing the containers this run started")
         report["stopped"] = str(e)
         code = EXIT_STOPPED
         args.keep = True  # evidence
+    except Exception as e:  # anything unexpected (an OSError from a host-side step, say) is a finding
+        report["error"] = f"{type(e).__name__}: {e}"
+        err(f"mutate-sandboxed: error: {type(e).__name__}: {e}")
+        code = EXIT_FINDINGS
+        args.keep = True  # evidence
     finally:
+        global _DEFERRED
+        _DEFERRED = []  # every stderr line from here on waits until the reports are written
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, signal.SIG_IGN)  # cleanup is not interrupted
         if runner:
-            if not runner.remove_pending():  # the retry of anything an earlier attempt left
+            if not runner.remove_pending(emergency=True):  # the retry of anything an earlier attempt left
                 left = ", ".join(runner.pending)
                 report["containers_left"] = left
-                print(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "
-                      "after checking their owner label", file=sys.stderr)
-                if code == EXIT_OK:
+                err(f"mutate-sandboxed: CONTAINERS NOT CONFIRMED REMOVED: {left}; remove them by hand "
+                    "after checking their owner label")
+                if code in (EXIT_OK, EXIT_DIAGNOSTIC):
                     code = EXIT_FINDINGS
                 args.keep = True  # never delete a directory a container may still have mounted
             report["container_cleanup"] = runner.cleanup_log
             for line in runner.cleanup_log:
-                print(f"mutate-sandboxed: container {line}", file=sys.stderr)
+                err(f"mutate-sandboxed: container {line}")
         # Every exit path, a stop by the deadline or a signal included, ends with the host check
         # against the state read at the start: a boundary failure is never reported as exit 6.
         if code != EXIT_SHARED_CHANGED:
@@ -1087,6 +1774,9 @@ def main(argv: list[str]) -> int:
                     for f, digest in runner.live.items():
                         if file_digest(args.tree / f) != digest:
                             raise SharedStateChanged(f"at the end of the run: the live tree's {f} changed")
+                    # By the active and integrity deadline, never extended: when it is exhausted the
+                    # check is incomplete (exit 6, integrity incomplete), never a manufactured 7.
+                    runner.verify_ro_mounts("at the end of the run", runner.hard_end)
             except SharedStateChanged as e:
                 loud(str(e))
                 report["shared_state_changed"] = str(e)
@@ -1097,23 +1787,130 @@ def main(argv: list[str]) -> int:
                 report["shared_state_changed"] = f"final check unreadable: {e}"
                 code = EXIT_SHARED_CHANGED
                 args.keep = True
+            except Stopped as e:  # the final check did not complete: never a pass, never 7
+                err(f"mutate-sandboxed: the final read-only mount check did not complete: {e}")
+                report["final_check"] = f"incomplete: {e}"
+                code = EXIT_STOPPED
+                args.keep = True
         try:
             report["identity_after"] = watch.snapshot()
         except OSError as e:
             report["identity_after"] = f"unreadable: {e}"
-        report["exit"] = code
-        text = json.dumps(report, indent=2, default=str)
-        if args.report:
-            args.report.write_text(text)
-        if work:
-            (work.path / "report.json").write_text(text)
-            if args.keep or code in (EXIT_BASELINE, EXIT_FINDINGS):  # a failure keeps its evidence
-                print(f"work directory kept: {work.path}", file=sys.stderr)
-            else:
-                try:
-                    work.remove()
-                except Refused as e:
-                    print(f"mutate-sandboxed: {e}", file=sys.stderr)
+        if args.deadline:
+            report["budgets"] = budgets(args.deadline)
+        code = finish(args, report, work, code)
+    return code
+
+
+def budgets(deadline: int) -> dict:
+    """The runner's cooperative bounds for --deadline D, in seconds, and the least hard deadline a
+    caller must enforce from outside to bound the process (see EMERGENCY_CLEANUP_S): no process exit
+    time is guaranteed by the runner itself."""
+    return {"active_and_integrity_deadline_s": deadline, "reserve_s": min(45.0, deadline / 3),
+            "emergency_cleanup_s": EMERGENCY_CLEANUP_S, "termination_margin_s": TERMINATION_MARGIN_S,
+            "cooperative_only": True,
+            "least_external_hard_deadline_s": deadline + EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S}
+
+
+def mark_diagnostic(report: dict, code: int) -> None:
+    """Set the diagnostic's integrity, settlement, evidence and status for the exit as it now
+    stands. Separate facts, never merged: the raw command_exit stays as recorded."""
+    d = report.get("diagnostic")
+    if not isinstance(d, dict):
+        return
+    if code == EXIT_SHARED_CHANGED:
+        d["integrity"] = "failed"
+    elif "final_check" in report:
+        d["integrity"] = "incomplete"
+    else:
+        d["integrity"] = "held"
+    if "containers_left" in report:
+        d["settlement"] = "unconfirmed"
+    d["evidence"] = "complete" if code == EXIT_DIAGNOSTIC else "incomplete"
+    if code == EXIT_SHARED_CHANGED:
+        d["status"] = "invalid: shared state changed"
+    elif d["settlement"] == "unconfirmed":
+        d["status"] = "not-completed: container not confirmed removed"
+    elif code != EXIT_DIAGNOSTIC:
+        for key, why in (("report_error", "report not written"), ("cleanup_error", "work directory not removed"),
+                         ("stream_errors", "terminal output failed")):
+            if key in report:
+                d["status"] = f"not-completed: {why}"
+                break
+        else:
+            if not str(d.get("status", "")).startswith("not-completed"):
+                d["status"] = f"not-completed: runner exit {code}"
+
+
+def downgrade(code: int) -> int:
+    """A pass or a recorded diagnostic whose evidence was then lost or not delivered is a finding."""
+    return EXIT_FINDINGS if code in (EXIT_OK, EXIT_DIAGNOSTIC) else code
+
+
+def write_reports(args, report: dict, work: "WorkDir | None", kept: bool, code: int) -> list[str]:
+    """Write --report and, when the work directory stays, <work>/report.json, as the report now
+    stands with exit `code`. Returns the writes that failed (none is retried)."""
+    report["exit"] = code
+    if BROKEN_STREAMS:
+        report["broken_streams"] = list(BROKEN_STREAMS)
+    if STREAM_ERRORS:
+        report["stream_errors"] = list(STREAM_ERRORS)
+    mark_diagnostic(report, code)
+    text = json.dumps(report, indent=2, default=str)
+    targets = ([args.report] if args.report else []) + ([work.path / "report.json"] if work and kept else [])
+    failed = []
+    for p in targets:
+        try:
+            Path(p).write_text(text)
+        except OSError as e:
+            failed.append(f"{p}: {type(e).__name__}: {e}")
+    return failed
+
+
+def finish(args, report: dict, work: "WorkDir | None", code: int) -> int:
+    """The end of every run, in this order: (1) the reports, while the work directory still exists;
+    (2) the work directory's removal, only after them; (3) terminal output, best effort, last. A
+    report that cannot be written, a removal that fails, and a terminal write that fails for any
+    reason but a broken stream each turn a pass or a recorded diagnostic into 5, and the reports
+    are written again with that exit. Whenever a report is written, its exit is the process's."""
+    global _DEFERRED
+    removable = bool(work) and not args.keep and code not in (EXIT_BASELINE, EXIT_FINDINGS)
+    kept = bool(work) and not removable
+    failed = write_reports(args, report, work, kept, code)
+    if failed:
+        report["report_error"] = "; ".join(failed)
+        err(f"mutate-sandboxed: cannot write the report: {report['report_error']}")
+        code = downgrade(code)
+        kept = bool(work)  # keep the directory as the evidence that survives
+        removable = False
+        write_reports(args, report, work, kept, code)
+    if removable and work:
+        try:
+            work.remove()
+        except (Refused, OSError) as e:
+            report["cleanup_error"] = f"{type(e).__name__}: {e}"
+            err(f"mutate-sandboxed: cleanup error: {e}")
+            if code == EXIT_OK:  # a pass whose cleanup failed is a finding, and says so
+                code = EXIT_FINDINGS
+            kept = True
+            write_reports(args, report, work, kept, code)
+    if work and kept:
+        err(f"work directory kept: {work.path}")
+    held, _DEFERRED = _DEFERRED or [], None
+    for line in held:
+        err(line)
+    if STREAM_ERRORS and code in (EXIT_OK, EXIT_DIAGNOSTIC):
+        code = downgrade(code)
+        write_reports(args, report, work, kept, code)
+    if code == EXIT_DIAGNOSTIC:  # only now: settled, checked, reported and no output failure
+        d = report["diagnostic"]
+        out(f"DIAGNOSTIC: command exit {d['command_exit']} (evidence only, never a pass; runner exit "
+            f"{EXIT_DIAGNOSTIC}); stdout {d['stdout']['path']}, stderr {d['stderr']['path']}")
+        if STREAM_ERRORS:
+            code = downgrade(code)
+            err("mutate-sandboxed: the DIAGNOSTIC line could not be written: " + STREAM_ERRORS[-1])
+    if BROKEN_STREAMS or STREAM_ERRORS:
+        write_reports(args, report, work, kept, code)  # the final word, with the streams recorded
     return code
 
 

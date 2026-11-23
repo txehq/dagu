@@ -14,11 +14,16 @@
     fake cache and the runner inside must exit 3. Nothing runs on this machine but `docker run`.
 
 <image-id> is an image already present locally, named by its immutable id (sha256:...); nothing
-is pulled. --deadline bounds the WHOLE demo, every container, error handling and cleanup
-included: the runner gets the deadline less a cleanup margin, and past it the demo stops the
-runner (SIGTERM, then SIGKILL) and force-removes the containers that were recorded as started
-(docker's --cidfile, outside every mount), each only when docker reports that container's own
-name and owner token. SIGTERM, SIGINT or SIGHUP to the demo do the same.
+is pulled. The demo is the runner's EXTERNAL hard bound (the runner's own bounds are cooperative
+and guarantee no exit time): the runner gets the deadline less a margin and less the allowance its
+README tells a caller to add (EMERGENCY_CLEANUP_S + TERMINATION_MARGIN_S, 15 s), and the demo
+waits for it until its own wait ends; past that the demo stops the runner (SIGTERM, then SIGKILL)
+and force-removes the containers that were recorded as started (docker's --cidfile, outside every
+mount), each only when docker reports that container's own name and owner token, drawing on
+EMERGENCY_CLEANUP_S (10 s) more. The demo's own file steps (state reads, logs, removing its root)
+have no deadline either: the demo guarantees no exit time of its own. SIGTERM, SIGINT or SIGHUP to
+the demo do the same. The sandboxed step refuses to start a runner with less
+than MIN_RUNNER_S (20 s); see that constant for the arithmetic: in practice --deadline 60 or more.
 
 The demo writes only inside one directory it creates exclusively (mkdtemp) and stamps with a
 random token; it removes that directory only when the token and the directory's identity
@@ -48,6 +53,14 @@ _spec.loader.exec_module(ms)
 
 OUTER_PREFIX = "txe-7549-outer"
 SENTINEL_TEXT = "TXE-7549 fixture sentinel\n"
+# The least --deadline the sandboxed step hands the runner. The runner gets
+# int(D - preflight - min(45, D/3) - 15), the preflight (image inspect, mkdtemp, the fixture copy)
+# included, so for D < 135 the step needs D >= 1.5 * (MIN_RUNNER_S + 15 + preflight): 52.5 s plus
+# 1.5 times the preflight; with up to 5 s of preflight, D >= 60. A runner deadline of 20 s leaves its
+# runs 20 - 20/3 = 13.3 s for the baseline, the mutant and the final baseline: enough for the
+# dependency-free fixture under the fake docker the tests use; a real image is not measured here
+# (the step's default --deadline is 300).
+MIN_RUNNER_S = 20
 
 
 class Demo:
@@ -114,9 +127,12 @@ class Demo:
         shutil.copytree(HERE / "testdata" / "fixture", root / "fixture", symlinks=True)
         before = self.fake_state(modcache, gocache)
         self.say("fake caches before: " + json.dumps(before, default=str))
-        runner_deadline = int(self.left() - self.margin)
-        if runner_deadline < 10:
-            raise ms.Stopped(f"only {runner_deadline}s left for the runner")
+        # The runner's cooperative bounds end by its --deadline + EMERGENCY_CLEANUP_S plus the margin
+        # its README tells a caller to add (TXE-8053): give it that much less than the wait below
+        # (left - margin/2), which is the hard bound: past it the runner is stopped and swept.
+        runner_deadline = int(self.left() - self.margin - ms.EMERGENCY_CLEANUP_S - ms.TERMINATION_MARGIN_S)
+        if runner_deadline < MIN_RUNNER_S:
+            raise ms.Stopped(f"only {runner_deadline}s left for the runner (it needs {MIN_RUNNER_S}s)")
         report = self.evidence / f"{self.args.step}.report.json"
         argv = [sys.executable, "-I", str(HERE / "mutate-sandboxed.py"), "--mutants", str(root / "fixture" / "mutants.json"),
                 "--tree", str(root / "fixture"), "--shared-modcache", str(modcache), "--shared-gocache", str(gocache),
@@ -193,7 +209,9 @@ class Demo:
                 targets.append((cid, f"mutate-sandboxed-{token[:12]}-{cid.stem}", token))
         for cidfile, name, token in targets:
             try:
-                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env, self.end))
+                # One emergency budget past the demo's deadline, consumed by every call (TXE-8053).
+                self.cleanup.append(ms.remove_owned_container(self.args.docker, cidfile, name, token, env,
+                                                              self.end + ms.EMERGENCY_CLEANUP_S))
             except (OSError, subprocess.TimeoutExpired) as e:
                 self.cleanup.append(f"{name}: cleanup error {e}")
         self.say(f"container sweep: {self.cleanup or 'nothing recorded'}")

@@ -21,7 +21,8 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   after any run (baselines included) stops the run.
 - **A container per run.** It has two mounts, both inside the work directory this run created:
   the run's own directory (read-write, at `/work`) and the seeded module proxy (read-only, at
-  `/goproxy`). It has no network (`--network none` unless `--network` says otherwise), no Docker
+  `/goproxy`), plus, only when `--ro-mount` is given, one read-only copy the runner made at
+  `/work/src/.git` (below). It has no network (`--network none` unless `--network` says otherwise), no Docker
   socket, no capabilities, a read-only root, `--memory`/`--cpus`/`--pids` limits (8g, 4, 4096 by
   default) and no variable from the caller's environment. Its host footprint is bounded too: a
   run whose captured output passes `--max-output-mib` (64), whose own directory (its only writable
@@ -45,6 +46,10 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   documentation, not observed here). A mount
   that would be, contain or lie inside the shared caches, GOPATH, HOME, the Docker socket or the
   live tree is refused before docker runs.
+- **Mount paths must be plain enough for docker's `--mount`.** Its value is comma-separated fields, and the runner
+  does not quote them. A `--workdir-root` (or any mount source or target) containing a comma, a double quote, or a
+  line break (LF or CR) is refused with exit 2 before any docker call, never passed to docker split or corrupted.
+  Every other path character, spaces included, is passed as is.
 - **The shared module cache is only read, and only before any mutant runs.** On the host, `go mod
   download` fills an owned cache from the unmutated copy with
   `GOPROXY=file://<shared GOMODCACHE>/cache/download,<your GOPROXY>`. Go never writes to a file
@@ -68,19 +73,161 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   and the ownership token written into it at creation still match.
 
 Exit codes: 0 done with no finding (survivors are listed, not failures); 2 refused or bad input;
-3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (the
-whole run, every container included) or by SIGTERM, SIGINT or SIGHUP. Any exit from 3 to 6 keeps
-the work directory as evidence.
+3 shared state changed; 4 the unmutated tree failed; 5 findings; 6 stopped by `--deadline` (every
+run, settlement and integrity check; cooperative bounds, no process-exit guarantee: see "The bounds" below) or
+by SIGTERM, SIGINT or SIGHUP; 7 a `--diagnostic` run
+completed and was recorded (below). Any exit from 3 to 7 keeps the work directory as evidence.
+
+## Diagnostic runs and the read-only git view (TXE-8053)
+
+```sh
+mutate-sandboxed --ro-manifest /abs/view                       # prints the view's digest; runs nothing
+mutate-sandboxed --diagnostic --tree . --image sha256:<id> \
+  --ro-mount /abs/view:/work/src/.git:<digest> -- python3 -I -B ops/ci/mutant-consumers-check.py --static-only
+```
+
+**`--diagnostic`** runs the unmutated tree once, with the same boundary, bounds and host checks as
+any run, and records the command's result as evidence. It takes no mutant list (`--mutants` with
+it is refused). The command's stdout and stderr go to `<work>/logs/001.stdout` and
+`001.stderr`, outside every mount; the report holds each one's path, size, sha256 and tail, and
+`"mode": "diagnostic", "gate": "never"`. The stderr file is the docker client's: it also carries
+anything docker itself prints. The two streams' interleaving is not recorded. The work directory
+is always kept.
+
+- **Exit 7 means evidence complete, not command success.** The container ran to its own exit with
+  a code N that is not docker's own (125 to 127), every host check held, the run's container was
+  confirmed removed or absent by the owner-checked cleanup call (docker's `--rm` is not taken on
+  trust), and the end-of-run checks held. Only then is the `DIAGNOSTIC: command exit N` line
+  printed. The outcome is `DIAGNOSTIC`, never PASSED, SURVIVED, KILLED or FAILED. A diagnostic
+  never exits 0, so it never passes a gate that reads exit 0. Read the report; do not chain on the
+  exit status, and never treat `command_exit` 0 as a gate success (`gate: never`).
+- **Separate facts, never merged.** `report["diagnostic"]` keeps:
+  - `command_exit`: the docker client's raw exit status, ALWAYS kept as evidence (null only when
+    the client was stopped or died before returning), with `command_exit_attribution`: `command`,
+    `ambiguous: docker-or-command` for 125 to 127, or `none: ...`;
+  - `settlement`: `confirmed` (the container removed or absent), `unconfirmed`, or `not checked`;
+  - `integrity`: `held`, `failed` (exit 3) or `incomplete` (the final check could not finish);
+  - `evidence`: `complete` only with exit 7, else `incomplete`; and `status`, a summary.
+  The overall exit is `report["exit"]`.
+- **7 never masks a failure.** A run that did not complete (docker's 125 to 127, the timeout, an
+  output or disk bound, the client killed by a signal, a container not confirmed removed) is exit
+  5 with `status: not-completed: ...`. A shared-state or read-only-mount change is exit 3: during
+  the run no diagnostic is recorded, and after it (in cleanup or the final check) the recorded one
+  is marked `integrity: failed`, `status: invalid: shared state changed`. Refusals are 2 and the
+  deadline or a signal 6, as in any run.
+- **Ambiguity: 125, 126 and 127 are attributed to neither side.** docker run reports its own
+  failures with those codes and the client cannot tell them from the command's, so the runner
+  does not claim either: such a run is exit 5, `not-completed`, with the value kept in
+  `command_exit` and `command_exit_attribution: ambiguous: docker-or-command`.
+- **Anything unexpected is a finding.** An exception the runner does not expect (a host-side step
+  failing, such as removing a run directory the command made unremovable) is exit 5 with
+  `report["error"]`; whenever a report is written, its `exit` equals the process's exit status.
+- **Reports first, terminal output last.** At the end the runner writes `--report` and, when the
+  work directory stays, `<work>/report.json`; only then removes the work directory; and only
+  then writes its held stderr lines and the `DIAGNOSTIC` line. A report that cannot be written
+  (`report_error`; the work directory is then kept as the evidence that survives), a work
+  directory that cannot be removed (`cleanup_error`), and a terminal write that fails for any
+  reason but a broken stream (`stream_errors`) each turn 0 or 7 into 5, and the reports are
+  written again with that exit. A broken pipe or a closed stdout or stderr, the expected case of a
+  reader that went away, is only noted (`broken_streams`) and changes nothing. No report can be
+  promised on a filesystem that refuses every write: then the exit is 5 and stderr says why.
+- **The bounds under `--deadline D`, none extended, all COOPERATIVE** (the report's `budgets`):
+  they bound what the runner checks a clock around. They are not a process-exit guarantee: see
+  the last item.
+  - **D, the active and integrity deadline.** Runs end a reserve before it: min(45, D/3) s,
+    chosen to hold settlement and the read-only mount checks after a run and at the end, each a
+    full re-hash of the view (with a view, the reserve has to cover two hashes; a large view or a
+    small D makes the end check run out). The reserve's adequacy is not measured. A run, a
+    settlement or an integrity check that cannot finish by D is exit 6 (integrity `incomplete`
+    when it is the end check), never 7; an earlier 2, 4 or 5 also becomes 6, the report keeping its
+    findings and results.
+  - **Emergency cleanup: 10 s after D,** one budget that every container-removal call past D
+    consumes (each call's timeout is what is left of it; none restarts its own); once it is spent
+    no call starts and the container is reported as not confirmed removed.
+  - **A 5 s termination margin** for the local steps left: the end-of-run host check (identities
+    and one-level listings of the watched directories), the report writes, the work directory's
+    removal and terminal output. These do host I/O with NO deadline of their own, and the
+    finalizer ignores SIGTERM, SIGINT and SIGHUP so that cleanup is not cut short. The margin is
+    an allowance for a caller to add, not something the runner enforces or has measured.
+  - **No process-exit guarantee; the caller owns the hard deadline and custody.** A caller that
+    needs the process gone by a time must enforce it from outside (SIGKILL, a job timeout), no
+    earlier than D + 15 s (`budgets.least_external_hard_deadline_s`), and keep custody of what a
+    kill leaves: the work directory, whose `cids/` holds each started container's id (and whose
+    name and owner label carry the run's token) for removal by hand. txe's CI launcher and
+    `fixture-demo.py` are such callers; the global launcher (`~/.coding_global/bin/mutate-sandboxed`)
+    is not: it execs the runner and adds no bound.
+- **Settlement after "removal already in progress".** When `rm -f` fails, the runner inspects the
+  same owner-checked container once more, within the emergency cleanup budget; only docker's own
+  "no such" counts as absent. Anything else, "in progress" included, is unconfirmed: exit 5.
+
+**`--ro-mount SRC:DST:SHA256`** gives the container a read-only view of a directory, in either
+mode. SRC is only read on the host and never mounted: the runner copies it into
+`<work>/ro/<n>` and mounts that copy.
+
+- **SRC** is absolute and equal to its own realpath (on macOS `/private/tmp/...`, not `/tmp/...`),
+  a plain directory, and does not equal, contain or lie inside the shared module or build cache,
+  GOPATH, the Docker socket, the live tree or the run's work directory; it may lie inside HOME but
+  not contain it. It holds only directories and regular files with names in `[A-Za-z0-9._-]`, no
+  two in one directory equal ignoring case.
+- **Bounds:** `--ro-max-files` (100000 entries), `--ro-max-depth` (32 levels), `--ro-max-mib`
+  (4096 MiB in all) and `--ro-max-file-mib` (2048 MiB per file). Bytes are counted as read, so a
+  file that grows during the copy is still bounded.
+- **Races:** every directory is opened relative to its parent's descriptor with `O_NOFOLLOW`, and
+  every file with `O_NOFOLLOW | O_NONBLOCK` and checked to be regular, so a directory or file
+  replaced mid-walk by a link or a FIFO is refused, not followed. The copy, not the source, is
+  hashed: a writer racing on the source can only cause a refusal.
+- **The copy** is new files and directories whose modes the runner sets explicitly (0644 and
+  0755, whatever the umask or the source's modes, on Linux and macOS alike) and checks, owned by
+  the runner's uid, which is the uid the container runs as (so git's ownership check holds);
+  times are not kept. Its manifest must equal SHA256. It is checked again (manifest, one link per file,
+  owner, and the git view's shape) immediately before every mount and after every run; a failure
+  then is exit 3.
+- **The manifest:** every entry below the root, sorted by its relative path as bytes,
+  `D <rel>\n` per directory (empty ones included) and `F <size> <sha256> <rel>\n` per file; its
+  digest is the sha256 of those lines joined. It covers names, types, sizes and contents, not
+  modes, owners or times. `--ro-manifest DIR` prints it with the same code. That mode takes no
+  `--deadline` (refused, exit 2): the walk is bounded by the `--ro-max-*` limits, and a caller that
+  needs a time bound wraps the command; a digest it cannot deliver (stdout gone or failing) is 5.
+- **DST** must be exactly `/work/src/.git`, a named exception to "no mount overlaps `/work`".
+  Any other destination, a second `--ro-mount`, two mounts on one target, or a read-only source
+  that a read-write mount source contains or lies inside is refused. There is no option field: a
+  writable form does not exist. Two separate checks guard the mountpoint:
+  - **No source data is shadowed.** The tree copy never holds `.git` (excluded at every depth),
+    and after each run's copy the runner refuses if anything exists at `src/.git`, before it
+    creates the mountpoint.
+  - **The mountpoint is the runner's.** The runner then creates it as an empty plain directory,
+    and immediately before building the argv checks that no link lies on its path and that it is
+    still an empty directory, so docker neither creates it nor resolves it through a link.
+- **The git view's contents.** Byte integrity says nothing about what the bytes are, so the copy
+  must also be the TXE-8047 view: `HEAD` (a detached object id), `config` (only `[core]` with
+  `repositoryformatversion`, `filemode`, `bare`, `logallrefupdates`, `ignorecase`,
+  `precomposeunicode`, `symlinks`, plain values), `objects/` (packs, idx and rev files, loose
+  objects, an empty `info/`), `refs/` (directories only), and optionally `index` and `shallow`.
+  Anything else (hooks, alternates, refs, `packed-refs`, reflogs, remotes, credential helpers,
+  includes, `commondir`, `description`) is refused. The runner does not check which commit the
+  objects hold or that the index matches it: that binding is the view builder's.
+- With the view mounted the container gets `GIT_OPTIONAL_LOCKS=0`, so git skips its optional
+  index refresh instead of trying `.git/index.lock`; a command that needs a lock fails on the
+  read-only mount.
+
+Limits: the read-only bind is enforced by Docker (on macOS by the VM's file sharing); the tests'
+fake docker cannot enforce it, so the per-run re-check is the alarm if it fails. Teardown: the
+mountpoint goes with the run's directory; the copy goes with the work directory under its
+ownership check, and stays as evidence whenever the work directory is kept.
 
 **Containers the runner started, and only those, are removed when it stops.** Each `docker run`
 records its container id with `--cidfile` in the work directory, outside every mount, and carries
-a unique name and an owner label holding the run's random token. On a timeout, the deadline or a
-signal, the runner force-removes each container whose docker client had not returned, and only
-when docker reports that exact name and token on it. Runs stop a cleanup reserve (a third of `--deadline`, at most
-45 s) before the deadline, and each cleanup call is cut to what remains, with a 1 s floor: a
-container left running is still removed when the deadline has just passed, so cleanup can overrun
-the deadline by about 2 s per such container (at most one: runs are sequential). A cleanup that
-fails is reported as `cleanup error` on stderr and in the report.
+a unique name and an owner label holding the run's random token. **A container leaves the
+runner's custody only when an owner-checked inspect or removal confirms it gone**, in every mode
+and outcome: a docker client that returned normally proves nothing (`--rm` is not taken on
+trust). After each run the runner settles it (removed, or confirmed absent) by the deadline before
+the next run starts or its directory is discarded; if a check after the run raises first (an
+integrity incident, the deadline), it stays pending and the finalizer's emergency removal settles
+it, or reports it in `containers_left`. Removal happens only when docker reports that exact name and
+token on the container. Runs stop the reserve (a third of `--deadline`, at most 45 s) before the
+deadline; settlement and the clearing of a stopped run draw on the deadline itself, and only the
+finalizer's emergency removal draws on the one budget that ends 10 s after it (above). A cleanup
+that fails is reported as `cleanup error` on stderr and in the report.
 
 The build cache: the baseline's GOCACHE is copied (copy-on-write on APFS) into each mutant's
 sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives each an empty one.
