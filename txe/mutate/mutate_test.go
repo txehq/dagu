@@ -265,6 +265,29 @@ func registry(t *testing.T, log string) map[string][]string {
 	return r
 }
 
+// logKeptEvidence logs, bounded, what a failed lifecycle assertion needs to be explained: every file
+// under the kept work directory's logs (the fake client's own stderr, a traceback included), the
+// fake docker's argv log and its container registry. Diagnostic output only; it asserts nothing.
+func logKeptEvidence(t *testing.T, stderr, log string) {
+	t.Helper()
+	const kept = "work directory kept: "
+	for _, line := range strings.Split(stderr, "\n") {
+		if dir, ok := strings.CutPrefix(line, kept); ok {
+			_ = filepath.WalkDir(filepath.Join(dir, "logs"), func(p string, d fs.DirEntry, err error) error {
+				if err == nil && !d.IsDir() {
+					b, _ := os.ReadFile(p)
+					t.Logf("kept %s (%d bytes):\n%s", p, len(b), b[:min(len(b), 8192)])
+				}
+				return nil
+			})
+		}
+	}
+	for _, p := range []string{log, log + ".containers"} {
+		b, err := os.ReadFile(p)
+		t.Logf("%s (err %v):\n%s", p, err, b[:min(len(b), 8192)])
+	}
+}
+
 type fixture struct {
 	root, tree, modcache, gocache, workRoot, log, docker string
 }
@@ -1438,6 +1461,38 @@ w = ms.WorkDir(root); print(verdict(w), w.path.exists())
 	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
 	require.NoError(t, err, string(out))
 	assert.Equal(t, "refused True\nrefused True\nremoved False\n", string(out))
+}
+
+// file_digest reads in bounded chunks: a log far over its output bound (a diagnostic's evidence
+// digest included) is never loaded whole. The digest is exact, read_bytes is never used, no read
+// asks for more than 1 MiB, and the missing (None) and unreadable (errno) results are unchanged.
+func TestFileDigestIsChunked(t *testing.T) {
+	prog := `
+import hashlib, importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+d = pathlib.Path(sys.argv[2])
+data = os.urandom(3 << 20)
+(d / "big").write_bytes(data)
+def whole(*a, **k):
+    raise AssertionError("read_bytes used")
+pathlib.Path.read_bytes = whole
+sizes, real_open = [], open
+class Counted:
+    def __init__(self, f): self.f = f
+    def __enter__(self): return self
+    def __exit__(self, *exc): self.f.close()
+    def read(self, n=-1):
+        sizes.append(n)
+        return self.f.read(n)
+ms.open = lambda p, mode: Counted(real_open(p, mode))
+print(ms.file_digest(d / "big") == hashlib.sha256(data).hexdigest(), max(sizes) == 1 << 20, min(sizes) > 0)
+print(ms.file_digest(d / "missing"))
+print(ms.file_digest(d))
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "True True True\nNone\nunreadable: errno 21\n", string(out))
 }
 
 // The deadline clock starts before preflight: a docker that hangs on the image check is stopped.
@@ -2959,7 +3014,9 @@ func TestAfterRunIntegrityErrorKeepsContainerPending(t *testing.T) {
 				}
 				require.Equal(t, 3, o.code, o.stdout+o.stderr)
 				assert.Contains(t, o.stderr, "SHARED STATE CHANGED")
-				assert.Contains(t, o.stderr, c.want)
+				if !assert.Contains(t, o.stderr, c.want) {
+					logKeptEvidence(t, o.stderr, f.log) // diagnostic only: the assertion is unchanged
+				}
 				if c.left {
 					assert.NotEmpty(t, o.report["containers_left"])
 					assert.Contains(t, o.stderr, "CONTAINERS NOT CONFIRMED REMOVED")

@@ -149,12 +149,18 @@ def identity(path: Path) -> dict | None:
 
 
 def file_digest(path: Path) -> str | None:
+    """sha256 of the file, read in bounded chunks (a log far over its bound is never held in memory
+    whole); None when it does not exist; "unreadable: errno N" for any other error, mid-read included."""
+    h = hashlib.sha256()
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
     except FileNotFoundError:
         return None
     except OSError as e:
         return f"unreadable: errno {e.errno}"
+    return h.hexdigest()
 
 
 @dataclass
