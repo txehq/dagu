@@ -333,13 +333,23 @@ There are no wildcard rows. A ticket id alone classifies nothing.
 - the demonstration's outer container intentionally runs with a writable root and the image's user. That is a
   demonstration boundary, not enforcement.
 
-The evidence for both rows (TXE-8053, the bytes with `--diagnostic` and `--ro-mount`):
-- `review_evidence` is root's scoped exact-byte source review of those two files' hashes, `msg_8aa61a2eb4f7`. It
-  accepts the classifications and the declared partial guards only: it is not a fixed-argv floor attestation, not
-  behavioural acceptance (no test had run on these bytes) and not adoption or a global pin;
-- `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same, `msg_47e1330eb699`.
-The rows' earlier evidence (`msg_f5d1db2e4e66`, `msg_e244f71997d3`) covered the TXE-7549 bytes, which no longer exist on
-this branch; the TXE-7549 acceptance the rows cite is historical. Any executable change to either file voids its row.
+The evidence for each row is bound to that row's exact bytes (TXE-8053):
+- `txe/mutate/fixture-demo.py` (836458c6): `review_evidence` is root's scoped exact-byte source review,
+  `msg_8aa61a2eb4f7`, and `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same,
+  `msg_47e1330eb699`.
+- `txe/mutate/mutate-sandboxed.py` (7803b411, the bytes with `--diagnostic`, `--ro-mount` and chunked file
+  hashing): `review_evidence` is root's scoped source review of those bytes, `msg_590f75e91493`, and `owner_ack` is
+  the custodian's acknowledgment of the same classification, `msg_e8ac8fe99474`.
+Each review accepts the classification and the declared partial guards only. It is not a fixed-argv floor
+attestation, not behavioural acceptance and not adoption or a global pin.
+
+**Historical evidence, kept apart:**
+- `msg_8aa61a2eb4f7` and `msg_47e1330eb699` also covered the runner's earlier TXE-8053 bytes (e9d6e717), which this
+  branch no longer has.
+- `msg_f5d1db2e4e66` and `msg_e244f71997d3` covered the TXE-7549 bytes, which no longer exist on this branch either,
+  so the TXE-7549 acceptance the rows cite is historical.
+
+Any executable change to either file voids its row.
 
 **Provenance:** TXE-7549's tools were written by cc7, then held by cc4-s246524. That contact is currently unreachable,
 so the acknowledgment is the current custodian's.

@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -265,27 +266,62 @@ func registry(t *testing.T, log string) map[string][]string {
 	return r
 }
 
-// logKeptEvidence logs, bounded, what a failed lifecycle assertion needs to be explained: every file
-// under the kept work directory's logs (the fake client's own stderr, a traceback included), the
-// fake docker's argv log and its container registry. Diagnostic output only; it asserts nothing.
+// logKeptEvidence logs what a failed lifecycle assertion needs to be explained: the files under the
+// kept work directory's logs (the fake client's own stderr, a traceback included), the fake docker's
+// log and its container registry. These are fixture-owned fake-client files only. Every read is
+// bounded on the open file (at most keptReadCap bytes, truncation stated), at most keptMaxFiles log
+// files are read, and every walk, open and read error is logged. Diagnostic output only; it asserts
+// nothing.
+const keptReadCap, keptMaxFiles = 8192, 16
+
 func logKeptEvidence(t *testing.T, stderr, log string) {
 	t.Helper()
 	const kept = "work directory kept: "
 	for _, line := range strings.Split(stderr, "\n") {
-		if dir, ok := strings.CutPrefix(line, kept); ok {
-			_ = filepath.WalkDir(filepath.Join(dir, "logs"), func(p string, d fs.DirEntry, err error) error {
-				if err == nil && !d.IsDir() {
-					b, _ := os.ReadFile(p)
-					t.Logf("kept %s (%d bytes):\n%s", p, len(b), b[:min(len(b), 8192)])
-				}
+		dir, ok := strings.CutPrefix(line, kept)
+		if !ok {
+			continue
+		}
+		n := 0
+		werr := filepath.WalkDir(filepath.Join(dir, "logs"), func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				t.Logf("kept walk %s: %v", p, err)
 				return nil
-			})
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if n++; n > keptMaxFiles {
+				t.Logf("kept: more than %d log files; %s and later not read", keptMaxFiles, p)
+				return fs.SkipAll
+			}
+			logBounded(t, "kept "+p, p)
+			return nil
+		})
+		if werr != nil {
+			t.Logf("kept walk %s: %v", dir, werr)
 		}
 	}
-	for _, p := range []string{log, log + ".containers"} {
-		b, err := os.ReadFile(p)
-		t.Logf("%s (err %v):\n%s", p, err, b[:min(len(b), 8192)])
+	logBounded(t, "fake docker log", log)
+	logBounded(t, "fake docker registry", log+".containers")
+}
+
+// logBounded logs at most keptReadCap bytes of p, read through a limit on the open file, and says
+// whether more followed; an open or read error is logged, never dropped.
+func logBounded(t *testing.T, label, p string) {
+	t.Helper()
+	fh, err := os.Open(p)
+	if err != nil {
+		t.Logf("%s: open: %v", label, err)
+		return
 	}
+	defer func() { _ = fh.Close() }()
+	b, err := io.ReadAll(io.LimitReader(fh, keptReadCap+1))
+	more := len(b) > keptReadCap
+	if more {
+		b = b[:keptReadCap]
+	}
+	t.Logf("%s (%d bytes shown, truncated: %v, read error: %v):\n%s", label, len(b), more, err, b)
 }
 
 type fixture struct {
