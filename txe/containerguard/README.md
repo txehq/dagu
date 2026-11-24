@@ -340,15 +340,17 @@ The evidence for each row is bound to that row's exact bytes (TXE-8053):
 - `txe/mutate/fixture-demo.py` (836458c6): `review_evidence` is root's scoped exact-byte source review,
   `msg_8aa61a2eb4f7`, and `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same,
   `msg_47e1330eb699`.
-- `txe/mutate/mutate-sandboxed.py` (1d23671c, the TXE-8385 bytes: the node seed written relative to a descriptor,
-  on top of TXE-8348's node seed and TXE-8053's `--diagnostic`, `--ro-mount`, chunked file hashing and mount-field
-  refusal): `review_evidence` is root's scoped exact-byte source review of those bytes, `msg_9d9d21e51448` (accepted
-  by root in `msg_8b48ba12d464`), and `owner_ack` is the custodian's (cc3) acknowledgment of the row,
-  `msg_e6ea429fa202`.
+- `txe/mutate/mutate-sandboxed.py` (8c8cd19f, the TXE-8374 bytes: the node seed's workspace-bin refusal reads the
+  lockfile's importer links, on top of TXE-8385's descriptor-relative seed writes, TXE-8348's node seed and
+  TXE-8053's `--diagnostic`, `--ro-mount`, chunked file hashing and mount-field refusal): `review_evidence` is root's
+  scoped exact-byte source review of those bytes, `msg_5a988ba67b99` (accepted by root in `msg_ba5ddb3c0c83`), and
+  `owner_ack` is the custodian's (cc3) acknowledgment of the row, `msg_f3687ca2bb64`.
 Each review accepts the classification and the declared partial guards only. It is not a fixed-argv floor
 attestation, not behavioural acceptance and not adoption or a global pin.
 
 **Historical evidence, kept apart:**
+- `msg_9d9d21e51448` (root's review, accepted in `msg_8b48ba12d464`) and `msg_e6ea429fa202` (the custodian's ack)
+  covered the runner's TXE-8385 bytes (1d23671c, main before TXE-8374).
 - `msg_00959f1a2c75` (root's review) and `msg_15b9f6cb6ce5` (the custodian's ack) covered the runner's TXE-8348
   bytes (67bf0fc7, main before TXE-8385). Root's review `msg_3a9b7aaa1a73` covered TXE-8385's earlier frozen
   bytes (46cbbe91), and asked for the fixes in 1d23671c.
