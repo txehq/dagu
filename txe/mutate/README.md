@@ -271,7 +271,7 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
     --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
   # only with --node-seed-allow-build NAME (repeatable):
-  pnpm rebuild --config.dangerously-allow-all-builds=true --store-dir=... --reporter=append-only NAME...
+  pnpm rebuild -r --config.dangerously-allow-all-builds=true --store-dir=... --reporter=append-only NAME...
   ```
 
   `--ignore-scripts` disables every lifecycle script, the workspace's own and every dependency's.
@@ -281,6 +281,8 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   a named rebuild of a package the workspace has not approved, silently; with
   `dangerously-allow-all-builds` the named rebuild ran exactly the named packages (measured with
   pnpm 10.33.0 on 2026-11-24: a second package's postinstall and the workspace's own stayed unrun).
+  `-r` is what reaches a package that only a workspace project (say `apps/web`) depends on: run at
+  the root without it, the rebuild ran nothing there (same pnpm, same day; found in review).
   Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
   rolldown, lightningcss) need no script: the Linux container installs the Linux one.
 - **What ran is recorded.** After the install the host reads every installed package's
@@ -288,8 +290,10 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   `lifecycle_scripts`: each workspace project's own lifecycle scripts (`workspace_skipped`) and
   each dependency with a `preinstall`, `install` or `postinstall` script, or a `binding.gyp`
   (`node-gyp rebuild`), marked `allowlisted` or `skipped`. The build's last line names both lists.
-- **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused), every
-  link inside the install's tree, no special file, and a root `node_modules`. It copies each
+- **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused; each is
+  opened no-follow and non-blocking and must be a regular file, so a FIFO the container left is
+  refused, never waited on), every link inside the install's tree, no special file, and a root
+  `node_modules`. It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, and every link's target), and writes `seed.json` last.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.

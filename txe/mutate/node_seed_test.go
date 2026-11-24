@@ -30,7 +30,7 @@ import (
 
 // fakePnpm writes pnpm-shaped output into its working directory. Its mode file (when present)
 // picks a failure: "fail" exits 1, "abslink" adds a link out of the tree, "touchlock" edits the
-// lockfile. Each call is appended to log as JSON: args, the files it could see before it wrote
+// lockfile, "fifo" replaces a manifest with a FIFO. Each call is appended to log as JSON: args, the files it could see before it wrote
 // anything, and a few environment values.
 const fakePnpm = `#!/usr/bin/env python3
 import json, os, sys
@@ -69,8 +69,11 @@ elif args[0] == "install":
         os.symlink("/etc", "node_modules/escape")
     if "touchlock" in mode:
         open("pnpm-lock.yaml", "a").write("# rewritten\n")
+    if "fifo" in mode:  # a manifest swapped for a FIFO: a blocking host read would wait forever
+        os.remove("apps/web/package.json")
+        os.mkfifo("apps/web/package.json")
 elif args[0] == "rebuild":
-    for name in [a for a in args[1:] if not a.startswith("--")]:
+    for name in [a for a in args[1:] if not a.startswith("-")]:
         write("node_modules/.rebuilt-" + name.replace("/", "+"), "rebuilt\n")
 `
 
@@ -390,6 +393,7 @@ func TestNodeSeedLifecycleAllowlist(t *testing.T) {
 	assert.Contains(t, strs(calls[1]["args"]), "--ignore-scripts", "the install itself still runs no script")
 	rebuild := strs(calls[2]["args"])
 	assert.Equal(t, "rebuild", rebuild[0])
+	assert.Equal(t, "-r", rebuild[1], "recursive: a package only a workspace project depends on is reached")
 	assert.Equal(t, "esbuild", rebuild[len(rebuild)-1], "only the allowlisted name is rebuilt")
 	runs := dockerRuns(t, f.log)
 	assert.Equal(t, []string{"sh", "esbuild"}, runs[0][len(runs[0])-2:], "names are arguments, never script text")
@@ -401,7 +405,7 @@ func TestNodeSeedLifecycleAllowlist(t *testing.T) {
 	log, err := os.ReadFile(filepath.Join(seedDir, "install.log"))
 	require.NoError(t, err)
 	// The fake docker maps /work to the run's host directory, so the store path is a host path here.
-	assert.Regexp(t, `\n\+ pnpm rebuild --config.dangerously-allow-all-builds=true --store-dir=\S+/sandbox/pnpm-store `+
+	assert.Regexp(t, `\n\+ pnpm rebuild -r --config.dangerously-allow-all-builds=true --store-dir=\S+/sandbox/pnpm-store `+
 		`--reporter=append-only esbuild\n`, string(log))
 
 	for name, c := range map[string]struct {
@@ -448,6 +452,9 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		"lockfile rewritten": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("touchlock"), 0o644))
 		}, "the seed's install changed pnpm-lock.yaml", true},
+		"manifest swapped for a FIFO": {func(t *testing.T, f nodeFixture, _ string) {
+			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("fifo"), 0o644))
+		}, "apps/web/package.json is not a regular file", true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

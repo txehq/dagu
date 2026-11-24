@@ -1427,12 +1427,13 @@ NODE_STORE = "/work/sandbox/pnpm-store"
 # pnpm 10's build policy blocks even a named `pnpm rebuild` of a package the workspace has not
 # approved, silently (measured with pnpm 10.33.0, 2026-11-24). With dangerously-allow-all-builds
 # the named rebuild runs exactly the packages named: another package's postinstall and the
-# workspace's own stayed unrun in the same measurement.
+# workspace's own stayed unrun in the same measurement. `-r` makes it reach a package that only
+# a workspace project depends on; without it the rebuild ran nothing there (same measurement).
 NODE_SEED_SCRIPT = """set -eux
 pnpm --version
 pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
  --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
-if [ "$#" -gt 0 ]; then pnpm rebuild --config.dangerously-allow-all-builds=true \
+if [ "$#" -gt 0 ]; then pnpm rebuild -r --config.dangerously-allow-all-builds=true \
  --store-dir="$MUTATE_NODE_STORE" --reporter=append-only "$@"; fi
 """
 WORKSPACE_SCRIPTS = ("preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare")
@@ -1461,13 +1462,26 @@ def node_inputs(root: Path, deadline: float | None = None) -> dict[str, str]:
         dirs[:] = sorted(x for x in dirs if x != "node_modules")
         if "package.json" in files:
             found.append(os.path.relpath(os.path.join(d, "package.json"), root))
-    out = {}
-    for rel in sorted(set(found)):
-        p = plain_target(root, rel)
-        if not stat.S_ISREG(os.lstat(p).st_mode):
+    return {rel: regular_digest(root, rel, deadline) for rel in sorted(set(found))}
+
+
+def regular_digest(root: Path, rel: str, deadline: float | None = None) -> str:
+    """sha256 of root/rel, refused unless the path is link-free and the file is regular. It is
+    opened O_NOFOLLOW | O_NONBLOCK and checked on its descriptor, so a FIFO or a link a container
+    swapped in is refused, never waited on; the read checks the deadline per MiB."""
+    p = plain_target(root, rel)
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise Refused(f"cannot open {rel} as a plain file: {e}") from e
+    h = hashlib.sha256()
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
             raise Refused(f"{rel} is not a regular file")
-        out[rel] = file_digest(p)
-    return out
+        while chunk := f.read(1 << 20):
+            check_deadline(deadline, f"hashing {rel}")
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | None = None) -> tuple[str, int]:
@@ -1677,8 +1691,8 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
         args.keep = True  # the install log is evidence
         raise Refused(f"the seed's install did not pass ({r.outcome}, exit {r.exit_code}); log {r.log}")
     src = plain_target(Path(r.dir), "src")
-    for rel, digest in inputs.items():
-        if file_digest(plain_target(src, rel)) != digest:
+    for rel, digest in inputs.items():  # written by the container: a FIFO or link here is refused, never read
+        if regular_digest(src, rel, runner.deadline) != digest:
             raise Refused(f"the seed's install changed {rel}; the lockfile must install as it is (--frozen-lockfile)")
     dirs = []
     for rel in inputs:
@@ -1725,7 +1739,7 @@ def apply_node_seed(args, pristine: Path, deadline: float | None) -> dict:
     seed = read_json_file(seed_dir, "seed.json")
     if seed.get("format") != NODE_SEED_FORMAT:
         raise Refused(f"--node-seed {seed_dir}: seed format {seed.get('format')!r} is not {NODE_SEED_FORMAT}")
-    lock = file_digest(pristine / "pnpm-lock.yaml")
+    lock = regular_digest(pristine, "pnpm-lock.yaml", deadline)
     if seed.get("lockfile_sha256") != lock:
         raise Refused(f"--node-seed {seed_dir} was built for pnpm-lock.yaml sha256 {seed.get('lockfile_sha256')}, "
                       f"and the tree's is {lock}: build a new seed with --node-seed-build")
