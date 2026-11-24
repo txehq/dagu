@@ -305,8 +305,10 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   refused instead of leaving dangling links (found in review). The lifecycle record finds packages
   under any `node_modules` directory, so `node-linker=hoisted` is recorded too. A workspace
   package that pnpm injects (`injectWorkspacePackages`, `dependenciesMeta.injected`) is a copy of
-  its source, which a manifest-only install cannot have, so a seed with one is refused (a linked
-  workspace package is a symlink and is fine). It copies each
+  its source, which a manifest-only install cannot have, so a seed with one is refused: an installed
+  package directory whose name is a project's and whose `package.json` is that project's, byte for
+  byte. A linked workspace package is a symlink and is fine, and so is a published release with a
+  project's name (its own `package.json`). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, and every link's target), and writes `seed.json` last.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.

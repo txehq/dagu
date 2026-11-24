@@ -87,6 +87,9 @@ elif args[0] == "install":
         open("pnpm-lock.yaml", "a").write("# rewritten\n")
     if "injected" in mode:  # injectWorkspacePackages: a copy of workspace project "web", manifest only
         pkg(store + "/web@file+apps+web/node_modules/web", {"name": "web"})
+    if "published" in mode:  # a registry release named like workspace project "web": its own manifest
+        pkg(store + "/web@1.0.0/node_modules/web", {"name": "web", "version": "1.0.0"})
+        write(store + "/web@1.0.0/node_modules/web/index.js", "module.exports = 1\n")
     if "fifo" in mode:  # a manifest swapped for a FIFO: a blocking host read would wait forever
         os.remove("apps/web/package.json")
         os.mkfifo("apps/web/package.json")
@@ -469,6 +472,16 @@ func TestNodeSeedHoistedLayout(t *testing.T) {
 	assert.Equal(t, "KILLED", o.outcomes()["guard removed"])
 }
 
+// A published release that shares a workspace project's name (a project depending on its previous
+// release) is a dependency with its own manifest, not an injected copy: the seed is built.
+func TestNodeSeedPublishedNamesakeIsNotInjected(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(f.pnpmMode, []byte("published"), 0o644))
+	o := f.build(t, filepath.Join(f.root, "seed"))
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	assert.FileExists(t, filepath.Join(f.root, "seed", "tree", "node_modules", ".pnpm", "web@1.0.0", "node_modules", "web", "index.js"))
+}
+
 // A seed build that cannot produce a sound seed writes none.
 func TestNodeSeedBuildRefusals(t *testing.T) {
 	cases := map[string]struct {
@@ -502,7 +515,7 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		// An injected workspace package is a copy of its source, which a manifest-only install lacks.
 		"injected workspace package": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("injected"), 0o644))
-		}, "injected the workspace project(s) web as copies", true},
+		}, "injected workspace project copies (web at node_modules/.pnpm/web@file+apps+web/node_modules/web:", true},
 		// A rebuild of a name nothing installed runs nothing, silently; it is never recorded as allowlisted.
 		"allowlisted name not installed": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("allow:nosuchpkg"), 0o644))

@@ -1631,7 +1631,7 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
     workspace project's own lifecycle scripts (never run: --ignore-scripts), and each installed
     package's preinstall/install/postinstall (or a binding.gyp, which implies `node-gyp rebuild`),
     marked allowlisted (run by the `pnpm rebuild` step) or skipped."""
-    record: dict = {"workspace_skipped": {}, "dependencies": {}, "installed": []}  # installed: names only, popped by the caller
+    record: dict = {"workspace_skipped": {}, "dependencies": {}, "installed": []}  # installed: (name, path), popped by the caller
     for rel in inputs:
         if Path(rel).name == "package.json":
             s = scripts_of(read_json_file(src, rel), WORKSPACE_SCRIPTS)
@@ -1657,7 +1657,7 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
             if not os.path.isfile(src / rel / "package.json"):
                 continue
             data = read_json_file(src, f"{rel}/package.json")
-            record["installed"].append(str(data.get("name", pkg)))
+            record["installed"].append((str(data.get("name", pkg)), rel))
             s = scripts_of(data, DEPENDENCY_SCRIPTS)
             if os.path.lexists(src / rel / "binding.gyp") and "install" not in s and "preinstall" not in s:
                 s["install"] = "node-gyp rebuild (implied by binding.gyp)"
@@ -1765,14 +1765,18 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     limits = (args.max_files, args.max_work_mib * 2**20)
     digests = {nm: tree_digest(src / nm, *limits, runner.deadline)[0] for nm in sorted(dirs)}
     scripts = lifecycle_record(src, inputs, allowed, args.max_files)
-    installed = set(scripts.pop("installed"))
+    found = scripts.pop("installed")  # (name, path) of every installed package directory
+    installed = {name for name, _rel in found}
     # A workspace package pnpm INJECTS (injectWorkspacePackages, dependenciesMeta.injected) is a copy
-    # of its source in the virtual store, and this install saw manifests only, so the copy is empty.
-    # A linked workspace package is a symlink, which the scan never counts as installed.
-    injected = sorted(installed & set(projects))
+    # of the project in the virtual store, and this install saw manifests only, so the copy holds the
+    # project's package.json, byte for byte, and no source. A linked workspace package is a symlink,
+    # which the scan never counts; a published release of a project (same name, fetched from a
+    # registry) has its own package.json and is not refused.
+    injected = sorted(f"{name} at {rel}" for name, rel in found if name in projects
+                      and regular_digest(src, f"{rel}/package.json", runner.deadline) == inputs[projects[name]])
     if injected:
-        raise Refused(f"the seed's install injected the workspace project(s) {', '.join(injected)} as copies "
-                      "(injectWorkspacePackages or dependenciesMeta.injected); the seed sees manifests only, so "
+        raise Refused(f"the seed's install injected workspace project copies ({', '.join(injected)}: "
+                      "injectWorkspacePackages or dependenciesMeta.injected); the seed sees manifests only, so "
                       "those copies hold no source: a seed cannot be built for an injected workspace package")
     missing = sorted(set(allowed) - installed)
     if missing:  # a rebuild of a name nothing installed does nothing, silently: never a recorded "allowlisted"
