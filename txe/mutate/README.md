@@ -320,7 +320,7 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
     never guessed;
   - every NESTED entry is matched whole (root's review): `overrides` (in both files) map a plain
     package name to a registry version or range, or an `npm:` alias; workspace `packages` are
-    globs inside the tree; every lockfile `packages` entry is a registry `name@version` whose
+    relative globs inside the tree (no absolute path and no `..`, after an optional `!`); every lockfile `packages` entry is a registry `name@version` whose
     `resolution` is `{integrity: sha512-...}` only, with fields from `engines`, `hasBin`,
     `peerDependencies`, `peerDependenciesMeta`, `cpu`, `os` and `libc`; every snapshot key and
     dependency version is a registry version (with pnpm's peer suffix) or an `npm:` alias's
@@ -372,7 +372,9 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   resolve `--image` to its id once, at the start, and launch every container by that id, never by
   the tag: a tag retargeted while a run is in progress cannot swap the image the seed was built
   with or a mutant runs in (root's review), and a tag that moved before a run starts resolves to
-  another id, which the seed refuses. The image needs node and pnpm on its PATH for any uid (the
+  another id, which the seed refuses. The id is resolved before the declared-volume check, and
+  that check reads the same id, so a tag retargeted between the two inspections cannot admit
+  another image's volumes. The image needs node and pnpm on its PATH for any uid (the
   container runs as yours). A pnpm
   bin shim records absolute paths under `/work/src`, which is where both the install and every run
   see the tree, so `node_modules/.bin/vitest` works in each run.

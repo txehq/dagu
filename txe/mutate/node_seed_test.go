@@ -391,6 +391,55 @@ func TestNodeRunsLaunchByImageID(t *testing.T) {
 	assert.Len(t, dockerRuns(t, f.log), 1+5, "no container ran on the retargeted tag")
 }
 
+func imageIDOf(name string) string {
+	s := sha256.Sum256([]byte(name))
+	return "sha256:" + hex.EncodeToString(s[:])
+}
+
+// dockerInspects lists the fake docker's `image inspect` argvs, in order.
+func dockerInspects(t *testing.T, log string) [][]string {
+	t.Helper()
+	raw, err := os.ReadFile(log)
+	require.NoError(t, err)
+	var out [][]string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
+		var argv []string
+		require.NoError(t, json.Unmarshal([]byte(line), &argv))
+		if len(argv) > 1 && argv[0] == "image" && argv[1] == "inspect" {
+			out = append(out, argv)
+		}
+	}
+	return out
+}
+
+// The volume check reads the image the run launches (root's review of b51ba7c9). The fake tag
+// names image A until its first inspection and image B, which declares a volume, from then on.
+// The runner resolves the tag's id first and checks that id's volumes, so A is checked and A is
+// launched; checking the tag first would have read A's volumes and then launched B. Once the tag
+// names B, B's volume is refused.
+func TestNodeVolumeCheckReadsTheResolvedImage(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(f.log+".voltag", []byte("node-image"), 0o644))
+	imageA, imageB := imageIDOf("node-image"), imageIDOf("node-image@retargeted")
+	o := f.build(t, filepath.Join(f.root, "seed"))
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	inspects := dockerInspects(t, f.log)
+	require.Len(t, inspects, 2)
+	assert.Equal(t, []string{"image", "inspect", "--format", "{{.Id}}", "node-image"}, inspects[0], "the id first")
+	assert.Equal(t, []string{"image", "inspect", "--format", "{{json .Config.Volumes}}", imageA}, inspects[1],
+		"then the volumes of that id, not of the tag, which has moved")
+	for _, argv := range dockerRuns(t, f.log) {
+		assert.Contains(t, argv, imageA)
+		assert.NotContains(t, argv, imageB)
+	}
+	assert.Equal(t, imageA, readSeed(t, filepath.Join(f.root, "seed"))["image_id"])
+
+	o = f.build(t, filepath.Join(f.root, "seed-b")) // the tag now names B
+	require.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "image "+imageB+" declares VOLUME /data")
+	assert.Len(t, dockerRuns(t, f.log), 1, "no container ran on B")
+}
+
 // A seed whose lockfile, manifests, image or content no longer match is refused before any run.
 func TestNodeSeedMismatchRefused(t *testing.T) {
 	cases := map[string]struct {
@@ -692,6 +741,10 @@ except ms.Refused as e:
 // is refused by name, never built into a different seed.
 func TestNodeConfigClosedSet(t *testing.T) {
 	assert.Equal(t, "ok", nodeConfigVerdict(t, nil), "okr/web's configuration is the supported one")
+	// Positive controls for the glob rule: a relative exclusion and a nested relative glob pass.
+	assert.Equal(t, "ok", nodeConfigVerdict(t, map[string]string{"pnpm-workspace.yaml": strings.Replace(
+		okrWebConfig["pnpm-workspace.yaml"], "  - apps/*", "  - apps/*\n  - '!apps/old'\n  - tools/web/*", 1)}),
+		"relative globs, `!` exclusions included, stay inside the tree")
 	const tail = "is outside the pnpm configuration the node seed supports"
 	lock, ws := okrWebConfig["pnpm-lock.yaml"], okrWebConfig["pnpm-workspace.yaml"]
 	cases := map[string]struct {
@@ -733,6 +786,13 @@ func TestNodeConfigClosedSet(t *testing.T) {
 			"the key 'playwright-core' is given twice"},
 		"workspace package glob outside": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "  - apps/*", "  - ../outside/*", 1)},
 			"pnpm-workspace.yaml packages: the entry '../outside/*'"},
+		// Absolute globs (root's review of b51ba7c9), with and without pnpm's `!` exclusion.
+		"workspace package glob absolute": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "  - apps/*", "  - /srv/apps/*", 1)},
+			"pnpm-workspace.yaml packages: the entry '/srv/apps/*'"},
+		"workspace exclusion glob absolute": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "  - apps/*", "  - apps/*\n  - '!/srv/apps/old'", 1)},
+			"pnpm-workspace.yaml packages: the entry '!/srv/apps/old'"},
+		"workspace exclusion glob outside": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "  - apps/*", "  - apps/*\n  - '!../old'", 1)},
+			"pnpm-workspace.yaml packages: the entry '!../old'"},
 		"lockfile override to link:": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "overrides:\n  playwright-core: 1.62.1", "overrides:\n  playwright-core: link:../pw", 1)},
 			"pnpm-lock.yaml overrides: the override playwright-core: 'link:../pw'"},
 		"lockfile tarball resolution": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "{integrity: sha512-BBBB}", "{tarball: https://example.com/ts.tgz}", 1)},

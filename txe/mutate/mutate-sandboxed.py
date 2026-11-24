@@ -1617,7 +1617,9 @@ def check_node_config(root: Path, inputs: dict[str, str]) -> None:
             if not isinstance(v, list):
                 refuse(f"pnpm-workspace.yaml {key}", f"the value {str(v)[:60]!r} (a list is expected)")
             for item in v:
-                if not (GLOB_RE if key == "packages" else NAME_RE).fullmatch(item) or ".." in item.split("/"):
+                glob = item[1:] if key == "packages" and item.startswith("!") else item
+                if not (GLOB_RE if key == "packages" else NAME_RE).fullmatch(item) or ".." in glob.split("/") \
+                        or glob.startswith("/"):
                     refuse(f"pnpm-workspace.yaml {key}", f"the entry {item!r}")  # a glob stays inside the tree
     lock = yaml_block(config_text(root, "pnpm-lock.yaml"), "pnpm-lock.yaml")
     for key in lock:
@@ -2491,22 +2493,25 @@ def main(argv: list[str]) -> int:
         for m in ro_mounts:  # refused before anything is created or run
             check_ro_source(m, forbidden, ro_limits(args), args.deadline_at)
         check_node_mode(args, forbidden)  # TXE-8348: before any docker call
+        args.image_id = None
+        if args.node_seed is not None or args.node_seed_build is not None:
+            # Node runs launch by the immutable id, so the id is resolved FIRST and the volume check
+            # reads that same image: a tag retargeted between two inspections cannot admit another
+            # image's volumes (root's review of b51ba7c9).
+            args.image_id = resolve_image_id(args)
         left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
         if left <= 0:
             raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
         try:
             inspected = subprocess.run([args.docker, "image", "inspect", "--format", "{{json .Config.Volumes}}",
-                                        args.image], capture_output=True, text=True,
+                                        args.image_id or args.image], capture_output=True, text=True,
                                        env=docker_client_env(), timeout=min(left, 60.0))
         except subprocess.TimeoutExpired as e:
             raise Stopped(f"docker image inspect took longer than {min(left, 60.0):.0f}s") from e
         if inspected.returncode != 0:
             raise Refused(f"image {args.image} is not present locally (or {args.docker} cannot reach a daemon); "
                           "this runner never pulls")
-        refuse_declared_volumes(args.image, inspected.stdout)
-        args.image_id = None
-        if args.node_seed is not None or args.node_seed_build is not None:
-            args.image_id = resolve_image_id(args)
+        refuse_declared_volumes(args.image_id or args.image, inspected.stdout)
         work = WorkDir(args.workdir_root)
         report["workdir"] = str(work.path)
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
