@@ -256,7 +256,9 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   `node_modules`). Trees with no root `package.json` or `pnpm-lock.yaml` are unaffected. Pass
   `--no-seed` too: a JavaScript tree has no `go.mod` for the Go module seed.
 - **The build** (`--node-seed-build DIR`, DIR new, its parent existing, outside the live tree, the
-  caches, GOPATH and the Docker socket; inside HOME is allowed) runs ONE container with
+  caches, GOPATH and the Docker socket; inside HOME is allowed; the parent your own and writable by
+  no group or other user, or sticky, and the runner not root, because the seed is written by
+  pathname and nobody else may be able to replace the directory meanwhile) runs ONE container with
   `--node-seed-network` (default `bridge`). Every other bound of a run applies to it: no Docker
   socket, no capabilities, read-only root, the memory, CPU, process, time, output and disk bounds,
   the host checks after it, owner-checked removal. It takes no command, no mutants, no

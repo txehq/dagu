@@ -1963,6 +1963,25 @@ def resolve_image_id(args) -> str:
     return iid
 
 
+def check_seed_parent(parent: Path, euid: int) -> None:
+    """The seed is written by pathname into a directory the build creates, so nobody else may be
+    able to rename or replace that directory under the runner (security review of a63cbc52): its
+    parent must be the invoker's own and writable by no group or other user, or sticky (as /tmp
+    is, where only an entry's owner can rename it). And the build never runs as root, whose
+    pathname writes would follow a link planted by any user."""
+    if euid == 0:
+        raise Refused("--node-seed-build refuses to run as root: run it as an ordinary user")
+    try:
+        st = os.stat(parent)
+    except OSError as e:
+        raise Refused(f"--node-seed-build: cannot read its parent directory {parent}: {e}") from e
+    private = st.st_uid == euid and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if not (private or st.st_mode & stat.S_ISVTX):
+        who = "owned by uid %d" % st.st_uid if st.st_uid != euid else "writable by its group or other users"
+        raise Refused(f"--node-seed-build {parent} is {who} and not sticky: another user could replace the seed "
+                      "directory while it is written; put the seed in a directory only you can write")
+
+
 def check_node_mode(args, forbidden: dict[str, Path]) -> None:
     """Before anything is created: a JavaScript tree runs only with a seed (or --no-node-seed), a
     seed is used only for a tree with a lockfile, and a seed being built goes to a new directory."""
@@ -1978,6 +1997,7 @@ def check_node_mode(args, forbidden: dict[str, Path]) -> None:
             raise Refused(f"--node-seed-build {out}: its parent directory does not exist")
         args.node_seed_build = real(out.parent) / out.name
         check_outside(args.node_seed_build, forbidden, "--node-seed-build directory")
+        check_seed_parent(args.node_seed_build.parent, os.geteuid())
     elif args.node_seed is not None:
         if not (tree / "pnpm-lock.yaml").is_file():
             raise Refused(f"--node-seed is for a pnpm workspace: {tree} has no pnpm-lock.yaml at its root")

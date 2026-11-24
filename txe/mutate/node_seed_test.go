@@ -440,6 +440,60 @@ func TestNodeVolumeCheckReadsTheResolvedImage(t *testing.T) {
 	assert.Len(t, dockerRuns(t, f.log), 1, "no container ran on B")
 }
 
+// The seed is written by pathname into the directory the build creates, so its parent must be
+// one nobody else can rename entries in (security review of a63cbc52): the invoker's own and not
+// group- or other-writable, or sticky. The build never runs as root. check_seed_parent takes the
+// euid as an argument, so another uid and uid 0 are faked here, not obtained.
+func TestNodeSeedParentDirectory(t *testing.T) {
+	root := t.TempDir()
+	mk := func(name string, mode os.FileMode) string {
+		p := filepath.Join(root, name)
+		require.NoError(t, os.Mkdir(p, 0o700))
+		require.NoError(t, os.Chmod(p, mode)) // after Mkdir: the umask never narrows it
+		return p
+	}
+	dirs := map[string]string{
+		"other-writable": mk("other-writable", 0o777), "group-writable": mk("group-writable", 0o775),
+		"sticky-shared": mk("sticky-shared", 0o777|os.ModeSticky), "own-0700": mk("own-0700", 0o700),
+		"own-0755": mk("own-0755", 0o755),
+	}
+	prog := `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+parent, euid = Path(sys.argv[2]), int(sys.argv[3])
+try:
+    ms.check_seed_parent(parent, os.getuid() if euid < 0 else euid)
+    print("ok")
+except ms.Refused as e:
+    print(e)
+`
+	verdict := func(dir string, euid int) string {
+		out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), dir, fmt.Sprint(euid)).CombinedOutput()
+		require.NoError(t, err, string(out))
+		return strings.TrimSpace(string(out))
+	}
+	const self = -1 // the test's own uid
+	assert.Contains(t, verdict(dirs["other-writable"], self), "is writable by its group or other users and not sticky")
+	assert.Contains(t, verdict(dirs["group-writable"], self), "is writable by its group or other users and not sticky")
+	assert.Contains(t, verdict(dirs["own-0755"], os.Getuid()+1), fmt.Sprintf("is owned by uid %d and not sticky", os.Getuid()),
+		"a parent owned by another uid than the invoker's")
+	assert.Equal(t, "ok", verdict(dirs["sticky-shared"], self), "a sticky shared directory, as /tmp is")
+	assert.Equal(t, "ok", verdict(dirs["sticky-shared"], os.Getuid()+1), "sticky protects whoever owns it")
+	assert.Equal(t, "ok", verdict(dirs["own-0700"], self))
+	assert.Equal(t, "ok", verdict(dirs["own-0755"], self))
+	assert.Contains(t, verdict(dirs["own-0700"], 0), "refuses to run as root")
+
+	// Through the runner: the build is refused before any docker call.
+	f := newNodeFixture(t)
+	o := f.build(t, filepath.Join(dirs["other-writable"], "seed"))
+	require.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "put the seed in a directory only you can write")
+	_, err := os.Stat(f.log)
+	assert.True(t, os.IsNotExist(err), "refused before any docker call")
+}
+
 // A seed whose lockfile, manifests, image or content no longer match is refused before any run.
 func TestNodeSeedMismatchRefused(t *testing.T) {
 	cases := map[string]struct {
