@@ -1220,6 +1220,8 @@ var dataWordsAllowed = []string{
 	// A module docstring and imports first, then the edit; and a warning filter with a builtin category.
 	"python3 - <<'PY'\n\"\"\"Rename the mutation hooks in the API docs.\"\"\"\nimport re\nfrom pathlib import Path\np = Path(\"docs/api.md\")\np.write_text(re.sub(r\"`useMutation`\", \"`useWrite`\", p.read_text()))\nPY",
 	`python3 -W ignore::DeprecationWarning -c 'print(1)'`,
+	// Wrappers that exec their arguments unchanged keep the view.
+	"timeout 60 nice -n 5 python3 - <<'PY'\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"`old`\", \"`new`\"))\nPY",
 	// os is a text module here: its process calls would be names in the code, and there are none.
 	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
 }
@@ -1273,6 +1275,12 @@ var dataWordsRefused = []string{
 	`X='");exec(open("mutants.py").read());#'; bash -c "python3 -c 'print(\"system mutants.py $X\")'"`,
 	`X='");exec(open("mutants.py").read());#'; eval "python3 -c 'print(\"system mutants.py $X\")'"`,
 	`env -S "python3 -c 'print(\"system mutants.py\")'"`,
+	// Local security review of 60e8ba9d: watch runs its words through sh -c, xargs -I rewrites
+	// them, sudo -s starts a shell. Only wrappers that exec their arguments unchanged keep the view.
+	`X='");exec(open("mutants.py").read());#'; watch -n 1 python3 -c "'print(\"system mutants.py $X\")'"`,
+	`echo '");exec(open("mutants.py").read());#' | xargs -I{} python3 -c 'print("system mutants.py {}")'`,
+	`sudo -s python3 -c 'print("system mutants.py")'`,
+	`uv run python3 -c 'print("system mutants.py")'`,
 	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
 	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
 	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).

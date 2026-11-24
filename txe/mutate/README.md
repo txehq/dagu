@@ -359,6 +359,9 @@ and process substitution, redirections, here-documents) and judges only what wou
     - code that is not at the top level of the command: inside `bash -c`, `eval`, `env -S`, go
       `-exec`, a subshell or a substitution. An outer shell may expand that text first. In
       `bash -c "python3 -c 'print(\"$X\")'"`, `$X` can close the Python string and add code;
+    - a wrapper or runner other than timeout, nice, nohup, `command` or `env` without `-S`. `watch`
+      runs its words through `sh -c`, `xargs -I` rewrites them, `sudo -s` starts a shell, and
+      `uv run`, `find -exec` and the like are not modelled;
   - every import comes first, before any other statement, at module level. Otherwise a statement
     could write `json.py` and a later `import json` would run it;
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;

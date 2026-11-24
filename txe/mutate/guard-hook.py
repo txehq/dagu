@@ -1121,8 +1121,10 @@ class Judge:
         only flags in PY_VIEW_FLAGS, no PYTHON* variable, and the top level of the command. Code
         inside bash -c, eval, env -S or go -exec was text of an outer command first, and an outer
         expansion (`bash -c "python3 -c 'print(\\"$X\\")'"`) can turn a Python string into code;
-        the nested reader sees the words after quote removal, not what the outer shell expands."""
-        return (not flags - PY_VIEW_FLAGS and self.depth == 0
+        the nested reader sees the words after quote removal, not what the outer shell expands.
+        Wrappers and runners too: only PY_CLEAR_WRAPPERS exec their arguments unchanged; watch runs
+        them through sh -c, xargs -I rewrites them, sudo -s starts a shell, and runners resolve."""
+        return (not flags - PY_VIEW_FLAGS and self.depth == 0 and set(self.via) <= PY_CLEAR_WRAPPERS
                 and not any(n.startswith("PYTHON") for n in self.python_names()))
 
     def python_lang(self, flags: set, unsupported: bool) -> str:
