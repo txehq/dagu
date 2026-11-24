@@ -234,6 +234,80 @@ sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives eac
 The sandbox sets `GOFLAGS=-modcacherw -count=1`, so that copied cache never replays a cached test
 result: every baseline and mutant run executes its tests.
 
+## JavaScript trees: the node seed (TXE-8348)
+
+A pnpm workspace's `node_modules` on a Mac holds macOS binaries (esbuild, rollup, rolldown,
+lightningcss), and a run's container is Linux with no network, so vitest cannot start in it. The
+copy never takes the host's `node_modules` (it is a default `--exclude`). Instead a Linux
+`node_modules` is built once, with network, and copied into every run's tree:
+
+```sh
+# once per lockfile, with network (the seed's install only)
+mutate-sandboxed --node-seed-build /abs/new-seed-dir --tree okr/web --image sha256:<node+pnpm image id>
+# every run, offline as always
+mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image sha256:<same id> \
+  --mutants mutants.json -- sh -c 'cd apps/web && exec node_modules/.bin/vitest run src/format.test.ts'
+```
+
+- **A JavaScript tree without a seed is refused.** A tree with a `package.json` or a
+  `pnpm-lock.yaml` at its root, given neither `--node-seed` nor `--no-node-seed`, is refused (exit
+  2) before any docker call, with the commands above in the message: unseeded, every run would fail
+  for want of a `node_modules`. `--no-node-seed` runs it as it is (a command that needs no
+  `node_modules`). Trees with no root `package.json` or `pnpm-lock.yaml` are unaffected. Pass
+  `--no-seed` too: a JavaScript tree has no `go.mod` for the Go module seed.
+- **The build** (`--node-seed-build DIR`, DIR new, its parent existing, outside the live tree, the
+  caches, GOPATH and the Docker socket; inside HOME is allowed) runs ONE container with
+  `--node-seed-network` (default `bridge`). Every other bound of a run applies to it: no Docker
+  socket, no capabilities, read-only root, the memory, CPU, process, time, output and disk bounds,
+  the host checks after it, owner-checked removal. It takes no command, no mutants, no
+  `--diagnostic` and no `--ro-mount`, and does not run the Go module seed.
+- **The seed is data, not code from the tree.** The install's `/work/src` holds only the
+  workspace's manifests: the root's `pnpm-lock.yaml`, `pnpm-workspace.yaml` and `.npmrc` (when
+  present) and every `package.json`; no source file, no `.pnpmfile.cjs`. Its command is the
+  runner's own, recorded in `seed.json` (`script`) and in `install.log` (`set -x`):
+
+  ```sh
+  pnpm --version
+  pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
+    --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
+  # only with --node-seed-allow-build NAME (repeatable):
+  pnpm rebuild --config.dangerously-allow-all-builds=true --store-dir=... --reporter=append-only NAME...
+  ```
+
+  `--ignore-scripts` disables every lifecycle script, the workspace's own and every dependency's.
+  `--node-seed-allow-build NAME` is the reviewed allowlist: after the install, `pnpm rebuild`
+  runs the install scripts of exactly the packages named. A name must be an npm package name, and
+  names reach the container as arguments, never as script text. pnpm 10's build policy blocks even
+  a named rebuild of a package the workspace has not approved, silently; with
+  `dangerously-allow-all-builds` the named rebuild ran exactly the named packages (measured with
+  pnpm 10.33.0 on 2026-11-24: a second package's postinstall and the workspace's own stayed unrun).
+  Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
+  rolldown, lightningcss) need no script: the Linux container installs the Linux one.
+- **What ran is recorded.** After the install the host reads every installed package's
+  `package.json` (bounded, link-free, not executed) and records in `seed.json`
+  `lifecycle_scripts`: each workspace project's own lifecycle scripts (`workspace_skipped`) and
+  each dependency with a `preinstall`, `install` or `postinstall` script, or a `binding.gyp`
+  (`node-gyp rebuild`), marked `allowlisted` or `skipped`. The build's last line names both lists.
+- **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused), every
+  link inside the install's tree, no special file, and a root `node_modules`. It copies each
+  project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
+  entry's type, name, size and content, and every link's target), and writes `seed.json` last.
+  An install that fails is exit 2, its log kept in the work directory, and no seed is written.
+- **The run** (`--node-seed DIR`) refuses, before any container, a seed whose `pnpm-lock.yaml`
+  sha256 differs from the tree's (the key), whose manifests differ (each one named), whose image
+  id differs from `--image`'s (native packages depend on the image's platform and libc), or
+  whose `node_modules` no longer hash as recorded. It copies the seed into the tree copy once, and
+  hashes the copy, not the seed, so what runs is what was checked; each run then copies that tree as
+  any run does. Runs are unchanged otherwise: `--network` (default `none`), the one `/work` mount
+  (the seed is copied, never mounted). Node runs also get `XDG_DATA_HOME`, `XDG_STATE_HOME` and
+  `npm_config_cache` under `/work/sandbox`; HOME stays unset.
+- **The image** needs node and pnpm on its PATH for any uid (the container runs as yours). A pnpm
+  bin shim records absolute paths under `/work/src`, which is where both the install and every run
+  see the tree, so `node_modules/.bin/vitest` works in each run.
+- **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
+  the registry; `--frozen-lockfile` binds it to the lockfile's integrity hashes. A mutant of a
+  `package.json` or the lockfile runs against the seed of the unmutated one.
+
 ## Limits
 
 - Tests that need `.git` in the tree, network access or a host service do not run unchanged.

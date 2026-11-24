@@ -34,6 +34,13 @@ Usage:
   mutate-sandboxed.py --mutants mutants.json [--tree DIR] --image IMAGE -- go test ./pkg/...
   mutate-sandboxed.py --diagnostic [--tree DIR] --image IMAGE [--ro-mount SRC:DST:SHA256] -- CMD...
   mutate-sandboxed.py --ro-manifest DIR
+  mutate-sandboxed.py --node-seed-build NEWDIR --tree PNPM_WORKSPACE --image IMAGE [--node-seed-allow-build PKG]
+  mutate-sandboxed.py --node-seed DIR --no-seed --mutants mutants.json --tree PNPM_WORKSPACE --image IMAGE -- CMD...
+
+--node-seed-build installs a pnpm workspace's Linux node_modules once, in one container with network,
+from its manifests alone and with lifecycle scripts disabled (TXE-8348); --node-seed copies it into the
+tree before any run, refused unless its lockfile, manifests, image and content match. A tree with a
+package.json or pnpm-lock.yaml at its root needs --node-seed (or --no-node-seed).
 
 --diagnostic runs the unmutated tree once, with the same boundary and checks, and records the
 command's raw stdout, stderr (two files outside every mount) and exit status in the report as
@@ -750,6 +757,11 @@ def copy_tree(src: Path, dst: Path, excludes: tuple[str, ...], deadline: float |
         return [n for n in names if n in excludes]
 
     shutil.copytree(src, dst, symlinks=True, ignore=ignore, copy_function=checked_copy(deadline, "copying the tree"))
+    check_links(dst, deadline)
+
+
+def check_links(dst: Path, deadline: float | None = None) -> None:
+    """Refuse any symlink under dst that resolves outside it (see copy_tree)."""
     top = real(dst)
     for d, dirs, files in os.walk(dst):
         check_deadline(deadline, "checking the copy's symlinks")
@@ -1008,6 +1020,8 @@ class Runner:
         self.diagnostic = bool(getattr(args, "diagnostic", False))
         self.err_log = None  # the open stderr file of the run in progress, in diagnostic mode
         self.err_path: Path | None = None  # the last run's stderr file, in diagnostic mode
+        # TXE-8348: a node run (the seed's install, or any run with --node-seed) gets the node sandbox dirs.
+        self.node = getattr(args, "node_seed", None) is not None or getattr(args, "node_seed_build", None) is not None
 
     def verify_ro_mounts(self, when: str, deadline: float | None = None) -> None:
         """Each read-only mount's copy still passes verify_ro_copy. Called immediately before every
@@ -1131,12 +1145,24 @@ class Runner:
         if not self.remove_pending():
             raise Stopped("a container could not be confirmed removed: " + ", ".join(self.pending))
 
-    # A run gets its own directory: src (the tree copy) and sandbox/<env dirs>.
-    def prepare(self, label: str, pristine: Path, mutant: Mutant | None) -> Path:
+    # A run gets its own directory: src (the tree copy) and sandbox/<env dirs>. With `inputs` (the
+    # node seed's install, TXE-8348) src holds only those manifest files, never the tree's source.
+    def prepare(self, label: str, pristine: Path, mutant: Mutant | None,
+                inputs: dict[str, str] | None = None) -> Path:
         self.seq += 1
         d = self.work.path / f"{self.seq:03d}-{''.join(c if c.isalnum() else '-' for c in label)[:40]}"
         d.mkdir()
-        clone_dir(pristine, d / "src", self.deadline)
+        if inputs is None:
+            clone_dir(pristine, d / "src", self.deadline)
+        else:
+            for rel, digest in inputs.items():
+                check_deadline(self.deadline, "copying the seed's manifests")
+                dst = d / "src" / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(plain_target(pristine, rel), dst)
+                if file_digest(dst) != digest:
+                    raise Refused(f"{rel} changed while the seed's manifests were copied")
+            (d / "sandbox" / "pnpm-store").mkdir(parents=True)
         if mutant:
             apply_mutant(d / "src", mutant)
         for m in self.ro_mounts:
@@ -1147,15 +1173,18 @@ class Runner:
                 raise Refused(f"the tree copy already holds {m.dst}; a read-only mount would shadow it")
             point.mkdir()
         sb = d / "sandbox"
-        for sub in SANDBOX_ENV_DIRS.values():
+        for sub in [*SANDBOX_ENV_DIRS.values(), *(NODE_ENV_DIRS.values() if self.node else ())]:
             (sb / sub).mkdir(parents=True)
         warm = self.work.path / "warm-gocache"
-        if self.args.warm_gocache and warm.is_dir():
+        if self.args.warm_gocache and warm.is_dir() and inputs is None:
             shutil.rmtree(sb / "gocache")
             clone_dir(warm, sb / "gocache", self.deadline)
         return d
 
-    def docker_argv(self, d: Path, name: str, cidfile: Path) -> list[str]:
+    def docker_argv(self, d: Path, name: str, cidfile: Path, command: list[str] | None = None,
+                    network: str | None = None) -> list[str]:
+        """The container for one run. `command` and `network` are given only for the node seed's
+        install (TXE-8348); every other run takes the caller's command and --network."""
         mounts: list[tuple[Path, str, bool]] = [(d, "/work", False)]
         seed = self.work.path / "seed" / "gomodcache" / "cache" / "download"
         if seed.is_dir():
@@ -1182,6 +1211,10 @@ class Runner:
             # one) reaches sandboxed code.
             **CLEARED_PROXY_ENV,
         })
+        if self.node:
+            env.update({k: f"/work/sandbox/{v}" for k, v in NODE_ENV_DIRS.items()})
+        if command is not None:
+            env["MUTATE_NODE_STORE"] = NODE_STORE
         if any(m.dst == "/work/src/.git" for m in self.ro_mounts):
             # git skips its optional index refresh, which would try .git/index.lock on a read-only
             # view; a command that needs a lock fails on the read-only mount instead of half-writing.
@@ -1190,7 +1223,7 @@ class Runner:
         # the attached stream the runner captures (and bounds) is unaffected.
         argv = [self.docker, "run", "--rm", "--pull", "never", "--log-driver", "none", "--name", name,
                 "--cidfile", str(cidfile),
-                "--label", f"{OWNER_LABEL}={self.work.token}", "--network", self.args.network,
+                "--label", f"{OWNER_LABEL}={self.work.token}", "--network", network or self.args.network,
                 "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", str(self.args.pids),
                 "--memory", self.args.memory, "--cpus", self.args.cpus,
                 "--read-only", "--tmpfs", "/tmp:rw,size=256m", "--user", f"{os.getuid()}:{os.getgid()}",
@@ -1199,19 +1232,20 @@ class Runner:
             argv += ["--mount", f"type=bind,source={real(src)},target={dst}" + (",readonly" if ro else "")]
         for k in sorted(env):
             argv += ["--env", f"{k}={env[k]}"]
-        return argv + [self.args.image, *self.args.command]
+        return argv + [self.args.image, *(self.args.command if command is None else command)]
 
-    def run(self, label: str, pristine: Path, mutant: Mutant | None) -> Result:
+    def run(self, label: str, pristine: Path, mutant: Mutant | None, inputs: dict[str, str] | None = None,
+            command: list[str] | None = None, network: str | None = None) -> Result:
         before = self.watch.snapshot()
         self.remaining(label)  # the deadline is checked before the run's own copies start
         warm = self.work.path / "warm-gocache"
         self.room(label, (pristine, warm) if self.args.warm_gocache and warm.is_dir() else (pristine,))
-        d = self.prepare(label, pristine, mutant)
+        d = self.prepare(label, pristine, mutant, inputs)
         name = f"mutate-sandboxed-{self.work.token[:12]}-{self.seq:03d}"
         # Outside every mount: sandboxed code cannot rewrite which container cleanup removes.
         cidfile = self.work.path / "cids" / f"{self.seq:03d}.cid"
         cidfile.parent.mkdir(exist_ok=True)
-        argv = self.docker_argv(d, name, cidfile)
+        argv = self.docker_argv(d, name, cidfile, command, network)
         limit = self.remaining(label)
         # Outside every mount: sandboxed code cannot truncate or replace its own output log.
         log_path = self.work.path / "logs" / f"{self.seq:03d}.log"
@@ -1368,6 +1402,364 @@ def seed_modules(args, work: WorkDir, pristine: Path, shared_modcache: Path, fac
         raise Refused(f"seeding the module proxy failed (log {seed / 'download.log'}):\n{out.stderr[-2000:]}")
 
 
+# ---------------------------------------------------------------- the node seed (TXE-8348)
+#
+# A pnpm workspace's node_modules on a Mac holds macOS binaries (esbuild, rollup, rolldown), and a
+# run's container is Linux with no network. --node-seed-build installs a Linux node_modules ONCE, in
+# one container with network, from the workspace's manifests alone (no source file of the tree is
+# in that container), with every lifecycle script disabled except an explicit allowlist, and
+# writes it to a seed directory keyed by the lockfile's sha256. --node-seed copies that seed into
+# the tree before any run; every run stays offline. A tree with a package.json or pnpm-lock.yaml
+# at its root and no seed is refused, as is a seed whose lockfile, manifests, image or content
+# differs from what it was built with.
+
+NODE_SEED_FORMAT = 1
+NODE_TREE_MARKERS = ("package.json", "pnpm-lock.yaml")
+# What the seed's install sees: these root files when present, and every package.json.
+NODE_ROOT_INPUTS = ("pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc")
+# npm's package-name rule (lower case, optional scope): an allowlisted name is never shell text.
+NPM_NAME = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*$")
+# Extra sandbox directories for node runs (the seed and every run with --node-seed). HOME stays unset.
+NODE_ENV_DIRS = {"XDG_DATA_HOME": "xdg-data", "XDG_STATE_HOME": "xdg-state", "npm_config_cache": "npm-cache"}
+NODE_STORE = "/work/sandbox/pnpm-store"
+# The seed container's whole command: fixed here, never from the caller or the tree. `set -x`
+# records each command as it ran; allowlisted package names arrive as positional arguments.
+# pnpm 10's build policy blocks even a named `pnpm rebuild` of a package the workspace has not
+# approved, silently (measured with pnpm 10.33.0, 2026-11-24). With dangerously-allow-all-builds
+# the named rebuild runs exactly the packages named: another package's postinstall and the
+# workspace's own stayed unrun in the same measurement.
+NODE_SEED_SCRIPT = """set -eux
+pnpm --version
+pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
+ --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
+if [ "$#" -gt 0 ]; then pnpm rebuild --config.dangerously-allow-all-builds=true \
+ --store-dir="$MUTATE_NODE_STORE" --reporter=append-only "$@"; fi
+"""
+WORKSPACE_SCRIPTS = ("preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare")
+DEPENDENCY_SCRIPTS = ("preinstall", "install", "postinstall")
+JSON_CAP = 1 << 20
+
+
+def is_node_tree(tree: Path) -> bool:
+    return any(os.path.lexists(tree / n) for n in NODE_TREE_MARKERS)
+
+
+def check_outside(p: Path, forbidden: dict[str, Path], what: str) -> None:
+    """p neither is, contains nor lies inside protected state; lying inside HOME is allowed."""
+    for name, f in forbidden.items():
+        fr = real(f)
+        if within(fr, p) or (name != "HOME" and within(p, fr)):
+            raise Refused(f"{what} {p} overlaps {name} ({fr})")
+
+
+def node_inputs(root: Path, deadline: float | None = None) -> dict[str, str]:
+    """{relative path: sha256} of what the seed's install may read: the root's lockfile, workspace
+    file and .npmrc, and every package.json (node_modules is never copied). Each is a regular file."""
+    found = [n for n in NODE_ROOT_INPUTS if os.path.lexists(root / n)]
+    for d, dirs, files in os.walk(root):
+        check_deadline(deadline, "listing the workspace's manifests")
+        dirs[:] = sorted(x for x in dirs if x != "node_modules")
+        if "package.json" in files:
+            found.append(os.path.relpath(os.path.join(d, "package.json"), root))
+    out = {}
+    for rel in sorted(set(found)):
+        p = plain_target(root, rel)
+        if not stat.S_ISREG(os.lstat(p).st_mode):
+            raise Refused(f"{rel} is not a regular file")
+        out[rel] = file_digest(p)
+    return out
+
+
+def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | None = None) -> tuple[str, int]:
+    """(sha256, entries) of a directory a container wrote, never following a link. One line per
+    entry, sorted by its relative path as bytes: "D\\0rel", "F\\0rel\\0size sha256" or
+    "L\\0rel\\0target". Each directory is opened relative to its parent's descriptor with
+    O_NOFOLLOW. Refused: a special file, a name or link target holding a line break, more than
+    max_entries entries or max_bytes bytes."""
+    lines: list[bytes] = []
+    tally = [0, 0]  # entries, bytes
+
+    def walk(fd: int, prefix: bytes, depth: int) -> None:
+        if depth > 256:
+            raise Refused(f"{root} is nested over 256 levels")
+        names = []
+        with os.scandir(fd) as it:
+            for e in it:
+                tally[0] += 1
+                if tally[0] > max_entries:
+                    raise Refused(f"{root} holds over {max_entries} entries")
+                check_deadline(deadline, f"hashing {root}")
+                names.append(e.name)
+        for name in sorted(names, key=os.fsencode):
+            b = os.fsencode(name)
+            if b"\n" in b or b"\r" in b:
+                raise Refused(f"{root}: a name holds a line break: {name!r}")
+            rel = prefix + b
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(st.st_mode):
+                lines.append(b"D\0" + rel + b"\n")
+                sub = os.open(name, DIR_FLAGS, dir_fd=fd)
+                try:
+                    walk(sub, rel + b"/", depth + 1)
+                finally:
+                    os.close(sub)
+            elif stat.S_ISREG(st.st_mode):
+                h, n = hashlib.sha256(), 0
+                with os.fdopen(open_regular_at(fd, name), "rb") as f:
+                    while chunk := f.read(1 << 20):
+                        check_deadline(deadline, f"hashing {root}")
+                        n += len(chunk)
+                        tally[1] += len(chunk)
+                        if tally[1] > max_bytes:
+                            raise Refused(f"{root} holds over {max_bytes} bytes")
+                        h.update(chunk)
+                lines.append(b"F\0" + rel + b"\0" + f"{n} {h.hexdigest()}".encode() + b"\n")
+            elif stat.S_ISLNK(st.st_mode):
+                target = os.fsencode(os.readlink(name, dir_fd=fd))
+                if b"\n" in target or b"\r" in target:
+                    raise Refused(f"{root}: the link {name!r} has a line break in its target")
+                lines.append(b"L\0" + rel + b"\0" + target + b"\n")
+            else:
+                raise Refused(f"{root}: {rel.decode(errors='replace')} is a special file "
+                              f"(mode {oct(stat.S_IFMT(st.st_mode))})")
+
+    try:
+        top = os.open(root, DIR_FLAGS)
+    except OSError as e:
+        raise Refused(f"{root} is not a plain directory: {e}") from e
+    try:
+        walk(top, b"", 0)
+    except OSError as e:
+        raise Refused(f"cannot read {root}: {e}") from e
+    finally:
+        os.close(top)
+    return hashlib.sha256(b"".join(lines)).hexdigest(), tally[0]
+
+
+def read_json_file(root: Path, rel: str) -> dict:
+    """A JSON object from a file under root, refused unless the path is link-free and the file is a
+    regular file of at most JSON_CAP bytes. Used on files a container wrote."""
+    p = plain_target(root, rel)
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise Refused(f"cannot open {rel}: {e}") from e
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refused(f"{rel} is not a regular file")
+        raw = f.read(JSON_CAP + 1)
+    if len(raw) > JSON_CAP:
+        raise Refused(f"{rel} is over {JSON_CAP} bytes")
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise Refused(f"{rel} is not JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise Refused(f"{rel} is not a JSON object")
+    return data
+
+
+def scripts_of(data: dict, keys: tuple[str, ...]) -> dict[str, str]:
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return {}
+    return {k: str(scripts[k]) for k in keys if k in scripts}
+
+
+def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_files: int) -> dict:
+    """What install-time code the seed's packages carry, read on the host after the install: each
+    workspace project's own lifecycle scripts (never run: --ignore-scripts), and each installed
+    package's preinstall/install/postinstall (or a binding.gyp, which implies `node-gyp rebuild`),
+    marked allowlisted (run by the `pnpm rebuild` step) or skipped."""
+    record: dict = {"workspace_skipped": {}, "dependencies": {}}
+    for rel in inputs:
+        if Path(rel).name == "package.json":
+            s = scripts_of(read_json_file(src, rel), WORKSPACE_SCRIPTS)
+            if s:
+                record["workspace_skipped"][rel] = s
+    store = src / "node_modules" / ".pnpm"
+    if not store.is_dir() or store.is_symlink():
+        return record
+    seen = 0
+    for entry in sorted(os.listdir(store)):
+        nm = f"node_modules/.pnpm/{entry}/node_modules"
+        if not os.path.isdir(src / nm) or os.path.islink(src / nm):
+            continue
+        pkgs = []
+        for name in sorted(os.listdir(src / nm)):
+            p = src / nm / name
+            if p.is_symlink() or not p.is_dir():
+                continue  # a link to another package, or .bin
+            if name.startswith("@"):
+                pkgs += [f"{name}/{s}" for s in sorted(os.listdir(p))
+                         if (p / s).is_dir() and not (p / s).is_symlink()]
+            else:
+                pkgs.append(name)
+        for pkg in pkgs:
+            seen += 1
+            if seen > max_files:
+                raise Refused(f"the seed holds over {max_files} packages")
+            rel = f"{nm}/{pkg}"
+            if not os.path.isfile(src / rel / "package.json"):
+                continue
+            data = read_json_file(src, f"{rel}/package.json")
+            s = scripts_of(data, DEPENDENCY_SCRIPTS)
+            if os.path.lexists(src / rel / "binding.gyp") and "install" not in s and "preinstall" not in s:
+                s["install"] = "node-gyp rebuild (implied by binding.gyp)"
+            if s:
+                name = str(data.get("name", pkg))
+                record["dependencies"][f"{name}@{data.get('version', '?')}"] = {
+                    "path": rel, "scripts": s, "ran": "allowlisted" if name in allowed else "skipped"}
+    return record
+
+
+def resolve_image_id(args) -> str:
+    """The local image's immutable id: a node seed is bound to the image it was built with (its
+    platform, libc and node decide which native packages pnpm installs)."""
+    left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
+    if left <= 0:
+        raise Stopped("the whole-run deadline passed before the image id was read")
+    try:
+        out = subprocess.run([args.docker, "image", "inspect", "--format", "{{.Id}}", args.image],
+                             capture_output=True, text=True, env=docker_client_env(), timeout=min(left, 60.0))
+    except subprocess.TimeoutExpired as e:
+        raise Stopped("docker image inspect took too long") from e
+    iid = out.stdout.strip()
+    if out.returncode != 0 or not re.fullmatch(r"sha256:[0-9a-f]{64}", iid):
+        raise Refused(f"cannot read the id of image {args.image}: {out.stderr.strip()[-200:] or iid!r}")
+    return iid
+
+
+def check_node_mode(args, forbidden: dict[str, Path]) -> None:
+    """Before anything is created: a JavaScript tree runs only with a seed (or --no-node-seed), a
+    seed is used only for a tree with a lockfile, and a seed being built goes to a new directory."""
+    tree = args.tree
+    if args.node_seed_build is not None:
+        for n in ("package.json", "pnpm-lock.yaml"):
+            if not (tree / n).is_file() or (tree / n).is_symlink():
+                raise Refused(f"--node-seed-build needs a pnpm workspace: {tree} has no regular {n} at its root")
+        out = Path(os.path.abspath(args.node_seed_build))
+        if os.path.lexists(out):
+            raise Refused(f"--node-seed-build {out} already exists; a seed is written to a new directory")
+        if not out.parent.is_dir():
+            raise Refused(f"--node-seed-build {out}: its parent directory does not exist")
+        args.node_seed_build = real(out.parent) / out.name
+        check_outside(args.node_seed_build, forbidden, "--node-seed-build directory")
+    elif args.node_seed is not None:
+        if not (tree / "pnpm-lock.yaml").is_file():
+            raise Refused(f"--node-seed is for a pnpm workspace: {tree} has no pnpm-lock.yaml at its root")
+        seed = real(args.node_seed)
+        check_outside(seed, forbidden, "--node-seed directory")
+        if not (seed / "seed.json").is_file() or not (seed / "tree").is_dir():
+            raise Refused(f"--node-seed {seed} is not a seed (no seed.json and tree/); build one with --node-seed-build")
+        args.node_seed = seed
+    elif is_node_tree(tree) and not args.no_node_seed:
+        marker = next(n for n in NODE_TREE_MARKERS if os.path.lexists(tree / n))
+        raise Refused(f"{tree} is a JavaScript workspace ({marker} at its root) and no --node-seed was given. "
+                      "Its node_modules is never copied (it holds the host's native binaries), and a run's "
+                      "container has no network to install one, so every run would fail. Build a Linux seed "
+                      "once with --node-seed-build DIR (with network, lifecycle scripts disabled) and pass "
+                      "--node-seed DIR; or pass --no-node-seed when the command needs no node_modules")
+
+
+def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int:
+    """--node-seed-build: one container, with network, installs the workspace's node_modules from
+    its manifests alone; the host checks the result and writes the seed directory."""
+    inputs = node_inputs(pristine, runner.deadline)
+    lock = inputs["pnpm-lock.yaml"]
+    allowed = list(args.node_seed_allow_build)
+    command = ["sh", "-c", NODE_SEED_SCRIPT, "sh", *allowed]
+    r = runner.run("node seed", pristine, None, inputs=inputs, command=command, network=args.node_seed_network)
+    runner.settle_or_stop(r)
+    report["results"].append(r.__dict__)
+    out(f"node seed install: {r.outcome} ({r.seconds}s)")
+    if r.outcome != "PASSED":
+        args.keep = True  # the install log is evidence
+        raise Refused(f"the seed's install did not pass ({r.outcome}, exit {r.exit_code}); log {r.log}")
+    src = plain_target(Path(r.dir), "src")
+    for rel, digest in inputs.items():
+        if file_digest(plain_target(src, rel)) != digest:
+            raise Refused(f"the seed's install changed {rel}; the lockfile must install as it is (--frozen-lockfile)")
+    dirs = []
+    for rel in inputs:
+        if Path(rel).name == "package.json":
+            nm = os.path.normpath(os.path.join(os.path.dirname(rel), "node_modules"))
+            if os.path.lexists(src / nm):
+                p = plain_target(src, nm)
+                if not p.is_dir():
+                    raise Refused(f"the seed's {nm} is not a directory")
+                dirs.append(nm)
+    if "node_modules" not in dirs:
+        raise Refused("the seed's install left no node_modules at the workspace root")
+    check_links(src, runner.deadline)
+    limits = (args.max_files, args.max_work_mib * 2**20)
+    digests = {nm: tree_digest(src / nm, *limits, runner.deadline)[0] for nm in sorted(dirs)}
+    scripts = lifecycle_record(src, inputs, allowed, args.max_files)
+    dest = args.node_seed_build
+    dest.mkdir()  # exclusive: checked absent before the run, and never a directory something else made
+    for nm in sorted(dirs):
+        check_deadline(runner.deadline, "writing the seed")
+        shutil.copytree(src / nm, dest / "tree" / nm, symlinks=True,
+                        copy_function=checked_copy(runner.deadline, "writing the seed"))
+        if tree_digest(dest / "tree" / nm, *limits, runner.deadline)[0] != digests[nm]:
+            raise Refused(f"the seed's {nm} changed while it was written to {dest}")
+    shutil.copyfile(r.log, dest / "install.log")
+    seed = {"format": NODE_SEED_FORMAT, "lockfile_sha256": lock, "inputs": inputs, "image": args.image,
+            "image_id": args.image_id, "network": args.node_seed_network, "script": NODE_SEED_SCRIPT,
+            "allow_build": allowed, "lifecycle_scripts": scripts, "node_modules": digests,
+            "install_log_sha256": file_digest(dest / "install.log"), "built_from": str(args.tree)}
+    (dest / "seed.json").write_text(json.dumps(seed, indent=2, sort_keys=True) + "\n")
+    report["node_seed"] = {"built": str(dest), **{k: seed[k] for k in ("lockfile_sha256", "image_id", "allow_build",
+                                                                       "lifecycle_scripts", "node_modules")}}
+    runner.discard(r)
+    skipped = sorted(k for k, v in scripts["dependencies"].items() if v["ran"] == "skipped")
+    out(f"node seed: {dest} (lockfile sha256 {lock}); lifecycle scripts skipped: {', '.join(skipped) or 'none'}; "
+        f"allowlisted: {', '.join(allowed) or 'none'}")
+    return EXIT_OK
+
+
+def apply_node_seed(args, pristine: Path, deadline: float | None) -> dict:
+    """--node-seed: check the seed against the copied tree (lockfile, every manifest, image) and copy
+    its node_modules into the copy, hashing what was copied (the copy, not the seed, is checked)."""
+    seed_dir = args.node_seed
+    seed = read_json_file(seed_dir, "seed.json")
+    if seed.get("format") != NODE_SEED_FORMAT:
+        raise Refused(f"--node-seed {seed_dir}: seed format {seed.get('format')!r} is not {NODE_SEED_FORMAT}")
+    lock = file_digest(pristine / "pnpm-lock.yaml")
+    if seed.get("lockfile_sha256") != lock:
+        raise Refused(f"--node-seed {seed_dir} was built for pnpm-lock.yaml sha256 {seed.get('lockfile_sha256')}, "
+                      f"and the tree's is {lock}: build a new seed with --node-seed-build")
+    inputs = node_inputs(pristine, deadline)
+    want = seed.get("inputs") if isinstance(seed.get("inputs"), dict) else {}
+    differ = sorted(k for k in set(inputs) | set(want) if inputs.get(k) != want.get(k))
+    if differ:
+        raise Refused(f"--node-seed {seed_dir} was built from other manifests ({', '.join(differ[:10])} differ): "
+                      "build a new seed with --node-seed-build")
+    if seed.get("image_id") != args.image_id:
+        raise Refused(f"--node-seed {seed_dir} was built with image {seed.get('image_id')}, and this run's image "
+                      f"is {args.image_id}: native packages depend on the image; use that image or build a new seed")
+    modules = seed.get("node_modules")
+    if not isinstance(modules, dict) or "node_modules" not in modules:
+        raise Refused(f"--node-seed {seed_dir}: seed.json lists no root node_modules")
+    limits = (args.max_files, args.max_work_mib * 2**20)
+    for nm, digest in sorted(modules.items()):
+        parts = Path(nm).parts
+        if Path(nm).is_absolute() or ".." in parts or parts[-1:] != ("node_modules",):
+            raise Refused(f"--node-seed {seed_dir}: {nm!r} is not a relative node_modules path")
+        if not os.path.isfile(pristine / os.path.dirname(nm) / "package.json"):
+            raise Refused(f"--node-seed {seed_dir}: {nm} has no package.json beside it in the tree")
+        dst = plain_target(pristine, nm)
+        if os.path.lexists(dst):
+            raise Refused(f"the tree copy already holds {nm}")
+        shutil.copytree(plain_target(seed_dir, f"tree/{nm}"), dst, symlinks=True,
+                        copy_function=checked_copy(deadline, "copying the node seed"))
+        if tree_digest(dst, *limits, deadline)[0] != digest:
+            raise Refused(f"--node-seed {seed_dir}: {nm} changed since the seed was built")
+    check_links(pristine, deadline)
+    return {"seed": str(seed_dir), "lockfile_sha256": lock, "image_id": args.image_id,
+            "node_modules": sorted(modules), "allow_build": seed.get("allow_build", [])}
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1428,6 +1820,20 @@ def parse(argv: list[str]):
                    help="a --ro-mount directory's files may total at most this many MiB")
     p.add_argument("--ro-max-file-mib", type=int, default=RoLimits.file_bytes >> 20,
                    help="one file in a --ro-mount directory may be at most this many MiB")
+    p.add_argument("--node-seed-build", type=Path, metavar="DIR",
+                   help="build a Linux node_modules seed for the pnpm workspace at --tree into the new directory "
+                        "DIR, in one container with --node-seed-network, from its manifests alone, with lifecycle "
+                        "scripts disabled (TXE-8348); takes no command and no mutants")
+    p.add_argument("--node-seed-network", default="bridge",
+                   help="docker network for the seed's install only (default bridge); every run keeps --network")
+    p.add_argument("--node-seed-allow-build", action="append", default=[], metavar="PKG",
+                   help="with --node-seed-build: run this package's install scripts (pnpm rebuild PKG) after the "
+                        "install; every other lifecycle script stays disabled. Repeatable, recorded in seed.json")
+    p.add_argument("--node-seed", type=Path, metavar="DIR",
+                   help="copy the seed DIR (from --node-seed-build) into the tree before any run; refused unless "
+                        "its lockfile, manifests and image match")
+    p.add_argument("--no-node-seed", action="store_true",
+                   help="run a tree with a root package.json or pnpm-lock.yaml without a seed (no node_modules)")
     p.add_argument("--keep", action="store_true", help="keep the work directory")
     p.add_argument("--report", type=Path, help="also write the JSON report here")
     p.add_argument("--docker", default="docker")
@@ -1446,6 +1852,20 @@ def parse(argv: list[str]):
             # --ro-max-* limits, and a caller that needs a time bound wraps the command (TXE-8053).
             p.error("--ro-manifest takes no --deadline: its walk is bounded by --ro-max-files, --ro-max-depth, "
                     "--ro-max-mib and --ro-max-file-mib; bound it in time from outside")
+        return args
+    if args.node_seed_allow_build and args.node_seed_build is None:
+        p.error("--node-seed-allow-build is used only with --node-seed-build")
+    for name in args.node_seed_allow_build:
+        if not NPM_NAME.fullmatch(name):
+            p.error(f"--node-seed-allow-build {name!r} is not an npm package name")
+    if args.node_seed is not None and args.no_node_seed:
+        p.error("--node-seed and --no-node-seed exclude each other")
+    if args.node_seed_build is not None:
+        if args.command or args.mutants or args.diagnostic or args.ro_mount or args.node_seed or args.no_node_seed:
+            p.error("--node-seed-build runs only the seed's own install: it takes no command, --mutants, "
+                    "--diagnostic, --ro-mount, --node-seed or --no-node-seed")
+        if not args.image:
+            p.error("the following arguments are required: --image")
         return args
     if not args.command:
         p.error("give the test command after --")
@@ -1660,7 +2080,7 @@ def main(argv: list[str]) -> int:
                 err(f"mutate-sandboxed: the digest could not be written: {(STREAM_ERRORS + BROKEN_STREAMS)[-1]}")
                 return EXIT_FINDINGS
             return EXIT_OK
-        mutants = [] if args.diagnostic else load_mutants(args.mutants, args.tree)
+        mutants = [] if args.diagnostic or args.node_seed_build is not None else load_mutants(args.mutants, args.tree)
         ro_mounts = parse_ro_mounts(args.ro_mount)
         modcache, gocache, gopath, go_facts = resolve_shared(args)
     except Refused as e:
@@ -1683,6 +2103,8 @@ def main(argv: list[str]) -> int:
                     "watched": {k: str(v) for k, v in watch.dirs.items()}, "results": []}
     if args.diagnostic:
         report.update(mode="diagnostic", gate="never")
+    if args.node_seed_build is not None:
+        report["mode"] = "node-seed-build"
     if ro_mounts:
         report["ro_mounts"] = [{"src": str(m.src), "dst": m.dst, "sha256": m.sha256} for m in ro_mounts]
     initial = watch.snapshot()
@@ -1697,6 +2119,7 @@ def main(argv: list[str]) -> int:
         check_workdir(args.workdir_root, {k: v for k, v in forbidden.items() if k != "HOME"})
         for m in ro_mounts:  # refused before anything is created or run
             check_ro_source(m, forbidden, ro_limits(args), args.deadline_at)
+        check_node_mode(args, forbidden)  # TXE-8348: before any docker call
         left = args.deadline_at - time.monotonic() if args.deadline_at else 60.0
         if left <= 0:
             raise Stopped(f"the whole-run deadline ({args.deadline}s) passed before the image check")
@@ -1710,6 +2133,9 @@ def main(argv: list[str]) -> int:
             raise Refused(f"image {args.image} is not present locally (or {args.docker} cannot reach a daemon); "
                           "this runner never pulls")
         refuse_declared_volumes(args.image, inspected.stdout)
+        args.image_id = None
+        if args.node_seed is not None or args.node_seed_build is not None:
+            args.image_id = resolve_image_id(args)
         work = WorkDir(args.workdir_root)
         report["workdir"] = str(work.path)
         check_workdir(work.path, {k: v for k, v in forbidden.items() if k != "HOME"})
@@ -1717,16 +2143,21 @@ def main(argv: list[str]) -> int:
         pristine = work.path / "pristine"
         runner.room("copying the tree", (args.tree,), tuple(args.exclude))
         copy_tree(args.tree, pristine, tuple(args.exclude), runner.deadline)
+        if args.node_seed is not None:
+            runner.room("copying the node seed", (args.node_seed / "tree",))
+            report["node_seed"] = apply_node_seed(args, pristine, runner.deadline)
         for i, m in enumerate(ro_mounts):
             runner.room(f"copying the --ro-mount for {m.dst}", (m.src,))
             prepare_ro_mount(m, work.path, i, forbidden, runner.ro_limits, runner.deadline)
             report["ro_mounts"][i]["copy"] = str(m.copy)
         runner.ro_mounts = ro_mounts
         runner.room("seeding")
-        if not args.no_seed:
+        if not args.no_seed and args.node_seed_build is None:
             seed_modules(args, work, pristine, modcache, go_facts, runner.remaining("seeding"))
             watch.verify(initial, "seeding the module proxy")
-        if args.diagnostic:
+        if args.node_seed_build is not None:
+            code = build_node_seed(args, runner, pristine, report)
+        elif args.diagnostic:
             code = run_diagnostic(runner, pristine, report)
         else:
             code = run_all(args, mutants, runner, pristine, report)
