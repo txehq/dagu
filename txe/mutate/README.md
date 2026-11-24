@@ -256,10 +256,7 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   `node_modules`). Trees with no root `package.json` or `pnpm-lock.yaml` are unaffected. Pass
   `--no-seed` too: a JavaScript tree has no `go.mod` for the Go module seed.
 - **The build** (`--node-seed-build DIR`, DIR new, its parent existing, outside the live tree, the
-  caches, GOPATH and the Docker socket; inside HOME is allowed; the parent and every ancestor up to
-  `/` owned by you or root and either writable by no group or other user or sticky, and the runner
-  not root, because the seed is written by pathname and nobody else may be able to replace the
-  directory, or one above it, meanwhile) runs ONE container with
+  caches, GOPATH and the Docker socket; inside HOME is allowed) runs ONE container with
   `--node-seed-network` (default `bridge`). Every other bound of a run applies to it: no Docker
   socket, no capabilities, read-only root, the memory, CPU, process, time, output and disk bounds,
   the host checks after it, owner-checked removal. It takes no command, no mutants, no
@@ -381,11 +378,22 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   container runs as yours). A pnpm
   bin shim records absolute paths under `/work/src`, which is where both the install and every run
   see the tree, so `node_modules/.bin/vitest` works in each run.
-- **Limits.** The seed directory rule reads owners and mode bits only. Another user with ACL (or
-  any other non-mode) write access to your directories can bypass it and redirect the seed's
-  pathname writes, so run the seed build in directories only you control. Writing the seed
-  relative to the directory's own descriptor, which closes this class, is TXE-8385. pnpm
-  workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
+- **Where the seed is written: screening, not a guarantee.** The seed is written by pathname, so
+  the build screens where it writes (`check_seed_parent`):
+  - it refuses to run as root;
+  - the destination's parent and every ancestor up to `/` must be owned by you or root, and
+    either writable by no group or other user, or sticky (a sticky directory owned by you or
+    root, as `/tmp` is);
+  - the seed directory itself is created with mode 0700 (`make_seed_dir`), whatever the umask,
+    and never widened.
+
+  That is screening by owner uid, POSIX mode bits and the sticky bit. It does not show that
+  nobody else can write there. Not examined: ACLs and other non-mode permissions, and pathname
+  changes made while the build runs. A process of your own uid is trusted. **Prerequisite:** no
+  untrusted party has effective ACL write or delete rights on those directories. Run the seed
+  build in directories only you control. Writing the seed relative to a pinned descriptor,
+  which closes this class, is TXE-8385.
+- **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
   the registry; `--frozen-lockfile` binds it to the lockfile's integrity hashes. A mutant of a
   `package.json` or the lockfile runs against the seed of the unmutated one.
 

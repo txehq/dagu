@@ -1963,14 +1963,26 @@ def resolve_image_id(args) -> str:
     return iid
 
 
+def make_seed_dir(dest: Path) -> Path:
+    """Create the seed directory, exclusively (checked absent before the run; never a directory
+    something else made), with mode 0700 at creation (root's review of 1ad1243e): with a
+    permissive umask (0002, 0000) a plain mkdir would make it group- or world-writable, and a
+    peer could plant entries the later pathname writes follow. The mode is never widened after."""
+    dest.mkdir(mode=0o700)
+    return dest
+
+
 def check_seed_parent(parent: Path, euid: int) -> None:
-    """The seed is written by pathname into a directory the build creates, so nobody else may be
-    able to rename or replace that directory, or any directory above it, under the runner
-    (security reviews of a63cbc52 and d33fb7db). The parent and every ancestor up to / must be
-    owned by the invoker or root, and either writable by no group or other user, or sticky (as
-    /tmp is: only an entry's owner, or the directory's, can rename it, so the directory's owner
-    must be trusted too). And the build never runs as root, whose pathname writes would follow a
-    link planted by any user."""
+    """Screening, not a guarantee: the seed is written by pathname into a directory the build
+    creates, so the parent and every ancestor up to / are screened by owner uid, POSIX mode bits
+    and the sticky bit (security reviews of a63cbc52 and d33fb7db). Each must be owned by the
+    invoker or root, and either writable by no group or other user, or sticky (as /tmp is: only
+    an entry's owner, or the directory's, can rename it, so the directory's owner must be trusted
+    too). The build never runs as root, whose pathname writes would follow a link planted by any
+    user. NOT examined: ACLs and other non-mode permissions, and pathname changes made while the
+    build runs; a process of the same uid is trusted. The build presumes no untrusted party has
+    effective ACL write or delete rights on these directories (README; the class fix, writes
+    relative to a pinned descriptor, is TXE-8385)."""
     if euid == 0:
         raise Refused("--node-seed-build refuses to run as root: run it as an ordinary user")
     d = Path(parent)
@@ -2094,8 +2106,7 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     missing = sorted(set(allowed) - installed)
     if missing:  # a rebuild of a name nothing installed does nothing, silently: never a recorded "allowlisted"
         raise Refused(f"--node-seed-allow-build {', '.join(missing)}: no installed dependency has that name")
-    dest = args.node_seed_build
-    dest.mkdir()  # exclusive: checked absent before the run, and never a directory something else made
+    dest = make_seed_dir(args.node_seed_build)
     for nm in sorted(dirs):
         check_deadline(runner.deadline, "writing the seed")
         shutil.copytree(src / nm, dest / "tree" / nm, symlinks=True,

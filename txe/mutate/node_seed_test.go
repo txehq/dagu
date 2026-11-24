@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -512,6 +513,45 @@ except ms.Refused as e:
 	assert.Contains(t, o.stderr, "put the seed in a directory only you (or root) can write, all the way up")
 	_, err = os.Stat(f.log)
 	assert.True(t, os.IsNotExist(err), "refused before any docker call")
+}
+
+// The seed directory is private from the moment it exists (root's review of 1ad1243e): it is made
+// with mode 0700 at creation, so a permissive umask (0002, 0000) cannot leave it writable by a
+// group peer before the first export write. Checked twice, in owned temporary fixtures:
+//   - make_seed_dir alone, under each umask, before anything is written into it;
+//   - a whole build under each umask: the published seed directory is still 0700.
+//
+// No test in this package runs in parallel, so the process umask set around a build is this test's.
+func TestNodeSeedDirectoryIsPrivateAtCreation(t *testing.T) {
+	for _, mask := range []int{0o002, 0o000} {
+		t.Run(fmt.Sprintf("umask %04o", mask), func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "seed")
+			prog := `
+import importlib.util, os, stat, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+os.umask(int(sys.argv[3], 8))
+d = ms.make_seed_dir(Path(sys.argv[2]))
+print(oct(stat.S_IMODE(os.lstat(d).st_mode)), len(os.listdir(d)))
+`
+			out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), dir,
+				fmt.Sprintf("%o", mask)).CombinedOutput()
+			require.NoError(t, err, string(out))
+			assert.Equal(t, "0o700 0", strings.TrimSpace(string(out)), "private, and empty: before any export write")
+
+			f := newNodeFixture(t)
+			old := syscall.Umask(mask)
+			defer syscall.Umask(old)
+			seed := filepath.Join(f.root, "seed")
+			o := f.build(t, seed)
+			syscall.Umask(old)
+			require.Equal(t, 0, o.code, o.stdout+o.stderr)
+			st, err := os.Lstat(seed)
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o700), st.Mode().Perm(), "the published seed directory is never widened")
+		})
+	}
 }
 
 // A seed whose lockfile, manifests, image or content no longer match is refused before any run.
