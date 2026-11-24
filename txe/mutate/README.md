@@ -381,7 +381,11 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   container runs as yours). A pnpm
   bin shim records absolute paths under `/work/src`, which is where both the install and every run
   see the tree, so `node_modules/.bin/vitest` works in each run.
-- **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
+- **Limits.** The seed directory rule reads owners and mode bits only. Another user with ACL (or
+  any other non-mode) write access to your directories can bypass it and redirect the seed's
+  pathname writes, so run the seed build in directories only you control. Writing the seed
+  relative to the directory's own descriptor, which closes this class, is TXE-8385. pnpm
+  workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
   the registry; `--frozen-lockfile` binds it to the lockfile's integrity hashes. A mutant of a
   `package.json` or the lockfile runs against the seed of the unmutated one.
 
