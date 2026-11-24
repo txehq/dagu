@@ -1033,6 +1033,11 @@ class Judge:
             t = words[i].text
             if t == "--":
                 i += 1
+                # `env -- NAME=value cmd` still assigns NAME (TXE-8351 review): record them too.
+                while prog == "env" and i < len(words) and ASSIGN.match(words[i].text):
+                    self.env_assigned.append(words[i].text.partition("=")[2])
+                    self.env_assigned_names.append(words[i].text)
+                    i += 1
                 break
             if prog == "command" and t in ("-v", "-V"):
                 return False

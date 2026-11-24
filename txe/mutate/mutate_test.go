@@ -1268,6 +1268,9 @@ var dataWordsRefused = []string{
 	`python3 -I -W ignore::tools.mutants.Warning -c 'print(1)'`,
 	`PYTHONWARNINGS=default,ignore::mutants.Warning python3 -c 'print(1)'`,
 	`python3 -X dev -Werror::mutants.W -c 'print(1)'`,
+	// Security review of 3aee88c5: `env --` still assigns the names after it.
+	`env -- PYTHONPATH=/tmp PYTHONWARNINGS=ignore::mutants.Warning python3 -c 'print("exec mutants.py")'`,
+	"env -- PYTHONPATH=/tmp python3 - <<'PY'\nprint(\"`exec` mutants.py\")\nPY",
 	`python3 -c 'open("json.py","w").write("exec(open(\"mutants.py\").read())"); import json'`,
 	"python3 - <<'PY'\nopen(\"json.py\", \"w\").write(\"exec(open('mutants.py').read())\")\nif True:\n    import json\nPY",
 	// Security review of f4aea221 (P2): an outer shell expands nested code first, so $X can close
