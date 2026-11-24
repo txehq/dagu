@@ -87,7 +87,8 @@ if args[:2] == ["image", "inspect"] and args[-1] == "missing":
 if args[:2] == ["image", "inspect"] and "slowinspect" in args[-1]:
     time.sleep(30)
 if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:  # an image's id: a hash of its name
-    print("sha256:" + hashlib.sha256(args[-1].encode()).hexdigest())
+    # With LOG.retag present the tag names another image, as a retargeted tag would.
+    print("sha256:" + hashlib.sha256((args[-1] + ("@retargeted" if os.path.exists(LOG + ".retag") else "")).encode()).hexdigest())
     sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     print('{"/data":{}}' if "volimage" in args[-1] else "null")

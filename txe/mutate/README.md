@@ -271,8 +271,17 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
     --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
   # only with --node-seed-allow-build NAME (repeatable):
-  pnpm rebuild -r --config.dangerously-allow-all-builds=true --store-dir=... --reporter=append-only NAME...
+  pnpm rebuild -r --config.dangerously-allow-all-builds=true --config.ignore-pnpmfile=true \
+    --config.manage-package-manager-versions=false --store-dir=... --reporter=append-only NAME...
   ```
+
+  The rebuild carries the install's pnpmfile and package-manager settings. It rejects the
+  `--ignore-pnpmfile` flag, and `--config.ignore-pnpmfile=true` kept a `.pnpmfile.cjs` unloaded
+  where the same rebuild without it loaded one (pnpm 10.33.0, measured). The install's other
+  flags do not apply to a rebuild: it resolves nothing, imports nothing, and running the named
+  packages' scripts is its purpose. The rebuild has network too: an allowlisted script can
+  download code (esbuild's install script fetches a binary when its platform package is missing)
+  and runs it inside the container.
 
   `--ignore-scripts` disables every lifecycle script, the workspace's own and every dependency's.
   `--node-seed-allow-build NAME` is the reviewed allowlist: after the install, `pnpm rebuild`
@@ -305,8 +314,20 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   - `pnpm-lock.yaml` version `'9.0'`, sections `lockfileVersion`, `settings`, `overrides`,
     `importers`, `packages` and `snapshots` only, and settings exactly `autoInstallPeers: true`
     and `excludeLinksFromLockfile: false`;
-  - both YAML files are read by a small grammar: block mappings, `key:` at column 0. Flow style,
-    anchors, tags and document markers at the top level are refused, never guessed;
+  - both YAML files are parsed whole by a small grammar, the block style pnpm writes (`key: value`,
+    `key:` over an indented block, `- scalar` items, bare or single-quoted). Duplicate keys,
+    double quotes, anchors, aliases, tags, block scalars, tabs and trailing comments are refused,
+    never guessed;
+  - every NESTED entry is matched whole (root's review): `overrides` (in both files) map a plain
+    package name to a registry version or range, or an `npm:` alias; workspace `packages` are
+    globs inside the tree; every lockfile `packages` entry is a registry `name@version` whose
+    `resolution` is `{integrity: sha512-...}` only, with fields from `engines`, `hasBin`,
+    `peerDependencies`, `peerDependenciesMeta`, `cpu`, `os` and `libc`; every snapshot key and
+    dependency version is a registry version (with pnpm's peer suffix) or an `npm:` alias's
+    target; every importer is a workspace project, each dependency exactly `specifier` and
+    `version`, and the only `link:` is a `workspace:*` dependency's version naming a workspace
+    project. So `file:`, `link:`, tarball, directory, git and URL forms are refused wherever they
+    appear (`TestNodeConfigClosedSet` has a negative control for each route);
   - manifest fields that pnpm's install reads, limited to those the tested layout uses (`name`,
     `version`, `private`, `type`, `scripts`, `engines`, `packageManager`, `dependencies`,
     `devDependencies`, `peerDependencies`, `bin`), plus fields the install never reads (`exports`,
@@ -347,7 +368,12 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   any run does. Runs are unchanged otherwise: `--network` (default `none`), the one `/work` mount
   (the seed is copied, never mounted). Node runs also get `XDG_DATA_HOME`, `XDG_STATE_HOME` and
   `npm_config_cache` under `/work/sandbox`; HOME stays unset.
-- **The image** needs node and pnpm on its PATH for any uid (the container runs as yours). A pnpm
+- **The image, by its immutable id.** Node runs (the build and every run with `--node-seed`)
+  resolve `--image` to its id once, at the start, and launch every container by that id, never by
+  the tag: a tag retargeted while a run is in progress cannot swap the image the seed was built
+  with or a mutant runs in (root's review), and a tag that moved before a run starts resolves to
+  another id, which the seed refuses. The image needs node and pnpm on its PATH for any uid (the
+  container runs as yours). A pnpm
   bin shim records absolute paths under `/work/src`, which is where both the install and every run
   see the tree, so `node_modules/.bin/vitest` works in each run.
 - **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and

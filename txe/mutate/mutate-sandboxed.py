@@ -1232,7 +1232,10 @@ class Runner:
             argv += ["--mount", f"type=bind,source={real(src)},target={dst}" + (",readonly" if ro else "")]
         for k in sorted(env):
             argv += ["--env", f"{k}={env[k]}"]
-        return argv + [self.args.image, *(self.args.command if command is None else command)]
+        # Node runs launch by the immutable id resolved once at the start (resolve_image_id), the id the
+        # seed records and is checked against: a tag retargeted mid-run cannot swap the image.
+        image = self.args.image_id if self.node and getattr(self.args, "image_id", None) else self.args.image
+        return argv + [image, *(self.args.command if command is None else command)]
 
     def run(self, label: str, pristine: Path, mutant: Mutant | None, inputs: dict[str, str] | None = None,
             command: list[str] | None = None, network: str | None = None) -> Result:
@@ -1429,12 +1432,17 @@ NODE_STORE = "/work/sandbox/pnpm-store"
 # the named rebuild runs exactly the packages named: another package's postinstall and the
 # workspace's own stayed unrun in the same measurement. `-r` makes it reach a package that only
 # a workspace project depends on; without it the rebuild ran nothing there (same measurement).
+# The rebuild carries the install's pnpmfile and package-manager settings: it rejects the
+# --ignore-pnpmfile flag, and --config.ignore-pnpmfile=true kept a .pnpmfile.cjs unloaded where the
+# same rebuild without it loaded one (pnpm 10.33.0, measured). The install's other flags do not
+# apply to a rebuild: it resolves nothing (--frozen-lockfile), imports nothing
+# (--package-import-method), and its scripts are the point (--ignore-scripts).
 NODE_SEED_SCRIPT = """set -eux
 pnpm --version
 pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
  --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
-if [ "$#" -gt 0 ]; then pnpm rebuild -r --config.dangerously-allow-all-builds=true \
- --store-dir="$MUTATE_NODE_STORE" --reporter=append-only "$@"; fi
+if [ "$#" -gt 0 ]; then pnpm rebuild -r --config.dangerously-allow-all-builds=true --config.ignore-pnpmfile=true \
+ --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only "$@"; fi
 """
 WORKSPACE_SCRIPTS = ("preinstall", "install", "postinstall", "preprepare", "prepare", "postprepare")
 DEPENDENCY_SCRIPTS = ("preinstall", "install", "postinstall")
@@ -1480,54 +1488,204 @@ def config_text(root: Path, rel: str) -> str:
         raise Refused(f"{rel} is not UTF-8") from None
 
 
-def yaml_top_keys(text: str, rel: str) -> dict[str, list[str]]:
-    """The top-level keys of a block-style YAML mapping, each with its indented lines. Read by a
-    deliberately small grammar: a line is blank, a comment, indented (part of the key above it),
-    or `key:` (optionally followed by a plain value) at column 0. Anything else (flow style, a
-    document marker, a directive, an anchor or a merge key at the top) is refused, never guessed."""
-    keys: dict[str, list[str]] = {}
-    current = None
+YAML_KEY = re.compile(r"^(?:'([^']*)'|([A-Za-z0-9._/(][A-Za-z0-9._/@()+~-]*)):(?: (.*))?$")
+
+
+def yaml_block(text: str, rel: str):
+    """A block-style YAML document as nested dicts and lists of string scalars, read by a
+    deliberately small grammar, the one pnpm writes: `key: value`, `key:` with an indented block
+    below, and `- scalar` list items; keys bare or single-quoted. A scalar is bare or single-quoted
+    (no escape); `{...}` and `[...]` stay raw text for the caller to match whole. Refused, never
+    guessed: a duplicate key, tabs, a double-quoted string, an anchor, alias, tag or block scalar,
+    a list item holding a mapping, a key with no value and no block, and a document marker."""
+    lines = []
     for n, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if line[0] in " \t":
-            if current is None:
-                raise Refused(f"{rel}:{n}: an indented line before any top-level key")
-            keys[current].append(line)
-            continue
-        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9_-]*):(?:\s+(.*))?", line)
-        if not m or (m.group(2) or "").startswith(("&", "*", "!", "{", "[", "|", ">")):
-            raise Refused(f"{rel}:{n}: {line[:80]!r} is outside the YAML the seed reads (block mappings only)")
-        current = m.group(1)
-        if current in keys:
-            raise Refused(f"{rel}:{n}: {current} is given twice")
-        keys[current] = [m.group(2)] if m.group(2) else []
-    return keys
+        body = line.lstrip(" ")
+        if "\t" in line or " #" in body:
+            raise Refused(f"{rel}:{n}: tabs and trailing comments are outside the YAML the seed reads")
+        lines.append((n, len(line) - len(body), body))
+
+    def scalar(raw: str, n: int) -> str:
+        if raw.startswith("'"):
+            if len(raw) < 2 or not raw.endswith("'") or "'" in raw[1:-1]:
+                raise Refused(f"{rel}:{n}: {raw[:60]!r} is not a plain single-quoted scalar")
+            return raw[1:-1]
+        if not raw or raw[0] in "\"&*!|>%@`" or raw in ("~", "null"):
+            raise Refused(f"{rel}:{n}: the value {raw[:60]!r} is outside the YAML the seed reads")
+        return raw
+
+    def block(i: int, indent: int):
+        is_list = lines[i][2].startswith("- ")
+        out: dict | list = [] if is_list else {}
+        while i < len(lines):
+            n, ind, body = lines[i]
+            if ind < indent:
+                break
+            if ind > indent or body.startswith("- ") != is_list:
+                raise Refused(f"{rel}:{n}: {body[:60]!r} does not fit its block (YAML the seed reads)")
+            if is_list:
+                item = body[2:]
+                if YAML_KEY.match(item) and not item.startswith("'"):
+                    raise Refused(f"{rel}:{n}: a list item holding a mapping is outside the YAML the seed reads")
+                out.append(scalar(item, n))
+                i += 1
+                continue
+            m = YAML_KEY.match(body)
+            if not m:
+                raise Refused(f"{rel}:{n}: {body[:60]!r} is outside the YAML the seed reads (block mappings only)")
+            key = m.group(1) if m.group(1) is not None else m.group(2)
+            if key in out:
+                raise Refused(f"{rel}:{n}: the key {key!r} is given twice")
+            i += 1
+            if m.group(3) is not None:
+                out[key] = scalar(m.group(3), n)
+                if i < len(lines) and lines[i][1] > indent:
+                    raise Refused(f"{rel}:{lines[i][0]}: an indented block under a key that has a value")
+            elif i < len(lines) and lines[i][1] > indent:
+                out[key], i = block(i, lines[i][1])
+            else:
+                raise Refused(f"{rel}:{n}: the key {key!r} has no value")
+        return out, i
+
+    if not lines:
+        return {}
+    if lines[0][1] != 0:
+        raise Refused(f"{rel}:{lines[0][0]}: the document must start at column 0")
+    doc, end = block(0, 0)
+    if end != len(lines) or not isinstance(doc, dict):
+        raise Refused(f"{rel}: not one block mapping (YAML the seed reads)")
+    return doc
+
+
+# Nested values of the closed set, matched whole. A name is npm's; a version is a registry version
+# with pnpm's optional peer suffix; nothing below admits ':' except the one `link:` form noted.
+PKG_NAME = r"(?:@[A-Za-z0-9._~-]+/)?[A-Za-z0-9._~-]+"
+REG_VERSION = r"[0-9][0-9A-Za-z.+-]*(?:\([A-Za-z0-9._~@/+()-]*\))*"
+NAME_RE = re.compile(rf"^{PKG_NAME}$")
+LOCK_VERSION = re.compile(rf"^(?:{PKG_NAME}@)?{REG_VERSION}$")  # `x@1.0.0` is an npm: alias's version
+PKG_KEY = re.compile(rf"^{PKG_NAME}@[0-9][0-9A-Za-z.+-]*$")
+SNAP_KEY = re.compile(rf"^{PKG_NAME}@{REG_VERSION}$")
+GLOB_RE = re.compile(r"^!?[A-Za-z0-9._*/-]+$")
+RESOLUTION = re.compile(r"^\{integrity: sha512-[A-Za-z0-9+/]+=*\}$")
+FLOW_ENGINES = re.compile(r"^\{[A-Za-z0-9_-]+: '?[0-9A-Za-z.^~<>=| *+-]+'?(?:, [A-Za-z0-9_-]+: '?[0-9A-Za-z.^~<>=| *+-]+'?)*\}$")
+FLOW_PLATFORMS = re.compile(r"^\[!?[A-Za-z0-9_-]+(?:, !?[A-Za-z0-9_-]+)*\]$")
+PACKAGE_FIELDS = {"resolution", "engines", "peerDependencies", "peerDependenciesMeta", "hasBin", "cpu", "os", "libc"}
+SNAPSHOT_FIELDS = {"dependencies", "optionalDependencies", "transitivePeerDependencies", "optional"}
+IMPORTER_FIELDS = {"dependencies", "devDependencies", "optionalDependencies"}
+
+
+def node_spec_ok(spec) -> bool:
+    return isinstance(spec, str) and bool(spec == "workspace:*" or SPEC_RANGE.fullmatch(spec)
+                                          or SPEC_ALIAS.fullmatch(spec))
 
 
 def check_node_config(root: Path, inputs: dict[str, str]) -> None:
-    """Refuse a workspace whose pnpm configuration or layout is outside the closed set above."""
+    """Refuse a workspace whose pnpm configuration or layout is outside the closed set above: every
+    key and every nested value of .npmrc, pnpm-workspace.yaml, pnpm-lock.yaml and the manifests."""
     def refuse(where: str, what: str) -> None:
         raise Refused(f"{where}: {what} is outside the pnpm configuration the node seed supports (TXE-8348: "
                       "okr/web's, as tested); supporting it is a reviewed change to the runner")
+
+    def mapping(where: str, v) -> dict:
+        if v == "{}":
+            return {}
+        if not isinstance(v, dict):
+            refuse(where, f"the value {str(v)[:60]!r} (a mapping is expected)")
+        return v
+
+    def overrides(where: str, v) -> None:
+        for name, spec in mapping(where, v).items():
+            if not NAME_RE.fullmatch(name):
+                refuse(where, f"the override selector {name!r} (a plain package name only)")
+            if spec == "workspace:*" or not node_spec_ok(spec):
+                refuse(where, f"the override {name}: {spec!r}")
+
     if ".npmrc" in inputs:
         for n, line in enumerate(config_text(root, ".npmrc").splitlines(), 1):
             if line.strip() and not line.lstrip().startswith(("#", ";")):
                 refuse(f".npmrc:{n}", f"the setting {line.strip()[:60]!r} (no .npmrc setting is supported)")
     if "pnpm-workspace.yaml" in inputs:
-        for key in yaml_top_keys(config_text(root, "pnpm-workspace.yaml"), "pnpm-workspace.yaml"):
+        ws = yaml_block(config_text(root, "pnpm-workspace.yaml"), "pnpm-workspace.yaml")
+        for key, v in ws.items():
             if key not in WORKSPACE_KEYS:
                 refuse("pnpm-workspace.yaml", f"the setting {key!r}")
-    lock = yaml_top_keys(config_text(root, "pnpm-lock.yaml"), "pnpm-lock.yaml")
+            if key == "overrides":
+                overrides("pnpm-workspace.yaml overrides", v)
+                continue
+            if not isinstance(v, list):
+                refuse(f"pnpm-workspace.yaml {key}", f"the value {str(v)[:60]!r} (a list is expected)")
+            for item in v:
+                if not (GLOB_RE if key == "packages" else NAME_RE).fullmatch(item) or ".." in item.split("/"):
+                    refuse(f"pnpm-workspace.yaml {key}", f"the entry {item!r}")  # a glob stays inside the tree
+    lock = yaml_block(config_text(root, "pnpm-lock.yaml"), "pnpm-lock.yaml")
     for key in lock:
         if key not in LOCKFILE_KEYS:
             refuse("pnpm-lock.yaml", f"the section {key!r}")
-    if lock.get("lockfileVersion") not in [[v] for v in LOCKFILE_VERSIONS]:
-        refuse("pnpm-lock.yaml", f"lockfileVersion {lock.get('lockfileVersion')}")
-    for line in lock.get("settings", []):
-        m = re.fullmatch(r"  ([A-Za-z]+):\s+(\S+)", line)
-        if not m or LOCKFILE_SETTINGS.get(m.group(1)) != m.group(2):
-            refuse("pnpm-lock.yaml settings", f"{line.strip()!r}")
+    if lock.get("lockfileVersion") not in {v.strip("'") for v in LOCKFILE_VERSIONS}:
+        refuse("pnpm-lock.yaml", f"lockfileVersion {lock.get('lockfileVersion')!r}")
+    for k, v in mapping("pnpm-lock.yaml settings", lock.get("settings", {})).items():
+        if LOCKFILE_SETTINGS.get(k) != v:
+            refuse("pnpm-lock.yaml settings", f"{f'{k}: {v}'!r}")
+    overrides("pnpm-lock.yaml overrides", lock.get("overrides", {}))
+    projects = set(project_dirs(inputs))
+    for imp, entry in mapping("pnpm-lock.yaml importers", lock.get("importers", {})).items():
+        where = f"pnpm-lock.yaml importers {imp}"
+        if imp not in projects:
+            refuse(where, "an importer that is not a workspace project")
+        for field, deps in mapping(where, entry).items():
+            if field not in IMPORTER_FIELDS:
+                refuse(where, f"the field {field!r}")
+            for name, dep in mapping(f"{where} {field}", deps).items():
+                d = mapping(f"{where} {field} {name}", dep)
+                spec, ver = d.get("specifier"), d.get("version")
+                if set(d) != {"specifier", "version"} or not NAME_RE.fullmatch(name) or not node_spec_ok(spec):
+                    refuse(f"{where} {field}", f"the entry {name}: {d!r}")
+                if spec == "workspace:*":
+                    # The one link: form: pnpm's link to a workspace project, which must be one.
+                    target = ver[5:] if isinstance(ver, str) and ver.startswith("link:") else None
+                    if target is None or os.path.normpath(os.path.join(imp, target)) not in projects:
+                        refuse(f"{where} {field}", f"the workspace version {name}: {ver!r}")
+                elif not isinstance(ver, str) or not LOCK_VERSION.fullmatch(ver):
+                    refuse(f"{where} {field}", f"the version {name}: {ver!r}")
+    for key, entry in mapping("pnpm-lock.yaml packages", lock.get("packages", {})).items():
+        where = f"pnpm-lock.yaml packages {key}"
+        if not PKG_KEY.fullmatch(key):
+            refuse("pnpm-lock.yaml packages", f"the package {key!r} (registry packages only)")
+        e = mapping(where, entry)
+        if not RESOLUTION.fullmatch(str(e.get("resolution", ""))):
+            refuse(where, f"the resolution {str(e.get('resolution'))[:80]!r} (a registry integrity only)")
+        for field, v in e.items():
+            if field not in PACKAGE_FIELDS:
+                refuse(where, f"the field {field!r}")
+            ok = {"resolution": True, "hasBin": v == "true",
+                  "engines": isinstance(v, str) and bool(FLOW_ENGINES.fullmatch(v)),
+                  "cpu": isinstance(v, str) and bool(FLOW_PLATFORMS.fullmatch(v)),
+                  "os": isinstance(v, str) and bool(FLOW_PLATFORMS.fullmatch(v)),
+                  "libc": isinstance(v, str) and bool(FLOW_PLATFORMS.fullmatch(v)),
+                  "peerDependencies": isinstance(v, dict) and all(NAME_RE.fullmatch(k) and isinstance(r, str)
+                                                                  and SPEC_RANGE.fullmatch(r) for k, r in v.items()),
+                  "peerDependenciesMeta": isinstance(v, dict) and all(NAME_RE.fullmatch(k) and m == {"optional": "true"}
+                                                                      for k, m in v.items())}[field]
+            if not ok:
+                refuse(where, f"the {field} value {str(v)[:80]!r}")
+    for key, entry in mapping("pnpm-lock.yaml snapshots", lock.get("snapshots", {})).items():
+        where = f"pnpm-lock.yaml snapshots {key}"
+        if not SNAP_KEY.fullmatch(key):
+            refuse("pnpm-lock.yaml snapshots", f"the snapshot {key!r} (registry packages only)")
+        for field, v in mapping(where, entry).items():
+            if field not in SNAPSHOT_FIELDS:
+                refuse(where, f"the field {field!r}")
+            if field == "optional":
+                ok = v == "true"
+            elif field == "transitivePeerDependencies":
+                ok = isinstance(v, list) and all(NAME_RE.fullmatch(x) for x in v)
+            else:
+                ok = isinstance(v, dict) and all(NAME_RE.fullmatch(k) and isinstance(x, str) and LOCK_VERSION.fullmatch(x)
+                                                 for k, x in v.items())
+            if not ok:
+                refuse(where, f"the {field} value {str(v)[:80]!r}")
     for rel in inputs:
         if Path(rel).name != "package.json":
             continue
@@ -1540,8 +1698,7 @@ def check_node_config(root: Path, inputs: dict[str, str]) -> None:
             if not isinstance(deps, dict):
                 refuse(rel, f"a non-object {field}")
             for dep, spec in deps.items():
-                if not isinstance(spec, str) or not (spec == "workspace:*" or SPEC_RANGE.fullmatch(spec)
-                                                     or SPEC_ALIAS.fullmatch(spec)):
+                if not node_spec_ok(spec):
                     refuse(rel, f"the {field} specifier {dep}: {spec!r}")
 
 

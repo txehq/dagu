@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
@@ -272,7 +273,8 @@ func TestNodeSeedBuildAndOfflineRuns(t *testing.T) {
 	assert.NotContains(t, seedRun, "host-only-value")
 	assert.Equal(t, []string{"/work"}, mountTargets(runs[0]))
 	n := len(runs[0])
-	assert.Equal(t, []string{"node-image", "sh", "-c"}, runs[0][n-5:n-2], "the runner's own command")
+	assert.Equal(t, []string{"sha256:" + hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("node-image")); return s[:] }()),
+		"sh", "-c"}, runs[0][n-5:n-2], "the runner's own command, launched by the image's id")
 	assert.Equal(t, "sh", runs[0][n-1], "no allowlisted name follows")
 	assert.Contains(t, runs[0][n-2], "pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile")
 
@@ -356,6 +358,39 @@ func mountTargets(argv []string) []string {
 	return out
 }
 
+// Node runs launch by the immutable id resolved once at the start, never by the caller's tag (root's
+// review of 984f6e0f): a tag retargeted while a run is in progress cannot swap the image a seed was
+// built with or a mutant runs in. The fake docker's tag moves on the first container (its
+// side effect), so a later launch by tag would get the other image; every launch must name the id.
+// A tag that has moved before a run starts resolves to another id, and the seed is refused.
+func TestNodeRunsLaunchByImageID(t *testing.T) {
+	f := newNodeFixture(t)
+	retag := f.log + ".retag"
+	f.docker = fakeDocker(t, f.root, f.log, fmt.Sprintf("open(%q, 'w').close()", retag))
+	imageA := "sha256:" + hex.EncodeToString(func() []byte { s := sha256.Sum256([]byte("node-image")); return s[:] }())
+	seedDir := filepath.Join(f.root, "seed")
+	o := f.build(t, seedDir)
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	assert.Equal(t, imageA, readSeed(t, seedDir)["image_id"], "the id the tag named when the build started")
+	require.FileExists(t, retag, "the tag moved once the seed's container started")
+
+	require.NoError(t, os.Remove(retag)) // the tag names image A again when the run starts
+	o = f.run(t, f.mutants(t, nodeMutants), "--node-seed", seedDir, "--image", "node-image")
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	runs := dockerRuns(t, f.log)
+	require.Len(t, runs, 1+5)
+	for _, argv := range runs {
+		assert.Contains(t, argv, imageA, "launched by the immutable id")
+		assert.NotContains(t, argv, "node-image", "never by the tag, which moved during each invocation")
+	}
+
+	require.FileExists(t, retag) // the tag moved again, and now names another image
+	o = f.run(t, f.mutants(t, nodeMutants), "--node-seed", seedDir, "--image", "node-image")
+	require.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "was built with image "+imageA)
+	assert.Len(t, dockerRuns(t, f.log), 1+5, "no container ran on the retargeted tag")
+}
+
 // A seed whose lockfile, manifests, image or content no longer match is refused before any run.
 func TestNodeSeedMismatchRefused(t *testing.T) {
 	cases := map[string]struct {
@@ -436,8 +471,9 @@ func TestNodeSeedLifecycleAllowlist(t *testing.T) {
 	log, err := os.ReadFile(filepath.Join(seedDir, "install.log"))
 	require.NoError(t, err)
 	// The fake docker maps /work to the run's host directory, so the store path is a host path here.
-	assert.Regexp(t, `\n\+ pnpm rebuild -r --config.dangerously-allow-all-builds=true --store-dir=\S+/sandbox/pnpm-store `+
-		`--reporter=append-only esbuild\n`, string(log))
+	// The install's pnpmfile and package-manager settings carry over (root's review of 984f6e0f).
+	assert.Regexp(t, `\n\+ pnpm rebuild -r --config.dangerously-allow-all-builds=true --config.ignore-pnpmfile=true `+
+		`--config.manage-package-manager-versions=false --store-dir=\S+/sandbox/pnpm-store --reporter=append-only esbuild\n`, string(log))
 
 	for name, c := range map[string]struct {
 		args []string
@@ -523,10 +559,94 @@ var okrWebConfig = map[string]string{
 		"# install script only downloads the same binary when that is missing, and\n" +
 		"# needs the network. The build uses the packaged one (TXE-3424).\n" +
 		"ignoredBuiltDependencies:\n  - '@sentry/cli'\n",
-	"pnpm-lock.yaml": "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n" +
-		"overrides:\n  playwright-core: 1.62.1\n\nimporters:\n\n  .:\n    devDependencies:\n      typescript:\n" +
-		"        specifier: 5.9.3\n        version: 5.9.3\n\npackages:\n\n  typescript@5.9.3:\n" +
-		"    resolution: {integrity: sha512-x}\n    engines: {node: '>=14.17'}\n\nsnapshots:\n\n  typescript@5.9.3: {}\n",
+	// The lockfile's header verbatim, then one entry of each nested shape okr/web's lockfile has
+	// (measured over its 6 importers, 547 packages and 547 snapshots): every resolution an
+	// integrity, `link:` only as a workspace:* importer version, an npm: alias, peer suffixes.
+	"pnpm-lock.yaml": `lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+overrides:
+  playwright-core: 1.62.1
+
+importers:
+
+  .:
+    devDependencies:
+      typescript:
+        specifier: 5.9.3
+        version: 5.9.3
+
+  apps/web:
+    dependencies:
+      '@okr/ui':
+        specifier: workspace:*
+        version: link:../../packages/ui
+      webreplay-css-tokenizer:
+        specifier: npm:@csstools/css-tokenizer@3.0.4
+        version: '@csstools/css-tokenizer@3.0.4'
+    devDependencies:
+      vitest:
+        specifier: 4.1.8
+        version: 4.1.8(@types/node@22.20.4)
+
+  packages/calc: {}
+
+  packages/ui:
+    dependencies:
+      '@okr/calc':
+        specifier: workspace:*
+        version: link:../calc
+
+packages:
+
+  '@csstools/css-tokenizer@3.0.4':
+    resolution: {integrity: sha512-AAAA}
+    engines: {node: '>=18'}
+
+  typescript@5.9.3:
+    resolution: {integrity: sha512-BBBB}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
+  vitest@4.1.8:
+    resolution: {integrity: sha512-CCCC==}
+    engines: {node: ^20.0.0 || ^22.0.0 || >=24.0.0}
+    hasBin: true
+    peerDependencies:
+      '@types/node': ^20.0.0 || ^22.0.0 || >=24.0.0
+      jsdom: '*'
+    peerDependenciesMeta:
+      jsdom:
+        optional: true
+
+  '@rolldown/binding-linux-arm64-gnu@1.0.3':
+    resolution: {integrity: sha512-DDDD}
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+snapshots:
+
+  '@csstools/css-tokenizer@3.0.4': {}
+
+  typescript@5.9.3: {}
+
+  vitest@4.1.8(@types/node@22.20.4):
+    dependencies:
+      '@types/node': 22.20.4
+    optionalDependencies:
+      '@rolldown/binding-linux-arm64-gnu': 1.0.3
+    transitivePeerDependencies:
+      - jsdom
+
+  '@rolldown/binding-linux-arm64-gnu@1.0.3':
+    optional: true
+`,
+	"packages/calc/package.json": `{"name": "@okr/calc", "private": true, "version": "0.0.0", "type": "module",
+		"exports": {".": "./src/index.ts"}, "sideEffects": false}`,
 	"package.json": `{"name": "okr-web", "private": true, "version": "0.0.0", "type": "module", "packageManager": "pnpm@10.33.0",
 		"engines": {"node": "^22.18.0 || >=23.6.0"}, "scripts": {"test": "pnpm -r run test"},
 		"devDependencies": {"typescript": "5.9.3", "globals": "^16.0.0"}}`,
@@ -573,7 +693,7 @@ except ms.Refused as e:
 func TestNodeConfigClosedSet(t *testing.T) {
 	assert.Equal(t, "ok", nodeConfigVerdict(t, nil), "okr/web's configuration is the supported one")
 	const tail = "is outside the pnpm configuration the node seed supports"
-	lock := okrWebConfig["pnpm-lock.yaml"]
+	lock, ws := okrWebConfig["pnpm-lock.yaml"], okrWebConfig["pnpm-workspace.yaml"]
 	cases := map[string]struct {
 		files map[string]string
 		want  string
@@ -594,7 +714,58 @@ func TestNodeConfigClosedSet(t *testing.T) {
 		"a lockfile section": {map[string]string{"pnpm-lock.yaml": lock + "\npatchedDependencies:\n  x: patches/x.patch\n"},
 			"pnpm-lock.yaml: the section 'patchedDependencies' " + tail},
 		"another lockfile version": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "'9.0'", "'6.0'", 1)},
-			"lockfileVersion [\"'6.0'\"] " + tail},
+			"lockfileVersion '6.0' " + tail},
+		// Nested routes (root's review of 984f6e0f): each way a nested entry could name a file:,
+		// link:, URL or git source, or repeat a key, is refused.
+		"workspace override to link:": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: link:../pw", 1)},
+			"pnpm-workspace.yaml overrides: the override playwright-core: 'link:../pw' " + tail},
+		"workspace override to file:": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: file:../pw.tgz", 1)},
+			"the override playwright-core: 'file:../pw.tgz'"},
+		"workspace override to a URL": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: https://example.com/pw.tgz", 1)},
+			"the override playwright-core: 'https://example.com/pw.tgz'"},
+		"workspace override to git": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: github:user/pw", 1)},
+			"the override playwright-core: 'github:user/pw'"},
+		"workspace override to workspace:": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: workspace:*", 1)},
+			"the override playwright-core: 'workspace:*'"},
+		"workspace override selector": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "'a>playwright-core': 1.62.1", 1)},
+			"the override selector 'a>playwright-core'"},
+		"workspace duplicate override": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "playwright-core: 1.62.1", "playwright-core: 1.62.1\n  playwright-core: 1.0.0", 1)},
+			"the key 'playwright-core' is given twice"},
+		"workspace package glob outside": {map[string]string{"pnpm-workspace.yaml": strings.Replace(ws, "  - apps/*", "  - ../outside/*", 1)},
+			"pnpm-workspace.yaml packages: the entry '../outside/*'"},
+		"lockfile override to link:": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "overrides:\n  playwright-core: 1.62.1", "overrides:\n  playwright-core: link:../pw", 1)},
+			"pnpm-lock.yaml overrides: the override playwright-core: 'link:../pw'"},
+		"lockfile tarball resolution": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "{integrity: sha512-BBBB}", "{tarball: https://example.com/ts.tgz}", 1)},
+			"the resolution '{tarball: https://example.com/ts.tgz}' (a registry integrity only)"},
+		"lockfile directory resolution": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "{integrity: sha512-BBBB}", "{directory: ../ts, type: directory}", 1)},
+			"the resolution '{directory: ../ts, type: directory}'"},
+		"lockfile git resolution": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "{integrity: sha512-BBBB}", "{commit: abc, repo: https://example.com/ts.git, type: git}", 1)},
+			"the resolution '{commit: abc, repo: https://example.com/ts.git, type: git}'"},
+		// Quoted, as pnpm writes such keys; unquoted, the ':' already fails the grammar.
+		"lockfile file: package": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  typescript@5.9.3:\n    resolution", "  'typescript@file:../ts':\n    resolution", 1)},
+			"the package 'typescript@file:../ts' (registry packages only)"},
+		"lockfile package field": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "    hasBin: true\n\n  vitest", "    hasBin: true\n    bundledDependencies: [x]\n\n  vitest", 1)},
+			"pnpm-lock.yaml packages typescript@5.9.3: the field 'bundledDependencies'"},
+		"lockfile duplicate package": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  typescript@5.9.3:\n    resolution: {integrity: sha512-BBBB}", "  typescript@5.9.3:\n    resolution: {integrity: sha512-BBBB}\n\n  typescript@5.9.3:\n    resolution: {integrity: sha512-BBBB}", 1)},
+			"the key 'typescript@5.9.3' is given twice"},
+		"lockfile snapshot link:": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "      '@types/node': 22.20.4", "      '@types/node': link:../node", 1)},
+			"pnpm-lock.yaml snapshots vitest@4.1.8(@types/node@22.20.4): the dependencies value"},
+		"lockfile file: snapshot": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  typescript@5.9.3: {}", "  'typescript@file:../ts': {}", 1)},
+			"the snapshot 'typescript@file:../ts' (registry packages only)"},
+		"lockfile importer specifier file:": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "        specifier: 4.1.8\n", "        specifier: file:../vitest\n", 1)},
+			"pnpm-lock.yaml importers apps/web devDependencies: the entry vitest"},
+		"lockfile importer version link:": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "        version: 4.1.8(@types/node@22.20.4)", "        version: link:../vitest", 1)},
+			"the version vitest: 'link:../vitest'"},
+		"lockfile workspace link outside": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "version: link:../../packages/ui", "version: link:../../../elsewhere", 1)},
+			"the workspace version @okr/ui: 'link:../../../elsewhere'"},
+		"lockfile unknown importer": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  packages/calc: {}", "  packages/calc: {}\n\n  ../other: {}", 1)},
+			"pnpm-lock.yaml importers ../other: an importer that is not a workspace project"},
+		"unquoted key with a colon": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  typescript@5.9.3: {}", "  typescript@file:../ts: {}", 1)},
+			"is outside the YAML the seed reads"},
+		"lockfile importer not a project": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  packages/calc: {}", "  packages/calc: {}\n\n  packages/gone: {}", 1)},
+			"pnpm-lock.yaml importers packages/gone: an importer that is not a workspace project"},
+		"lockfile double-quoted value": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "playwright-core: 1.62.1", `playwright-core: "1.62.1"`, 1)},
+			"is outside the YAML the seed reads"},
 		"a pnpm field": {map[string]string{"package.json": `{"name": "okr-web", "pnpm": {"overrides": {}}}`},
 			"package.json: the field 'pnpm' " + tail},
 		"dependenciesMeta": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "dependenciesMeta": {"@okr/ui": {"injected": true}}}`},
