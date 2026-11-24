@@ -391,7 +391,11 @@ and process substitution, redirections, here-documents) and judges only what wou
   No program in it is named for mutation. One command is refused when all three hold:
   1. it writes `.go`, `.py` or `.sh` source. That means an output redirection or `tee` to such a
      file, an in-place `sed -i`, `perl -i` or `ruby -i` of one, or interpreter code that names
-     one and writes a file (`open(p, "w")`, `write_text`, `os.replace`, `writeFileSync`, ...);
+     one and writes a file (`open(p, "w")`, `write_text`, `os.replace`, `writeFileSync`, ...).
+     For Python the write targets are read from the AST: literals, names bound once, `Path(...)`,
+     `os.path.join` and `+`. A source name inside written Markdown is data. A target it cannot
+     resolve, or a write it does not model (`fileinput`, `os.open`), falls back to any token
+     naming source, in the code or the interpreter's arguments;
   2. it runs `go test`, `pytest`, `python -m pytest` or `bazel test`;
   3. its text names a mutant or a mutation (comments included; `mutate-sandboxed` itself does not
      count).

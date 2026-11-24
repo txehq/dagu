@@ -1472,7 +1472,11 @@ SOURCE_EXT = re.compile(r"\.(?:go|py|sh)$")
 TEST_PROGRAMS = re.compile(r"^(?:pytest(?:-3)?|py\.test)$")
 CODE_WRITES = re.compile(r"""\bopen\s*\([^)]*?,\s*(?:mode\s*=\s*)?[rbt]*['"][^'"]*[wax+]|\.write(?:_text|_bytes|lines)?\s*\("""
                          r"""|\bos\s*\.\s*(?:replace|rename)\b|\bshutil\s*\.\s*(?:copy\w*|move)\b"""
-                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]""")
+                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]"""
+                         r"""|\.open\s*\(\s*['"][^'"]*[wax+]|\binplace\b|\bos\s*\.\s*(?:open|write)\b""")
+# Python writes python_write_targets() does not resolve: their target is unknown.
+PY_UNMODELED_WRITES = re.compile(r"\bfileinput\b|\binplace\b|\bos\s*\.\s*(?:open|write|link|symlink)\b|\bcopytree\b"
+                                 r"|\bsetattr\b|\bexec\b|\beval\b|\b__\w+")
 
 
 def program_words(ws: list) -> list:
@@ -1536,9 +1540,95 @@ def writes_source(cmd: Cmd) -> bool:
     if PYTHONS.match(prog) or prog in OTHER_INTERPRETERS:
         texts = list(args) + [src[1] for src in cmd.fds.values()
                               if isinstance(src, (list, tuple)) and src[0] in ("text", "text-expanding")]
-        return any(CODE_WRITES.search(t) and any(SOURCE_EXT.search(tok) for tok in CODE_TOKEN.findall(t))
-                   for t in texts)
+        writing = [t for t in texts if CODE_WRITES.search(t)]
+        if not writing:
+            return False
+        if PYTHONS.match(prog):
+            # Python: the file a call writes, from its AST, so a source name inside written
+            # Markdown is data (TXE-8351 review). A target it cannot resolve falls back below.
+            targets = [python_write_targets(t) for t in writing]
+            if all(ts is not None for ts in targets):
+                return any(SOURCE_EXT.search(x) for ts in targets for x in ts)
+        # Any token naming source, in the code or the interpreter's arguments (`sys.argv[1]`).
+        return any(SOURCE_EXT.search(tok) for t in texts for tok in CODE_TOKEN.findall(t))
     return False
+
+
+def python_write_targets(code: str):
+    """The files Python code writes, as literal paths, or None when the code does not parse or a
+    target is not a literal, a name bound once to one, Path(...) of one, os.path.join or + of
+    them. Writes: open(X, mode with w/a/x/+), X.write_text/write_bytes, os.replace/rename(_, X),
+    shutil.copy*/move(_, X). Runs nothing: ast.parse only builds a tree."""
+    if PY_UNMODELED_WRITES.search(code):
+        return None  # a write this reader does not resolve: unknown
+    try:
+        tree = ast.parse(code)
+    except Exception:  # noqa: BLE001 - SyntaxError, ValueError, RecursionError: unknown
+        return None
+    bound: dict = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            bound[name] = None if name in bound else node.value  # bound twice: unknown
+
+    def resolve(e, seen=0):
+        if seen > 8:
+            return None
+        if isinstance(e, ast.Constant) and isinstance(e.value, str):
+            return e.value
+        if isinstance(e, ast.Name):
+            return resolve(bound[e.id], seen + 1) if bound.get(e.id) is not None else None
+        if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Div)):
+            a, b = resolve(e.left, seen + 1), resolve(e.right, seen + 1)
+            return None if a is None or b is None else (a + b if isinstance(e.op, ast.Add) else a + "/" + b)
+        if isinstance(e, ast.Call) and not e.keywords:
+            f = e.func
+            fname = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+            if fname in ("Path", "PurePath", "PosixPath") and len(e.args) == 1:
+                return resolve(e.args[0], seen + 1)
+            if fname == "join" and e.args:
+                parts = [resolve(a, seen + 1) for a in e.args]
+                return None if None in parts else "/".join(parts)
+        return None
+
+    targets = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f, target = node.func, False
+        if isinstance(f, ast.Name) and f.id == "open":
+            mode = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords if k.arg == "mode"), None)
+            if mode is None:
+                continue
+            if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
+                return None  # a computed mode may write
+            if not set(mode.value) & set("wax+"):
+                continue
+            target = node.args[0] if node.args else None
+        elif isinstance(f, ast.Attribute) and f.attr in ("write_text", "write_bytes"):
+            target = f.value
+        elif isinstance(f, ast.Attribute) and f.attr == "open":
+            # Path(x).open("w") writes Path(x); io.open/codecs.open(x, "w") write x; others unknown.
+            is_module = isinstance(f.value, ast.Name) and f.value.id in ("io", "codecs")
+            args = node.args[1:] if is_module else node.args
+            mode = args[0] if args else next((k.value for k in node.keywords if k.arg == "mode"), None)
+            if mode is None:
+                continue
+            if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
+                return None
+            if not set(mode.value) & set("wax+"):
+                continue
+            target = (node.args[0] if node.args else None) if is_module else f.value
+        elif isinstance(f, ast.Attribute) and f.attr in ("replace", "rename", "copy", "copy2", "copyfile", "move") \
+                and isinstance(f.value, ast.Name) and f.value.id in ("os", "shutil"):
+            target = node.args[1] if len(node.args) > 1 else None
+        else:
+            continue
+        path = resolve(target) if target is not None else None
+        if path is None:
+            return None
+        targets.append(path)
+    return targets
 
 
 def hand_mutation_run(command: str, cmds: list, writes: list) -> bool:
