@@ -41,6 +41,10 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
   source), that imports only text-handling modules (sys only through a few attributes) and that
   has no construct which can turn a string into a call (a dunder, a frame attribute, help(),
   sys.modules); anything else is judged on its full text, strings included.
+One command is also a mutation run when it does what TXE-7547's hand runner did: it writes .go, .py
+or .sh source (an output redirection, tee, sed -i/perl -i, or interpreter code that writes a file
+it names), runs go test, pytest, python -m pytest or bazel test, and names a mutant or a mutation
+anywhere in its text (TXE-8351).
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
 `--body` or `--text` message, a path given to cat or shasum, the body of a here-document written
 to a file, a comment, and code that only mentions the names (prints them, edits text containing
@@ -222,6 +226,7 @@ class Parser:
         self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
         self.braces = []  # where each open `{ ...` group starts in self.cmds
         self.expansions = 0  # how many expansions have been read (Word.expanded compares counts)
+        self.writes = []  # files output redirections write (`> x.go`, `>> x.py`, `&> x.sh`)
 
     def parse(self) -> list:
         self.seq(None)
@@ -242,6 +247,7 @@ class Parser:
         found = p.parse()
         self.too_deep = self.too_deep or p.too_deep
         self.cmds.extend(found)
+        self.writes.extend(p.writes)
         return found
 
     def seq(self, end):
@@ -334,6 +340,8 @@ class Parser:
         start = self.i
         target = self.word()
         src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
+        if target.procsub is None and op in (">", ">>", ">|", "&>", "&>>", "<>", ">&"):
+            self.writes.append(target.text)  # `>&2` names no file and matches no source extension
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
             quoted = any(q in raw for q in "'\"\\")
@@ -379,6 +387,7 @@ class Parser:
                 p = Parser(body, self.depth)
                 p.dquote(None)
                 self.cmds.extend(p.cmds)
+                self.writes.extend(p.writes)
                 self.too_deep = self.too_deep or p.too_deep
         self.heredocs = []
 
@@ -1446,6 +1455,98 @@ class Judge:
         return False
 
 
+# ------------------------------------------------- A hand mutation run in one command (TXE-8351)
+# The TXE-7547 incident shape: edit executable source, then run the tests over the live tree, in one
+# command, outside mutate-sandboxed. No program in it is named for mutation, so the rules above see
+# nothing to run. One command is refused when all three hold (coordinator ruling on PR 306):
+# 1. it writes executable source (.go, .py, .sh): an output redirection or `tee` to such a file, an
+#    in-place `sed -i`/`perl -i`/`ruby -i` of one, or interpreter code (an argument, a here-document
+#    or a here-string) that names one and writes a file;
+# 2. the same command runs a test runner: go test, pytest, python -m pytest, bazel test;
+# 3. its text names a mutant or a mutation (MUTANT_FILE, with mutate-sandboxed's own name removed).
+# An edit of .md or .ts files, an edit with no test, and a test with no mutation word stay allowed;
+# so does a test run by mutate-sandboxed, whose program is the runner, not the test.
+SOURCE_EXT = re.compile(r"\.(?:go|py|sh)$")
+TEST_PROGRAMS = re.compile(r"^(?:pytest(?:-3)?|py\.test)$")
+CODE_WRITES = re.compile(r"""\bopen\s*\([^)]*?,\s*(?:mode\s*=\s*)?[rbt]*['"][^'"]*[wax+]|\.write(?:_text|_bytes|lines)?\s*\("""
+                         r"""|\bos\s*\.\s*(?:replace|rename)\b|\bshutil\s*\.\s*(?:copy\w*|move)\b"""
+                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]""")
+
+
+def program_words(ws: list) -> list:
+    """The words from the program on: assignments, keywords, wrappers and runners skipped (an
+    approximation of Judge._program for the rule below)."""
+    i = 0
+    while i < len(ws):
+        t, b = ws[i], base(ws[i])
+        if ASSIGN.match(t) or t in KEYWORDS:
+            i += 1
+        elif b in WRAPPERS:
+            value_opts, positionals = WRAPPERS[b]
+            i += 1
+            while i < len(ws) and (ws[i].startswith("-") or (b == "env" and ASSIGN.match(ws[i]))):
+                i += 2 if ws[i] in value_opts else 1
+            i += positionals
+        elif b in RUNNERS:
+            i += 1
+            if RUNNERS[b] is not None:
+                while i < len(ws) and ws[i] != RUNNERS[b]:
+                    i += 1
+                i += 1
+            while i < len(ws) and ws[i].startswith("-"):
+                i += 2 if ws[i] in RUNNER_VALUE_OPTS else 1
+        else:
+            return ws[i:]
+    return []
+
+
+def runs_tests(cmd: Cmd) -> bool:
+    """Whether this command's program is a test runner over a tree: go test, pytest, python -m
+    pytest, bazel test."""
+    ws = program_words([w.text for w in cmd.words])
+    if not ws:
+        return False
+    prog, args = base(ws[0]), ws[1:]
+    if prog in ("go", "bazel", "bazelisk"):
+        return "test" in [a for a in args if not a.startswith("-")][:2]
+    if TEST_PROGRAMS.match(prog):
+        return True
+    if PYTHONS.match(prog):
+        return any((a == "-m" and args[n + 1:n + 2] == ["pytest"]) or (a.startswith("-") and a.endswith("mpytest"))
+                   for n, a in enumerate(args))
+    return False
+
+
+def writes_source(cmd: Cmd) -> bool:
+    """Whether this command writes executable source other than by an output redirection (those
+    are in Parser.writes): tee, an in-place editor, or interpreter code that names a source file
+    and writes a file."""
+    ws = program_words([w.text for w in cmd.words])
+    if not ws:
+        return False
+    prog, args = base(ws[0]), ws[1:]
+    if prog == "tee":
+        return any(SOURCE_EXT.search(a) for a in args)
+    in_place = any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a[1:])
+                   for a in args)
+    if prog in ("sed", "gsed", "perl", "ruby") and in_place and any(SOURCE_EXT.search(a) for a in args):
+        return True
+    if PYTHONS.match(prog) or prog in OTHER_INTERPRETERS:
+        texts = list(args) + [src[1] for src in cmd.fds.values()
+                              if isinstance(src, (list, tuple)) and src[0] in ("text", "text-expanding")]
+        return any(CODE_WRITES.search(t) and any(SOURCE_EXT.search(tok) for tok in CODE_TOKEN.findall(t))
+                   for t in texts)
+    return False
+
+
+def hand_mutation_run(command: str, cmds: list, writes: list) -> bool:
+    if not MUTANT_FILE.search(command.replace("mutate-sandboxed", " ")):
+        return False
+    if not any(runs_tests(c) for c in cmds):
+        return False
+    return any(SOURCE_EXT.search(w) for w in writes) or any(writes_source(c) for c in cmds)
+
+
 def refuses(command: str, depth: int = 0, outer=None) -> bool:
     if depth > MAX_DEPTH:
         return True  # shell code nested this deep is not read: refused rather than let through
@@ -1454,7 +1555,7 @@ def refuses(command: str, depth: int = 0, outer=None) -> bool:
     cmds = parser.parse()
     if parser.too_deep:
         return True
-    return any(judge.runs_mutation(cmd) for cmd in cmds)
+    return any(judge.runs_mutation(cmd) for cmd in cmds) or hand_mutation_run(command, cmds, parser.writes)
 
 
 def command_of(data: dict):

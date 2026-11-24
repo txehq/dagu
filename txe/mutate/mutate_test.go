@@ -1222,6 +1222,13 @@ var dataWordsAllowed = []string{
 	`python3 -W ignore::DeprecationWarning -c 'print(1)'`,
 	// Wrappers that exec their arguments unchanged keep the view.
 	"timeout 60 nice -n 5 python3 - <<'PY'\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"`old`\", \"`new`\"))\nPY",
+	// Coordinator ruling on PR 306: edit, then test, in one command is refused only when it writes
+	// .go/.py/.sh source and names a mutation. An .md or .ts edit followed by a test stays allowed,
+	// as do a source edit with no mutation word, and a test that mutate-sandboxed runs.
+	"cp spec.md spec.v1.md && python3 - <<'PY' && go test ./...\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited; see `PATCH /objectives/{id}/links`.\"))\nPY",
+	"cd okr/web && python3 - <<'PY' && python3 -m pytest -q ../../tests\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"  'held-form',\\n\", \"  'held-form',\\n  'mutation',\\n\"))\nPY",
+	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"ok :=\", \"okay :=\"))\nPY",
+	"cat > m.json <<'EOF'\n[{\"name\": \"mutation 1\", \"file\": \"internal/guard.go\", \"old\": \"if !ok {\", \"new\": \"if false {\"}]\nEOF\nmutate-sandboxed --mutants m.json --tree . --image sha256:abc -- go test ./internal/...",
 	// os is a text module here: its process calls would be names in the code, and there are none.
 	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
 }
@@ -1233,6 +1240,17 @@ var dataWordsRefused = []string{
 	// the live tree.
 	"python3 - <<'PY'\nimport subprocess\np = \"internal/guard.go\"\ns = open(p).read()\nfor old, new in [(\"if !ok {\", \"if false {\")]:  # mutation 1: drop the guard\n    open(p, \"w\").write(s.replace(old, new))\n    subprocess.run([\"go\", \"test\", \"./internal/...\"])\nopen(p, \"w\").write(s)\nPY",
 	"python3 - <<'PY'\nimport os\np = \"tools/guard.py\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"return False\", \"return True\"))\nprint(\"mutant 1 applied\")\nos.system(\"pytest -q tests/test_guard.py\")\nopen(p, \"w\").write(s)\nPY",
+	// Coordinator ruling on PR 306: the same hand mutation run with the test in the shell, in one
+	// command (TXE-7547's shape). Each writes .go/.py/.sh source, runs a test runner and names a
+	// mutation; all were allowed before TXE-8351.
+	"python3 - <<'PY'\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"if !ok {\", \"if false {\"))  # mutation 1\nPY\ngo test ./internal/...",
+	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"if !ok {\", \"if false {\"))  # mutation 1\nPY",
+	"python3 - <<'PY' && python3 -m pytest -q tests/test_guard.py\nfrom pathlib import Path\np = Path(\"tools/guard.py\")\np.write_text(p.read_text().replace(\"return False\", \"return True\"))\nprint(\"mutant 2 applied\")\nPY",
+	"cat > internal/guard_override.go <<'EOF'\n// mutation 3: the guard always passes\npackage internal\nfunc init() { guardOff = true }\nEOF\ngo test ./internal/...",
+	"sed -i '' 's/if !ok {/if false {/' internal/guard.go && go test ./internal/... # mutant 4",
+	"perl -pi -e 's/exit 1/exit 0/' tools/check.sh && bazel test //tools:check # mutation 5",
+	"printf 'GUARD_OFF = True\\n' | tee -a tools/guard.py && timeout 600 pytest -q # mutant 6",
+	"node -e 'require(\"fs\").writeFileSync(\"tools/guard.py\", \"\")' && pytest # mutation 7",
 	// os's process calls imported by name (allowed before TXE-8351).
 	"python3 - <<'PY'\nfrom os import popen\nmutants = [(\"tools/guard.py\", \"return False\", \"return True\")]\nfor f, old, new in mutants:\n    s = open(f).read()\n    open(f, \"w\").write(s.replace(old, new))\n    print(popen(\"pytest -q\").read())\n    open(f, \"w\").write(s)\nPY",
 	"python3 -c 'from os import execvp; execvp(\"python3\", [\"python3\", \"mutants.py\"])'",

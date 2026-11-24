@@ -384,6 +384,22 @@ and process substitution, redirections, here-documents) and judges only what wou
   read in NFKC form, as Python reads identifiers, so a fullwidth `ｅｘｅｃ` is `exec`. `os`'s
   process calls imported by name (`from os import popen, execvp`) are run calls too.
 
+- **A hand mutation run in one command (TXE-8351).** A mutant applied by hand and tested over the
+  live tree in the same command is the TXE-7547 shape: `python3 - <<'PY' ... PY && go test ./...`.
+  No program in it is named for mutation. One command is refused when all three hold:
+  1. it writes `.go`, `.py` or `.sh` source. That means an output redirection or `tee` to such a
+     file, an in-place `sed -i`, `perl -i` or `ruby -i` of one, or interpreter code that names
+     one and writes a file (`open(p, "w")`, `write_text`, `os.replace`, `writeFileSync`, ...);
+  2. it runs `go test`, `pytest`, `python -m pytest` or `bazel test`;
+  3. its text names a mutant or a mutation (comments included; `mutate-sandboxed` itself does not
+     count).
+
+  These stay allowed:
+  - an edit of `.md` or `.ts` files, even followed by a test;
+  - a source edit with no mutation word;
+  - an edit with no test;
+  - a test that `mutate-sandboxed` runs.
+
   A warning filter's category is imported when Python starts. So a `-W` or `PYTHONWARNINGS` whose
   category is in a mutant-named module (`-W ignore::mutants.Warning`) is refused, whatever the
   code, isolated or not.
@@ -454,11 +470,10 @@ the controls for them.
   that file can be it: an uncaught exception imports `traceback`, and the `idna` codec imports
   `stringprep`. The code view cannot see such an import. Only imports the program states are
   required to come first. Code meant to be read as data is safest under `python3 -I`.
-- **An edit followed by a test run in shell.** `python3 - <<'PY' ... PY && go test ./...`, where
-  the here-document applies a mutant and the shell then runs the tests, is allowed. Writing a file
-  runs nothing, and `go test` names no mutant, so neither command is a mutation run on its own.
-  The same two steps inside one Python program are refused when the program names a mutant
-  anywhere, for example a `mutants` list or a `# mutation 1` comment (TXE-8351).
+- **Edit, then test, in two commands.** The hand-mutation rule (above) judges one command. An edit
+  of `.go`, `.py` or `.sh` source in one Bash call followed by `go test` in the next is not refused,
+  and neither is a write the rule does not model (`cp`, `mv`, `git apply`). The same applies to a
+  runner it does not list (`make test`, `npm test`).
 - **Python's path-component rule over-refuses.** Uncleared Python code that may run something
   is refused when any word names a mutant in any component, for example
   `subprocess.run(["go", "test", "./txe/mutate/..."])`. That code is not a data read; ask your
