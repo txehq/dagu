@@ -2189,6 +2189,9 @@ def write_seed(dest: Path, parent_ident: tuple[int, int], src: Path, dirs: list[
             os.close(lfd)
             raise Refused(f"the install log {log} is not a regular file")
         log_sha256 = write_new_at(seed_fd, "install.log", read_chunks(lfd), SEED_FILE_MODE, deadline, what)
+    except OSError as e:  # an entry that cannot be read, made or opened: a refusal, never an internal error
+        os.close(seed_fd)
+        raise Refused(f"{what} to {dest}: {e}") from e
     except BaseException:
         os.close(seed_fd)
         raise
