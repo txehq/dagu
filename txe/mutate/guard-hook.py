@@ -900,6 +900,22 @@ def _python_code_view(code: str):
             continue
         if any(m.split(".")[0] not in PY_TEXT_MODULES for m in modules):
             return None
+    # A text module re-exports other modules (`pathlib.operator`, `pathlib.os`, `re.functools`):
+    # an attribute or from-import naming a standard-library module reaches past the text list
+    # (TXE-8351 review). os.path is not a top-level module name, so it stays.
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        return None  # before Python 3.10 the list is not known: no view
+    bound_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            bound_modules.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and any(a.name in stdlib for a in node.names):
+            return None  # from pathlib import os
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and node.attr in stdlib and isinstance(node.value, ast.Name)
+                and node.value.id in bound_modules):
+            return None  # pathlib.operator, shutil.os
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in sys_names:
@@ -1520,8 +1536,26 @@ def runs_tests(cmd: Cmd) -> bool:
     if TEST_PROGRAMS.match(prog):
         return True
     if PYTHONS.match(prog):
-        return any((a == "-m" and args[n + 1:n + 2] == ["pytest"]) or (a.startswith("-") and a.endswith("mpytest"))
-                   for n, a in enumerate(args))
+        # Python's options end at -c, -m, a script operand, `-` or `--`: words after them are the
+        # program's arguments (`python3 -c '...' -m pytest` runs no tests; TXE-8351 review).
+        n = 0
+        while n < len(args):
+            a = args[n]
+            if not a.startswith("-") or a in ("-", "--"):
+                return False
+            if a.startswith("--"):
+                n += 1
+                continue
+            for k in range(1, len(a)):
+                if a[k] == "c":
+                    return False
+                if a[k] == "m":
+                    return (a[k + 1:] or (args[n + 1] if n + 1 < len(args) else "")) == "pytest"
+                if a[k] in "WX":
+                    n += 0 if a[k + 1:] else 1  # the value is attached or the next word
+                    break
+            n += 1
+        return False
     return False
 
 

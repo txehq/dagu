@@ -369,6 +369,10 @@ and process substitution, redirections, here-documents) and judges only what wou
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;
   - no from-import of a private name or `*`: `from os import _execvpe` runs a process under a
     name no run rule lists;
+  - no module reached through a text module: an attribute or from-import that names a
+    standard-library module (`pathlib.operator`, `from pathlib import os`, `re.functools`) keeps
+    the strings, because it reaches past the import list. `os.path` is not a top-level module
+    name, so it stays;
   - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
     `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
     such as `timeit`, `string`, `operator` or `pkgutil` can run a string or look up a callable by

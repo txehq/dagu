@@ -1228,6 +1228,10 @@ var dataWordsAllowed = []string{
 	"cp spec.md spec.v1.md && python3 - <<'PY' && go test ./...\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited; see `PATCH /objectives/{id}/links`.\"))\nPY",
 	"cd okr/web && python3 - <<'PY' && python3 -m pytest -q ../../tests\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"  'held-form',\\n\", \"  'held-form',\\n  'mutation',\\n\"))\nPY",
 	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"ok :=\", \"okay :=\"))\nPY",
+	// Connector review of a7111416: after -c the words are the program's arguments, so `-m pytest`
+	// there runs no tests. os.path stays usable on the view.
+	`sed -i 's/old/new/' foo.go; python3 -c 'print("mutation")' -m pytest`,
+	"python3 - <<'PY'\nimport os\np = os.path.join(\"docs\", \"mutations.md\")\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"`old`\", \"`new`\"))\nPY",
 	"cat > m.json <<'EOF'\n[{\"name\": \"mutation 1\", \"file\": \"internal/guard.go\", \"old\": \"if !ok {\", \"new\": \"if false {\"}]\nEOF\nmutate-sandboxed --mutants m.json --tree . --image sha256:abc -- go test ./internal/...",
 	// os is a text module here: its process calls would be names in the code, and there are none.
 	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
@@ -1265,6 +1269,11 @@ var dataWordsRefused = []string{
 	"python3 - <<'PY' && go test ./internal/... # mutation 16\nfor p in [\"internal/guard.go\"]:\n    open(p, \"w\").write(\"package internal\\n\")\nPY",
 	"F=internal/guard.go; python3 - <<PY && go test ./internal/... # mutation 17\nopen(\"$F\", \"w\").write(\"package internal\\n\")\nPY",
 	"python3 - <<'PY' && go test ./internal/... # mutation 18\nimport shutil\nshutil.copy(\"/tmp/mutant/guard.go\", \"internal/\")\nPY",
+	// Security review of a7111416: a text module re-exports other modules, which reach a string-to-call
+	// route the import list excludes.
+	`python3 -c 'import pathlib; pathlib.operator.methodcaller("system", "python3 mutants.py")(pathlib.os)'`,
+	"python3 - <<'PY'\nfrom pathlib import operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
+	`python3 -c 'import re; re.functools.partial(re.enum.sys.modules["os"].system, "python3 mutants.py")()'`,
 	// A source name built by concatenation or formatting still leaves a `.go` token for the reader
 	// (local security review of ab4d3c7b); only an extension split apart (`"." + "go"`) is a name
 	// assembled at run time, a documented limit.
