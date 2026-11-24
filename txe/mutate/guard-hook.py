@@ -34,7 +34,17 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
   in a read mode, print) is data whatever its arguments name; other Python code that may run
   something is refused when any input it is given names a mutant in any path component, whatever
   the extension (`exec(open("mutants.json").read())`, a file under a mutate-sandboxed work
-  directory). With -i, the stdin read after the code is judged as a program.
+  directory). With -i, the stdin read after the code is judged as a program. Whether Python code
+  may run something is read from its code, never from its string literals or comments (TXE-8351):
+  a backtick or `system` in replacement text an editing script writes is data. That holds only
+  for code Python runs exactly as written (no shell expansion, no flag such as -x that changes the
+  source), that imports only text-handling modules (sys only through a few attributes) and that
+  has no construct which can turn a string into a call (a dunder, a frame attribute, help(),
+  sys.modules); anything else is judged on its full text, strings included.
+One command is also a mutation run when it does what TXE-7547's hand runner did: it writes .go, .py
+or .sh source (an output redirection, tee, sed -i/perl -i, or interpreter code that writes a file
+it names), runs go test, pytest, python -m pytest or bazel test, and names a mutant or a mutation
+anywhere in its text (TXE-8351).
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
 `--body` or `--text` message, a path given to cat or shasum, the body of a here-document written
 to a file, a comment, and code that only mentions the names (prints them, edits text containing
@@ -47,11 +57,14 @@ AGENTS.md rule is the policy.
 """
 import ast
 import builtins
+import io
 import json
 import os
 import re
 import shlex
 import sys
+import tokenize
+import unicodedata
 
 TOOLS = re.compile(r"^(?:mutmut|go-mutesting|gremlins|cosmic-ray|mull-runner|mull-cxx|stryker|"
                    r"mutatest|mutpy|pitest|ooze)$", re.I)
@@ -162,8 +175,9 @@ class Word:
     def __init__(self):
         self.text = ""
         self.procsub: "list[Cmd] | None" = None  # when the word is <(...) or >(...)
-        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks), so
-        # that `text` is not what the program receives (TXE-8183: such code is never cleared).
+        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks, and
+        # unquoted * ? [ { ~), so that `text` is not what the program receives (TXE-8183: such
+        # code is never cleared; TXE-8351: its strings are never blanked).
         self.expanded = False
 
 
@@ -197,6 +211,8 @@ class Cmd:
 
 REDIRECT = re.compile(r"(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)")
 WORD_END = set(" \t\n;&|()<>")
+# Unquoted characters a shell expands into other text: pathname (* ? [), brace ({) and tilde (~).
+UNQUOTED_EXPANDING = set("*?[{~")
 
 
 class Parser:
@@ -210,6 +226,7 @@ class Parser:
         self.too_deep = False  # nesting past MAX_DEPTH was not read: the caller refuses
         self.braces = []  # where each open `{ ...` group starts in self.cmds
         self.expansions = 0  # how many expansions have been read (Word.expanded compares counts)
+        self.writes = []  # files output redirections write (`> x.go`, `>> x.py`, `&> x.sh`)
 
     def parse(self) -> list:
         self.seq(None)
@@ -230,6 +247,7 @@ class Parser:
         found = p.parse()
         self.too_deep = self.too_deep or p.too_deep
         self.cmds.extend(found)
+        self.writes.extend(p.writes)
         return found
 
     def seq(self, end):
@@ -322,6 +340,8 @@ class Parser:
         start = self.i
         target = self.word()
         src = ("procsub", target.procsub) if target.procsub is not None else ("file", target.text)
+        if target.procsub is None and op in (">", ">>", ">|", "&>", "&>>", "<>", ">&"):
+            self.writes.append(target.text)  # `>&2` names no file and matches no source extension
         if op in ("<<", "<<-"):
             raw = self.s[start:self.i]
             quoted = any(q in raw for q in "'\"\\")
@@ -367,6 +387,7 @@ class Parser:
                 p = Parser(body, self.depth)
                 p.dquote(None)
                 self.cmds.extend(p.cmds)
+                self.writes.extend(p.writes)
                 self.too_deep = self.too_deep or p.too_deep
         self.heredocs = []
 
@@ -427,6 +448,10 @@ class Parser:
             elif c in "$`":
                 w.text += self.substitution()
             else:
+                if c in UNQUOTED_EXPANDING:
+                    # Pathname, brace or tilde expansion can replace the word (`python3 -c
+                    # print\(\"x\ *\"\)` runs a file name as code), so it counts (TXE-8351 review).
+                    self.expansions += 1
                 w.text += c
                 self.i += 1
         w.expanded = self.expansions != start
@@ -553,15 +578,33 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0, la
         return True if fd_of_path(value) is not None else mutant_named(value)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
-    if kind == "text-expanding" and lang == "python":
-        lang = "python-strict"  # the shell expands this text first: never cleared (TXE-8183)
+    if kind == "text-expanding" and lang.startswith("python"):
+        # The shell expands this text first: never cleared (TXE-8183), and judged on its full
+        # text, since a string literal here is not the string Python receives (TXE-8351).
+        lang = "python-expanded"
     return refuses(value, depth + 1) if shell else code_runs_mutant(value, lang)
 
 
 def runs_evidence(code: str, lang: str) -> bool:
     """Whether code may run a file or a process. Python code that python_reads_only() could not
-    clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before."""
-    return bool(CODE_RUNS.search(code) or (lang.startswith("python") and PY_EXTRA_RUNS.search(code)))
+    clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before. Python
+    code is judged on python_code_view() when it has one: its string literals and comments are
+    data (TXE-8351), and constructs that can turn a string into a call count as run evidence."""
+    view = python_code_view(code) if lang in ("python", "python-strict") else None
+    if view is not None:
+        return bool(CODE_RUNS.search(view) or PY_EXTRA_RUNS.search(view) or PY_RESOLVES.search(view))
+    if lang.startswith("python"):
+        code = unicodedata.normalize("NFKC", code)  # how Python reads identifiers
+        return bool(CODE_RUNS.search(code) or PY_EXTRA_RUNS.search(code))
+    return bool(CODE_RUNS.search(code))
+
+
+def imports_mutant(code: str, lang: str) -> bool:
+    """An import statement of a mutant module, not import text inside a string or a comment.
+    Python code with a python_code_view() is read from that view, which knows Python's string
+    syntax (a triple-quoted string holding "from mutations import x" is data)."""
+    view = python_code_view(code) if lang in ("python", "python-strict") else None
+    return bool(CODE_IMPORTS_MUTANT.search(view if view is not None else CODE_STRING_OR_COMMENT.sub(" ", code)))
 
 
 def mutant_in_path(text: str) -> bool:
@@ -581,8 +624,8 @@ def code_runs_mutant(code: str, lang: str = "other") -> bool:
     python_reads_only() proves non-executing is data, whatever it names."""
     if lang == "python" and python_reads_only(code):
         return False
-    if CODE_IMPORTS_MUTANT.search(CODE_STRING_OR_COMMENT.sub(" ", code)):
-        return True  # an import statement, not import text inside a string or a comment
+    if imports_mutant(code, lang):
+        return True
     if not runs_evidence(code, lang):
         return False
     if lang.startswith("python"):
@@ -636,7 +679,11 @@ PY_CLEAR_WRAPPERS = {"timeout", "gtimeout", "nice", "nohup", "command", "env"}
 PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|locals|vars|compile|breakpoint|"
                            r"pickle|cPickle|_pickle|marshal|shelve|dill|cloudpickle|joblib|ctypes|cffi|"
                            r"multiprocessing|pty|importlib|exec_module|load_module|run_path|run_module|"
-                           r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop)\b"
+                           r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop|"
+                           # os's process calls imported by name (`from os import execv, popen`).
+                           r"exec[lv]\w*|spawn[lv]\w*|posix_spawnp?|popen\w*|"
+                           # sys calls that resolve a callable by name or run a file (TXE-8351 review).
+                           r"breakpointhook|remote_exec)\b"
                            r"|\bcode\s*\.\s*interact")
 # A coding declaration on line 1 or 2 makes Python decode a program read as bytes (stdin, a
 # here-document, a descriptor) differently from the text parsed here (utf-7 can hide code).
@@ -767,6 +814,140 @@ def _open_reads_only(node) -> bool:
     return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set("wax+")
 
 
+# ------------------------------------------- Python string literals are data (TXE-8351)
+# An editing script carries the text it writes as string literals: Markdown with `code spans`,
+# TypeScript whose writes are called mutations. Searched as one text, those literals supplied both
+# halves of the run-call rule (a backtick or `system` as the run call, `mutation` as the name),
+# so a script that only replaced text was refused. The run call is therefore looked for in the
+# code itself: python_code_view() is the source with every string literal and comment blanked out,
+# positions kept (tokenize, which runs nothing, knows Python's string syntax: triple quotes,
+# prefixes, f-strings). Names are still looked for in the full text, strings included, because a
+# string is what names the file a real run call runs (`subprocess.run(["python3", "mutants.py"])`).
+#
+# The view exists only when blanking a string cannot hide how a string becomes a call; otherwise
+# the code is judged on its full text, as before:
+# - Python runs the text as written (not "python-expanded": shell expansion, or an interpreter flag
+#   outside PY_VIEW_FLAGS, such as -x, which skips the first line, a PYTHON* variable, or code
+#   nested in bash -c, eval, env -S or go -exec, whose text an outer shell expanded first), it
+#   tokenizes and parses, and it
+#   has no coding comment, \r or BOM (PY_CODING_COOKIE); the view is judged in NFKC form, the
+#   form in which Python reads identifiers;
+# - every import comes before any other statement, at module level;
+# - every import is of a module in PY_TEXT_MODULES, absolute, and sys is used only as
+#   `sys.<attr>` for an attribute in PY_SYS_ATTRS; no from-import of a private name or `*`;
+# - in 3.11 and earlier an f-string is one STRING token, so a string with an f or t prefix is kept.
+# On the view, PY_RESOLVES also counts as run evidence: a dunder, a private attribute, a frame or
+# code attribute, help() (it imports a module by name) and sys.modules can each look up a callable
+# by a name that only a string holds.
+# Text-handling modules whose calls never turn a string into code or a process. os is one: each of
+# its process calls is a name in the code, which CODE_RUNS or PY_EXTRA_RUNS sees.
+PY_TEXT_MODULES = frozenset({"os", "sys", "re", "json", "pathlib", "io", "shutil", "textwrap", "difflib",
+                             "glob", "fnmatch", "hashlib", "tempfile"})
+# sys is a text module only through these attributes (TXE-8351 review): others resolve a callable
+# from a string or the environment (breakpointhook reads PYTHONBREAKPOINT="os.system"), run a file
+# (remote_exec) or reach other modules (modules, path, meta_path). The name sys may not be used any
+# other way (passed on, rebound, aliased to something that is).
+PY_SYS_ATTRS = frozenset({"argv", "stdin", "stdout", "stderr", "exit", "platform", "version",
+                          "version_info", "maxsize", "byteorder", "getdefaultencoding",
+                          "getfilesystemencoding"})
+# Interpreter flags that leave the source Python runs as written and import nothing. Any other
+# means the view is not built (TXE-8351 review): -x skips the first line, -W imports a warning
+# category's module, and -X and -i are not modelled.
+PY_VIEW_FLAGS = frozenset("BbdEIOPqRsSuv")
+PY_RESOLVES = re.compile(r"\b__\w+|\.\s*_\w*|\.\s*(?:f|gi|cr|ag|tb|co)_\w+|\b(?:help|modules|_getframe)\b")
+PY_BLANKED = {tokenize.COMMENT} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
+                                   if hasattr(tokenize, n)}
+_view_cache: dict = {}
+
+
+def python_code_view(code: str):
+    """Python code with its string literals and comments blanked, or None when that view is not
+    sound for this code (see above)."""
+    if code not in _view_cache:
+        try:
+            _view_cache[code] = _python_code_view(code)
+        except Exception:  # noqa: BLE001 - SyntaxError, TokenError, RecursionError, ...: no view
+            _view_cache[code] = None
+    return _view_cache[code]
+
+
+def _python_code_view(code: str):
+    if PY_CODING_COOKIE.search(code):
+        return None
+    tree = ast.parse(code)
+    # Every import runs before anything else (TXE-8351 review): an import after a statement could
+    # load a module file that statement wrote (`open("json.py", "w").write(...); import json`).
+    leading = 0
+    while leading < len(tree.body) and (isinstance(tree.body[leading], (ast.Import, ast.ImportFrom)) or (
+            leading == 0 and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant))):
+        leading += 1
+    if any(isinstance(n, (ast.Import, ast.ImportFrom)) for s in tree.body[leading:] for n in ast.walk(s)):
+        return None
+    sys_names = {"sys"}  # names bound to the sys module: `import sys`, `import sys as s`
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [a.name for a in node.names]
+            sys_names.update(a.asname for a in node.names if a.asname and a.name.split(".")[0] == "sys")
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                return None  # a relative import names no module this list can judge
+            modules = [node.module]
+            if node.module == "sys" and any(a.name not in PY_SYS_ATTRS for a in node.names):
+                return None
+            if any(a.name.startswith("_") or a.name == "*" for a in node.names):
+                return None  # a private name (`from os import _execvpe`) or `*` is not judged by name
+        else:
+            continue
+        if any(m.split(".")[0] not in PY_TEXT_MODULES for m in modules):
+            return None
+    # A text module re-exports other modules (`pathlib.operator`, `pathlib.os`, `re.functools`):
+    # an attribute or from-import naming a standard-library module reaches past the text list
+    # (TXE-8351 review). os.path is not a top-level module name, so it stays.
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        return None  # before Python 3.10 the list is not known: no view
+    bound_modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            bound_modules.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and any(a.name in stdlib for a in node.names):
+            return None  # from pathlib import os
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in stdlib:
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and (root.id in bound_modules or root.id in sys_names):
+                return None  # pathlib.operator, shutil.os, os.path.genericpath.os, at any depth
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and (node.id in sys_names or node.id in bound_modules):
+            # A module only as `module.attr` (sys only through PY_SYS_ATTRS): never rebound, passed
+            # on or held, so `p = pathlib; p.operator` cannot hide a module (local security review).
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Attribute) and parent.value is node
+                    and (node.id not in sys_names or parent.attr in PY_SYS_ATTRS)):
+                return None  # sys.breakpointhook, `m = sys`, `p = pathlib`, f(os), [os][0], ...
+        if isinstance(node, ast.Attribute) and node.attr == "sys":
+            return None  # os.sys is the sys module by another path
+    line_starts = [0] + [i + 1 for i, ch in enumerate(code) if ch == "\n"]
+    view = list(code)
+    for tok in tokenize.generate_tokens(io.StringIO(code).readline):
+        if tok.type == tokenize.ERRORTOKEN:
+            return None
+        prefix = re.match(r"[A-Za-z]*", tok.string).group(0).lower() if tok.type == tokenize.STRING else ""
+        if tok.type in PY_BLANKED or (tok.type == tokenize.STRING and not set(prefix) & set("ft")):
+            a = line_starts[tok.start[0] - 1] + tok.start[1]
+            b = line_starts[tok.end[0] - 1] + tok.end[1]
+            if code[a:b] != tok.string:
+                return None  # positions that do not match the text (an escaped {{ in an f-string)
+            for k in range(a, b):
+                if view[k] != "\n":
+                    view[k] = " "
+    # Python reads identifiers in NFKC form, so a fullwidth `ｅｘｅｃ` is exec: judge that form.
+    return unicodedata.normalize("NFKC", "".join(view))
+
+
 def stdin_is_mutant(cmd, shell: bool, depth: int, lang: str = "other") -> bool:
     """An interpreter with no script reads its program from stdin."""
     if cmd is None:
@@ -885,6 +1066,11 @@ class Judge:
             t = words[i].text
             if t == "--":
                 i += 1
+                # `env -- NAME=value cmd` still assigns NAME (TXE-8351 review): record them too.
+                while prog == "env" and i < len(words) and ASSIGN.match(words[i].text):
+                    self.env_assigned.append(words[i].text.partition("=")[2])
+                    self.env_assigned_names.append(words[i].text)
+                    i += 1
                 break
             if prog == "command" and t in ("-v", "-V"):
                 return False
@@ -975,19 +1161,71 @@ class Judge:
         """Variable names this command's interpreter may see: shell, enclosing and env ones."""
         return list(self.vars) + list(self.outer) + [n.partition("=")[0] for n in self.env_assigned_names]
 
+    def view_allowed(self, flags: set) -> bool:
+        """Whether this interpreter's code may be judged on python_code_view() (TXE-8351 review):
+        only flags in PY_VIEW_FLAGS, no PYTHON* variable, and the top level of the command. Code
+        inside bash -c, eval, env -S or go -exec was text of an outer command first, and an outer
+        expansion (`bash -c "python3 -c 'print(\\"$X\\")'"`) can turn a Python string into code;
+        the nested reader sees the words after quote removal, not what the outer shell expands.
+        Wrappers and runners too: only PY_CLEAR_WRAPPERS exec their arguments unchanged; watch runs
+        them through sh -c, xargs -I rewrites them, sudo -s starts a shell, and runners resolve."""
+        return (not flags - PY_VIEW_FLAGS and self.depth == 0 and set(self.via) <= PY_CLEAR_WRAPPERS
+                and not any(n.startswith("PYTHON") for n in self.python_names()))
+
     def python_lang(self, flags: set, unsupported: bool) -> str:
         """"python" when Python code here may be cleared by python_reads_only(), which is only in
         the supported form: isolated (-I, plus only -B/-u), at the top level of the command (not
         inside eval, env -S, bash -c or go -exec), reached directly or through PY_CLEAR_WRAPPERS
         only, with no PYTHON* variable set. Anything else is "python-strict": the Python run-call
-        and path rules, never clearance (TXE-8183 review F1, F2)."""
+        and path rules, never clearance (TXE-8183 review F1, F2). A flag that may change the source
+        or import a module (-x, -W, ...), or a PYTHON* variable (PYTHONPATH, PYTHONWARNINGS), makes
+        it "python-expanded": judged on its full text, strings included (TXE-8351 review)."""
+        if not self.view_allowed(flags):
+            return "python-expanded"
         if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
                 or not set(self.via) <= PY_CLEAR_WRAPPERS
                 or any(n.startswith("PYTHON") for n in self.python_names())):
             return "python-strict"
         return "python"
 
+    def warnings_import_mutant(self, args: list) -> bool:
+        """A warning filter's category is imported at startup (`-W ignore::mutants.Warning`,
+        PYTHONWARNINGS=...): a category in a mutant-named module runs it (TXE-8351 review). Every
+        -W value and every PYTHONWARNINGS the command shows is judged, isolated or not."""
+        specs = [v for n, v in {**self.outer, **self.vars}.items() if n == "PYTHONWARNINGS"]
+        specs += [n.partition("=")[2] for n in self.env_assigned_names if n.startswith("PYTHONWARNINGS=")]
+        j = 0
+        while j < len(args):
+            t = args[j].text
+            if t == "--" or t == "-" or not t.startswith("-"):
+                break  # the options end at a script, `-` or `--`
+            if t.startswith("--"):
+                j += 2 if t == "--check-hash-based-pycs" else 1
+                continue
+            value_in_next = False
+            for k in range(1, len(t)):
+                if t[k] in "cm":
+                    return self._category_mutant(specs)  # the rest is code or a module, and arguments
+                if t[k] in "WX":
+                    if t[k] == "W":
+                        specs.append(t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else ""))
+                    value_in_next = not t[k + 1:]
+                    break
+            j += 2 if value_in_next else 1
+        return self._category_mutant(specs)
+
+    @staticmethod
+    def _category_mutant(specs: list) -> bool:
+        for spec in (s for v in specs for s in v.split(",")):
+            fields = spec.split(":")
+            category = fields[2].strip() if len(fields) > 2 else ""
+            if category and any(mutant_named(p) for p in category.split(".")):
+                return True
+        return False
+
     def python(self, args: list, cmd) -> bool:
+        if self.warnings_import_mutant(args):
+            return True
         flags, unsupported = set(), False
         j = 0
         while j < len(args):
@@ -1008,7 +1246,7 @@ class Judge:
                     lang = self.python_lang(flags, unsupported)
                     code_word = args[j] if t[k + 1:] else (args[j + 1] if j + 1 < len(args) else None)
                     if code_word is None or code_word.expanded:
-                        lang = "python-strict"  # "...$(cmd)..." or $'...': not the text Python gets
+                        lang = "python-expanded"  # "...$(cmd)..." or $'...': not the text Python gets
                     return (code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
                             or self.interactive_stdin(flags, cmd))
                 if ch == "m":
@@ -1028,7 +1266,8 @@ class Judge:
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             # A script operand (or a descriptor holding the program) is never a clearance form.
-            return (operand_is_mutant(args[j], cmd, False, self.depth, "python-strict")
+            lang = "python-strict" if self.view_allowed(flags) else "python-expanded"
+            return (operand_is_mutant(args[j], cmd, False, self.depth, lang)
                     or self.interactive_stdin(flags, cmd))
         return stdin_is_mutant(cmd, False, self.depth, self.python_lang(flags, unsupported))
 
@@ -1037,7 +1276,7 @@ class Judge:
         code, module or script: that stdin is judged as a program too (TXE-8183 review F1)."""
         if "i" not in flags and "PYTHONINSPECT" not in self.python_names():
             return False
-        return stdin_is_mutant(cmd, False, self.depth, "python-strict")
+        return stdin_is_mutant(cmd, False, self.depth, "python-strict" if self.view_allowed(flags) else "python-expanded")
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0
@@ -1240,6 +1479,133 @@ class Judge:
         return False
 
 
+# ------------------------------------------------- A hand mutation run in one command (TXE-8351)
+# The TXE-7547 incident shape: edit executable source, then run the tests over the live tree, in one
+# command, outside mutate-sandboxed. No program in it is named for mutation, so the rules above see
+# nothing to run. One command is refused when all three hold (coordinator ruling on PR 306):
+# 1. it writes executable source (.go, .py, .sh): an output redirection or `tee` to such a file, an
+#    in-place `sed -i`/`perl -i`/`ruby -i` of one, or interpreter code (an argument, a here-document
+#    or a here-string) that may write a file while the command names such a file anywhere. Which
+#    file the code writes is not resolved, so a source name inside written Markdown counts too: an
+#    over-refusal on the safe side (TXE-8351 review);
+# 2. the same command runs a test runner: go test, pytest, python -m pytest, bazel test;
+# 3. its text names a mutant or a mutation (MUTANT_FILE, with mutate-sandboxed's own name removed).
+# An edit of .md or .ts files, an edit with no test, and a test with no mutation word stay allowed;
+# so does a test run by mutate-sandboxed, whose program is the runner, not the test.
+SOURCE_EXT = re.compile(r"\.(?:go|py|sh)$")
+TEST_PROGRAMS = re.compile(r"^(?:pytest(?:-3)?|py\.test)$")
+# Interpreter code that may write a file: a deliberately wide net, matched anywhere in the code's
+# text (fail closed; TXE-8351 review). It is one half of condition 1; the other is a source token
+# anywhere in the command.
+CODE_WRITES = re.compile(r"""\bopen\s*\(|\.write(?:_text|_bytes|lines)?\s*\(|\bwrite\w*\s*\("""
+                         r"""|\.(?:rename|replace|symlink_to|hardlink_to|link_to|touch|truncate)\s*\("""
+                         r"""|\b(?:copy\w*|move|copyfileobj|symlink|link|fileinput|inplace|FileIO|mkstemp)\b"""
+                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]""")
+
+
+def program_words(ws: list) -> list:
+    """The words from the program on: assignments, keywords, wrappers and runners skipped (an
+    approximation of Judge._program for the rule below)."""
+    i = 0
+    while i < len(ws):
+        t, b = ws[i], base(ws[i])
+        if ASSIGN.match(t) or t in KEYWORDS:
+            i += 1
+        elif b in WRAPPERS:
+            value_opts, positionals = WRAPPERS[b]
+            i += 1
+            while i < len(ws) and (ws[i].startswith("-") or (b == "env" and ASSIGN.match(ws[i]))):
+                i += 2 if ws[i] in value_opts else 1
+            i += positionals
+        elif b in RUNNERS:
+            i += 1
+            if RUNNERS[b] is not None:
+                while i < len(ws) and ws[i] != RUNNERS[b]:
+                    i += 1
+                i += 1
+            while i < len(ws) and ws[i].startswith("-"):
+                i += 2 if ws[i] in RUNNER_VALUE_OPTS else 1
+        else:
+            return ws[i:]
+    return []
+
+
+def runs_tests(cmd: Cmd) -> bool:
+    """Whether this command's program is a test runner over a tree: go test, pytest, python -m
+    pytest, bazel test."""
+    ws = program_words([w.text for w in cmd.words])
+    if not ws:
+        return False
+    prog, args = base(ws[0]), ws[1:]
+    if prog in ("go", "bazel", "bazelisk"):
+        return "test" in [a for a in args if not a.startswith("-")][:2]
+    if TEST_PROGRAMS.match(prog):
+        return True
+    if PYTHONS.match(prog):
+        # Python's options end at -c, -m, a script operand, `-` or `--`: words after them are the
+        # program's arguments (`python3 -c '...' -m pytest` runs no tests; TXE-8351 review).
+        n = 0
+        while n < len(args):
+            a = args[n]
+            if not a.startswith("-") or a in ("-", "--"):
+                return False
+            if a == "--check-hash-based-pycs":
+                n += 2  # takes a separate value
+                continue
+            if a.startswith("--"):
+                # Another long option may take a value this reader does not know: fail closed on
+                # `-m pytest` anywhere after it (local security review of a1b8495d).
+                rest = args[n + 1:]
+                return any((b == "-m" and rest[i + 1:i + 2] == ["pytest"]) or b.endswith("mpytest")
+                           for i, b in enumerate(rest))
+            for k in range(1, len(a)):
+                if a[k] == "c":
+                    return False
+                if a[k] == "m":
+                    return (a[k + 1:] or (args[n + 1] if n + 1 < len(args) else "")) == "pytest"
+                if a[k] in "WX":
+                    n += 0 if a[k + 1:] else 1  # the value is attached or the next word
+                    break
+            n += 1
+        return False
+    return False
+
+
+def writes_source(cmd: Cmd, names_source: bool) -> bool:
+    """Whether this command writes executable source other than by an output redirection (those
+    are in Parser.writes): tee or an in-place editor of a source file, or interpreter code that
+    may write a file while the command names source anywhere (`names_source`). Which file the code
+    writes is not resolved: a variable, an argument, a shell expansion or an API not modelled
+    could each hide it, so the guard fails closed (TXE-8351 review)."""
+    ws = program_words([w.text for w in cmd.words])
+    if not ws:
+        return False
+    prog, args = base(ws[0]), ws[1:]
+    if prog == "tee":
+        return any(SOURCE_EXT.search(a) for a in args)
+    in_place = any(a.startswith("--in-place") or (a.startswith("-") and not a.startswith("--") and "i" in a[1:])
+                   for a in args)
+    if prog in ("sed", "gsed", "perl", "ruby") and in_place and any(SOURCE_EXT.search(a) for a in args):
+        return True
+    if (PYTHONS.match(prog) or prog in OTHER_INTERPRETERS) and names_source:
+        texts = list(args) + [src[1] for src in cmd.fds.values()
+                              if isinstance(src, (list, tuple)) and src[0] in ("text", "text-expanding")]
+        return any(CODE_WRITES.search(t) for t in texts)
+    return False
+
+
+def hand_mutation_run(command: str, cmds: list, writes: list) -> bool:
+    if not MUTANT_FILE.search(command.replace("mutate-sandboxed", " ")):
+        return False
+    if not any(runs_tests(c) for c in cmds):
+        return False
+    if any(SOURCE_EXT.search(w) for w in writes):
+        return True
+    # A source name anywhere: in code, a here-document, an argument or a shell variable's value.
+    names_source = any(SOURCE_EXT.search(tok) for tok in CODE_TOKEN.findall(command))
+    return any(writes_source(c, names_source) for c in cmds)
+
+
 def refuses(command: str, depth: int = 0, outer=None) -> bool:
     if depth > MAX_DEPTH:
         return True  # shell code nested this deep is not read: refused rather than let through
@@ -1248,7 +1614,7 @@ def refuses(command: str, depth: int = 0, outer=None) -> bool:
     cmds = parser.parse()
     if parser.too_deep:
         return True
-    return any(judge.runs_mutation(cmd) for cmd in cmds)
+    return any(judge.runs_mutation(cmd) for cmd in cmds) or hand_mutation_run(command, cmds, parser.writes)
 
 
 def command_of(data: dict):

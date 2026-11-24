@@ -1202,6 +1202,199 @@ func TestGuardHookFileEditTools(t *testing.T) {
 	}
 }
 
+// TXE-8351: an editing script carries the text it writes as Python string literals, and that text
+// (Markdown with `code spans`, TypeScript whose writes are mutations) supplied both halves of the
+// run-call rule, so two ordinary edits were refused on 2026-11-24. Run calls are now read from the
+// code, never from its strings or comments; names are still read from both. All inert: the guard
+// only reads the JSON, and nothing in it is executed.
+var dataWordsAllowed = []string{
+	// The two refusals of 2026-11-24, reconstructed from the ticket (the commands were not kept):
+	// the coordinator's spec edit (~12:20 AWST) and the TXE-8341 worker's domains.ts edit (~12:45).
+	"cp spec.md spec.v1.md && python3 - <<'PY'\np = \"spec.md\"\ns = open(p).read()\npairs = [\n    (\"Objectives link to strategies.\", \"Objective strategy-link mutations go through `PATCH /objectives/{id}/links`; the system records each one.\"),\n    (\"Edits are audited.\", \"Every mutation is audited, and a failed mutation leaves the record unchanged.\"),\n]\nfor old, new in pairs:\n    assert s.count(old) == 1, old\n    s = s.replace(old, new)\nopen(p, \"w\").write(s)\nprint(\"ok\")\nPY",
+	"cd okr/web && python3 - <<'PY'\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nold = \"  'flow-firsts': page('flow', ['focus']),\\n\"\nnew = old + \"\"\"  // What a write answered, read back by `useRead` after the mutation settles (TXE-8341).\n  'write-results': page('mutation', ['goals'], { gcTime: GC_DEFAULT }),\n\"\"\"\nassert s.count(old) == 1, old\ns = s.replace(old, new)\nopen(p, \"w\").write(s)\nprint(\"ok\")\nPY",
+	// Import text inside a triple-quoted string (the old string stripper did not know triple quotes).
+	"python3 - <<'PY'\nfrom pathlib import Path\np = Path(\"docs/specs/okr/spec.md\")\ns = p.read_text()\ns = s.replace(\"## Writes\\n\", \"\"\"## Writes\n\nThe system keeps its audit trail as mutations:\nimport mutations from the log, and `load` replays them.\n\"\"\")\np.write_text(s)\nPY",
+	// Run words in a TypeScript string and in a comment, on -c and on a here-document.
+	`python3 -c 'import re, sys; p = sys.argv[1]; s = open(p).read(); open(p, "w").write(re.sub(r"useMutation\(", "useMutation(", s) + "const mutations = require(\"./mutations\");\n")' apps/web/src/hooks.ts`,
+	"python3 - <<'PY'\n# no exec, no subprocess: this only rewrites the mutation docs\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"draft\", \"final\"))\nPY",
+	// A module docstring and imports first, then the edit; and a warning filter with a builtin category.
+	"python3 - <<'PY'\n\"\"\"Rename the mutation hooks in the API docs.\"\"\"\nimport re\nfrom pathlib import Path\np = Path(\"docs/api.md\")\np.write_text(re.sub(r\"`useMutation`\", \"`useWrite`\", p.read_text()))\nPY",
+	`python3 -W ignore::DeprecationWarning -c 'print(1)'`,
+	// Wrappers that exec their arguments unchanged keep the view.
+	"timeout 60 nice -n 5 python3 - <<'PY'\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"`old`\", \"`new`\"))\nPY",
+	// Coordinator ruling on PR 306: edit, then test, in one command is refused only when it writes
+	// .go/.py/.sh source and names a mutation. An .md or .ts edit followed by a test stays allowed,
+	// as do a source edit with no mutation word, and a test that mutate-sandboxed runs.
+	"cp spec.md spec.v1.md && python3 - <<'PY' && go test ./...\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited; see `PATCH /objectives/{id}/links`.\"))\nPY",
+	"cd okr/web && python3 - <<'PY' && python3 -m pytest -q ../../tests\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"  'held-form',\\n\", \"  'held-form',\\n  'mutation',\\n\"))\nPY",
+	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"ok :=\", \"okay :=\"))\nPY",
+	// Connector review of a7111416: after -c the words are the program's arguments, so `-m pytest`
+	// there runs no tests. os.path stays usable on the view.
+	`sed -i 's/old/new/' foo.go; python3 -c 'print("mutation")' -m pytest`,
+	"python3 - <<'PY'\nimport os\np = os.path.join(\"docs\", \"mutations.md\")\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"`old`\", \"`new`\"))\nPY",
+	"cat > m.json <<'EOF'\n[{\"name\": \"mutation 1\", \"file\": \"internal/guard.go\", \"old\": \"if !ok {\", \"new\": \"if false {\"}]\nEOF\nmutate-sandboxed --mutants m.json --tree . --image sha256:abc -- go test ./internal/...",
+	// os is a text module here: its process calls would be names in the code, and there are none.
+	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
+}
+
+// The executing counterparts: the same data words with a run call in the code, the mutation runs
+// the ticket names, and every construct that could turn a string the guard blanks into a call.
+var dataWordsRefused = []string{
+	// A here-document program that writes a mutated .go or .py file and runs go test or pytest on
+	// the live tree.
+	"python3 - <<'PY'\nimport subprocess\np = \"internal/guard.go\"\ns = open(p).read()\nfor old, new in [(\"if !ok {\", \"if false {\")]:  # mutation 1: drop the guard\n    open(p, \"w\").write(s.replace(old, new))\n    subprocess.run([\"go\", \"test\", \"./internal/...\"])\nopen(p, \"w\").write(s)\nPY",
+	"python3 - <<'PY'\nimport os\np = \"tools/guard.py\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"return False\", \"return True\"))\nprint(\"mutant 1 applied\")\nos.system(\"pytest -q tests/test_guard.py\")\nopen(p, \"w\").write(s)\nPY",
+	// Coordinator ruling on PR 306: the same hand mutation run with the test in the shell, in one
+	// command (TXE-7547's shape). Each writes .go/.py/.sh source, runs a test runner and names a
+	// mutation; all were allowed before TXE-8351.
+	"python3 - <<'PY'\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"if !ok {\", \"if false {\"))  # mutation 1\nPY\ngo test ./internal/...",
+	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"if !ok {\", \"if false {\"))  # mutation 1\nPY",
+	"python3 - <<'PY' && python3 -m pytest -q tests/test_guard.py\nfrom pathlib import Path\np = Path(\"tools/guard.py\")\np.write_text(p.read_text().replace(\"return False\", \"return True\"))\nprint(\"mutant 2 applied\")\nPY",
+	"cat > internal/guard_override.go <<'EOF'\n// mutation 3: the guard always passes\npackage internal\nfunc init() { guardOff = true }\nEOF\ngo test ./internal/...",
+	"sed -i '' 's/if !ok {/if false {/' internal/guard.go && go test ./internal/... # mutant 4",
+	"perl -pi -e 's/exit 1/exit 0/' tools/check.sh && bazel test //tools:check # mutation 5",
+	"printf 'GUARD_OFF = True\\n' | tee -a tools/guard.py && timeout 600 pytest -q # mutant 6",
+	"node -e 'require(\"fs\").writeFileSync(\"tools/guard.py\", \"\")' && pytest # mutation 7",
+	// Write targets the AST reader resolves or falls back on: Path.open, a target from argv, fileinput.
+	"python3 - <<'PY' && go test ./internal/... # mutation 8\nfrom pathlib import Path\nwith Path(\"internal\", ).joinpath(\"guard.go\").open(\"w\") as f:\n    f.write(\"package internal\\n\")\nPY",
+	"python3 - internal/guard.go <<'PY' && go test ./internal/... # mutation 9\nimport sys\nopen(sys.argv[1], \"w\").write(\"package internal\\n\")\nPY",
+	// Documented over-refusal (connector review of bce44499): which file interpreter code writes is
+	// not resolved, so a source name inside written Markdown counts when the same command tests and
+	// names a mutation. Resolving targets drew a bypass per review round (local security reviews of
+	// 5f77bb5c), so the rule fails closed instead.
+	"python3 - <<'PY' && go test ./...\nfrom pathlib import Path\nPath(\"README.md\").write_text(\"Mutation example: tools/guard.py\")\nPY",
+	// The local security reviews' shapes: a starred open mode, a name bound in a loop, a target from
+	// a shell variable in an expanded here-document, and a copy into a directory.
+	"python3 - <<'PY' && go test ./internal/... # mutation 15\na = [\"internal/guard.go\", \"w\"]\nopen(*a).write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 16\nfor p in [\"internal/guard.go\"]:\n    open(p, \"w\").write(\"package internal\\n\")\nPY",
+	"F=internal/guard.go; python3 - <<PY && go test ./internal/... # mutation 17\nopen(\"$F\", \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 18\nimport shutil\nshutil.copy(\"/tmp/mutant/guard.go\", \"internal/\")\nPY",
+	// Security review of a7111416: a text module re-exports other modules, which reach a string-to-call
+	// route the import list excludes.
+	`python3 -c 'import pathlib; pathlib.operator.methodcaller("system", "python3 mutants.py")(pathlib.os)'`,
+	"python3 - <<'PY'\nfrom pathlib import operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
+	`python3 -c 'import re; re.functools.partial(re.enum.sys.modules["os"].system, "python3 mutants.py")()'`,
+	// Local security review of a1b8495d: a module rebound or held hides which module an attribute
+	// reaches, and a long option's value hides `-m pytest` from the option scan.
+	"python3 - <<'PY'\nimport pathlib\np = pathlib\np.operator.methodcaller(\"system\", \"python3 mutants.py\")(p.os)\nPY",
+	"python3 - <<'PY'\nimport pathlib\n[pathlib][0].operator.methodcaller(\"system\", \"python3 mutants.py\")([pathlib][0].os)\nPY",
+	"python3 - <<'PY'\nimport os\nos.path.genericpath.os.system(\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport glob\nm = glob.fnmatch.os\nprint(\"exec mutants.py\")\nPY",
+	"sed -i 's/if !ok/if false/' tools/guard.py && python3 --check-hash-based-pycs always -m pytest # mutation 22",
+	"sed -i 's/if !ok/if false/' tools/guard.py && python3 --some-new-option value -m pytest # mutation 23",
+	// A source name built by concatenation or formatting still leaves a `.go` token for the reader
+	// (local security review of ab4d3c7b); only an extension split apart (`"." + "go"`) is a name
+	// assembled at run time, a documented limit.
+	"python3 - <<'PY' && go test ./internal/... # mutation 19\np = \"internal/guard\" + \".go\"\nopen(p, \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 20\nb = \"internal/guard\"\nopen(f\"{b}.go\", \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 21\nopen(\"%s.go\" % \"internal/guard\", \"w\").write(\"package internal\\n\")\nPY",
+	// Local security review of 5f77bb5c: renames, links, copies and touch write their target, an
+	// alias hides the callee, and copyfileobj is unknown. Each fails closed.
+	"python3 - <<'PY' && go test ./internal/... # mutation 11\nfrom pathlib import Path\nPath(\"tmp.txt\").write_text(\"package internal\\n\")\nPath(\"tmp.txt\").rename(\"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 12\nimport shutil as s\ns.copy(\"/tmp/mutant.txt\", \"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 13\nfrom shutil import copy\nopen(\"notes.md\", \"w\").write(\"x\")\ncopy(\"/tmp/m.txt\", \"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && pytest -q # mutant 14\nfrom pathlib import Path\nopen(\"notes.md\", \"w\").write(\"x\")\nPath(\"tools/guard.py\").symlink_to(\"/tmp/m.py\")\nPY",
+	"python3 - <<'PY' && pytest -q # mutant 10\nimport fileinput\nfor line in fileinput.input(\"tools/guard.py\", inplace=True):\n    print(line.replace(\"return False\", \"return True\"), end=\"\")\nPY",
+	// os's process calls imported by name (allowed before TXE-8351).
+	"python3 - <<'PY'\nfrom os import popen\nmutants = [(\"tools/guard.py\", \"return False\", \"return True\")]\nfor f, old, new in mutants:\n    s = open(f).read()\n    open(f, \"w\").write(s.replace(old, new))\n    print(popen(\"pytest -q\").read())\n    open(f, \"w\").write(s)\nPY",
+	"python3 -c 'from os import execvp; execvp(\"python3\", [\"python3\", \"mutants.py\"])'",
+	// The spec edit, then a real run call: a string still names the file the call runs.
+	"cp spec.md spec.v1.md && python3 - <<'PY'\nimport subprocess\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited.\"))\nsubprocess.run([\"python3\", \"mutants.py\"])\nPY",
+	// A string turned into a call: a dunder, sys.modules, a frame attribute, help() (it imports a
+	// module by name; allowed before TXE-8351) and an f-string's expression, which is code.
+	"python3 - <<'PY'\nimport os\nos.__dict__[\"system\"](\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport sys\nsys.modules[\"subprocess\"].run([\"python3\", \"mutants.py\"])\nPY",
+	"python3 - <<'PY'\nb = (x for x in ()).gi_frame.f_builtins\nb[\"exec\"](open(\"mutants.py\").read())\nPY",
+	`python3 -c 'help("mutants")'`,
+	"python3 - <<'PY'\nimport os\nprint(f\"{os.system('python3 mutants.py')}\")\nPY",
+	// A module outside the text list keeps the strings: timeit runs one, string.Formatter and
+	// operator look a callable up by its name.
+	"python3 - <<'PY'\nimport timeit\ntimeit.timeit(\"exec(open('mutants.py').read())\", number=1)\nPY",
+	"python3 - <<'PY'\nimport os, string\nf = string.Formatter().get_field(\"0.system\", [os], {})[0]\nf(\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
+	// Connector review of fd996e25 (P1): -x skips the first source line, so the opening quote is
+	// not code and the "string" runs. On stdin and on a descriptor operand, and -X, not modelled.
+	"python3 -x - <<'PY'\n\"\"\"\nimport os; os.system(\"python3 mutants.py\")\n# \"\"\"\nPY",
+	"python3 -x /dev/fd/3 3<<'PY'\n\"\"\"\nimport os; os.system(\"python3 mutants.py\")\n# \"\"\"\nPY",
+	"python3 -X utf8 - <<'PY'\nprint(\"`mutants.py`\")\nPY",
+	// Security review of fd996e25 (P2): sys.breakpointhook resolves the callable PYTHONBREAKPOINT
+	// names, so sys is a text module only through a few attributes.
+	`PYTHONBREAKPOINT=os.system python3 -c 'import sys; sys.breakpointhook("python3 mutants.py")'`,
+	"python3 - <<'PY'\nimport os, sys\nos.environ[\"PYTHONBREAKPOINT\"] = \"os.system\"\nsys.breakpointhook(\"python3 mutants.py\")\nPY",
+	`PYTHONBREAKPOINT=os.system python3 -c 'import os; os.sys.breakpointhook("python3 mutants.py")'`,
+	`PYTHONBREAKPOINT=runpy.run_path python3 -c 'from sys import breakpointhook as b; b("mutants.py")'`,
+	// Connector and security review of 2e11c92e (P2): a warning category's module is imported at
+	// startup (-W, PYTHONWARNINGS; the last three were allowed before TXE-8351 too), and an import
+	// after a statement can load a module file that statement wrote.
+	`PYTHONPATH=/tmp python3 -W ignore::mutants.Warning -c 'print("exec mutants.py")'`,
+	`python3 -I -W ignore::tools.mutants.Warning -c 'print(1)'`,
+	`PYTHONWARNINGS=default,ignore::mutants.Warning python3 -c 'print(1)'`,
+	`python3 -X dev -Werror::mutants.W -c 'print(1)'`,
+	// Security review of 2faa0236: a private os name imported by name runs a process.
+	"python3 - <<'PY'\nimport os\nfrom os import _execvpe as x\nx(\"sh\", [\"sh\", \"-c\", \"exec python3 mutants.py\"], os.environ)\nPY",
+	// Security review of 3aee88c5: `env --` still assigns the names after it.
+	`env -- PYTHONPATH=/tmp PYTHONWARNINGS=ignore::mutants.Warning python3 -c 'print("exec mutants.py")'`,
+	"env -- PYTHONPATH=/tmp python3 - <<'PY'\nprint(\"`exec` mutants.py\")\nPY",
+	`python3 -c 'open("json.py","w").write("exec(open(\"mutants.py\").read())"); import json'`,
+	"python3 - <<'PY'\nopen(\"json.py\", \"w\").write(\"exec(open('mutants.py').read())\")\nif True:\n    import json\nPY",
+	// Security review of f4aea221 (P2): an outer shell expands nested code first, so $X can close
+	// the Python string and add code. Nested Python is judged on its full text.
+	`X='");exec(open("mutants.py").read());#'; bash -c "python3 -c 'print(\"system mutants.py $X\")'"`,
+	`X='");exec(open("mutants.py").read());#'; eval "python3 -c 'print(\"system mutants.py $X\")'"`,
+	`env -S "python3 -c 'print(\"system mutants.py\")'"`,
+	// Connector review of 6f634fd2 (P1): an unquoted glob, brace or tilde lets the shell replace
+	// the source word (a file named like code becomes the program), so it is judged whole.
+	`python3 -c print\(\"exec\ mutants.py\ *\"\)`,
+	`python3 -c print\(\"exec\ mutants.py\ {a,b}\"\)`,
+	`python3 -c print\(\"exec\ mutants.py\"\)\ #?`,
+	// Local security review of 60e8ba9d: watch runs its words through sh -c, xargs -I rewrites
+	// them, sudo -s starts a shell. Only wrappers that exec their arguments unchanged keep the view.
+	`X='");exec(open("mutants.py").read());#'; watch -n 1 python3 -c "'print(\"system mutants.py $X\")'"`,
+	`echo '");exec(open("mutants.py").read());#' | xargs -I{} python3 -c 'print("system mutants.py {}")'`,
+	`sudo -s python3 -c 'print("system mutants.py")'`,
+	`uv run python3 -c 'print("system mutants.py")'`,
+	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
+	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
+	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).
+	"python3 - <<'PY'\nｅｘｅｃ(open(\"mutants.py\").read())\nPY",
+	// Text the shell expands first is judged whole: after expansion a string may not be a string.
+	`python3 -c "print('mutants.py is exec $X')"`,
+	"python3 - <<PY\nprint(\"mutants.py is exec $X\")\nPY",
+	// A mutation tool or a mutant-named program, the bare words included.
+	"python3 mutants.py",
+	"mutmut run",
+	"mutate",
+	"mutate run ./...",
+	"./mutation --all",
+	"mutation run",
+	"timeout 60 mutate ./internal/...",
+}
+
+func TestGuardHookDataWords(t *testing.T) {
+	for _, c := range dataWordsAllowed {
+		code, stdout, stderr := hook(t, bashInput(t, c))
+		assert.Equal(t, 0, code, "should allow: %s (%s)", c, stderr)
+		assert.Empty(t, stdout+stderr)
+	}
+	for _, c := range dataWordsRefused {
+		code, stdout, stderr := hook(t, bashInput(t, c))
+		assert.Equal(t, 2, code, "should refuse: %s", c)
+		assert.Empty(t, stdout)
+		assert.Contains(t, stderr, "do not rename anything", c)
+	}
+	// From Python 3.12 an f-string's literal text is its own token, so it is blanked like any
+	// string; before 3.12 an f-string is one token and is kept whole.
+	out, err := exec.Command(python(t), "-I", "-c", "import sys; print(sys.version_info >= (3, 12))").Output()
+	require.NoError(t, err)
+	fstring := "python3 - <<'PY'\nn = open(\"src/api.ts\").read().count(\"useMutation\")\nprint(f\"`useMutation` appears {n} times; each mutation is a write\")\nPY"
+	code, _, stderr := hook(t, bashInput(t, fstring))
+	if strings.TrimSpace(string(out)) == "True" {
+		assert.Equal(t, 0, code, stderr)
+	} else {
+		assert.Equal(t, 2, code)
+	}
+}
+
 // Without --no-seed or explicit caches, the runner takes the shared caches from `go env`, seeds an
 // owned module cache on the host from a file proxy over the shared one (HOME unchanged), and
 // offers only that seed to the container, read-only. A fake go stands in for the toolchain.

@@ -338,6 +338,84 @@ and process substitution, redirections, here-documents) and judges only what wou
   - `python3` on PATH is CPython, with an unmodified standard library;
   - its site-packages `.pth` files, which `-I` does not disable, and anything installed system-wide
     are state outside the command.
+- **Python string literals are data (TXE-8351).** An editing script carries the text it writes
+  as string literals. On 2026-11-24 two such scripts were refused: a Markdown spec edit and an OKR
+  web `domains.ts` edit, both on a quoted here-document to `python3`. Their replacement text held
+  both halves of the run-call rule: a backtick (a code span) counted as the run call, and
+  `mutation` (TanStack Query's word for a write) counted as the name. Uncleared Python code now
+  looks for its run call in the code only, via a view of the source with every string literal and
+  comment blanked. `tokenize` builds that view and runs nothing. Names are still read from the full
+  text, strings included, because a string is what names the file a real run call runs:
+  `subprocess.run(["python3", "mutants.py"])` is refused, and so is a here-document program that
+  writes a mutated file and runs `go test` or `pytest`.
+
+  The view is used only when blanking a string cannot hide how a string becomes a call. Otherwise
+  the code is judged on its full text, as before. It needs all of these:
+  - Python runs the text exactly as written, and imports nothing it does not show. That excludes:
+    - shell-expanded text (`"...$X..."`, an unquoted `<<EOF`, `$'...'`), including an unquoted
+      `*`, `?`, `[`, `{` or `~`. Pathname, brace or tilde expansion can replace the word, so a file
+      named like code becomes the program;
+    - any interpreter flag outside `-BbdEIOPqRsSuv`: `-x` skips the first source line, `-W`
+      imports a warning category's module, and `-X` and `-i` are not modelled;
+    - a `PYTHON*` variable in the command (`PYTHONPATH`, `PYTHONWARNINGS`);
+    - code that is not at the top level of the command: inside `bash -c`, `eval`, `env -S`, go
+      `-exec`, a subshell or a substitution. An outer shell may expand that text first. In
+      `bash -c "python3 -c 'print(\"$X\")'"`, `$X` can close the Python string and add code;
+    - a wrapper or runner other than timeout, nice, nohup, `command` or `env` without `-S`. `watch`
+      runs its words through `sh -c`, `xargs -I` rewrites them, `sudo -s` starts a shell, and
+      `uv run`, `find -exec` and the like are not modelled;
+  - every import comes first, before any other statement, at module level. Otherwise a statement
+    could write `json.py` and a later `import json` would run it;
+  - the code tokenizes and parses, with no coding comment, `\r` or BOM;
+  - no from-import of a private name or `*`: `from os import _execvpe` runs a process under a
+    name no run rule lists;
+  - no module reached through a text module. An attribute at any depth below an imported module,
+    or a from-import, that names a standard-library module keeps the strings, because it reaches
+    past the import list: `pathlib.operator`, `os.path.genericpath.os`, `from pathlib import os`.
+    `os.path` is not a top-level module name, so it stays;
+  - an imported module used only as `module.attr`. Rebinding it (`p = pathlib`), passing it on, or
+    holding it (`[pathlib][0]`) keeps the strings;
+  - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
+    `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
+    such as `timeit`, `string`, `operator` or `pkgutil` can run a string or look up a callable by
+    its name, so it keeps the strings;
+  - `sys` is used only as `sys.argv`, `sys.stdin`, `sys.stdout`, `sys.stderr`, `sys.exit` or a few
+    read-only facts. `sys.breakpointhook` resolves a callable named by `PYTHONBREAKPOINT`, and
+    `sys.modules` reaches any loaded module, so any other use keeps the strings. So do `os.sys`,
+    and `sys` passed on or rebound;
+  - before Python 3.12 an f-string is one token, so an `f`/`t`-prefixed string is never blanked.
+    From 3.12 only its literal text is blanked, and its `{...}` expressions are code.
+
+  On the view, these also count as run calls, since each can look a callable up by a name only a
+  string holds: a dunder (`os.__dict__["system"]`), a private attribute, a frame or code attribute
+  (`gi_frame`, `f_builtins`), `help()` (it imports a module by name) and `sys.modules`. The view is
+  read in NFKC form, as Python reads identifiers, so a fullwidth `ｅｘｅｃ` is `exec`. `os`'s
+  process calls imported by name (`from os import popen, execvp`) are run calls too.
+
+- **A hand mutation run in one command (TXE-8351).** A mutant applied by hand and tested over the
+  live tree in the same command is the TXE-7547 shape: `python3 - <<'PY' ... PY && go test ./...`.
+  No program in it is named for mutation. One command is refused when all three hold:
+  1. it writes `.go`, `.py` or `.sh` source. That means an output redirection or `tee` to such a
+     file, or an in-place `sed -i`, `perl -i` or `ruby -i` of one. It also counts as writing
+     source when interpreter code may write a file (`open(`, `write_text`, a rename, copy, link
+     or touch, `fileinput`, `writeFileSync`, ...) and the command names a `.go`, `.py` or `.sh`
+     file anywhere: in the code, an argument, or a shell variable's value. Which file the code
+     writes is not resolved. Resolving it drew a new bypass in each review round (a starred
+     `open` mode, a name bound in a loop, a shell-expanded here-document, an aliased `shutil`, a
+     copy into a directory), so the rule fails closed instead;
+  2. it runs `go test`, `pytest`, `python -m pytest` or `bazel test`;
+  3. its text names a mutant or a mutation (comments included; `mutate-sandboxed` itself does not
+     count).
+
+  These stay allowed:
+  - an edit of `.md` or `.ts` files, even followed by a test;
+  - a source edit with no mutation word;
+  - an edit with no test;
+  - a test that `mutate-sandboxed` runs.
+
+  A warning filter's category is imported when Python starts. So a `-W` or `PYTHONWARNINGS` whose
+  category is in a mutant-named module (`-W ignore::mutants.Warning`) is refused, whatever the
+  code, isolated or not.
 - **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
   `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
   and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
@@ -397,8 +475,27 @@ the controls for them.
   program, so `< mutants.py` and `cat mutants.py |` are refused. A stdin the command does not
   show, such as a terminal or an inherited descriptor, cannot be judged.
 - **Other languages keep the shared run-call list.** `node -e`, `perl -e` and `ruby -e` code are
-  judged as before, and no read-only grammar clears them. They can still be refused for a word
-  like `load` or `require` used as data.
+  judged as before, and no read-only grammar clears them. Their string literals are not blanked
+  either (TXE-8351 covers Python only), so they can still be refused for a word like `load` or
+  `require` used as data.
+- **Lazy imports in non-isolated Python.** Without `-I` the current directory is on `sys.path`.
+  A standard-library call made after the program writes a file can import a module by name, and
+  that file can be it: an uncaught exception imports `traceback`, and the `idna` codec imports
+  `stringprep`. The code view cannot see such an import. Only imports the program states are
+  required to come first. Code meant to be read as data is safest under `python3 -I`.
+- **The hand-mutation rule needs a source extension in the command's text.** A path built by
+  concatenation or formatting still shows one (`"internal/guard" + ".go"`, `f"{b}.go"`,
+  `"%s.go" % b`). An extension split apart (`"." + "go"`) is a name assembled at run time, as in
+  the first limit above.
+- **The hand-mutation rule over-refuses source names in written text.** Take one command that
+  writes Markdown naming a source file, runs a test, and mentions a mutation, for example
+  `Path("README.md").write_text("Mutation example: tools/guard.py") && go test`. It is refused,
+  although only Markdown is written. To proceed, split the edit and the test into two commands,
+  or make the edit with an editor tool.
+- **Edit, then test, in two commands.** The hand-mutation rule (above) judges one command. An edit
+  of `.go`, `.py` or `.sh` source in one Bash call followed by `go test` in the next is not refused,
+  and neither is a write the rule does not model (`cp`, `mv`, `git apply`). The same applies to a
+  runner it does not list (`make test`, `npm test`).
 - **Python's path-component rule over-refuses.** Uncleared Python code that may run something
   is refused when any word names a mutant in any component, for example
   `subprocess.run(["go", "test", "./txe/mutate/..."])`. That code is not a data read; ask your
