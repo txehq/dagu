@@ -487,6 +487,25 @@ func TestNodeSeedPublishedNamesakeIsNotInjected(t *testing.T) {
 	assert.FileExists(t, filepath.Join(f.root, "seed", "tree", "node_modules", ".pnpm", "web@1.0.0", "node_modules", "web", "index.js"))
 }
 
+// A workspace package's bin points at source the manifest-only install lacks, so pnpm would link no
+// shim for the project that depends on it: refused after the image check, before any container.
+// A bin that no other project depends on links nothing and is fine.
+func TestNodeSeedWorkspaceBinRefused(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "apps", "web", "package.json"),
+		[]byte(`{"name": "web", "bin": {"web-cli": "src/cli.js"}}`), 0o644))
+	o := f.build(t, filepath.Join(f.root, "seed-unused"))
+	require.Equal(t, 0, o.code, "a bin no project depends on: "+o.stdout+o.stderr)
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "package.json"),
+		[]byte(`{"name": "ws", "private": true, "devDependencies": {"web": "workspace:*"}}`), 0o644))
+	before := len(dockerRuns(t, f.log))
+	o = f.build(t, filepath.Join(f.root, "seed"))
+	require.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, "package.json uses web (apps/web/package.json)")
+	assert.NoFileExists(t, filepath.Join(f.root, "seed", "seed.json"))
+	assert.Len(t, dockerRuns(t, f.log), before, "no container ran")
+}
+
 // A seed build that cannot produce a sound seed writes none.
 func TestNodeSeedBuildRefusals(t *testing.T) {
 	cases := map[string]struct {

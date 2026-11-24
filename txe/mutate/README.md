@@ -308,7 +308,9 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   its source, which a manifest-only install cannot have, so a seed with one is refused: an installed
   package directory whose name is a project's and whose `package.json` is that project's, byte for
   byte. A linked workspace package is a symlink and is fine, and so is a published release with a
-  project's name (its own `package.json`). It copies each
+  project's name (its own `package.json`). A workspace package with a `bin` (or `directories.bin`)
+  that another project depends on is refused before the container starts: its bin points at source
+  the install does not have, so pnpm links no shim, with only a warning (found in review). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, each file's execute bits, and every link's target), and
   writes `seed.json` last.

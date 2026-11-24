@@ -1735,11 +1735,24 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     allowed = list(args.node_seed_allow_build)
     # `pnpm rebuild -r NAME` selects by name: a workspace project of that name would have its own
     # scripts (code from the tree) run. Refused before the container starts.
-    projects = {str(read_json_file(pristine, rel).get("name")): rel for rel in inputs if Path(rel).name == "package.json"}
+    manifests = {rel: read_json_file(pristine, rel) for rel in inputs if Path(rel).name == "package.json"}
+    projects = {str(m.get("name")): rel for rel, m in manifests.items()}
     clash = sorted(n for n in allowed if n in projects)
     if clash:
         raise Refused(f"--node-seed-allow-build {', '.join(clash)} names a workspace project "
                       f"({', '.join(projects[n] for n in clash)}), whose own scripts never run; allowlist dependencies only")
+    # A workspace package's `bin` points at its source, which a manifest-only install does not have,
+    # so pnpm links no shim for the projects that depend on it (with only a warning), and a command
+    # that uses it would fail in every run. Refused before the container starts.
+    binned = {str(m.get("name")): rel for rel, m in manifests.items()
+              if m.get("bin") or (isinstance(m.get("directories"), dict) and m["directories"].get("bin"))}
+    users = sorted(f"{rel} uses {dep} ({binned[dep]})" for rel, m in manifests.items()
+                   for field in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+                   if isinstance(m.get(field), dict) for dep in m[field] if dep in binned and projects.get(dep) != rel)
+    if users:
+        raise Refused(f"a workspace package with a `bin` is a dependency of another project ({'; '.join(users)}): "
+                      "the seed's install sees manifests only, so pnpm cannot link that bin, and a seed cannot be "
+                      "built for this workspace")
     command = ["sh", "-c", NODE_SEED_SCRIPT, "sh", *allowed]
     r = runner.run("node seed", pristine, None, inputs=inputs, command=command, network=args.node_seed_network)
     runner.settle_or_stop(r)
