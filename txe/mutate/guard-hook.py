@@ -834,7 +834,7 @@ def _open_reads_only(node) -> bool:
 #   form in which Python reads identifiers;
 # - every import comes before any other statement, at module level;
 # - every import is of a module in PY_TEXT_MODULES, absolute, and sys is used only as
-#   `sys.<attr>` for an attribute in PY_SYS_ATTRS;
+#   `sys.<attr>` for an attribute in PY_SYS_ATTRS; no from-import of a private name or `*`;
 # - in 3.11 and earlier an f-string is one STRING token, so a string with an f or t prefix is kept.
 # On the view, PY_RESOLVES also counts as run evidence: a dunder, a private attribute, a frame or
 # code attribute, help() (it imports a module by name) and sys.modules can each look up a callable
@@ -894,6 +894,8 @@ def _python_code_view(code: str):
             modules = [node.module]
             if node.module == "sys" and any(a.name not in PY_SYS_ATTRS for a in node.names):
                 return None
+            if any(a.name.startswith("_") or a.name == "*" for a in node.names):
+                return None  # a private name (`from os import _execvpe`) or `*` is not judged by name
         else:
             continue
         if any(m.split(".")[0] not in PY_TEXT_MODULES for m in modules):

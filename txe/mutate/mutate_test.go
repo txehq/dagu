@@ -1286,6 +1286,8 @@ var dataWordsRefused = []string{
 	`python3 -I -W ignore::tools.mutants.Warning -c 'print(1)'`,
 	`PYTHONWARNINGS=default,ignore::mutants.Warning python3 -c 'print(1)'`,
 	`python3 -X dev -Werror::mutants.W -c 'print(1)'`,
+	// Security review of 2faa0236: a private os name imported by name runs a process.
+	"python3 - <<'PY'\nimport os\nfrom os import _execvpe as x\nx(\"sh\", [\"sh\", \"-c\", \"exec python3 mutants.py\"], os.environ)\nPY",
 	// Security review of 3aee88c5: `env --` still assigns the names after it.
 	`env -- PYTHONPATH=/tmp PYTHONWARNINGS=ignore::mutants.Warning python3 -c 'print("exec mutants.py")'`,
 	"env -- PYTHONPATH=/tmp python3 - <<'PY'\nprint(\"`exec` mutants.py\")\nPY",

@@ -367,6 +367,8 @@ and process substitution, redirections, here-documents) and judges only what wou
   - every import comes first, before any other statement, at module level. Otherwise a statement
     could write `json.py` and a later `import json` would run it;
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;
+  - no from-import of a private name or `*`: `from os import _execvpe` runs a process under a
+    name no run rule lists;
   - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
     `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
     such as `timeit`, `string`, `operator` or `pkgutil` can run a string or look up a callable by
