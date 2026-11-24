@@ -353,8 +353,11 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   package directory whose name is a project's and whose `package.json` is that project's, byte for
   byte. A linked workspace package is a symlink and is fine, and so is a published release with a
   project's name (its own `package.json`). A workspace package with a `bin` (or `directories.bin`)
-  that another project depends on is refused before the container starts: its bin points at source
-  the install does not have, so pnpm links no shim, with only a warning (found in review). It copies each
+  that the lockfile links into another project (an importer's version `link:` to it) is refused
+  before the container starts: its bin points at source the install does not have, so pnpm links no
+  shim, with only a warning (found in review). The lockfile decides, never a name: a dependency on a
+  published release that shares that project's name has a registry version, installs its own bin,
+  and is fine (TXE-8374). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, each file's execute bits, and every link's target), and
   writes `seed.json` last. A setuid or setgid file is refused: exported with its mode, it would be a

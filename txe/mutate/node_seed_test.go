@@ -1022,8 +1022,8 @@ func TestNodeSeedPublishedNamesakeIsNotInjected(t *testing.T) {
 }
 
 // A workspace package's bin points at source the manifest-only install lacks, so pnpm would link no
-// shim for the project that depends on it: refused after the image check, before any container.
-// A bin that no other project depends on links nothing and is fine.
+// shim for the project its lockfile links to it: refused after the image check, before any
+// container. A bin that no other project depends on links nothing and is fine.
 func TestNodeSeedWorkspaceBinRefused(t *testing.T) {
 	f := newNodeFixture(t)
 	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "apps", "web", "package.json"),
@@ -1032,12 +1032,38 @@ func TestNodeSeedWorkspaceBinRefused(t *testing.T) {
 	require.Equal(t, 0, o.code, "a bin no project depends on: "+o.stdout+o.stderr)
 	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "package.json"),
 		[]byte(`{"name": "ws", "private": true, "devDependencies": {"web": "workspace:*"}}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n\n"+
+		"importers:\n\n  .:\n    devDependencies:\n      web:\n        specifier: workspace:*\n        version: link:apps/web\n\n"+
+		"  apps/web: {}\n"), 0o644))
 	before := len(dockerRuns(t, f.log))
 	o = f.build(t, filepath.Join(f.root, "seed"))
 	require.Equal(t, 2, o.code, o.stdout+o.stderr)
 	assert.Contains(t, o.stderr, "package.json uses web (apps/web/package.json)")
 	assert.NoFileExists(t, filepath.Join(f.root, "seed", "seed.json"))
 	assert.Len(t, dockerRuns(t, f.log), before, "no container ran")
+}
+
+// A registry release that only shares its name with a workspace project that has a bin is not a
+// link to that project: the lockfile's importer gives it a registry version, never link:, and pnpm
+// installs the published package with its own bin. The seed is built (TXE-8374; connector thread
+// 4681479851 on PR 307).
+func TestNodeSeedRegistryNamesakeOfBinProject(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(f.pnpmMode, []byte("published"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "apps", "web", "package.json"),
+		[]byte(`{"name": "web", "version": "2.0.0", "bin": {"web-cli": "src/cli.js"}}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "package.json"),
+		[]byte(`{"name": "ws", "private": true, "devDependencies": {"web": "1.0.0"}}`), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, "pnpm-lock.yaml"), []byte("lockfileVersion: '9.0'\n\n"+
+		"importers:\n\n  .:\n    devDependencies:\n      web:\n        specifier: 1.0.0\n        version: 1.0.0\n\n"+
+		"  apps/web: {}\n\n"+
+		"packages:\n\n  web@1.0.0:\n    resolution: {integrity: sha512-AAAA}\n    hasBin: true\n\n"+
+		"snapshots:\n\n  web@1.0.0: {}\n"), 0o644))
+	o := f.build(t, filepath.Join(f.root, "seed"))
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	assert.NotContains(t, o.stderr, "a workspace package with a `bin`")
+	assert.FileExists(t, filepath.Join(f.root, "seed", "seed.json"))
+	assert.FileExists(t, filepath.Join(f.root, "seed", "tree", "node_modules", ".pnpm", "web@1.0.0", "node_modules", "web", "index.js"))
 }
 
 // okrWebConfig is okr/web's pnpm configuration surface on txehq/txe main b002c1d0 (2026-11-24):
@@ -1153,7 +1179,8 @@ snapshots:
 }
 
 // nodeConfigVerdict writes files over okrWebConfig into a new tree and runs the runner's own
-// check_node_config on it: "ok" or the refusal's text.
+// check_node_config and workspace_bin_users on it: "ok", the refusal's text, or "bin users: "
+// and the importer links to a workspace project with a bin.
 func nodeConfigVerdict(t *testing.T, files map[string]string) string {
 	t.Helper()
 	root := t.TempDir()
@@ -1172,8 +1199,11 @@ spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
 ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
 root = Path(sys.argv[2])
 try:
-    ms.check_node_config(root, ms.node_inputs(root))
-    print("ok")
+    inputs = ms.node_inputs(root)
+    lock = ms.check_node_config(root, inputs)
+    users = ms.workspace_bin_users(lock, {rel: ms.read_json_file(root, rel) for rel in inputs
+                                          if Path(rel).name == "package.json"})
+    print("bin users: " + "; ".join(users) if users else "ok")
 except ms.Refused as e:
     print(e)
 `
@@ -1192,6 +1222,21 @@ func TestNodeConfigClosedSet(t *testing.T) {
 		"relative globs, `!` exclusions included, stay inside the tree")
 	const tail = "is outside the pnpm configuration the node seed supports"
 	lock, ws := okrWebConfig["pnpm-lock.yaml"], okrWebConfig["pnpm-workspace.yaml"]
+	// The workspace-bin check reads the importer links (TXE-8374): okr/web with @okr/ui given a bin
+	// is a link to a bin project; the same bin with apps/web on a registry release named @okr/ui
+	// (the importer's version a registry one, never link:) is not.
+	binUI := strings.Replace(okrWebConfig["packages/ui/package.json"], `"scripts": {},`, `"scripts": {}, "bin": {"ui": "src/cli.js"},`, 1)
+	require.NotEqual(t, okrWebConfig["packages/ui/package.json"], binUI)
+	assert.Equal(t, "bin users: apps/web/package.json uses @okr/ui (packages/ui/package.json)",
+		nodeConfigVerdict(t, map[string]string{"packages/ui/package.json": binUI}))
+	namesakeLock := strings.Replace(lock, "specifier: workspace:*\n        version: link:../../packages/ui",
+		"specifier: 1.0.0\n        version: 1.0.0", 1)
+	require.NotEqual(t, lock, namesakeLock)
+	namesakeWeb := strings.Replace(okrWebConfig["apps/web/package.json"], `"@okr/ui": "workspace:*"`, `"@okr/ui": "1.0.0"`, 1)
+	require.NotEqual(t, okrWebConfig["apps/web/package.json"], namesakeWeb)
+	assert.Equal(t, "ok", nodeConfigVerdict(t, map[string]string{"packages/ui/package.json": binUI,
+		"pnpm-lock.yaml": namesakeLock, "apps/web/package.json": namesakeWeb}),
+		"a registry release that shares a bin project's name is not a link to it")
 	cases := map[string]struct {
 		files map[string]string
 		want  string

@@ -1581,9 +1581,10 @@ def node_spec_ok(spec) -> bool:
                                           or SPEC_ALIAS.fullmatch(spec))
 
 
-def check_node_config(root: Path, inputs: dict[str, str]) -> None:
+def check_node_config(root: Path, inputs: dict[str, str]) -> dict:
     """Refuse a workspace whose pnpm configuration or layout is outside the closed set above: every
-    key and every nested value of .npmrc, pnpm-workspace.yaml, pnpm-lock.yaml and the manifests."""
+    key and every nested value of .npmrc, pnpm-workspace.yaml, pnpm-lock.yaml and the manifests.
+    Returns the lockfile it checked, as yaml_block read it."""
     def refuse(where: str, what: str) -> None:
         raise Refused(f"{where}: {what} is outside the pnpm configuration the node seed supports (TXE-8348: "
                       "okr/web's, as tested); supporting it is a reviewed change to the runner")
@@ -1702,6 +1703,31 @@ def check_node_config(root: Path, inputs: dict[str, str]) -> None:
             for dep, spec in deps.items():
                 if not node_spec_ok(spec):
                     refuse(rel, f"the {field} specifier {dep}: {spec!r}")
+    return lock
+
+
+def workspace_bin_users(lock: dict, manifests: dict[str, dict]) -> list[str]:
+    """Each lockfile importer link to another workspace project whose manifest has a `bin`, as
+    "<importer's manifest> uses <name> (<bin project's manifest>)". lock is what check_node_config
+    returned. Only an importer's `link:` version links a project (check_node_config admits it for a
+    workspace:* specifier alone, and no package or snapshot can be one), so a registry release that
+    only shares a bin project's name is not a link and is not listed (TXE-8374)."""
+    def entries(v) -> dict:
+        return v if isinstance(v, dict) else {}  # check_node_config admitted "{}" as the only other value
+    manifest_of = {os.path.dirname(rel) or ".": rel for rel in manifests}
+    binned = {os.path.dirname(rel) or ".": rel for rel, m in manifests.items()
+              if m.get("bin") or (isinstance(m.get("directories"), dict) and m["directories"].get("bin"))}
+    users = set()
+    for imp, entry in entries(lock.get("importers")).items():
+        for field in sorted(IMPORTER_FIELDS):
+            for name, dep in entries(entries(entry).get(field)).items():
+                ver = entries(dep).get("version")
+                if not (isinstance(ver, str) and ver.startswith("link:")):
+                    continue
+                target = os.path.normpath(os.path.join(imp, ver[5:]))
+                if target in binned and target != os.path.normpath(imp):
+                    users.add(f"{manifest_of[imp]} uses {name} ({binned[target]})")
+    return sorted(users)
 
 
 def is_node_tree(tree: Path) -> bool:
@@ -2292,7 +2318,7 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     """--node-seed-build: one container, with network, installs the workspace's node_modules from
     its manifests alone; the host checks the result and writes the seed directory."""
     inputs = node_inputs(pristine, runner.deadline)
-    check_node_config(pristine, inputs)  # the closed set: refused before the container starts
+    lockfile = check_node_config(pristine, inputs)  # the closed set: refused before the container starts
     lock = inputs["pnpm-lock.yaml"]
     allowed = list(args.node_seed_allow_build)
     # `pnpm rebuild -r NAME` selects by name: a workspace project of that name would have its own
@@ -2304,13 +2330,10 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
         raise Refused(f"--node-seed-allow-build {', '.join(clash)} names a workspace project "
                       f"({', '.join(projects[n] for n in clash)}), whose own scripts never run; allowlist dependencies only")
     # A workspace package's `bin` points at its source, which a manifest-only install does not have,
-    # so pnpm links no shim for the projects that depend on it (with only a warning), and a command
-    # that uses it would fail in every run. Refused before the container starts.
-    binned = {str(m.get("name")): rel for rel, m in manifests.items()
-              if m.get("bin") or (isinstance(m.get("directories"), dict) and m["directories"].get("bin"))}
-    users = sorted(f"{rel} uses {dep} ({binned[dep]})" for rel, m in manifests.items()
-                   for field in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
-                   if isinstance(m.get(field), dict) for dep in m[field] if dep in binned and projects.get(dep) != rel)
+    # so pnpm links no shim for the projects linked to it (with only a warning), and a command that
+    # uses it would fail in every run. Refused before the container starts. The lockfile's importer
+    # links decide, never a dependency's name (TXE-8374).
+    users = workspace_bin_users(lockfile, manifests)
     if users:
         raise Refused(f"a workspace package with a `bin` is a dependency of another project ({'; '.join(users)}): "
                       "the seed's install sees manifests only, so pnpm cannot link that bin, and a seed cannot be "
