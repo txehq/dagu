@@ -568,6 +568,8 @@ print(oct(stat.S_IMODE(os.fstat(fd).st_mode)), len(os.listdir(fd)))
 // with the rest of its arguments. argv: attack, target, moved, decoy, then the runner's arguments.
 //   - rename: once the seed directory is open, target (the seed directory or an ancestor) is renamed
 //     to moved, and a link to decoy takes its place: a pathname write would land in decoy.
+//   - after-screen: as soon as check_seed_parent has screened the parent, before anything else
+//     reads it, target (the parent) is renamed to moved and an empty directory takes its place.
 //   - before-open: after check_node_mode screens the parent, target (the parent) is renamed to
 //     moved and an empty directory takes its place, before the build opens it.
 //   - plant:NAME: once the seed directory is open, a link NAME -> decoy/NAME is planted in it.
@@ -577,7 +579,15 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
 ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
 attack, target, moved, decoy = sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5])
-if attack == "before-open":
+if attack == "after-screen":
+    screen = ms.check_seed_parent
+    def hooked_screen(parent, euid):
+        st = screen(parent, euid)
+        os.rename(target, moved)
+        os.mkdir(target, 0o700)
+        return st
+    ms.check_seed_parent = hooked_screen
+elif attack == "before-open":
     check = ms.check_node_mode
     def hooked_check(args, forbidden):
         check(args, forbidden)
@@ -669,18 +679,76 @@ func TestNodeSeedWritesFollowTheDescriptor(t *testing.T) {
 		})
 	}
 
-	// Renamed between the screening and the open: the build refuses, and writes nothing anywhere.
-	t.Run("parent replaced before it is opened", func(t *testing.T) {
-		f := newNodeFixture(t)
-		parent := filepath.Join(f.root, "p")
-		require.NoError(t, os.Mkdir(parent, 0o755))
-		moved := filepath.Join(f.root, "p-moved")
-		o := f.attackedBuild(t, "before-open", parent, moved, filepath.Join(f.root, "unused"), filepath.Join(parent, "seed"))
-		require.Equal(t, 2, o.code, o.stdout+o.stderr)
-		assert.Contains(t, o.stderr, "is no longer the directory screened at the start (it or an ancestor was renamed)")
-		assert.Empty(t, filesUnder(t, parent))
-		assert.Empty(t, filesUnder(t, moved))
-	})
+	// Replaced between the screening and the open: the build refuses, and writes nothing anywhere.
+	// after-screen swaps it the moment the screen returns, before any later read of the parent
+	// could take the replacement as the identity to require (root's review of 2837c048).
+	for _, attack := range []string{"after-screen", "before-open"} {
+		t.Run("parent replaced "+attack, func(t *testing.T) {
+			f := newNodeFixture(t)
+			parent := filepath.Join(f.root, "p")
+			require.NoError(t, os.Mkdir(parent, 0o755))
+			moved := filepath.Join(f.root, "p-moved")
+			o := f.attackedBuild(t, attack, parent, moved, filepath.Join(f.root, "unused"), filepath.Join(parent, "seed"))
+			require.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "is no longer the directory screened at the start (it or an ancestor was renamed)")
+			assert.Empty(t, filesUnder(t, parent))
+			assert.Empty(t, filesUnder(t, moved))
+		})
+	}
+}
+
+// Every descriptor the seed writer opens is closed when a write is refused (root's review of
+// 2837c048): the source file when copy_dir_at's exclusive create of its destination is refused
+// before a byte is read, the install log and the seed directory when write_seed's install.log is
+// refused, and the parent when open_seed_parent refuses it. Each case compares this process's
+// open descriptors (/dev/fd) before and after the refusal.
+func TestNodeSeedWriterClosesDescriptorsOnRefusal(t *testing.T) {
+	prog := `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+def fds():
+    return sorted(int(n) for n in os.listdir("/dev/fd") if os.path.exists(f"/dev/fd/{n}"))
+def case(name, fn):
+    before = fds()
+    try:
+        fn()
+        print(name, "NOT REFUSED")
+        return
+    except ms.Refused:
+        pass
+    after = fds()
+    print(name, "ok" if after == before else f"leaked {sorted(set(after) - set(before))}")
+
+# copy_dir_at: the destination already holds the file, so its exclusive create is refused.
+(root / "src").mkdir(); (root / "src" / "a").write_text("x")
+(root / "dst").mkdir(); (root / "dst" / "a").write_text("planted")
+s, d = os.open(root / "src", ms.DIR_FLAGS), os.open(root / "dst", ms.DIR_FLAGS)
+case("copy_dir_at", lambda: ms.copy_dir_at(s, d, [100], None, "copy"))
+
+# write_seed: a link planted at install.log once the seed directory is open.
+nm = root / "install" / "node_modules"; nm.mkdir(parents=True); (nm / "x").write_text("x")
+log = root / "install.log"; log.write_text("log\n")
+parent = root / "parent"; parent.mkdir()
+st = os.lstat(parent)
+digests = {"node_modules": ms.tree_digest(nm, 100, 1 << 20)[0]}
+opened = ms.open_seed_dir
+def planted(parent_fd, name):
+    fd = opened(parent_fd, name)
+    os.symlink(root / "decoy", parent / name / "install.log")
+    return fd
+ms.open_seed_dir = planted
+case("write_seed", lambda: ms.write_seed(parent / "seed", (st.st_dev, st.st_ino), root / "install",
+                                         ["node_modules"], digests, log, (100, 1 << 20), None))
+
+# open_seed_parent: the identity does not match.
+case("open_seed_parent", lambda: ms.open_seed_parent(parent, (st.st_dev, st.st_ino + 1)))
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "copy_dir_at ok\nwrite_seed ok\nopen_seed_parent ok", strings.TrimSpace(string(out)))
 }
 
 // A link planted in the seed directory where the build will create seed.json, install.log or tree

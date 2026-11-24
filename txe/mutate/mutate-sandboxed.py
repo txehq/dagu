@@ -1974,10 +1974,16 @@ def resolve_image_id(args) -> str:
 #
 # The seed is written relative to descriptors, never by pathname: the build opens the parent
 # directory it screened (and checks it is still that directory), creates the seed directory in it
-# with mkdirat, opens and verifies it, and every later write is relative to that descriptor:
-# directories with mkdirat, files opened O_CREAT | O_EXCL | O_NOFOLLOW, links with symlinkat. A
-# rename of the seed directory or of any ancestor after it is opened moves the writes with it, never
-# elsewhere; an entry planted inside it is refused, never followed.
+# with mkdirat, opens and checks it, and every later write is relative to that descriptor:
+# directories with mkdirat, files opened O_CREAT | O_EXCL | O_NOFOLLOW, links with symlinkat. Once
+# the descriptor is obtained, a rename of the seed directory or of any ancestor moves the writes
+# with it, never elsewhere, and an entry planted inside it is refused, never followed.
+#
+# Prerequisite (trusted namespace): from the screening (check_seed_parent) through the create and
+# the open of the seed directory, no untrusted party can rename or create entries in the parent,
+# or replace it through an ancestor. The checks on each descriptor (device and inode against the
+# name, owner, mode, emptiness) detect the swaps they can see; they do not prove the directory
+# opened is the inode mkdirat created. A process of the invoker's uid is trusted.
 
 SEED_DIR_MODE = 0o700
 SEED_FILE_MODE = 0o644
@@ -1987,8 +1993,11 @@ NEW_FILE_FLAGS = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW
 
 def open_dir_at(parent_fd: int, name: str, what: str) -> int:
     """A descriptor on directory name in parent_fd, opened O_DIRECTORY | O_NOFOLLOW, refused unless
-    it is the entry name holds (fstat against an lstat of name, by device and inode) and is owned by
-    this process's euid."""
+    it is the directory name holds now (fstat against an lstat of name, by device and inode) and is
+    owned by this process's euid. That does not prove it is the inode an earlier mkdirat created: a
+    party who can rename entries in parent_fd between the two could put its own there (the
+    trusted-namespace prerequisite, write_seed). Once returned, the descriptor is unaffected by any
+    later rename."""
     try:
         fd = os.open(name, DIR_FLAGS | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
     except OSError as e:
@@ -2008,17 +2017,21 @@ def open_dir_at(parent_fd: int, name: str, what: str) -> int:
 
 def open_seed_parent(parent: Path, ident: tuple[int, int]) -> int:
     """A descriptor on the seed's parent directory, refused unless it is still the directory
-    check_node_mode screened (same device and inode): a rename of it or of an ancestor since then is
-    refused, and one after this open cannot move the writes away from it."""
+    check_seed_parent screened (ident: the device and inode of the very lstat it screened): a
+    replacement of it, or a rename of an ancestor that leads the path elsewhere, since then is
+    refused, and a rename after this open cannot move the writes away from it."""
     try:
         fd = os.open(parent, DIR_FLAGS | getattr(os, "O_CLOEXEC", 0))
     except OSError as e:
         raise Refused(f"--node-seed-build: cannot open {parent} as a plain directory: {e}") from e
-    st = os.fstat(fd)
-    if (st.st_dev, st.st_ino) != ident:
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != ident:
+            raise Refused(f"--node-seed-build: {parent} is no longer the directory screened at the start "
+                          "(it or an ancestor was renamed); nothing was written")
+    except BaseException:
         os.close(fd)
-        raise Refused(f"--node-seed-build: {parent} is no longer the directory screened at the start "
-                      "(it or an ancestor was renamed); nothing was written")
+        raise
     return fd
 
 
@@ -2034,8 +2047,10 @@ def make_seed_dir(parent_fd: int, name: str) -> None:
 
 
 def open_seed_dir(parent_fd: int, name: str) -> int:
-    """make_seed_dir, then a verified descriptor on what it made: the entry it created (open_dir_at),
-    with the mode it set, 0700 exactly (a umask that removes owner bits is refused), and empty."""
+    """make_seed_dir, then a checked descriptor on the directory at that name (open_dir_at): owned
+    by the euid, mode 0700 exactly (a umask that removes owner bits is refused), and empty. These
+    checks do not prove it is the inode mkdirat created; that rests on the trusted-namespace
+    prerequisite (write_seed). From here on, the descriptor is what every write uses."""
     make_seed_dir(parent_fd, name)
     fd = open_dir_at(parent_fd, name, "--node-seed-build")
     try:
@@ -2095,10 +2110,10 @@ def write_new_at(dir_fd: int, name: str, chunks, like: os.stat_result | int, dea
 
 
 def read_chunks(fd: int):
-    """The bytes of descriptor fd, a MiB at a time; fd is closed at the end."""
-    with os.fdopen(fd, "rb") as f:
-        while chunk := f.read(1 << 20):
-            yield chunk
+    """The bytes of descriptor fd, a MiB at a time. It never closes fd: the caller owns it, and
+    closes it whether or not the chunks were ever read (a refused destination reads none)."""
+    while chunk := os.read(fd, 1 << 20):
+        yield chunk
 
 
 def copy_dir_at(src: int, dst: int, budget: list[int], deadline: float | None, what: str, depth: int = 0) -> None:
@@ -2131,7 +2146,10 @@ def copy_dir_at(src: int, dst: int, budget: list[int], deadline: float | None, w
                 os.close(s)
         elif stat.S_ISREG(st.st_mode):
             r = open_regular_at(src, name)
-            write_new_at(dst, name, read_chunks(r), os.fstat(r), deadline, what)
+            try:
+                write_new_at(dst, name, read_chunks(r), os.fstat(r), deadline, what)
+            finally:
+                os.close(r)
         elif stat.S_ISLNK(st.st_mode):
             os.symlink(os.readlink(name, dir_fd=src), name, dir_fd=dst)
         else:
@@ -2150,7 +2168,9 @@ def write_seed(dest: Path, parent_ident: tuple[int, int], src: Path, dirs: list[
     """Create the seed directory dest and write into it, relative to its descriptor only: each
     node_modules in dirs (from src, the install's tree) under tree/, checked against digests by
     hashing the copy through the same descriptors, then install.log. Returns the seed directory's
-    open descriptor (the caller writes seed.json through it and closes it) and install.log's sha256."""
+    open descriptor (the caller writes seed.json through it and closes it) and install.log's sha256.
+    Every descriptor it opens is closed on every path, a refusal included. The trusted-namespace
+    prerequisite (above make_seed_dir's section) holds from the screening through the open."""
     what = "writing the seed"
     parent_fd = open_seed_parent(dest.parent, parent_ident)
     try:
@@ -2185,10 +2205,12 @@ def write_seed(dest: Path, parent_ident: tuple[int, int], src: Path, dirs: list[
             lfd = os.open(log, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         except OSError as e:
             raise Refused(f"cannot open the install log {log}: {e}") from e
-        if not stat.S_ISREG(os.fstat(lfd).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(lfd).st_mode):
+                raise Refused(f"the install log {log} is not a regular file")
+            log_sha256 = write_new_at(seed_fd, "install.log", read_chunks(lfd), SEED_FILE_MODE, deadline, what)
+        finally:
             os.close(lfd)
-            raise Refused(f"the install log {log} is not a regular file")
-        log_sha256 = write_new_at(seed_fd, "install.log", read_chunks(lfd), SEED_FILE_MODE, deadline, what)
     except OSError as e:  # an entry that cannot be read, made or opened: a refusal, never an internal error
         os.close(seed_fd)
         raise Refused(f"{what} to {dest}: {e}") from e
@@ -2198,17 +2220,22 @@ def write_seed(dest: Path, parent_ident: tuple[int, int], src: Path, dirs: list[
     return seed_fd, log_sha256
 
 
-def check_seed_parent(parent: Path, euid: int) -> None:
+def check_seed_parent(parent: Path, euid: int) -> os.stat_result:
     """A second line of defence since TXE-8385, which writes the seed relative to a pinned
     descriptor (write_seed). Screening, not a guarantee: the parent and every ancestor up to / are
     screened by owner uid, POSIX mode bits and the sticky bit (security reviews of a63cbc52 and
     d33fb7db). Each must be owned by the invoker or root, and either writable by no group or other
     user, or sticky (as /tmp is: only an entry's owner, or the directory's, can rename it, so the
     directory's owner must be trusted too). The build never runs as root. NOT examined: ACLs and
-    other non-mode permissions; a process of the same uid is trusted (README)."""
+    other non-mode permissions; a process of the same uid is trusted (README).
+
+    Returns the lstat of parent that was screened: its device and inode are the identity the build
+    later requires of the parent it opens (open_seed_parent), never a second, later sample (root's
+    review of 2837c048)."""
     if euid == 0:
         raise Refused("--node-seed-build refuses to run as root: run it as an ordinary user")
     d = Path(parent)
+    screened = None
     while True:
         try:
             st = os.lstat(d)  # parent is a resolved path: no link to follow on the way up
@@ -2220,8 +2247,10 @@ def check_seed_parent(parent: Path, euid: int) -> None:
             who = f"owned by uid {st.st_uid}" if not trusted else "writable by its group or other users and not sticky"
             raise Refused(f"--node-seed-build: {where} {d} is {who}: another user could replace the seed directory "
                           "while it is written; put the seed in a directory only you (or root) can write, all the way up")
+        if screened is None:
+            screened = st
         if d.parent == d:
-            return
+            return screened
         d = d.parent
 
 
@@ -2240,9 +2269,8 @@ def check_node_mode(args, forbidden: dict[str, Path]) -> None:
             raise Refused(f"--node-seed-build {out}: its parent directory does not exist")
         args.node_seed_build = real(out.parent) / out.name
         check_outside(args.node_seed_build, forbidden, "--node-seed-build directory")
-        check_seed_parent(args.node_seed_build.parent, os.geteuid())
-        st = os.lstat(args.node_seed_build.parent)
-        args.node_seed_parent_ident = (st.st_dev, st.st_ino)  # the build writes only into this directory
+        st = check_seed_parent(args.node_seed_build.parent, os.geteuid())
+        args.node_seed_parent_ident = (st.st_dev, st.st_ino)  # the screened directory: the build writes only into it
     elif args.node_seed is not None:
         if not (tree / "pnpm-lock.yaml").is_file():
             raise Refused(f"--node-seed is for a pnpm workspace: {tree} has no pnpm-lock.yaml at its root")

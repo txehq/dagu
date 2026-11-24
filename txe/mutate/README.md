@@ -380,12 +380,15 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   see the tree, so `node_modules/.bin/vitest` works in each run.
 - **Where the seed is written: relative to a descriptor, never by pathname (TXE-8385).**
   - The build opens the seed's parent directory `O_DIRECTORY | O_NOFOLLOW` and refuses it unless
-    it is still the directory screened at the start (same device and inode). A rename of it or of
-    an ancestor in between is refused, before anything is written.
+    it is still the directory screened at the start: the same device and inode as the very
+    `lstat` that `check_seed_parent` screened, never a later sample. A replacement in between is
+    refused, before anything is written.
   - It creates the seed directory in that descriptor with `mkdirat`, mode 0700 (`make_seed_dir`),
-    opens it `O_DIRECTORY | O_NOFOLLOW`, and checks the descriptor: the entry it created (`fstat`
-    against an `lstat` of the name, by device and inode), owned by you, mode 0700 exactly (a umask
-    that removes owner bits is refused) and empty (`open_seed_dir`).
+    opens it `O_DIRECTORY | O_NOFOLLOW`, and checks the descriptor (`open_seed_dir`): it is the
+    directory at that name now (`fstat` against an `lstat` of the name, by device and inode),
+    owned by you, mode 0700 exactly (a umask that removes owner bits is refused), and empty.
+    These checks do not prove it is the inode `mkdirat` created; that rests on the prerequisite
+    below.
   - Every later write is relative to that descriptor: directories with `mkdirat`, each opened
     `O_NOFOLLOW` and checked the same way; files created `O_CREAT | O_EXCL | O_NOFOLLOW`; links
     with `symlinkat`. A descriptor-walking copy (`copy_dir_at`) replaces `shutil.copytree` for the
@@ -393,18 +396,32 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
     permission bits (setuid, setgid and sticky dropped) and times. Each `node_modules` is hashed
     again through the same descriptors before `install.log` and, last, `seed.json` are written.
 
-  So a rename of the seed directory, its parent or any ancestor while the build writes moves the
-  writes with the directory, and none lands where the old pathname now leads. An entry planted
-  in the seed directory (a link at `seed.json`, `install.log` or `tree`) is refused, never
-  followed. The exported seed hashes the same as the old `copytree` export: checked on okr/web's
-  real seed (`TestNodeSeedRealExportHashesAlike`, run with `NODE_SEED_EXPORT_DIR`).
+  Once the seed directory's descriptor is obtained, a rename of the seed directory, its parent or
+  any ancestor moves the writes with the directory, and none lands where the old pathname now
+  leads. An entry planted in the seed directory (a link at `seed.json`, `install.log` or `tree`)
+  is refused, never followed. Every descriptor the writer opens is closed on every path, a
+  refusal included. The exported seed hashes the same as the old `copytree` export, entry by
+  entry: checked on okr/web's real seed (`TestNodeSeedRealExportHashesAlike`, run with
+  `NODE_SEED_EXPORT_DIR`). That check copies the real seed's `node_modules` both ways; it does not
+  rebuild the seed.
+
+  **Prerequisite: a trusted namespace from the screening through the open.** From
+  `check_seed_parent`'s screening, through the creation of the seed directory, to the open of its
+  descriptor, no untrusted party may be able to rename or create entries in the parent, or to
+  replace the parent through an ancestor. The checks above detect the swaps they can see, but
+  they cannot prove that the directory opened is the one created. The descriptor protects the
+  writes only after it is obtained.
 
   `check_seed_parent` stays as a second line of defence. It refuses to run as root, and it
   screens the destination's parent and every ancestor up to `/`: each must be owned by you or
-  root, and either writable by no group or other user, or sticky (as `/tmp` is).
+  root, and either writable by no group or other user, or sticky (as `/tmp` is). That screens
+  owner uid, POSIX mode bits and the sticky bit only; ACLs and other non-mode permissions are not
+  examined, which is why the prerequisite above is stated rather than checked.
 
-  **Residual risk.** The descriptor fixes where the writes go. It does not make the result private.
-  A party with ACL or other non-mode write or delete rights on the parent can still:
+  **Residual risk.** The descriptor fixes where the writes go after it is obtained. It does not
+  make the result private. A party with ACL or other non-mode write or delete rights on the parent
+  can, in breach of the prerequisite, swap the parent or the new seed directory before the open.
+  Even when the prerequisite holds during the build, such a party can afterwards:
   - delete or rename the finished seed directory;
   - put another directory at its pathname after the build, for a later `--node-seed` to read. A
     run re-checks the seed it reads (lockfile, manifests, image id and each `node_modules` digest),
