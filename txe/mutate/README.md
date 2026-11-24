@@ -351,9 +351,13 @@ and process substitution, redirections, here-documents) and judges only what wou
 
   The view is used only when blanking a string cannot hide how a string becomes a call. Otherwise
   the code is judged on its full text, as before. It needs all of these:
-  - Python runs the text exactly as written. That excludes shell-expanded text (`"...$X..."`, an
-    unquoted `<<EOF`, `$'...'`). It also excludes any interpreter flag outside `-BbdEIOPqRsSuvW`:
-    `-x` skips the first source line, and `-X` and `-i` are not modelled;
+  - Python runs the text exactly as written, and imports nothing it does not show. That excludes:
+    - shell-expanded text (`"...$X..."`, an unquoted `<<EOF`, `$'...'`);
+    - any interpreter flag outside `-BbdEIOPqRsSuv`: `-x` skips the first source line, `-W`
+      imports a warning category's module, and `-X` and `-i` are not modelled;
+    - a `PYTHON*` variable in the command (`PYTHONPATH`, `PYTHONWARNINGS`);
+  - every import comes first, before any other statement, at module level. Otherwise a statement
+    could write `json.py` and a later `import json` would run it;
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;
   - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
     `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
@@ -371,6 +375,10 @@ and process substitution, redirections, here-documents) and judges only what wou
   (`gi_frame`, `f_builtins`), `help()` (it imports a module by name) and `sys.modules`. The view is
   read in NFKC form, as Python reads identifiers, so a fullwidth `ｅｘｅｃ` is `exec`. `os`'s
   process calls imported by name (`from os import popen, execvp`) are run calls too.
+
+  A warning filter's category is imported when Python starts. So a `-W` or `PYTHONWARNINGS` whose
+  category is in a mutant-named module (`-W ignore::mutants.Warning`) is refused, whatever the
+  code, isolated or not.
 - **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
   `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
   and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
@@ -433,6 +441,11 @@ the controls for them.
   judged as before, and no read-only grammar clears them. Their string literals are not blanked
   either (TXE-8351 covers Python only), so they can still be refused for a word like `load` or
   `require` used as data.
+- **Lazy imports in non-isolated Python.** Without `-I` the current directory is on `sys.path`.
+  A standard-library call made after the program writes a file can import a module by name, and
+  that file can be it: an uncaught exception imports `traceback`, and the `idna` codec imports
+  `stringprep`. The code view cannot see such an import. Only imports the program states are
+  required to come first. Code meant to be read as data is safest under `python3 -I`.
 - **An edit followed by a test run in shell.** `python3 - <<'PY' ... PY && go test ./...`, where
   the here-document applies a mutant and the shell then runs the tests, is allowed. Writing a file
   runs nothing, and `go test` names no mutant, so neither command is a mutation run on its own.

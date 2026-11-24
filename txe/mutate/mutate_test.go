@@ -1217,6 +1217,9 @@ var dataWordsAllowed = []string{
 	// Run words in a TypeScript string and in a comment, on -c and on a here-document.
 	`python3 -c 'import re, sys; p = sys.argv[1]; s = open(p).read(); open(p, "w").write(re.sub(r"useMutation\(", "useMutation(", s) + "const mutations = require(\"./mutations\");\n")' apps/web/src/hooks.ts`,
 	"python3 - <<'PY'\n# no exec, no subprocess: this only rewrites the mutation docs\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"draft\", \"final\"))\nPY",
+	// A module docstring and imports first, then the edit; and a warning filter with a builtin category.
+	"python3 - <<'PY'\n\"\"\"Rename the mutation hooks in the API docs.\"\"\"\nimport re\nfrom pathlib import Path\np = Path(\"docs/api.md\")\np.write_text(re.sub(r\"`useMutation`\", \"`useWrite`\", p.read_text()))\nPY",
+	`python3 -W ignore::DeprecationWarning -c 'print(1)'`,
 	// os is a text module here: its process calls would be names in the code, and there are none.
 	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
 }
@@ -1256,6 +1259,15 @@ var dataWordsRefused = []string{
 	"python3 - <<'PY'\nimport os, sys\nos.environ[\"PYTHONBREAKPOINT\"] = \"os.system\"\nsys.breakpointhook(\"python3 mutants.py\")\nPY",
 	`PYTHONBREAKPOINT=os.system python3 -c 'import os; os.sys.breakpointhook("python3 mutants.py")'`,
 	`PYTHONBREAKPOINT=runpy.run_path python3 -c 'from sys import breakpointhook as b; b("mutants.py")'`,
+	// Connector and security review of 2e11c92e (P2): a warning category's module is imported at
+	// startup (-W, PYTHONWARNINGS; the last three were allowed before TXE-8351 too), and an import
+	// after a statement can load a module file that statement wrote.
+	`PYTHONPATH=/tmp python3 -W ignore::mutants.Warning -c 'print("exec mutants.py")'`,
+	`python3 -I -W ignore::tools.mutants.Warning -c 'print(1)'`,
+	`PYTHONWARNINGS=default,ignore::mutants.Warning python3 -c 'print(1)'`,
+	`python3 -X dev -Werror::mutants.W -c 'print(1)'`,
+	`python3 -c 'open("json.py","w").write("exec(open(\"mutants.py\").read())"); import json'`,
+	"python3 - <<'PY'\nopen(\"json.py\", \"w\").write(\"exec(open('mutants.py').read())\")\nif True:\n    import json\nPY",
 	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
 	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
 	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).

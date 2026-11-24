@@ -814,6 +814,7 @@ def _open_reads_only(node) -> bool:
 #   outside PY_VIEW_FLAGS, such as -x, which skips the first line), it tokenizes and parses, and it
 #   has no coding comment, \r or BOM (PY_CODING_COOKIE); the view is judged in NFKC form, the
 #   form in which Python reads identifiers;
+# - every import comes before any other statement, at module level;
 # - every import is of a module in PY_TEXT_MODULES, absolute, and sys is used only as
 #   `sys.<attr>` for an attribute in PY_SYS_ATTRS;
 # - in 3.11 and earlier an f-string is one STRING token, so a string with an f or t prefix is kept.
@@ -831,9 +832,10 @@ PY_TEXT_MODULES = frozenset({"os", "sys", "re", "json", "pathlib", "io", "shutil
 PY_SYS_ATTRS = frozenset({"argv", "stdin", "stdout", "stderr", "exit", "platform", "version",
                           "version_info", "maxsize", "byteorder", "getdefaultencoding",
                           "getfilesystemencoding"})
-# Interpreter flags that leave the source Python runs as written. Any other (-x skips the first
-# line; -X and -i are not modelled) means the view is not built (TXE-8351 review).
-PY_VIEW_FLAGS = frozenset("BbdEIOPqRsSuvW")
+# Interpreter flags that leave the source Python runs as written and import nothing. Any other
+# means the view is not built (TXE-8351 review): -x skips the first line, -W imports a warning
+# category's module, and -X and -i are not modelled.
+PY_VIEW_FLAGS = frozenset("BbdEIOPqRsSuv")
 PY_RESOLVES = re.compile(r"\b__\w+|\.\s*_\w*|\.\s*(?:f|gi|cr|ag|tb|co)_\w+|\b(?:help|modules|_getframe)\b")
 PY_BLANKED = {tokenize.COMMENT} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
                                    if hasattr(tokenize, n)}
@@ -855,6 +857,14 @@ def _python_code_view(code: str):
     if PY_CODING_COOKIE.search(code):
         return None
     tree = ast.parse(code)
+    # Every import runs before anything else (TXE-8351 review): an import after a statement could
+    # load a module file that statement wrote (`open("json.py", "w").write(...); import json`).
+    leading = 0
+    while leading < len(tree.body) and (isinstance(tree.body[leading], (ast.Import, ast.ImportFrom)) or (
+            leading == 0 and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant))):
+        leading += 1
+    if any(isinstance(n, (ast.Import, ast.ImportFrom)) for s in tree.body[leading:] for n in ast.walk(s)):
+        return None
     sys_names = {"sys"}  # names bound to the sys module: `import sys`, `import sys as s`
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1110,9 +1120,9 @@ class Judge:
         inside eval, env -S, bash -c or go -exec), reached directly or through PY_CLEAR_WRAPPERS
         only, with no PYTHON* variable set. Anything else is "python-strict": the Python run-call
         and path rules, never clearance (TXE-8183 review F1, F2). A flag that may change the source
-        Python runs (-x skips its first line) makes it "python-expanded": judged on its full text,
-        strings included (TXE-8351 review)."""
-        if flags - PY_VIEW_FLAGS:
+        or import a module (-x, -W, ...), or a PYTHON* variable (PYTHONPATH, PYTHONWARNINGS), makes
+        it "python-expanded": judged on its full text, strings included (TXE-8351 review)."""
+        if flags - PY_VIEW_FLAGS or any(n.startswith("PYTHON") for n in self.python_names()):
             return "python-expanded"
         if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
                 or not set(self.via) <= PY_CLEAR_WRAPPERS
@@ -1120,7 +1130,44 @@ class Judge:
             return "python-strict"
         return "python"
 
+    def warnings_import_mutant(self, args: list) -> bool:
+        """A warning filter's category is imported at startup (`-W ignore::mutants.Warning`,
+        PYTHONWARNINGS=...): a category in a mutant-named module runs it (TXE-8351 review). Every
+        -W value and every PYTHONWARNINGS the command shows is judged, isolated or not."""
+        specs = [v for n, v in {**self.outer, **self.vars}.items() if n == "PYTHONWARNINGS"]
+        specs += [n.partition("=")[2] for n in self.env_assigned_names if n.startswith("PYTHONWARNINGS=")]
+        j = 0
+        while j < len(args):
+            t = args[j].text
+            if t == "--" or t == "-" or not t.startswith("-"):
+                break  # the options end at a script, `-` or `--`
+            if t.startswith("--"):
+                j += 2 if t == "--check-hash-based-pycs" else 1
+                continue
+            value_in_next = False
+            for k in range(1, len(t)):
+                if t[k] in "cm":
+                    return self._category_mutant(specs)  # the rest is code or a module, and arguments
+                if t[k] in "WX":
+                    if t[k] == "W":
+                        specs.append(t[k + 1:] or (args[j + 1].text if j + 1 < len(args) else ""))
+                    value_in_next = not t[k + 1:]
+                    break
+            j += 2 if value_in_next else 1
+        return self._category_mutant(specs)
+
+    @staticmethod
+    def _category_mutant(specs: list) -> bool:
+        for spec in (s for v in specs for s in v.split(",")):
+            fields = spec.split(":")
+            category = fields[2].strip() if len(fields) > 2 else ""
+            if category and any(mutant_named(p) for p in category.split(".")):
+                return True
+        return False
+
     def python(self, args: list, cmd) -> bool:
+        if self.warnings_import_mutant(args):
+            return True
         flags, unsupported = set(), False
         j = 0
         while j < len(args):
