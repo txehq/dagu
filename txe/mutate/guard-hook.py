@@ -811,7 +811,9 @@ def _open_reads_only(node) -> bool:
 # The view exists only when blanking a string cannot hide how a string becomes a call; otherwise
 # the code is judged on its full text, as before:
 # - Python runs the text as written (not "python-expanded": shell expansion, or an interpreter flag
-#   outside PY_VIEW_FLAGS, such as -x, which skips the first line), it tokenizes and parses, and it
+#   outside PY_VIEW_FLAGS, such as -x, which skips the first line, a PYTHON* variable, or code
+#   nested in bash -c, eval, env -S or go -exec, whose text an outer shell expanded first), it
+#   tokenizes and parses, and it
 #   has no coding comment, \r or BOM (PY_CODING_COOKIE); the view is judged in NFKC form, the
 #   form in which Python reads identifiers;
 # - every import comes before any other statement, at module level;
@@ -1114,6 +1116,15 @@ class Judge:
         """Variable names this command's interpreter may see: shell, enclosing and env ones."""
         return list(self.vars) + list(self.outer) + [n.partition("=")[0] for n in self.env_assigned_names]
 
+    def view_allowed(self, flags: set) -> bool:
+        """Whether this interpreter's code may be judged on python_code_view() (TXE-8351 review):
+        only flags in PY_VIEW_FLAGS, no PYTHON* variable, and the top level of the command. Code
+        inside bash -c, eval, env -S or go -exec was text of an outer command first, and an outer
+        expansion (`bash -c "python3 -c 'print(\\"$X\\")'"`) can turn a Python string into code;
+        the nested reader sees the words after quote removal, not what the outer shell expands."""
+        return (not flags - PY_VIEW_FLAGS and self.depth == 0
+                and not any(n.startswith("PYTHON") for n in self.python_names()))
+
     def python_lang(self, flags: set, unsupported: bool) -> str:
         """"python" when Python code here may be cleared by python_reads_only(), which is only in
         the supported form: isolated (-I, plus only -B/-u), at the top level of the command (not
@@ -1122,7 +1133,7 @@ class Judge:
         and path rules, never clearance (TXE-8183 review F1, F2). A flag that may change the source
         or import a module (-x, -W, ...), or a PYTHON* variable (PYTHONPATH, PYTHONWARNINGS), makes
         it "python-expanded": judged on its full text, strings included (TXE-8351 review)."""
-        if flags - PY_VIEW_FLAGS or any(n.startswith("PYTHON") for n in self.python_names()):
+        if not self.view_allowed(flags):
             return "python-expanded"
         if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
                 or not set(self.via) <= PY_CLEAR_WRAPPERS
@@ -1208,7 +1219,7 @@ class Judge:
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             # A script operand (or a descriptor holding the program) is never a clearance form.
-            lang = "python-expanded" if flags - PY_VIEW_FLAGS else "python-strict"
+            lang = "python-strict" if self.view_allowed(flags) else "python-expanded"
             return (operand_is_mutant(args[j], cmd, False, self.depth, lang)
                     or self.interactive_stdin(flags, cmd))
         return stdin_is_mutant(cmd, False, self.depth, self.python_lang(flags, unsupported))
@@ -1218,7 +1229,7 @@ class Judge:
         code, module or script: that stdin is judged as a program too (TXE-8183 review F1)."""
         if "i" not in flags and "PYTHONINSPECT" not in self.python_names():
             return False
-        return stdin_is_mutant(cmd, False, self.depth, "python-expanded" if flags - PY_VIEW_FLAGS else "python-strict")
+        return stdin_is_mutant(cmd, False, self.depth, "python-strict" if self.view_allowed(flags) else "python-expanded")
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0

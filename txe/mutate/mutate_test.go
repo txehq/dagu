@@ -1268,6 +1268,11 @@ var dataWordsRefused = []string{
 	`python3 -X dev -Werror::mutants.W -c 'print(1)'`,
 	`python3 -c 'open("json.py","w").write("exec(open(\"mutants.py\").read())"); import json'`,
 	"python3 - <<'PY'\nopen(\"json.py\", \"w\").write(\"exec(open('mutants.py').read())\")\nif True:\n    import json\nPY",
+	// Security review of f4aea221 (P2): an outer shell expands nested code first, so $X can close
+	// the Python string and add code. Nested Python is judged on its full text.
+	`X='");exec(open("mutants.py").read());#'; bash -c "python3 -c 'print(\"system mutants.py $X\")'"`,
+	`X='");exec(open("mutants.py").read());#'; eval "python3 -c 'print(\"system mutants.py $X\")'"`,
+	`env -S "python3 -c 'print(\"system mutants.py\")'"`,
 	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
 	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
 	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).

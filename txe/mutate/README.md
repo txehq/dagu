@@ -356,6 +356,9 @@ and process substitution, redirections, here-documents) and judges only what wou
     - any interpreter flag outside `-BbdEIOPqRsSuv`: `-x` skips the first source line, `-W`
       imports a warning category's module, and `-X` and `-i` are not modelled;
     - a `PYTHON*` variable in the command (`PYTHONPATH`, `PYTHONWARNINGS`);
+    - code that is not at the top level of the command: inside `bash -c`, `eval`, `env -S`, go
+      `-exec`, a subshell or a substitution. An outer shell may expand that text first. In
+      `bash -c "python3 -c 'print(\"$X\")'"`, `$X` can close the Python string and add code;
   - every import comes first, before any other statement, at module level. Otherwise a statement
     could write `json.py` and a later `import json` would run it;
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;
