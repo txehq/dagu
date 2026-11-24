@@ -286,7 +286,8 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   Because the rebuild selects by name, a name equal to a workspace project's own `name` is refused
   before the container starts (that project's scripts are tree code), and a name that no installed
   dependency has is refused after the install (its rebuild would run nothing, silently), with no
-  seed written. `lifecycle_scripts` records each package by its path as well as its name.
+  seed written. `lifecycle_scripts` records each package by name and version with every path it is
+  installed at (`paths`).
   Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
   rolldown, lightningcss) need no script: the Linux container installs the Linux one.
 - **What ran is recorded.** After the install the host reads every installed package's
@@ -296,8 +297,12 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   (`node-gyp rebuild`), marked `allowlisted` or `skipped`. The build's last line names both lists.
 - **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused; each is
   opened no-follow and non-blocking and must be a regular file, so a FIFO the container left is
-  refused, never waited on), every link inside the install's tree, no special file, and a root
-  `node_modules`. It copies each
+  refused, never waited on), no special file, a root `node_modules`, and every link in the seeded
+  `node_modules` resolving inside one of them or to exactly a workspace project's directory. The
+  tree's `.npmrc` or `pnpm-workspace.yaml` can move pnpm's layout (`virtual-store-dir`,
+  `modules-dir`), and only `node_modules` is copied, so a layout that puts packages elsewhere is
+  refused instead of leaving dangling links (found in review). The lifecycle record finds packages
+  under any `node_modules` directory, so `node-linker=hoisted` is recorded too. It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, and every link's target), and writes `seed.json` last.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.

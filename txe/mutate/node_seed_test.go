@@ -30,7 +30,8 @@ import (
 
 // fakePnpm writes pnpm-shaped output into its working directory. Its mode file (when present)
 // picks a failure: "fail" exits 1, "abslink" adds a link out of the tree, "touchlock" edits the
-// lockfile, "fifo" replaces a manifest with a FIFO. Each call is appended to log as JSON: args, the files it could see before it wrote
+// lockfile, "fifo" replaces a manifest with a FIFO, "outsidestore" puts the packages in a virtual
+// store outside node_modules, and "hoisted" lays them out as node-linker=hoisted does. Each call is appended to log as JSON: args, the files it could see before it wrote
 // anything, and a few environment values.
 const fakePnpm = `#!/usr/bin/env python3
 import json, os, sys
@@ -54,7 +55,17 @@ elif args[0] == "install":
         sys.exit(1)
     if "--ignore-scripts" not in args:
         write("tree-script-ran", "the workspace's postinstall would have run\n")
-    store = "node_modules/.pnpm"
+    if "hoisted" in mode:  # node-linker=hoisted: packages are plain directories under node_modules
+        pkg("node_modules/leftpad", {"name": "leftpad", "version": "1.0.0"})
+        write("node_modules/leftpad/index.js", "module.exports = 1\n")
+        pkg("node_modules/esbuild", {"name": "esbuild", "version": "0.25.0", "scripts": {"postinstall": "node install.js"}})
+        os.makedirs("apps/web/node_modules", exist_ok=True)
+        os.symlink("../../../node_modules/leftpad", "apps/web/node_modules/leftpad")
+        sys.exit(0)
+    # virtual-store-dir outside node_modules: the packages' contents are where the seed copies nothing
+    store = ".pnpm-store-outside" if "outsidestore" in mode else "node_modules/.pnpm"
+    if "outsidestore" in mode:
+        os.makedirs("node_modules", exist_ok=True)
     pkg(store + "/leftpad@1.0.0/node_modules/leftpad", {"name": "leftpad", "version": "1.0.0"})
     write(store + "/leftpad@1.0.0/node_modules/leftpad/index.js", "module.exports = 1\n")
     pkg(store + "/esbuild@0.25.0/node_modules/esbuild",
@@ -62,9 +73,10 @@ elif args[0] == "install":
     pkg(store + "/@scope+native@2.0.0/node_modules/@scope/native", {"name": "@scope/native", "version": "2.0.0"})
     write(store + "/@scope+native@2.0.0/node_modules/@scope/native/binding.gyp", "{}\n")
     os.symlink("../../esbuild@0.25.0/node_modules/esbuild", store + "/leftpad@1.0.0/node_modules/esbuild")
-    os.symlink(".pnpm/leftpad@1.0.0/node_modules/leftpad", "node_modules/leftpad")
+    leftpad = store + "/leftpad@1.0.0/node_modules/leftpad"
+    os.symlink(os.path.relpath(leftpad, "node_modules"), "node_modules/leftpad")
     os.makedirs("apps/web/node_modules", exist_ok=True)
-    os.symlink("../../../node_modules/.pnpm/leftpad@1.0.0/node_modules/leftpad", "apps/web/node_modules/leftpad")
+    os.symlink(os.path.relpath(leftpad, "apps/web/node_modules"), "apps/web/node_modules/leftpad")
     if "abslink" in mode:
         os.symlink("/etc", "node_modules/escape")
     if "touchlock" in mode:
@@ -431,6 +443,23 @@ func TestNodeSeedLifecycleAllowlist(t *testing.T) {
 	assert.Len(t, dockerRuns(t, f.log), 1, "no refused call reached docker run")
 }
 
+// The tree's .npmrc can set node-linker=hoisted: packages are plain directories under node_modules,
+// and the record and the allowlist check still find them, by path.
+func TestNodeSeedHoistedLayout(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(f.pnpmMode, []byte("hoisted"), 0o644))
+	seedDir := filepath.Join(f.root, "seed")
+	o := f.build(t, seedDir, "--node-seed-allow-build", "esbuild")
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	deps := readSeed(t, seedDir)["lifecycle_scripts"].(map[string]any)["dependencies"].(map[string]any)
+	esbuild := deps["esbuild@0.25.0"].(map[string]any)
+	assert.Equal(t, "allowlisted", esbuild["ran"])
+	assert.Equal(t, []any{"node_modules/esbuild"}, esbuild["paths"])
+	o = f.run(t, f.mutants(t, nodeMutants), "--node-seed", seedDir, "--image", "node-image")
+	require.Equal(t, 0, o.code, o.stdout+o.stderr)
+	assert.Equal(t, "KILLED", o.outcomes()["guard removed"])
+}
+
 // A seed build that cannot produce a sound seed writes none.
 func TestNodeSeedBuildRefusals(t *testing.T) {
 	cases := map[string]struct {
@@ -457,6 +486,10 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		"manifest swapped for a FIFO": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("fifo"), 0o644))
 		}, "apps/web/package.json is not a regular file", true},
+		// The tree's .npmrc can set virtual-store-dir: copying only node_modules would leave dangling links.
+		"virtual store outside node_modules": {func(t *testing.T, f nodeFixture, _ string) {
+			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("outsidestore"), 0o644))
+		}, "outside every node_modules", true},
 		// A rebuild of a name nothing installed runs nothing, silently; it is never recorded as allowlisted.
 		"allowlisted name not installed": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("allow:nosuchpkg"), 0o644))

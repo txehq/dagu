@@ -1580,6 +1580,52 @@ def scripts_of(data: dict, keys: tuple[str, ...]) -> dict[str, str]:
     return {k: str(scripts[k]) for k in keys if k in scripts}
 
 
+def node_modules_dirs(inputs: dict[str, str]) -> list[str]:
+    """The node_modules beside each manifest: where pnpm puts each project's dependencies."""
+    return sorted({os.path.normpath(os.path.join(os.path.dirname(rel), "node_modules"))
+                   for rel in inputs if Path(rel).name == "package.json"})
+
+
+def record_roots(inputs: dict[str, str], src: Path) -> list[str]:
+    return [nm for nm in node_modules_dirs(inputs) if os.path.isdir(src / nm) and not os.path.islink(src / nm)]
+
+
+def package_parents(src: Path, roots: list[str], max_files: int) -> list[str]:
+    """Every directory named node_modules at or below each root (links never followed), relative to
+    src: the parents of installed packages in any pnpm layout, isolated (.pnpm/<id>/node_modules)
+    or hoisted (node_modules/<pkg>/node_modules)."""
+    out, seen = [], 0
+    for root in roots:
+        for d, dirs, _files in os.walk(src / root):
+            seen += len(dirs)
+            if seen > max_files:
+                raise Refused(f"the seed holds over {max_files} directories")
+            dirs[:] = sorted(x for x in dirs if not os.path.islink(os.path.join(d, x)))
+            if os.path.basename(d) == "node_modules":
+                out.append(os.path.relpath(d, src))
+    return out
+
+
+def check_seed_links(src: Path, dirs: list[str], projects: list[str], deadline: float | None = None) -> None:
+    """Every link in the seeded node_modules resolves inside one of them, or is exactly a workspace
+    project's directory (pnpm's link to a workspace package). A link anywhere else (a virtual store
+    outside node_modules, set by the tree's .npmrc, say) would dangle once only node_modules is
+    copied, so the seed is refused instead of silently incomplete."""
+    nms = [real(src / nm) for nm in dirs]
+    allowed = {real(src / p) for p in projects}
+    for nm in dirs:
+        for d, subdirs, files in os.walk(src / nm):
+            check_deadline(deadline, "checking the seed's links")
+            for n in subdirs + files:
+                p = Path(d) / n
+                if p.is_symlink():
+                    r = real(p)
+                    if r not in allowed and not any(within(r, x) for x in nms):
+                        raise Refused(f"the seed's {p.relative_to(src)} links to {os.readlink(p)}, outside every "
+                                      "node_modules: the tree's pnpm settings (.npmrc or pnpm-workspace.yaml) put "
+                                      "packages where the seed does not copy them")
+
+
 def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_files: int) -> dict:
     """What install-time code the seed's packages carry, read on the host after the install: each
     workspace project's own lifecycle scripts (never run: --ignore-scripts), and each installed
@@ -1591,14 +1637,8 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
             s = scripts_of(read_json_file(src, rel), WORKSPACE_SCRIPTS)
             if s:
                 record["workspace_skipped"][rel] = s
-    store = src / "node_modules" / ".pnpm"
-    if not store.is_dir() or store.is_symlink():
-        return record
     seen = 0
-    for entry in sorted(os.listdir(store)):
-        nm = f"node_modules/.pnpm/{entry}/node_modules"
-        if not os.path.isdir(src / nm) or os.path.islink(src / nm):
-            continue
+    for nm in package_parents(src, record_roots(inputs, src), max_files):
         pkgs = []
         for name in sorted(os.listdir(src / nm)):
             p = src / nm / name
@@ -1623,9 +1663,14 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
                 s["install"] = "node-gyp rebuild (implied by binding.gyp)"
             if s:
                 name = str(data.get("name", pkg))
-                record["dependencies"][f"{name}@{data.get('version', '?')}"] = {
-                    "path": rel, "scripts": s, "ran": "allowlisted" if name in allowed else "skipped"}
+                entry = record["dependencies"].setdefault(f"{name}@{data.get('version', '?')}", {
+                    "paths": [], "scripts": s, "ran": "allowlisted" if name in allowed else "skipped"})
+                entry["paths"].append(rel)  # one name@version can be installed at several paths (hoisted)
     return record
+
+
+def project_dirs(inputs: dict[str, str]) -> list[str]:
+    return sorted({os.path.dirname(rel) or "." for rel in inputs if Path(rel).name == "package.json"})
 
 
 def resolve_image_id(args) -> str:
@@ -1714,6 +1759,7 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     if "node_modules" not in dirs:
         raise Refused("the seed's install left no node_modules at the workspace root")
     check_links(src, runner.deadline)
+    check_seed_links(src, dirs, project_dirs(inputs), runner.deadline)
     limits = (args.max_files, args.max_work_mib * 2**20)
     digests = {nm: tree_digest(src / nm, *limits, runner.deadline)[0] for nm in sorted(dirs)}
     scripts = lifecycle_record(src, inputs, allowed, args.max_files)
@@ -1781,6 +1827,7 @@ def apply_node_seed(args, pristine: Path, deadline: float | None) -> dict:
         if tree_digest(dst, *limits, deadline)[0] != digest:
             raise Refused(f"--node-seed {seed_dir}: {nm} changed since the seed was built")
     check_links(pristine, deadline)
+    check_seed_links(pristine, sorted(modules), project_dirs(inputs), deadline)
     return {"seed": str(seed_dir), "lockfile_sha256": lock, "image_id": args.image_id,
             "node_modules": sorted(modules), "allow_build": seed.get("allow_build", [])}
 
