@@ -475,22 +475,42 @@ except ms.Refused as e:
 		return strings.TrimSpace(string(out))
 	}
 	const self = -1 // the test's own uid
-	assert.Contains(t, verdict(dirs["other-writable"], self), "is writable by its group or other users and not sticky")
+	other := os.Getuid() + 1
+	assert.Contains(t, verdict(dirs["other-writable"], self), "its parent directory "+dirs["other-writable"]+
+		" is writable by its group or other users and not sticky")
 	assert.Contains(t, verdict(dirs["group-writable"], self), "is writable by its group or other users and not sticky")
-	assert.Contains(t, verdict(dirs["own-0755"], os.Getuid()+1), fmt.Sprintf("is owned by uid %d and not sticky", os.Getuid()),
+	assert.Contains(t, verdict(dirs["own-0755"], other), fmt.Sprintf("is owned by uid %d:", os.Getuid()),
 		"a parent owned by another uid than the invoker's")
-	assert.Equal(t, "ok", verdict(dirs["sticky-shared"], self), "a sticky shared directory, as /tmp is")
-	assert.Equal(t, "ok", verdict(dirs["sticky-shared"], os.Getuid()+1), "sticky protects whoever owns it")
+	assert.Equal(t, "ok", verdict(dirs["sticky-shared"], self), "a sticky shared directory the invoker owns")
+	// The owner of a sticky directory can still rename its entries: one owned by another uid is refused.
+	assert.Contains(t, verdict(dirs["sticky-shared"], other), fmt.Sprintf("its parent directory %s is owned by uid %d:",
+		dirs["sticky-shared"], os.Getuid()))
 	assert.Equal(t, "ok", verdict(dirs["own-0700"], self))
 	assert.Equal(t, "ok", verdict(dirs["own-0755"], self))
 	assert.Contains(t, verdict(dirs["own-0700"], 0), "refuses to run as root")
+
+	// Every ancestor, not only the parent: a private parent under a writable, non-sticky directory is
+	// refused, naming that ancestor.
+	ancestor := mk("writable-ancestor", 0o777)
+	child := filepath.Join(ancestor, "private")
+	require.NoError(t, os.Mkdir(child, 0o700))
+	assert.Contains(t, verdict(child, self), "an ancestor of its parent directory "+ancestor+
+		" is writable by its group or other users and not sticky")
+	// A root-owned sticky ancestor (the real /tmp) passes, with the invoker's private directory below it.
+	tmp, err := filepath.EvalSymlinks("/tmp")
+	require.NoError(t, err)
+	under, err := os.MkdirTemp(tmp, "txe-8348-seed-parent-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(under) })
+	require.NoError(t, os.Chmod(under, 0o700))
+	assert.Equal(t, "ok", verdict(under, self), "a private directory under the root-owned sticky /tmp")
 
 	// Through the runner: the build is refused before any docker call.
 	f := newNodeFixture(t)
 	o := f.build(t, filepath.Join(dirs["other-writable"], "seed"))
 	require.Equal(t, 2, o.code, o.stdout+o.stderr)
-	assert.Contains(t, o.stderr, "put the seed in a directory only you can write")
-	_, err := os.Stat(f.log)
+	assert.Contains(t, o.stderr, "put the seed in a directory only you (or root) can write, all the way up")
+	_, err = os.Stat(f.log)
 	assert.True(t, os.IsNotExist(err), "refused before any docker call")
 }
 

@@ -1965,21 +1965,29 @@ def resolve_image_id(args) -> str:
 
 def check_seed_parent(parent: Path, euid: int) -> None:
     """The seed is written by pathname into a directory the build creates, so nobody else may be
-    able to rename or replace that directory under the runner (security review of a63cbc52): its
-    parent must be the invoker's own and writable by no group or other user, or sticky (as /tmp
-    is, where only an entry's owner can rename it). And the build never runs as root, whose
-    pathname writes would follow a link planted by any user."""
+    able to rename or replace that directory, or any directory above it, under the runner
+    (security reviews of a63cbc52 and d33fb7db). The parent and every ancestor up to / must be
+    owned by the invoker or root, and either writable by no group or other user, or sticky (as
+    /tmp is: only an entry's owner, or the directory's, can rename it, so the directory's owner
+    must be trusted too). And the build never runs as root, whose pathname writes would follow a
+    link planted by any user."""
     if euid == 0:
         raise Refused("--node-seed-build refuses to run as root: run it as an ordinary user")
-    try:
-        st = os.stat(parent)
-    except OSError as e:
-        raise Refused(f"--node-seed-build: cannot read its parent directory {parent}: {e}") from e
-    private = st.st_uid == euid and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    if not (private or st.st_mode & stat.S_ISVTX):
-        who = "owned by uid %d" % st.st_uid if st.st_uid != euid else "writable by its group or other users"
-        raise Refused(f"--node-seed-build {parent} is {who} and not sticky: another user could replace the seed "
-                      "directory while it is written; put the seed in a directory only you can write")
+    d = Path(parent)
+    while True:
+        try:
+            st = os.lstat(d)  # parent is a resolved path: no link to follow on the way up
+        except OSError as e:
+            raise Refused(f"--node-seed-build: cannot read {d}: {e}") from e
+        trusted = st.st_uid in (euid, 0)
+        if not (trusted and (not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or st.st_mode & stat.S_ISVTX)):
+            where = "its parent directory" if d == Path(parent) else "an ancestor of its parent directory"
+            who = f"owned by uid {st.st_uid}" if not trusted else "writable by its group or other users and not sticky"
+            raise Refused(f"--node-seed-build: {where} {d} is {who}: another user could replace the seed directory "
+                          "while it is written; put the seed in a directory only you (or root) can write, all the way up")
+        if d.parent == d:
+            return
+        d = d.parent
 
 
 def check_node_mode(args, forbidden: dict[str, Path]) -> None:
