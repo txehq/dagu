@@ -348,6 +348,19 @@ and process substitution, redirections, here-documents) and judges only what wou
   written to a file, comments, and interpreter code that only mentions the names (prints them,
   counts them, edits text that contains them). `mutate-sandboxed` itself, and the guard's own
   files (`mutant-run-guard`, `guard-hook.py`), are never refused.
+- **File-edit tools (TXE-8344).** Codex sends a patch to its hooks as
+  `{"tool_name": "apply_patch", "tool_input": {"command": "<patch>"}}`. That is the canonical name
+  in openai/codex rust-v0.171.0 `core/src/tools/hook_names.rs`, where `Write` and `Edit` are
+  matcher aliases that never reach the hook. A patch is file content, not a command, and read as
+  shell text its prose lines become programs (a line `+Mutant file ...` names a program
+  `+Mutant`). So a call whose harness-supplied `tool_name` is exactly `apply_patch` is not judged.
+  - **What stays judged as a command, as before:** the same text under any other name — `Bash`,
+    `exec_command`, `shell`, an unknown, missing or non-string name, or a case or spelling variant
+    such as `APPLY_PATCH` or `apply-patch`.
+  - **Never exempted:** nothing is exempt because of what the payload text looks like (a command
+    can begin with `*** Begin Patch`), and the hook registration's matcher is unchanged.
+  - **Limit:** a patch that writes a mutant script is allowed, because writing runs nothing.
+    Running that script afterwards is judged like any other command.
 
 The case lists in `mutate_test.go` (`guardRefused`, `guardAllowed`) hold the v3 rollout's
 acceptance cases and every false positive observed since, in their observed shape. The reader

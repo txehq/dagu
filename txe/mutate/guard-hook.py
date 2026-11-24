@@ -9,8 +9,9 @@ loud: a shell command that runs a mutation script or a mutation tool any other w
 It reads the hook input (Claude Code and Codex share the shape) on stdin, and for a refused
 command exits 2 with the reason on stderr, which both harnesses feed back to the agent. It prints
 nothing and exits 0 for anything else, including hook input that is not JSON or carries no shell
-command. A command it cannot judge fails closed: nesting deeper than MAX_DEPTH levels, or an
-internal error, is refused.
+command, and a call from a file-edit tool named exactly in FILE_EDIT_TOOLS by the harness (Codex's
+apply_patch; TXE-8344), whose payload is file content. A command it cannot judge fails closed:
+nesting deeper than MAX_DEPTH levels, or an internal error, is refused.
 
 The command is read the way a shell reads it (quotes, escapes, pipelines, lists, subshells,
 command and process substitution, redirections and here-documents), and only what a shell would
@@ -60,6 +61,13 @@ SCRIPT_EXT = re.compile(r"\.(?:py|sh|bash|zsh|go|js|mjs|ts|rb|pl)$", re.I)
 ALLOWED = re.compile(r"^mutate-sandboxed(?:\.py)?$")
 # The guard's own files: running them tests the guard, it is not a mutation run.
 GUARD_FILES = {"mutant-run-guard", "guard-hook.py"}
+# Harness-supplied tool names of file-edit tools: their payload is file content and runs nothing
+# (TXE-8344). Codex sends a patch as {"tool_name": "apply_patch", "tool_input": {"command":
+# "<patch>"}} (openai/codex rust-v0.171.0: core/src/tools/hook_names.rs, where Write and Edit are
+# matcher aliases only, and core/src/tools/handlers/apply_patch.rs). Matched exactly, never by
+# payload text: a shell or exec tool, an unknown, missing or non-string name, or a case variant
+# is judged as a command.
+FILE_EDIT_TOOLS = frozenset({"apply_patch"})
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=")
 VARIABLE = re.compile(r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$")
 
@@ -1246,7 +1254,11 @@ def refuses(command: str, depth: int = 0, outer=None) -> bool:
 def command_of(data: dict):
     """The shell command a tool call runs, or None. Claude's Bash and Codex's shell tools carry
     it as tool_input.command or tool_input.cmd, as a string or an argv list (quoted back into one
-    command line, so `["bash", "-lc", "python3 x.py"]` keeps its code string whole)."""
+    command line, so `["bash", "-lc", "python3 x.py"]` keeps its code string whole). A call whose
+    harness-supplied tool_name is exactly a file-edit tool carries file content, not a command."""
+    tool_name = data.get("tool_name")
+    if isinstance(tool_name, str) and tool_name in FILE_EDIT_TOOLS:
+        return None
     tool_input = data.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
