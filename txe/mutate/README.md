@@ -234,6 +234,169 @@ sandbox so a mutant does not rebuild from nothing; `--no-warm-gocache` gives eac
 The sandbox sets `GOFLAGS=-modcacherw -count=1`, so that copied cache never replays a cached test
 result: every baseline and mutant run executes its tests.
 
+## JavaScript trees: the node seed (TXE-8348)
+
+A pnpm workspace's `node_modules` on a Mac holds macOS binaries (esbuild, rollup, rolldown,
+lightningcss), and a run's container is Linux with no network, so vitest cannot start in it. The
+copy never takes the host's `node_modules` (it is a default `--exclude`). Instead a Linux
+`node_modules` is built once, with network, and copied into every run's tree:
+
+```sh
+# once per lockfile, with network (the seed's install only)
+mutate-sandboxed --node-seed-build /abs/new-seed-dir --tree okr/web --image sha256:<node+pnpm image id>
+# every run, offline as always
+mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image sha256:<same id> \
+  --mutants mutants.json -- sh -c 'cd apps/web && exec node_modules/.bin/vitest run src/format.test.ts'
+```
+
+- **A JavaScript tree without a seed is refused.** A tree with a `package.json` or a
+  `pnpm-lock.yaml` at its root, given neither `--node-seed` nor `--no-node-seed`, is refused (exit
+  2) before any docker call, with the commands above in the message: unseeded, every run would fail
+  for want of a `node_modules`. `--no-node-seed` runs it as it is (a command that needs no
+  `node_modules`). Trees with no root `package.json` or `pnpm-lock.yaml` are unaffected. Pass
+  `--no-seed` too: a JavaScript tree has no `go.mod` for the Go module seed.
+- **The build** (`--node-seed-build DIR`, DIR new, its parent existing, outside the live tree, the
+  caches, GOPATH and the Docker socket; inside HOME is allowed) runs ONE container with
+  `--node-seed-network` (default `bridge`). Every other bound of a run applies to it: no Docker
+  socket, no capabilities, read-only root, the memory, CPU, process, time, output and disk bounds,
+  the host checks after it, owner-checked removal. It takes no command, no mutants, no
+  `--diagnostic` and no `--ro-mount`, and does not run the Go module seed.
+- **The seed is data, not code from the tree.** The install's `/work/src` holds only the
+  workspace's manifests: the root's `pnpm-lock.yaml`, `pnpm-workspace.yaml` and `.npmrc` (when
+  present) and every `package.json`; no source file, no `.pnpmfile.cjs`. Its command is the
+  runner's own, recorded in `seed.json` (`script`) and in `install.log` (`set -x`):
+
+  ```sh
+  pnpm --version
+  pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --package-import-method=copy \
+    --config.manage-package-manager-versions=false --store-dir="$MUTATE_NODE_STORE" --reporter=append-only
+  # only with --node-seed-allow-build NAME (repeatable):
+  pnpm rebuild -r --config.dangerously-allow-all-builds=true --config.ignore-pnpmfile=true \
+    --config.manage-package-manager-versions=false --store-dir=... --reporter=append-only NAME...
+  ```
+
+  The rebuild carries the install's pnpmfile and package-manager settings. It rejects the
+  `--ignore-pnpmfile` flag, and `--config.ignore-pnpmfile=true` kept a `.pnpmfile.cjs` unloaded
+  where the same rebuild without it loaded one (pnpm 10.33.0, measured). The install's other
+  flags do not apply to a rebuild: it resolves nothing, imports nothing, and running the named
+  packages' scripts is its purpose. The rebuild has network too: an allowlisted script can
+  download code (esbuild's install script fetches a binary when its platform package is missing)
+  and runs it inside the container.
+
+  `--ignore-scripts` disables every lifecycle script, the workspace's own and every dependency's.
+  `--node-seed-allow-build NAME` is the reviewed allowlist: after the install, `pnpm rebuild`
+  runs the install scripts of exactly the packages named. A name must be an npm package name, and
+  names reach the container as arguments, never as script text. pnpm 10's build policy blocks even
+  a named rebuild of a package the workspace has not approved, silently; with
+  `dangerously-allow-all-builds` the named rebuild ran exactly the named packages (measured with
+  pnpm 10.33.0 on 2026-11-24: a second package's postinstall and the workspace's own stayed unrun).
+  `-r` is what reaches a package that only a workspace project (say `apps/web`) depends on: run at
+  the root without it, the rebuild ran nothing there (same pnpm, same day; found in review).
+  Because the rebuild selects by name, a name equal to a workspace project's own `name` is refused
+  before the container starts (that project's scripts are tree code), and a name that no installed
+  dependency has is refused after the install (its rebuild would run nothing, silently), with no
+  seed written. `lifecycle_scripts` records each package by name and version, with the scripts of
+  every path it is installed at (`paths`: path to scripts), so copies at two paths cannot hide one
+  another's scripts.
+  Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
+  rolldown, lightningcss) need no script: the Linux container installs the Linux one.
+- **What ran is recorded.** After the install the host reads every installed package's
+  `package.json` (bounded, link-free, not executed) and records in `seed.json`
+  `lifecycle_scripts`: each workspace project's own lifecycle scripts (`workspace_skipped`) and
+  each dependency with a `preinstall`, `install` or `postinstall` script, or a `binding.gyp`
+  (`node-gyp rebuild`), marked `allowlisted` or `skipped`. The build's last line names both lists.
+- **A closed set of configurations.** The seed supports exactly the pnpm configuration and layout
+  it was built and tested for, okr/web's (txehq/txe main `b002c1d0`, 2026-11-24), and refuses
+  anything else by name, before the build's container starts and again before a seed is applied.
+  It never quietly builds a different seed (`check_node_config`):
+  - no `.npmrc` setting (comments only);
+  - `pnpm-workspace.yaml` keys `packages`, `overrides` and `ignoredBuiltDependencies` only;
+  - `pnpm-lock.yaml` version `'9.0'`, sections `lockfileVersion`, `settings`, `overrides`,
+    `importers`, `packages` and `snapshots` only, and settings exactly `autoInstallPeers: true`
+    and `excludeLinksFromLockfile: false`;
+  - both YAML files are parsed whole by a small grammar, the block style pnpm writes (`key: value`,
+    `key:` over an indented block, `- scalar` items, bare or single-quoted). Duplicate keys,
+    double quotes, anchors, aliases, tags, block scalars, tabs and trailing comments are refused,
+    never guessed;
+  - every NESTED entry is matched whole (root's review): `overrides` (in both files) map a plain
+    package name to a registry version or range, or an `npm:` alias; workspace `packages` are
+    relative globs inside the tree (no absolute path and no `..`, after an optional `!`); every lockfile `packages` entry is a registry `name@version` whose
+    `resolution` is `{integrity: sha512-...}` only, with fields from `engines`, `hasBin`,
+    `peerDependencies`, `peerDependenciesMeta`, `cpu`, `os` and `libc`; every snapshot key and
+    dependency version is a registry version (with pnpm's peer suffix) or an `npm:` alias's
+    target; every importer is a workspace project, each dependency exactly `specifier` and
+    `version`, and the only `link:` is a `workspace:*` dependency's version naming a workspace
+    project. So `file:`, `link:`, tarball, directory, git and URL forms are refused wherever they
+    appear (`TestNodeConfigClosedSet` has a negative control for each route);
+  - manifest fields that pnpm's install reads, limited to those the tested layout uses (`name`,
+    `version`, `private`, `type`, `scripts`, `engines`, `packageManager`, `dependencies`,
+    `devDependencies`, `peerDependencies`, `bin`), plus fields the install never reads (`exports`,
+    `main`, `types`, `files`, `description`, `license` and the like). So `pnpm`,
+    `dependenciesMeta`, `optionalDependencies`, `peerDependenciesMeta`, bundled dependencies,
+    `publishConfig`, `directories` and `workspaces` are refused;
+  - dependency specifiers that are a registry version, range or dist-tag (no `:` or `/`),
+    `workspace:*`, or an `npm:` alias of a registry version. So `file:`, `link:`, git, URL and
+    GitHub forms, and other `workspace:` ranges, are refused.
+
+  Supporting more is a reviewed change to these lists and their tests (`TestNodeConfigClosedSet`
+  checks okr/web's configuration surface and each refusal). The checks below stay as a second line.
+- **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused; each is
+  opened no-follow and non-blocking and must be a regular file, so a FIFO the container left is
+  refused, never waited on), no special file, a root `node_modules`, and every link in the seeded
+  `node_modules` resolving inside one of them or to exactly a workspace project's directory. The
+  tree's `.npmrc` or `pnpm-workspace.yaml` can move pnpm's layout (`virtual-store-dir`,
+  `modules-dir`), and only `node_modules` is copied, so a layout that puts packages elsewhere is
+  refused instead of leaving dangling links (found in review). The lifecycle record finds packages
+  under any `node_modules` directory, so `node-linker=hoisted` is recorded too. A workspace
+  package that pnpm injects (`injectWorkspacePackages`, `dependenciesMeta.injected`) is a copy of
+  its source, which a manifest-only install cannot have, so a seed with one is refused: an installed
+  package directory whose name is a project's and whose `package.json` is that project's, byte for
+  byte. A linked workspace package is a symlink and is fine, and so is a published release with a
+  project's name (its own `package.json`). A workspace package with a `bin` (or `directories.bin`)
+  that another project depends on is refused before the container starts: its bin points at source
+  the install does not have, so pnpm links no shim, with only a warning (found in review). It copies each
+  project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
+  entry's type, name, size and content, each file's execute bits, and every link's target), and
+  writes `seed.json` last. A setuid or setgid file is refused: exported with its mode, it would be a
+  privilege a script inside the container planted on the host.
+  An install that fails is exit 2, its log kept in the work directory, and no seed is written.
+- **The run** (`--node-seed DIR`) refuses, before any container, a seed whose `pnpm-lock.yaml`
+  sha256 differs from the tree's (the key), whose manifests differ (each one named), whose image
+  id differs from `--image`'s (native packages depend on the image's platform and libc), or
+  whose `node_modules` no longer hash as recorded. It copies the seed into the tree copy once, and
+  hashes the copy, not the seed, so what runs is what was checked; each run then copies that tree as
+  any run does. Runs are unchanged otherwise: `--network` (default `none`), the one `/work` mount
+  (the seed is copied, never mounted). Node runs also get `XDG_DATA_HOME`, `XDG_STATE_HOME` and
+  `npm_config_cache` under `/work/sandbox`; HOME stays unset.
+- **The image, by its immutable id.** Node runs (the build and every run with `--node-seed`)
+  resolve `--image` to its id once, at the start, and launch every container by that id, never by
+  the tag: a tag retargeted while a run is in progress cannot swap the image the seed was built
+  with or a mutant runs in (root's review), and a tag that moved before a run starts resolves to
+  another id, which the seed refuses. The id is resolved before the declared-volume check, and
+  that check reads the same id, so a tag retargeted between the two inspections cannot admit
+  another image's volumes. The image needs node and pnpm on its PATH for any uid (the
+  container runs as yours). A pnpm
+  bin shim records absolute paths under `/work/src`, which is where both the install and every run
+  see the tree, so `node_modules/.bin/vitest` works in each run.
+- **Where the seed is written: screening, not a guarantee.** The seed is written by pathname, so
+  the build screens where it writes (`check_seed_parent`):
+  - it refuses to run as root;
+  - the destination's parent and every ancestor up to `/` must be owned by you or root, and
+    either writable by no group or other user, or sticky (a sticky directory owned by you or
+    root, as `/tmp` is);
+  - the build requests mode 0700 when it creates the seed directory (`make_seed_dir`); the umask
+    can only remove further bits, never add group or other access. The mode is never widened.
+
+  That is screening by owner uid, POSIX mode bits and the sticky bit. It does not show that
+  nobody else can write there. Not examined: ACLs and other non-mode permissions, and pathname
+  changes made while the build runs. A process of your own uid is trusted. **Prerequisite:** no
+  untrusted party has effective ACL write or delete rights on those directories. Run the seed
+  build in directories only you control. Writing the seed relative to a pinned descriptor,
+  which closes this class, is TXE-8385.
+- **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
+  the registry; `--frozen-lockfile` binds it to the lockfile's integrity hashes. A mutant of a
+  `package.json` or the lockfile runs against the seed of the unmutated one.
+
 ## Limits
 
 - Tests that need `.git` in the tree, network access or a host service do not run unchanged.

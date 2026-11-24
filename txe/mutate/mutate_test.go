@@ -86,6 +86,20 @@ if args[:2] == ["image", "inspect"] and args[-1] == "missing":
     sys.exit(1)
 if args[:2] == ["image", "inspect"] and "slowinspect" in args[-1]:
     time.sleep(30)
+if args[:2] == ["image", "inspect"] and os.path.exists(LOG + ".voltag"):
+    # The tag named in LOG.voltag names image A (no volume) until its first inspection, of either
+    # kind, and image B (which declares a volume) from then on: a tag retargeted between two reads.
+    tag = open(LOG + ".voltag").read()
+    moved = os.path.exists(LOG + ".retag")
+    open(LOG + ".retag", "a").close()
+    a, b = ("sha256:" + hashlib.sha256(x.encode()).hexdigest() for x in (tag, tag + "@retargeted"))
+    image = (b if moved else a) if args[-1] == tag else args[-1]
+    print(image if "{{.Id}}" in args else ('{"/data":{}}' if image == b else "null"))
+    sys.exit(0)
+if args[:2] == ["image", "inspect"] and "{{.Id}}" in args:  # an image's id: a hash of its name
+    # With LOG.retag present the tag names another image, as a retargeted tag would.
+    print("sha256:" + hashlib.sha256((args[-1] + ("@retargeted" if os.path.exists(LOG + ".retag") else "")).encode()).hexdigest())
+    sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     print('{"/data":{}}' if "volimage" in args[-1] else "null")
     sys.exit(0)

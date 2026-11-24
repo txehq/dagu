@@ -926,7 +926,7 @@ class Repository(unittest.TestCase):
         self.assertEqual(classified, {"txe/mutate/fixture-demo.py", "txe/mutate/mutate-sandboxed.py"})
         evidence = {  # each row's owner_ack and review_evidence, bound to that file's reviewed bytes
             "txe/mutate/fixture-demo.py": ("msg_47e1330eb699", "msg_8aa61a2eb4f7"),
-            "txe/mutate/mutate-sandboxed.py": ("msg_4d5a1be7bc6b", "msg_ff5c217159b5"),
+            "txe/mutate/mutate-sandboxed.py": ("msg_15b9f6cb6ce5", "msg_00959f1a2c75"),
         }
         for r in [x.split("\t") for x in reg.splitlines()[1:]]:
             self.assertEqual((r[8], r[9]), evidence[r[1]], r[1])
