@@ -1441,6 +1441,110 @@ DEPENDENCY_SCRIPTS = ("preinstall", "install", "postinstall")
 JSON_CAP = 1 << 20
 
 
+# The closed set (TXE-8348): the pnpm configuration and layout features the seed was built and
+# tested for, okr/web's on 2026-11-24. Anything else is refused by name, at build and at apply,
+# never built into a different seed. Supporting more is a reviewed change to these lists and
+# their tests.
+WORKSPACE_KEYS = {"packages", "overrides", "ignoredBuiltDependencies"}
+LOCKFILE_KEYS = {"lockfileVersion", "settings", "overrides", "importers", "packages", "snapshots"}
+LOCKFILE_VERSIONS = {"'9.0'"}
+LOCKFILE_SETTINGS = {"autoInstallPeers": "true", "excludeLinksFromLockfile": "false"}
+# Manifest keys pnpm's install reads that the tested layout uses, and keys the install never reads.
+MANIFEST_KEYS = {"name", "version", "private", "type", "scripts", "engines", "packageManager", "dependencies",
+                 "devDependencies", "peerDependencies", "bin",
+                 "description", "license", "author", "contributors", "repository", "homepage", "bugs", "keywords",
+                 "main", "module", "types", "typings", "files", "exports", "imports", "sideEffects", "browser"}
+DEPENDENCY_FIELDS = ("dependencies", "devDependencies", "peerDependencies")
+# A registry version, range or dist-tag (no ':' or '/', so no file:, link:, git, URL or GitHub
+# shorthand), `workspace:*`, or an npm alias of a registry version.
+SPEC_RANGE = re.compile(r"^[0-9A-Za-z.^~<>=| *+-]+$")
+SPEC_ALIAS = re.compile(r"^npm:(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*@[0-9A-Za-z.^~<>=| *+-]+$")
+CONFIG_CAP = 64 << 20
+
+
+def config_text(root: Path, rel: str) -> str:
+    p = plain_target(root, rel)
+    try:
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise Refused(f"cannot open {rel}: {e}") from e
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise Refused(f"{rel} is not a regular file")
+        raw = f.read(CONFIG_CAP + 1)
+    if len(raw) > CONFIG_CAP:
+        raise Refused(f"{rel} is over {CONFIG_CAP} bytes")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused(f"{rel} is not UTF-8") from None
+
+
+def yaml_top_keys(text: str, rel: str) -> dict[str, list[str]]:
+    """The top-level keys of a block-style YAML mapping, each with its indented lines. Read by a
+    deliberately small grammar: a line is blank, a comment, indented (part of the key above it),
+    or `key:` (optionally followed by a plain value) at column 0. Anything else (flow style, a
+    document marker, a directive, an anchor or a merge key at the top) is refused, never guessed."""
+    keys: dict[str, list[str]] = {}
+    current = None
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t":
+            if current is None:
+                raise Refused(f"{rel}:{n}: an indented line before any top-level key")
+            keys[current].append(line)
+            continue
+        m = re.fullmatch(r"([A-Za-z][A-Za-z0-9_-]*):(?:\s+(.*))?", line)
+        if not m or (m.group(2) or "").startswith(("&", "*", "!", "{", "[", "|", ">")):
+            raise Refused(f"{rel}:{n}: {line[:80]!r} is outside the YAML the seed reads (block mappings only)")
+        current = m.group(1)
+        if current in keys:
+            raise Refused(f"{rel}:{n}: {current} is given twice")
+        keys[current] = [m.group(2)] if m.group(2) else []
+    return keys
+
+
+def check_node_config(root: Path, inputs: dict[str, str]) -> None:
+    """Refuse a workspace whose pnpm configuration or layout is outside the closed set above."""
+    def refuse(where: str, what: str) -> None:
+        raise Refused(f"{where}: {what} is outside the pnpm configuration the node seed supports (TXE-8348: "
+                      "okr/web's, as tested); supporting it is a reviewed change to the runner")
+    if ".npmrc" in inputs:
+        for n, line in enumerate(config_text(root, ".npmrc").splitlines(), 1):
+            if line.strip() and not line.lstrip().startswith(("#", ";")):
+                refuse(f".npmrc:{n}", f"the setting {line.strip()[:60]!r} (no .npmrc setting is supported)")
+    if "pnpm-workspace.yaml" in inputs:
+        for key in yaml_top_keys(config_text(root, "pnpm-workspace.yaml"), "pnpm-workspace.yaml"):
+            if key not in WORKSPACE_KEYS:
+                refuse("pnpm-workspace.yaml", f"the setting {key!r}")
+    lock = yaml_top_keys(config_text(root, "pnpm-lock.yaml"), "pnpm-lock.yaml")
+    for key in lock:
+        if key not in LOCKFILE_KEYS:
+            refuse("pnpm-lock.yaml", f"the section {key!r}")
+    if lock.get("lockfileVersion") not in [[v] for v in LOCKFILE_VERSIONS]:
+        refuse("pnpm-lock.yaml", f"lockfileVersion {lock.get('lockfileVersion')}")
+    for line in lock.get("settings", []):
+        m = re.fullmatch(r"  ([A-Za-z]+):\s+(\S+)", line)
+        if not m or LOCKFILE_SETTINGS.get(m.group(1)) != m.group(2):
+            refuse("pnpm-lock.yaml settings", f"{line.strip()!r}")
+    for rel in inputs:
+        if Path(rel).name != "package.json":
+            continue
+        m = read_json_file(root, rel)
+        for key in m:
+            if key not in MANIFEST_KEYS:
+                refuse(rel, f"the field {key!r}")
+        for field in DEPENDENCY_FIELDS:
+            deps = m.get(field, {})
+            if not isinstance(deps, dict):
+                refuse(rel, f"a non-object {field}")
+            for dep, spec in deps.items():
+                if not isinstance(spec, str) or not (spec == "workspace:*" or SPEC_RANGE.fullmatch(spec)
+                                                     or SPEC_ALIAS.fullmatch(spec)):
+                    refuse(rel, f"the {field} specifier {dep}: {spec!r}")
+
+
 def is_node_tree(tree: Path) -> bool:
     return any(os.path.lexists(tree / n) for n in NODE_TREE_MARKERS)
 
@@ -1518,6 +1622,11 @@ def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | 
                 finally:
                     os.close(sub)
             elif stat.S_ISREG(st.st_mode):
+                if st.st_mode & (stat.S_ISUID | stat.S_ISGID):
+                    # A setuid or setgid file would be exported with its mode (copy2), owned by the
+                    # runner's uid: a privilege a script inside the container could plant on the host.
+                    raise Refused(f"{root}: {rel.decode(errors='replace')} is setuid or setgid "
+                                  f"(mode {oct(stat.S_IMODE(st.st_mode))}); a seed never holds one")
                 h, n = hashlib.sha256(), 0
                 with os.fdopen(open_regular_at(fd, name), "rb") as f:
                     while chunk := f.read(1 << 20):
@@ -1731,6 +1840,7 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     """--node-seed-build: one container, with network, installs the workspace's node_modules from
     its manifests alone; the host checks the result and writes the seed directory."""
     inputs = node_inputs(pristine, runner.deadline)
+    check_node_config(pristine, inputs)  # the closed set: refused before the container starts
     lock = inputs["pnpm-lock.yaml"]
     allowed = list(args.node_seed_allow_build)
     # `pnpm rebuild -r NAME` selects by name: a workspace project of that name would have its own
@@ -1837,6 +1947,7 @@ def apply_node_seed(args, pristine: Path, deadline: float | None) -> dict:
     if differ:
         raise Refused(f"--node-seed {seed_dir} was built from other manifests ({', '.join(differ[:10])} differ): "
                       "build a new seed with --node-seed-build")
+    check_node_config(pristine, inputs)  # the closed set, again: a seed is used only for a supported layout
     if seed.get("image_id") != args.image_id:
         raise Refused(f"--node-seed {seed_dir} was built with image {seed.get('image_id')}, and this run's image "
                       f"is {args.image_id}: native packages depend on the image; use that image or build a new seed")

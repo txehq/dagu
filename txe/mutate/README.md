@@ -296,6 +296,29 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   `lifecycle_scripts`: each workspace project's own lifecycle scripts (`workspace_skipped`) and
   each dependency with a `preinstall`, `install` or `postinstall` script, or a `binding.gyp`
   (`node-gyp rebuild`), marked `allowlisted` or `skipped`. The build's last line names both lists.
+- **A closed set of configurations.** The seed supports exactly the pnpm configuration and layout
+  it was built and tested for, okr/web's (txehq/txe main `b002c1d0`, 2026-11-24), and refuses
+  anything else by name, before the build's container starts and again before a seed is applied.
+  It never quietly builds a different seed (`check_node_config`):
+  - no `.npmrc` setting (comments only);
+  - `pnpm-workspace.yaml` keys `packages`, `overrides` and `ignoredBuiltDependencies` only;
+  - `pnpm-lock.yaml` version `'9.0'`, sections `lockfileVersion`, `settings`, `overrides`,
+    `importers`, `packages` and `snapshots` only, and settings exactly `autoInstallPeers: true`
+    and `excludeLinksFromLockfile: false`;
+  - both YAML files are read by a small grammar: block mappings, `key:` at column 0. Flow style,
+    anchors, tags and document markers at the top level are refused, never guessed;
+  - manifest fields that pnpm's install reads, limited to those the tested layout uses (`name`,
+    `version`, `private`, `type`, `scripts`, `engines`, `packageManager`, `dependencies`,
+    `devDependencies`, `peerDependencies`, `bin`), plus fields the install never reads (`exports`,
+    `main`, `types`, `files`, `description`, `license` and the like). So `pnpm`,
+    `dependenciesMeta`, `optionalDependencies`, `peerDependenciesMeta`, bundled dependencies,
+    `publishConfig`, `directories` and `workspaces` are refused;
+  - dependency specifiers that are a registry version, range or dist-tag (no `:` or `/`),
+    `workspace:*`, or an `npm:` alias of a registry version. So `file:`, `link:`, git, URL and
+    GitHub forms, and other `workspace:` ranges, are refused.
+
+  Supporting more is a reviewed change to these lists and their tests (`TestNodeConfigClosedSet`
+  checks okr/web's configuration surface and each refusal). The checks below stay as a second line.
 - **The host checks the result**: the manifests unchanged (a rewritten lockfile is refused; each is
   opened no-follow and non-blocking and must be a regular file, so a FIFO the container left is
   refused, never waited on), no special file, a root `node_modules`, and every link in the seeded
@@ -313,7 +336,8 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   the install does not have, so pnpm links no shim, with only a warning (found in review). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, each file's execute bits, and every link's target), and
-  writes `seed.json` last.
+  writes `seed.json` last. A setuid or setgid file is refused: exported with its mode, it would be a
+  privilege a script inside the container planted on the host.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.
 - **The run** (`--node-seed DIR`) refuses, before any container, a seed whose `pnpm-lock.yaml`
   sha256 differs from the tree's (the key), whose manifests differ (each one named), whose image

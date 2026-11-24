@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,6 +88,9 @@ elif args[0] == "install":
         os.symlink("/etc", "node_modules/escape")
     if "touchlock" in mode:
         open("pnpm-lock.yaml", "a").write("# rewritten\n")
+    if "setuid" in mode:  # an allowlisted script planting a setuid binary in the seed
+        write("node_modules/.bin/shell", "#!/bin/sh\n")
+        os.chmod("node_modules/.bin/shell", 0o4755)
     if "injected" in mode:  # injectWorkspacePackages: a copy of workspace project "web", manifest only
         pkg(store + "/web@file+apps+web/node_modules/web", {"name": "web"})
     if "published" in mode:  # a registry release named like workspace project "web": its own manifest
@@ -506,6 +510,150 @@ func TestNodeSeedWorkspaceBinRefused(t *testing.T) {
 	assert.Len(t, dockerRuns(t, f.log), before, "no container ran")
 }
 
+// okrWebConfig is okr/web's pnpm configuration surface on txehq/txe main b002c1d0 (2026-11-24):
+// pnpm-workspace.yaml and the lockfile's header verbatim, and every manifest field and dependency
+// specifier shape its six projects use. The lockfile body and the dependency list are not copied:
+// this repository is public, and they would list a private application's dependencies.
+var okrWebConfig = map[string]string{
+	"pnpm-workspace.yaml": "packages:\n  - packages/*\n  - apps/*\n\n" +
+		"# @axe-core/playwright accepts any playwright-core; pin it to the one\n" +
+		"# @playwright/test uses so there is a single Playwright in the workspace.\n" +
+		"overrides:\n  playwright-core: 1.62.1\n\n" +
+		"# @sentry/cli ships its binary as a per-platform optional dependency; its\n" +
+		"# install script only downloads the same binary when that is missing, and\n" +
+		"# needs the network. The build uses the packaged one (TXE-3424).\n" +
+		"ignoredBuiltDependencies:\n  - '@sentry/cli'\n",
+	"pnpm-lock.yaml": "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  excludeLinksFromLockfile: false\n\n" +
+		"overrides:\n  playwright-core: 1.62.1\n\nimporters:\n\n  .:\n    devDependencies:\n      typescript:\n" +
+		"        specifier: 5.9.3\n        version: 5.9.3\n\npackages:\n\n  typescript@5.9.3:\n" +
+		"    resolution: {integrity: sha512-x}\n    engines: {node: '>=14.17'}\n\nsnapshots:\n\n  typescript@5.9.3: {}\n",
+	"package.json": `{"name": "okr-web", "private": true, "version": "0.0.0", "type": "module", "packageManager": "pnpm@10.33.0",
+		"engines": {"node": "^22.18.0 || >=23.6.0"}, "scripts": {"test": "pnpm -r run test"},
+		"devDependencies": {"typescript": "5.9.3", "globals": "^16.0.0"}}`,
+	"apps/web/package.json": `{"name": "@okr/web", "private": true, "version": "0.0.0", "type": "module", "scripts": {"test": "vitest run"},
+		"dependencies": {"@okr/ui": "workspace:*", "rrweb": "2.0.0-alpha.20", "webreplay-css-tokenizer": "npm:@csstools/css-tokenizer@3.0.4"},
+		"devDependencies": {"vitest": "4.1.8"}}`,
+	"packages/ui/package.json": `{"name": "@okr/ui", "private": true, "version": "0.0.0", "type": "module", "scripts": {},
+		"exports": {".": "./src/index.ts"}, "sideEffects": false, "dependencies": {"@okr/calc": "workspace:*"},
+		"peerDependencies": {"react": "^19.0.0"}, "devDependencies": {"@types/react": "^19.0.0"}}`,
+}
+
+// nodeConfigVerdict writes files over okrWebConfig into a new tree and runs the runner's own
+// check_node_config on it: "ok" or the refusal's text.
+func nodeConfigVerdict(t *testing.T, files map[string]string) string {
+	t.Helper()
+	root := t.TempDir()
+	merged := map[string]string{}
+	maps.Copy(merged, okrWebConfig)
+	maps.Copy(merged, files)
+	for rel, text := range merged {
+		p := filepath.Join(root, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(text), 0o644))
+	}
+	prog := `
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+try:
+    ms.check_node_config(root, ms.node_inputs(root))
+    print("ok")
+except ms.Refused as e:
+    print(e)
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	require.NoError(t, err, string(out))
+	return strings.TrimSpace(string(out))
+}
+
+// The closed set: okr/web's configuration passes, and each setting or layout feature outside it
+// is refused by name, never built into a different seed.
+func TestNodeConfigClosedSet(t *testing.T) {
+	assert.Equal(t, "ok", nodeConfigVerdict(t, nil), "okr/web's configuration is the supported one")
+	const tail = "is outside the pnpm configuration the node seed supports"
+	lock := okrWebConfig["pnpm-lock.yaml"]
+	cases := map[string]struct {
+		files map[string]string
+		want  string
+	}{
+		"an .npmrc setting": {map[string]string{".npmrc": "# layout\nnode-linker=hoisted\n"},
+			".npmrc:2: the setting 'node-linker=hoisted' (no .npmrc setting is supported) " + tail},
+		"a workspace setting": {map[string]string{"pnpm-workspace.yaml": okrWebConfig["pnpm-workspace.yaml"] + "injectWorkspacePackages: true\n"},
+			"pnpm-workspace.yaml: the setting 'injectWorkspacePackages' " + tail},
+		"workspace flow style": {map[string]string{"pnpm-workspace.yaml": "{packages: [apps/*]}\n"},
+			"is outside the YAML the seed reads"},
+		"a workspace anchor": {map[string]string{"pnpm-workspace.yaml": "packages: &p\n  - apps/*\n"},
+			"is outside the YAML the seed reads"},
+		"a lockfile setting": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "  excludeLinksFromLockfile: false\n",
+			"  excludeLinksFromLockfile: false\n  injectWorkspacePackages: true\n", 1)},
+			"pnpm-lock.yaml settings: 'injectWorkspacePackages: true' " + tail},
+		"a lockfile setting's value": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "autoInstallPeers: true", "autoInstallPeers: false", 1)},
+			"'autoInstallPeers: false' " + tail},
+		"a lockfile section": {map[string]string{"pnpm-lock.yaml": lock + "\npatchedDependencies:\n  x: patches/x.patch\n"},
+			"pnpm-lock.yaml: the section 'patchedDependencies' " + tail},
+		"another lockfile version": {map[string]string{"pnpm-lock.yaml": strings.Replace(lock, "'9.0'", "'6.0'", 1)},
+			"lockfileVersion [\"'6.0'\"] " + tail},
+		"a pnpm field": {map[string]string{"package.json": `{"name": "okr-web", "pnpm": {"overrides": {}}}`},
+			"package.json: the field 'pnpm' " + tail},
+		"dependenciesMeta": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "dependenciesMeta": {"@okr/ui": {"injected": true}}}`},
+			"apps/web/package.json: the field 'dependenciesMeta' " + tail},
+		"optionalDependencies": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "optionalDependencies": {"x": "1.0.0"}}`},
+			"the field 'optionalDependencies'"},
+		"publishConfig": {map[string]string{"packages/ui/package.json": `{"name": "@okr/ui", "publishConfig": {"directory": "dist"}}`},
+			"the field 'publishConfig'"},
+		"a file: dependency": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "dependencies": {"x": "file:../vendor/x"}}`},
+			"the dependencies specifier x: 'file:../vendor/x' " + tail},
+		"a link: dependency": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "devDependencies": {"x": "link:../x"}}`},
+			"the devDependencies specifier x: 'link:../x'"},
+		"a GitHub dependency": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "dependencies": {"x": "user/repo"}}`},
+			"the dependencies specifier x: 'user/repo'"},
+		"another workspace range": {map[string]string{"apps/web/package.json": `{"name": "@okr/web", "dependencies": {"@okr/ui": "workspace:^"}}`},
+			"the dependencies specifier @okr/ui: 'workspace:^'"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, nodeConfigVerdict(t, c.files), c.want)
+		})
+	}
+}
+
+// A real workspace's configuration against the closed set, read only (nothing is installed or
+// run): set NODE_SEED_CONFIG_TREE to a pnpm workspace's root. Skipped when it is unset, as in CI,
+// which has no such tree (TXE-8348 ran it on an export of okr/web).
+func TestNodeConfigRealTree(t *testing.T) {
+	root := os.Getenv("NODE_SEED_CONFIG_TREE")
+	if root == "" {
+		t.Skip("NODE_SEED_CONFIG_TREE is unset")
+	}
+	prog := `
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+inputs = ms.node_inputs(root)
+ms.check_node_config(root, inputs)
+print("ok:", len(inputs), "inputs")
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), root).CombinedOutput()
+	require.NoError(t, err, string(out))
+	t.Log(strings.TrimSpace(string(out)))
+}
+
+// The closed set stops the build before its container: an unlisted setting writes no seed.
+func TestNodeSeedBuildRefusesUnlistedConfig(t *testing.T) {
+	f := newNodeFixture(t)
+	require.NoError(t, os.WriteFile(filepath.Join(f.tree, ".npmrc"), []byte("virtual-store-dir=.pnpm\n"), 0o644))
+	o := f.build(t, filepath.Join(f.root, "seed"))
+	require.Equal(t, 2, o.code, o.stdout+o.stderr)
+	assert.Contains(t, o.stderr, ".npmrc:1: the setting 'virtual-store-dir=.pnpm'")
+	assert.NoFileExists(t, filepath.Join(f.root, "seed", "seed.json"))
+	assert.Empty(t, dockerRuns(t, f.log), "no container ran")
+	assert.Nil(t, f.pnpmCalls(t))
+}
+
 // A seed build that cannot produce a sound seed writes none.
 func TestNodeSeedBuildRefusals(t *testing.T) {
 	cases := map[string]struct {
@@ -536,6 +684,10 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		"virtual store outside node_modules": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("outsidestore"), 0o644))
 		}, "outside every node_modules", true},
+		// A setuid file would keep its mode when exported, owned by the runner's uid.
+		"setuid file in the seed": {func(t *testing.T, f nodeFixture, _ string) {
+			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("setuid"), 0o644))
+		}, "node_modules: .bin/shell is setuid or setgid (mode 0o4755); a seed never holds one", true},
 		// An injected workspace package is a copy of its source, which a manifest-only install lacks.
 		"injected workspace package": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("injected"), 0o644))
