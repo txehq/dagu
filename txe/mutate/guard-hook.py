@@ -37,7 +37,8 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
   directory). With -i, the stdin read after the code is judged as a program. Whether Python code
   may run something is read from its code, never from its string literals or comments (TXE-8351):
   a backtick or `system` in replacement text an editing script writes is data. That holds only
-  for code Python receives exactly as written, that imports only text-handling modules and that
+  for code Python runs exactly as written (no shell expansion, no flag such as -x that changes the
+  source), that imports only text-handling modules (sys only through a few attributes) and that
   has no construct which can turn a string into a call (a dunder, a frame attribute, help(),
   sys.modules); anything else is judged on its full text, strings included.
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
@@ -664,7 +665,9 @@ PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|
                            r"multiprocessing|pty|importlib|exec_module|load_module|run_path|run_module|"
                            r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop|"
                            # os's process calls imported by name (`from os import execv, popen`).
-                           r"exec[lv]\w*|spawn[lv]\w*|posix_spawnp?|popen\w*)\b"
+                           r"exec[lv]\w*|spawn[lv]\w*|posix_spawnp?|popen\w*|"
+                           # sys calls that resolve a callable by name or run a file (TXE-8351 review).
+                           r"breakpointhook|remote_exec)\b"
                            r"|\bcode\s*\.\s*interact")
 # A coding declaration on line 1 or 2 makes Python decode a program read as bytes (stdin, a
 # here-document, a descriptor) differently from the text parsed here (utf-7 can hide code).
@@ -807,10 +810,12 @@ def _open_reads_only(node) -> bool:
 #
 # The view exists only when blanking a string cannot hide how a string becomes a call; otherwise
 # the code is judged on its full text, as before:
-# - Python receives the text as written (not "python-expanded"), it tokenizes and parses, and it
+# - Python runs the text as written (not "python-expanded": shell expansion, or an interpreter flag
+#   outside PY_VIEW_FLAGS, such as -x, which skips the first line), it tokenizes and parses, and it
 #   has no coding comment, \r or BOM (PY_CODING_COOKIE); the view is judged in NFKC form, the
 #   form in which Python reads identifiers;
-# - every import is of a module in PY_TEXT_MODULES, absolute;
+# - every import is of a module in PY_TEXT_MODULES, absolute, and sys is used only as
+#   `sys.<attr>` for an attribute in PY_SYS_ATTRS;
 # - in 3.11 and earlier an f-string is one STRING token, so a string with an f or t prefix is kept.
 # On the view, PY_RESOLVES also counts as run evidence: a dunder, a private attribute, a frame or
 # code attribute, help() (it imports a module by name) and sys.modules can each look up a callable
@@ -819,6 +824,16 @@ def _open_reads_only(node) -> bool:
 # its process calls is a name in the code, which CODE_RUNS or PY_EXTRA_RUNS sees.
 PY_TEXT_MODULES = frozenset({"os", "sys", "re", "json", "pathlib", "io", "shutil", "textwrap", "difflib",
                              "glob", "fnmatch", "hashlib", "tempfile"})
+# sys is a text module only through these attributes (TXE-8351 review): others resolve a callable
+# from a string or the environment (breakpointhook reads PYTHONBREAKPOINT="os.system"), run a file
+# (remote_exec) or reach other modules (modules, path, meta_path). The name sys may not be used any
+# other way (passed on, rebound, aliased to something that is).
+PY_SYS_ATTRS = frozenset({"argv", "stdin", "stdout", "stderr", "exit", "platform", "version",
+                          "version_info", "maxsize", "byteorder", "getdefaultencoding",
+                          "getfilesystemencoding"})
+# Interpreter flags that leave the source Python runs as written. Any other (-x skips the first
+# line; -X and -i are not modelled) means the view is not built (TXE-8351 review).
+PY_VIEW_FLAGS = frozenset("BbdEIOPqRsSuvW")
 PY_RESOLVES = re.compile(r"\b__\w+|\.\s*_\w*|\.\s*(?:f|gi|cr|ag|tb|co)_\w+|\b(?:help|modules|_getframe)\b")
 PY_BLANKED = {tokenize.COMMENT} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
                                    if hasattr(tokenize, n)}
@@ -839,17 +854,30 @@ def python_code_view(code: str):
 def _python_code_view(code: str):
     if PY_CODING_COOKIE.search(code):
         return None
-    for node in ast.walk(ast.parse(code)):
+    tree = ast.parse(code)
+    sys_names = {"sys"}  # names bound to the sys module: `import sys`, `import sys as s`
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules = [a.name for a in node.names]
+            sys_names.update(a.asname for a in node.names if a.asname and a.name.split(".")[0] == "sys")
         elif isinstance(node, ast.ImportFrom):
             if node.level or not node.module:
                 return None  # a relative import names no module this list can judge
             modules = [node.module]
+            if node.module == "sys" and any(a.name not in PY_SYS_ATTRS for a in node.names):
+                return None
         else:
             continue
         if any(m.split(".")[0] not in PY_TEXT_MODULES for m in modules):
             return None
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in sys_names:
+            parent = parents.get(node)
+            if not (isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in PY_SYS_ATTRS):
+                return None  # sys.breakpointhook, sys.modules, `m = sys`, f(sys), ...
+        if isinstance(node, ast.Attribute) and node.attr == "sys":
+            return None  # os.sys is the sys module by another path
     line_starts = [0] + [i + 1 for i, ch in enumerate(code) if ch == "\n"]
     view = list(code)
     for tok in tokenize.generate_tokens(io.StringIO(code).readline):
@@ -1081,7 +1109,11 @@ class Judge:
         the supported form: isolated (-I, plus only -B/-u), at the top level of the command (not
         inside eval, env -S, bash -c or go -exec), reached directly or through PY_CLEAR_WRAPPERS
         only, with no PYTHON* variable set. Anything else is "python-strict": the Python run-call
-        and path rules, never clearance (TXE-8183 review F1, F2)."""
+        and path rules, never clearance (TXE-8183 review F1, F2). A flag that may change the source
+        Python runs (-x skips its first line) makes it "python-expanded": judged on its full text,
+        strings included (TXE-8351 review)."""
+        if flags - PY_VIEW_FLAGS:
+            return "python-expanded"
         if (unsupported or "I" not in flags or not flags <= PY_CLEAR_FLAGS or self.depth != 0
                 or not set(self.via) <= PY_CLEAR_WRAPPERS
                 or any(n.startswith("PYTHON") for n in self.python_names())):
@@ -1129,7 +1161,8 @@ class Judge:
             j += 1
         if j < len(args) and args[j].text not in ("-", "/dev/stdin"):
             # A script operand (or a descriptor holding the program) is never a clearance form.
-            return (operand_is_mutant(args[j], cmd, False, self.depth, "python-strict")
+            lang = "python-expanded" if flags - PY_VIEW_FLAGS else "python-strict"
+            return (operand_is_mutant(args[j], cmd, False, self.depth, lang)
                     or self.interactive_stdin(flags, cmd))
         return stdin_is_mutant(cmd, False, self.depth, self.python_lang(flags, unsupported))
 
@@ -1138,7 +1171,7 @@ class Judge:
         code, module or script: that stdin is judged as a program too (TXE-8183 review F1)."""
         if "i" not in flags and "PYTHONINSPECT" not in self.python_names():
             return False
-        return stdin_is_mutant(cmd, False, self.depth, "python-strict")
+        return stdin_is_mutant(cmd, False, self.depth, "python-expanded" if flags - PY_VIEW_FLAGS else "python-strict")
 
     def other_interpreter(self, prog: str, args: list, cmd) -> bool:
         j = 0

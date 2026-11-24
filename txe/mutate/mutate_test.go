@@ -1245,6 +1245,17 @@ var dataWordsRefused = []string{
 	"python3 - <<'PY'\nimport timeit\ntimeit.timeit(\"exec(open('mutants.py').read())\", number=1)\nPY",
 	"python3 - <<'PY'\nimport os, string\nf = string.Formatter().get_field(\"0.system\", [os], {})[0]\nf(\"python3 mutants.py\")\nPY",
 	"python3 - <<'PY'\nimport operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
+	// Connector review of fd996e25 (P1): -x skips the first source line, so the opening quote is
+	// not code and the "string" runs. On stdin and on a descriptor operand, and -X, not modelled.
+	"python3 -x - <<'PY'\n\"\"\"\nimport os; os.system(\"python3 mutants.py\")\n# \"\"\"\nPY",
+	"python3 -x /dev/fd/3 3<<'PY'\n\"\"\"\nimport os; os.system(\"python3 mutants.py\")\n# \"\"\"\nPY",
+	"python3 -X utf8 - <<'PY'\nprint(\"`mutants.py`\")\nPY",
+	// Security review of fd996e25 (P2): sys.breakpointhook resolves the callable PYTHONBREAKPOINT
+	// names, so sys is a text module only through a few attributes.
+	`PYTHONBREAKPOINT=os.system python3 -c 'import sys; sys.breakpointhook("python3 mutants.py")'`,
+	"python3 - <<'PY'\nimport os, sys\nos.environ[\"PYTHONBREAKPOINT\"] = \"os.system\"\nsys.breakpointhook(\"python3 mutants.py\")\nPY",
+	`PYTHONBREAKPOINT=os.system python3 -c 'import os; os.sys.breakpointhook("python3 mutants.py")'`,
+	`PYTHONBREAKPOINT=runpy.run_path python3 -c 'from sys import breakpointhook as b; b("mutants.py")'`,
 	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
 	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
 	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).

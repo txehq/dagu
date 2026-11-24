@@ -351,12 +351,18 @@ and process substitution, redirections, here-documents) and judges only what wou
 
   The view is used only when blanking a string cannot hide how a string becomes a call. Otherwise
   the code is judged on its full text, as before. It needs all of these:
-  - Python receives the text exactly as written: not `"...$X..."`, an unquoted `<<EOF` or `$'...'`;
+  - Python runs the text exactly as written. That excludes shell-expanded text (`"...$X..."`, an
+    unquoted `<<EOF`, `$'...'`). It also excludes any interpreter flag outside `-BbdEIOPqRsSuvW`:
+    `-x` skips the first source line, and `-X` and `-i` are not modelled;
   - the code tokenizes and parses, with no coding comment, `\r` or BOM;
   - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
     `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
     such as `timeit`, `string`, `operator` or `pkgutil` can run a string or look up a callable by
     its name, so it keeps the strings;
+  - `sys` is used only as `sys.argv`, `sys.stdin`, `sys.stdout`, `sys.stderr`, `sys.exit` or a few
+    read-only facts. `sys.breakpointhook` resolves a callable named by `PYTHONBREAKPOINT`, and
+    `sys.modules` reaches any loaded module, so any other use keeps the strings. So do `os.sys`,
+    and `sys` passed on or rebound;
   - before Python 3.12 an f-string is one token, so an `f`/`t`-prefixed string is never blanked.
     From 3.12 only its literal text is blanked, and its `{...}` expressions are code.
 
