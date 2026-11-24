@@ -1275,6 +1275,11 @@ var dataWordsRefused = []string{
 	`X='");exec(open("mutants.py").read());#'; bash -c "python3 -c 'print(\"system mutants.py $X\")'"`,
 	`X='");exec(open("mutants.py").read());#'; eval "python3 -c 'print(\"system mutants.py $X\")'"`,
 	`env -S "python3 -c 'print(\"system mutants.py\")'"`,
+	// Connector review of 6f634fd2 (P1): an unquoted glob, brace or tilde lets the shell replace
+	// the source word (a file named like code becomes the program), so it is judged whole.
+	`python3 -c print\(\"exec\ mutants.py\ *\"\)`,
+	`python3 -c print\(\"exec\ mutants.py\ {a,b}\"\)`,
+	`python3 -c print\(\"exec\ mutants.py\"\)\ #?`,
 	// Local security review of 60e8ba9d: watch runs its words through sh -c, xargs -I rewrites
 	// them, sudo -s starts a shell. Only wrappers that exec their arguments unchanged keep the view.
 	`X='");exec(open("mutants.py").read());#'; watch -n 1 python3 -c "'print(\"system mutants.py $X\")'"`,

@@ -171,8 +171,9 @@ class Word:
     def __init__(self):
         self.text = ""
         self.procsub: "list[Cmd] | None" = None  # when the word is <(...) or >(...)
-        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks), so
-        # that `text` is not what the program receives (TXE-8183: such code is never cleared).
+        # Whether the shell expands anything in it ($VAR, ${...}, $(...), $((...)), backticks, and
+        # unquoted * ? [ { ~), so that `text` is not what the program receives (TXE-8183: such
+        # code is never cleared; TXE-8351: its strings are never blanked).
         self.expanded = False
 
 
@@ -206,6 +207,8 @@ class Cmd:
 
 REDIRECT = re.compile(r"(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:<<<|<<-|<<|<>|<&|>&|>>|>\||&>>|&>|<|>)")
 WORD_END = set(" \t\n;&|()<>")
+# Unquoted characters a shell expands into other text: pathname (* ? [), brace ({) and tilde (~).
+UNQUOTED_EXPANDING = set("*?[{~")
 
 
 class Parser:
@@ -436,6 +439,10 @@ class Parser:
             elif c in "$`":
                 w.text += self.substitution()
             else:
+                if c in UNQUOTED_EXPANDING:
+                    # Pathname, brace or tilde expansion can replace the word (`python3 -c
+                    # print\(\"x\ *\"\)` runs a file name as code), so it counts (TXE-8351 review).
+                    self.expansions += 1
                 w.text += c
                 self.i += 1
         w.expanded = self.expansions != start

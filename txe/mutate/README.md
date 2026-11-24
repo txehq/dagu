@@ -352,7 +352,9 @@ and process substitution, redirections, here-documents) and judges only what wou
   The view is used only when blanking a string cannot hide how a string becomes a call. Otherwise
   the code is judged on its full text, as before. It needs all of these:
   - Python runs the text exactly as written, and imports nothing it does not show. That excludes:
-    - shell-expanded text (`"...$X..."`, an unquoted `<<EOF`, `$'...'`);
+    - shell-expanded text (`"...$X..."`, an unquoted `<<EOF`, `$'...'`), including an unquoted
+      `*`, `?`, `[`, `{` or `~`. Pathname, brace or tilde expansion can replace the word, so a file
+      named like code becomes the program;
     - any interpreter flag outside `-BbdEIOPqRsSuv`: `-x` skips the first source line, `-W`
       imports a warning category's module, and `-X` and `-i` are not modelled;
     - a `PYTHON*` variable in the command (`PYTHONPATH`, `PYTHONWARNINGS`);
