@@ -1274,6 +1274,14 @@ var dataWordsRefused = []string{
 	`python3 -c 'import pathlib; pathlib.operator.methodcaller("system", "python3 mutants.py")(pathlib.os)'`,
 	"python3 - <<'PY'\nfrom pathlib import operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
 	`python3 -c 'import re; re.functools.partial(re.enum.sys.modules["os"].system, "python3 mutants.py")()'`,
+	// Local security review of a1b8495d: a module rebound or held hides which module an attribute
+	// reaches, and a long option's value hides `-m pytest` from the option scan.
+	"python3 - <<'PY'\nimport pathlib\np = pathlib\np.operator.methodcaller(\"system\", \"python3 mutants.py\")(p.os)\nPY",
+	"python3 - <<'PY'\nimport pathlib\n[pathlib][0].operator.methodcaller(\"system\", \"python3 mutants.py\")([pathlib][0].os)\nPY",
+	"python3 - <<'PY'\nimport os\nos.path.genericpath.os.system(\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport glob\nm = glob.fnmatch.os\nprint(\"exec mutants.py\")\nPY",
+	"sed -i 's/if !ok/if false/' tools/guard.py && python3 --check-hash-based-pycs always -m pytest # mutation 22",
+	"sed -i 's/if !ok/if false/' tools/guard.py && python3 --some-new-option value -m pytest # mutation 23",
 	// A source name built by concatenation or formatting still leaves a `.go` token for the reader
 	// (local security review of ab4d3c7b); only an extension split apart (`"." + "go"`) is a name
 	// assembled at run time, a documented limit.

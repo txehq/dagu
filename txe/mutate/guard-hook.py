@@ -913,15 +913,21 @@ def _python_code_view(code: str):
         elif isinstance(node, ast.ImportFrom) and any(a.name in stdlib for a in node.names):
             return None  # from pathlib import os
     for node in ast.walk(tree):
-        if (isinstance(node, ast.Attribute) and node.attr in stdlib and isinstance(node.value, ast.Name)
-                and node.value.id in bound_modules):
-            return None  # pathlib.operator, shutil.os
+        if isinstance(node, ast.Attribute) and node.attr in stdlib:
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and (root.id in bound_modules or root.id in sys_names):
+                return None  # pathlib.operator, shutil.os, os.path.genericpath.os, at any depth
     parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in sys_names:
+        if isinstance(node, ast.Name) and (node.id in sys_names or node.id in bound_modules):
+            # A module only as `module.attr` (sys only through PY_SYS_ATTRS): never rebound, passed
+            # on or held, so `p = pathlib; p.operator` cannot hide a module (local security review).
             parent = parents.get(node)
-            if not (isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in PY_SYS_ATTRS):
-                return None  # sys.breakpointhook, sys.modules, `m = sys`, f(sys), ...
+            if not (isinstance(parent, ast.Attribute) and parent.value is node
+                    and (node.id not in sys_names or parent.attr in PY_SYS_ATTRS)):
+                return None  # sys.breakpointhook, `m = sys`, `p = pathlib`, f(os), [os][0], ...
         if isinstance(node, ast.Attribute) and node.attr == "sys":
             return None  # os.sys is the sys module by another path
     line_starts = [0] + [i + 1 for i, ch in enumerate(code) if ch == "\n"]
@@ -1543,9 +1549,15 @@ def runs_tests(cmd: Cmd) -> bool:
             a = args[n]
             if not a.startswith("-") or a in ("-", "--"):
                 return False
-            if a.startswith("--"):
-                n += 1
+            if a == "--check-hash-based-pycs":
+                n += 2  # takes a separate value
                 continue
+            if a.startswith("--"):
+                # Another long option may take a value this reader does not know: fail closed on
+                # `-m pytest` anywhere after it (local security review of a1b8495d).
+                rest = args[n + 1:]
+                return any((b == "-m" and rest[i + 1:i + 2] == ["pytest"]) or b.endswith("mpytest")
+                           for i, b in enumerate(rest))
             for k in range(1, len(a)):
                 if a[k] == "c":
                     return False
