@@ -145,11 +145,18 @@ func newNodeFixture(t *testing.T) nodeFixture {
 // raw runs the runner with exactly these arguments, plus the fixture's fake caches and docker.
 func (f nodeFixture) raw(t *testing.T, args ...string) outcome {
 	t.Helper()
+	return f.launch(t, []string{"-I", "-B", script(t, "mutate-sandboxed.py")}, args...)
+}
+
+// launch is raw with the interpreter's arguments given: the runner's script, or a harness program
+// that loads it, patches it and calls its main with the remaining arguments.
+func (f nodeFixture) launch(t *testing.T, interp []string, args ...string) outcome {
+	t.Helper()
 	report := filepath.Join(f.root, "report.json")
 	_ = os.Remove(report)
-	all := append([]string{"-I", "-B", script(t, "mutate-sandboxed.py"), "--tree", f.tree,
+	all := append(append(interp, "--tree", f.tree,
 		"--shared-modcache", f.modcache, "--shared-gocache", f.gocache, "--workdir-root", f.workRoot,
-		"--docker", f.docker, "--report", report, "--timeout", "60"}, args...)
+		"--docker", f.docker, "--report", report, "--timeout", "60"), args...)
 	cmd := exec.Command(python(t), all...)
 	cmd.Env = append(os.Environ(), "MUTATE_TEST_CANARY=host-only-value")
 	var out, errb bytes.Buffer
@@ -518,7 +525,8 @@ except ms.Refused as e:
 // The seed directory is private from the moment it exists (root's review of 1ad1243e): it is made
 // with mode 0700 at creation, so a permissive umask (0002, 0000) cannot leave it writable by a
 // group peer before the first export write. Checked twice, in owned temporary fixtures:
-//   - make_seed_dir alone, under each umask, before anything is written into it;
+//   - open_seed_dir (make_seed_dir, then the verified descriptor) alone, under each umask, before
+//     anything is written into it;
 //   - a whole build under each umask: the published seed directory is still 0700.
 //
 // No test in this package runs in parallel, so the process umask set around a build is this test's.
@@ -532,8 +540,10 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
 ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
 os.umask(int(sys.argv[3], 8))
-d = ms.make_seed_dir(Path(sys.argv[2]))
-print(oct(stat.S_IMODE(os.lstat(d).st_mode)), len(os.listdir(d)))
+d = Path(sys.argv[2])
+parent = os.open(d.parent, os.O_RDONLY | os.O_DIRECTORY)
+fd = ms.open_seed_dir(parent, d.name)
+print(oct(stat.S_IMODE(os.fstat(fd).st_mode)), len(os.listdir(fd)))
 `
 			out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), dir,
 				fmt.Sprintf("%o", mask)).CombinedOutput()
@@ -550,6 +560,327 @@ print(oct(stat.S_IMODE(os.lstat(d).st_mode)), len(os.listdir(d)))
 			st, err := os.Lstat(seed)
 			require.NoError(t, err)
 			assert.Equal(t, os.FileMode(0o700), st.Mode().Perm(), "the published seed directory is never widened")
+		})
+	}
+}
+
+// seedHarness loads the runner, patches one step of the build to play an attacker, and runs main
+// with the rest of its arguments. argv: attack, target, moved, decoy, then the runner's arguments.
+//   - rename: once the seed directory is open, target (the seed directory or an ancestor) is renamed
+//     to moved, and a link to decoy takes its place: a pathname write would land in decoy.
+//   - after-screen: as soon as check_seed_parent has screened the parent, before anything else
+//     reads it, target (the parent) is renamed to moved and an empty directory takes its place.
+//   - before-open: after check_node_mode screens the parent, target (the parent) is renamed to
+//     moved and an empty directory takes its place, before the build opens it.
+//   - plant:NAME: once the seed directory is open, a link NAME -> decoy/NAME is planted in it.
+const seedHarness = `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+attack, target, moved, decoy = sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5])
+if attack == "after-screen":
+    screen = ms.check_seed_parent
+    def hooked_screen(parent, euid):
+        st = screen(parent, euid)
+        os.rename(target, moved)
+        os.mkdir(target, 0o700)
+        return st
+    ms.check_seed_parent = hooked_screen
+elif attack == "before-open":
+    check = ms.check_node_mode
+    def hooked_check(args, forbidden):
+        check(args, forbidden)
+        os.rename(target, moved)
+        os.mkdir(target, 0o700)
+    ms.check_node_mode = hooked_check
+else:
+    opened = ms.open_seed_dir
+    def hooked_open(parent_fd, name):
+        fd = opened(parent_fd, name)
+        if attack == "rename":
+            os.rename(target, moved)
+            os.symlink(decoy, target)
+        else:
+            planted = attack.removeprefix("plant:")
+            os.symlink(decoy / planted, target / planted)
+        return fd
+    ms.open_seed_dir = hooked_open
+sys.exit(ms.main(sys.argv[6:]))
+`
+
+func (f nodeFixture) attackedBuild(t *testing.T, attack, target, moved, decoy, seed string) outcome {
+	t.Helper()
+	return f.launch(t, []string{"-I", "-B", "-c", seedHarness, script(t, "mutate-sandboxed.py"), attack, target, moved, decoy},
+		"--node-seed-build", seed, "--image", "node-image")
+}
+
+// filesUnder lists every entry below dir, relative, with a trailing / for a directory.
+func filesUnder(t *testing.T, dir string) []string {
+	t.Helper()
+	var out []string
+	require.NoError(t, filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || p == dir {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		if d.IsDir() {
+			rel += "/"
+		}
+		out = append(out, rel)
+		return nil
+	}))
+	return out
+}
+
+// The seed is written relative to the descriptor of the directory the build created, never by
+// pathname (TXE-8385): a rename of the seed directory, of its parent or of a further ancestor while
+// the build writes moves every write with the directory, and none lands where the old pathname
+// now leads (a link to a decoy). The seed is whole where it moved: install.log, seed.json last,
+// and each node_modules checked against its digest through the same descriptor.
+func TestNodeSeedWritesFollowTheDescriptor(t *testing.T) {
+	for _, which := range []string{"seed", "parent", "ancestor"} {
+		t.Run(which, func(t *testing.T) {
+			f := newNodeFixture(t)
+			anc := filepath.Join(f.root, "a")
+			parent := filepath.Join(anc, "p")
+			require.NoError(t, os.MkdirAll(parent, 0o755))
+			seed := filepath.Join(parent, "seed")
+			decoy := filepath.Join(f.root, "decoy")
+			require.NoError(t, os.Mkdir(decoy, 0o700))
+			c := map[string]struct {
+				target, renameTo string // what is renamed, and to where
+				moved            string // where the seed directory is then
+				leads            string // where the seed's old pathname then leads, through the decoy link
+			}{
+				"seed":     {seed, filepath.Join(parent, "seed-moved"), filepath.Join(parent, "seed-moved"), decoy},
+				"parent":   {parent, filepath.Join(anc, "p-moved"), filepath.Join(anc, "p-moved", "seed"), filepath.Join(decoy, "seed")},
+				"ancestor": {anc, filepath.Join(f.root, "a-moved"), filepath.Join(f.root, "a-moved", "p", "seed"), filepath.Join(decoy, "p", "seed")},
+			}[which]
+			moved := c.moved
+			// The decoy holds the directories a pathname write would need, empty: a write there would show.
+			require.NoError(t, os.MkdirAll(c.leads, 0o700))
+			before := filesUnder(t, decoy)
+
+			o := f.attackedBuild(t, "rename", c.target, c.renameTo, decoy, seed)
+			require.Equal(t, 0, o.code, o.stdout+o.stderr)
+			assert.Equal(t, before, filesUnder(t, decoy), "no write followed the old pathname")
+			got := readSeed(t, moved)
+			assert.ElementsMatch(t, []string{"node_modules", "apps/web/node_modules"}, keys(got["node_modules"]))
+			assert.Equal(t, sha256File(t, filepath.Join(moved, "install.log")), got["install_log_sha256"])
+			assert.FileExists(t, filepath.Join(moved, "tree", "node_modules", ".pnpm", "leftpad@1.0.0", "node_modules",
+				"leftpad", "index.js"))
+			link, err := os.Readlink(filepath.Join(moved, "tree", "apps", "web", "node_modules", "leftpad"))
+			require.NoError(t, err)
+			assert.Equal(t, "../../../node_modules/.pnpm/leftpad@1.0.0/node_modules/leftpad", link)
+			st, err := os.Lstat(moved)
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o700), st.Mode().Perm())
+		})
+	}
+
+	// Replaced between the screening and the open: the build refuses, and writes nothing anywhere.
+	// after-screen swaps it the moment the screen returns, before any later read of the parent
+	// could take the replacement as the identity to require (root's review of 2837c048).
+	for _, attack := range []string{"after-screen", "before-open"} {
+		t.Run("parent replaced "+attack, func(t *testing.T) {
+			f := newNodeFixture(t)
+			parent := filepath.Join(f.root, "p")
+			require.NoError(t, os.Mkdir(parent, 0o755))
+			moved := filepath.Join(f.root, "p-moved")
+			o := f.attackedBuild(t, attack, parent, moved, filepath.Join(f.root, "unused"), filepath.Join(parent, "seed"))
+			require.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, "is no longer the directory screened at the start (it or an ancestor was renamed)")
+			assert.Empty(t, filesUnder(t, parent))
+			assert.Empty(t, filesUnder(t, moved))
+		})
+	}
+}
+
+// Every descriptor the seed writer opens is closed when a write is refused (root's review of
+// 2837c048): the source file when copy_dir_at's exclusive create of its destination is refused
+// before a byte is read, the install log and the seed directory when write_seed's install.log is
+// refused, and the parent when open_seed_parent refuses it. Each case compares this process's
+// open descriptors (/dev/fd) before and after the refusal.
+func TestNodeSeedWriterClosesDescriptorsOnRefusal(t *testing.T) {
+	prog := `
+import importlib.util, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+root = Path(sys.argv[2])
+def fds():
+    return sorted(int(n) for n in os.listdir("/dev/fd") if os.path.exists(f"/dev/fd/{n}"))
+def case(name, fn):
+    before = fds()
+    try:
+        fn()
+        print(name, "NOT REFUSED")
+        return
+    except ms.Refused:
+        pass
+    after = fds()
+    print(name, "ok" if after == before else f"leaked {sorted(set(after) - set(before))}")
+
+# copy_dir_at: the destination already holds the file, so its exclusive create is refused.
+(root / "src").mkdir(); (root / "src" / "a").write_text("x")
+(root / "dst").mkdir(); (root / "dst" / "a").write_text("planted")
+s, d = os.open(root / "src", ms.DIR_FLAGS), os.open(root / "dst", ms.DIR_FLAGS)
+case("copy_dir_at", lambda: ms.copy_dir_at(s, d, [100], None, "copy"))
+
+# write_seed: a link planted at install.log once the seed directory is open.
+nm = root / "install" / "node_modules"; nm.mkdir(parents=True); (nm / "x").write_text("x")
+log = root / "install.log"; log.write_text("log\n")
+parent = root / "parent"; parent.mkdir()
+st = os.lstat(parent)
+digests = {"node_modules": ms.tree_digest(nm, 100, 1 << 20)[0]}
+opened = ms.open_seed_dir
+def planted(parent_fd, name):
+    fd = opened(parent_fd, name)
+    os.symlink(root / "decoy", parent / name / "install.log")
+    return fd
+ms.open_seed_dir = planted
+case("write_seed", lambda: ms.write_seed(parent / "seed", (st.st_dev, st.st_ino), root / "install",
+                                         ["node_modules"], digests, log, (100, 1 << 20), None))
+
+# open_seed_parent: the identity does not match.
+case("open_seed_parent", lambda: ms.open_seed_parent(parent, (st.st_dev, st.st_ino + 1)))
+`
+	out, err := exec.Command(python(t), "-I", "-B", "-c", prog, script(t, "mutate-sandboxed.py"), t.TempDir()).CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Equal(t, "copy_dir_at ok\nwrite_seed ok\nopen_seed_parent ok", strings.TrimSpace(string(out)))
+}
+
+// A link planted in the seed directory where the build will create seed.json, install.log or tree
+// (a peer that could write there, say) is never followed: the build refuses and the link's target
+// is never created.
+func TestNodeSeedPlantedLinkNotFollowed(t *testing.T) {
+	for name, want := range map[string]string{
+		"seed.json":   "writing the seed: cannot create seed.json: [Errno 17] File exists",
+		"install.log": "writing the seed: cannot create install.log: [Errno 17] File exists",
+		"tree":        "writing the seed: cannot open tree as a plain directory",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newNodeFixture(t)
+			seed := filepath.Join(f.root, "seed")
+			decoy := filepath.Join(f.root, "decoy")
+			require.NoError(t, os.Mkdir(decoy, 0o700))
+			o := f.attackedBuild(t, "plant:"+name, seed, filepath.Join(f.root, "unused"), decoy, seed)
+			require.Equal(t, 2, o.code, o.stdout+o.stderr)
+			assert.Contains(t, o.stderr, want)
+			assert.Empty(t, filesUnder(t, decoy), "the planted link's target was never created")
+			if name != "seed.json" {
+				assert.NoFileExists(t, filepath.Join(seed, "seed.json"), "no seed is written")
+			}
+		})
+	}
+}
+
+// copyCompare copies src twice, with the old export (shutil.copytree, symlinks kept, copy2) and with
+// the descriptor copy (copy_dir_at, then the top directory's mode and times, as write_seed does), and
+// prints each copy's tree_digest, then every entry whose type, permission bits, modification time
+// or link target differ between the two. A link's own permission bits and times are not compared:
+// they grant nothing, the digest does not cover them, and the descriptor copy does not keep them
+// (copytree set them with lchmod where the platform has it).
+const copyCompare = `
+import importlib.util, os, shutil, stat, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("ms", sys.argv[1])
+ms = importlib.util.module_from_spec(spec); sys.modules["ms"] = ms; spec.loader.exec_module(ms)
+src, out = Path(sys.argv[2]), Path(sys.argv[3])
+old, new = out / "old", out / "new"
+shutil.copytree(src, old, symlinks=True, copy_function=shutil.copy2)
+os.mkdir(new, 0o700)
+s = os.open(src, ms.DIR_FLAGS)
+d = os.open(new, ms.DIR_FLAGS)
+ms.copy_dir_at(s, d, [10**7], None, "copy")
+ms.keep_mode_and_times(d, os.fstat(s))
+limits = (10**7, 1 << 40)
+print(ms.tree_digest(old, *limits)[0])
+print(ms.tree_digest(new, *limits)[0])
+def facts(root):
+    got = {}
+    for dirpath, dirs, files in os.walk(root):
+        for n in [".", *dirs, *files] if dirpath == str(root) else [*dirs, *files]:
+            p = os.path.join(dirpath, n)
+            st = os.lstat(p)
+            if stat.S_ISLNK(st.st_mode):  # a link's own mode and times mean nothing, and are not kept
+                fact = (stat.S_IFMT(st.st_mode), None, None, os.readlink(p))
+            else:
+                fact = (stat.S_IFMT(st.st_mode), stat.S_IMODE(st.st_mode), st.st_mtime_ns, None)
+            got[os.path.normpath(os.path.relpath(p, root))] = fact
+    return got
+a, b = facts(old), facts(new)
+for k in sorted(set(a) | set(b)):
+    if a.get(k) != b.get(k):
+        print("DIFF", k, a.get(k), b.get(k))
+`
+
+// The descriptor copy exports what the old shutil.copytree export did: the same tree_digest, and
+// every entry's type, permission bits, modification time and link target alike, over directories,
+// files and links of several modes (one directory read-only, one file executable, a link dangling
+// and one absolute, which a seed refuses elsewhere but the copy keeps as it is).
+func TestNodeSeedCopyMatchesCopytree(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	write := func(rel, text string, mode os.FileMode) {
+		p := filepath.Join(src, rel)
+		require.NoError(t, os.MkdirAll(filepath.Dir(p), 0o755))
+		require.NoError(t, os.WriteFile(p, []byte(text), 0o600))
+		require.NoError(t, os.Chmod(p, mode))
+	}
+	write(".pnpm/a@1.0.0/node_modules/a/index.js", "module.exports = 1\n", 0o644)
+	write(".pnpm/a@1.0.0/node_modules/a/bin.js", "#!/usr/bin/env node\n", 0o755)
+	write(".pnpm/a@1.0.0/node_modules/a/private", "x", 0o600)
+	write(".bin/a", "#!/bin/sh\n", 0o750)
+	write("empty-dir/.keep", "", 0o644)
+	require.NoError(t, os.Remove(filepath.Join(src, "empty-dir/.keep")))
+	require.NoError(t, os.Symlink(".pnpm/a@1.0.0/node_modules/a", filepath.Join(src, "a")))
+	require.NoError(t, os.Symlink("nowhere", filepath.Join(src, "dangling")))
+	require.NoError(t, os.Symlink("/etc", filepath.Join(src, ".pnpm/abs")))
+	require.NoError(t, os.Chmod(filepath.Join(src, ".pnpm/a@1.0.0"), 0o555))
+	t.Cleanup(func() {
+		for _, top := range []string{src, filepath.Join(root, "out")} {
+			_ = filepath.WalkDir(top, func(p string, d os.DirEntry, _ error) error {
+				if d != nil && d.IsDir() {
+					_ = os.Chmod(p, 0o755)
+				}
+				return nil
+			})
+		}
+	})
+	outDir := filepath.Join(root, "out")
+	require.NoError(t, os.Mkdir(outDir, 0o700))
+	out, err := exec.Command(python(t), "-I", "-B", "-c", copyCompare, script(t, "mutate-sandboxed.py"), src, outDir).CombinedOutput()
+	require.NoError(t, err, string(out))
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	require.Len(t, lines, 2, "two digests and no DIFF line: %s", out)
+	assert.Equal(t, lines[0], lines[1], "the same tree_digest")
+}
+
+// okr/web's real seed, exported by TXE-8348's build: each of its node_modules is exported again by
+// the old shutil.copytree export and by the descriptor copy (copyCompare), and the two hash alike
+// and agree entry by entry. Set NODE_SEED_EXPORT_DIR to that seed's directory; skipped when it is
+// unset, as in CI, which has no such seed. Nothing is installed or run: host-side copies into a
+// temporary directory, hashed. The digests in that seed's seed.json are not compared: it was built
+// before the digest covered execute bits (TXE-8348 ccca0513), so they are in an older format.
+func TestNodeSeedRealExportHashesAlike(t *testing.T) {
+	seedDir := os.Getenv("NODE_SEED_EXPORT_DIR")
+	if seedDir == "" {
+		t.Skip("NODE_SEED_EXPORT_DIR is unset")
+	}
+	modules := readSeed(t, seedDir)["node_modules"].(map[string]any)
+	require.NotEmpty(t, modules)
+	for nm := range modules {
+		t.Run(nm, func(t *testing.T) {
+			outDir := t.TempDir()
+			out, err := exec.Command(python(t), "-I", "-B", "-c", copyCompare, script(t, "mutate-sandboxed.py"),
+				filepath.Join(seedDir, "tree", nm), outDir).CombinedOutput()
+			require.NoError(t, err, string(out))
+			lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+			require.Len(t, lines, 2, "two digests and no DIFF line: %s", out)
+			assert.Equal(t, lines[0], lines[1], "the old export and the descriptor copy hash alike")
+			t.Logf("%s %s", nm, lines[1])
 		})
 	}
 }
