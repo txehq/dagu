@@ -1148,6 +1148,60 @@ func TestGuardHook(t *testing.T) {
 	}
 }
 
+// toolInput is hook input with an explicit tool name (nil leaves tool_name out) and one
+// tool_input key.
+func toolInput(t *testing.T, tool any, key string, value any) string {
+	t.Helper()
+	in := map[string]any{"tool_input": map[string]any{key: value}}
+	if tool != nil {
+		in["tool_name"] = tool
+	}
+	raw, err := json.Marshal(in)
+	require.NoError(t, err)
+	return string(raw)
+}
+
+// TXE-8344: a file-edit tool's payload is file content, never a command. Codex sends a patch as
+// {"tool_name": "apply_patch", "tool_input": {"command": "<patch>"}} (openai/codex rust-v0.171.0,
+// core/src/tools/hook_names.rs and core/src/tools/handlers/apply_patch.rs), so only that exact,
+// harness-supplied name is exempt. The identical text under a shell or exec tool, an unknown,
+// missing or non-string name, or a case or spelling variant is judged as a command, as before.
+// All inert: the guard only reads the JSON, and nothing in it is executed.
+func TestGuardHookFileEditTools(t *testing.T) {
+	patches := []string{
+		// A prose line whose first word names a mutant: read as shell text, +Mutant is the program.
+		"*** Begin Patch\n*** Add File: /tmp/scratch/note.txt\n+Mutant file /tmp/scratch/mutants-r8.json is the list; no other change.\n*** End Patch",
+		// A line that, read as shell text, runs a mutant script.
+		"*** Begin Patch\n*** Add File: /tmp/scratch/run.txt\npython3 mutants.py\n*** End Patch",
+	}
+	judged := []struct {
+		name any
+		key  string
+	}{
+		{"Bash", "command"}, {"exec_command", "cmd"}, {"shell", "command"}, {"unified_exec", "cmd"},
+		{nil, "command"}, {"", "command"}, {"APPLY_PATCH", "command"}, {"Apply_Patch", "command"},
+		{"apply_patch ", "command"}, {"apply-patch", "command"}, {"applypatch", "command"},
+		{"Write", "command"}, {"Edit", "command"}, {[]string{"apply_patch"}, "command"},
+	}
+	for _, p := range patches {
+		code, stdout, stderr := hook(t, toolInput(t, "apply_patch", "command", p))
+		assert.Equal(t, 0, code, "apply_patch writes files and runs nothing: %q (%s)", p, stderr)
+		assert.Empty(t, stdout+stderr)
+		for _, tool := range judged {
+			code, stdout, stderr := hook(t, toolInput(t, tool.name, tool.key, p))
+			assert.Equal(t, 2, code, "tool %#v must judge %q as a command", tool.name, p)
+			assert.Empty(t, stdout)
+			assert.Contains(t, stderr, "do not rename anything", "tool %#v", tool.name)
+		}
+	}
+	// The exemption is the tool name alone: a shell command that begins like a patch is judged.
+	for _, c := range []string{"*** Begin Patch\npython3 mutants.py", "python3 mutants.py"} {
+		code, _, stderr := hook(t, bashInput(t, c))
+		assert.Equal(t, 2, code, c)
+		assert.Contains(t, stderr, "do not rename anything", c)
+	}
+}
+
 // Without --no-seed or explicit caches, the runner takes the shared caches from `go env`, seeds an
 // owned module cache on the host from a file proxy over the shared one (HOME unchanged), and
 // offers only that seed to the container, read-only. A fake go stands in for the toolchain.
