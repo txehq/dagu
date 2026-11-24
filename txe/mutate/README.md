@@ -384,8 +384,8 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   - the destination's parent and every ancestor up to `/` must be owned by you or root, and
     either writable by no group or other user, or sticky (a sticky directory owned by you or
     root, as `/tmp` is);
-  - the seed directory itself is created with mode 0700 (`make_seed_dir`), whatever the umask,
-    and never widened.
+  - the build requests mode 0700 when it creates the seed directory (`make_seed_dir`); the umask
+    can only remove further bits, never add group or other access. The mode is never widened.
 
   That is screening by owner uid, POSIX mode bits and the sticky bit. It does not show that
   nobody else can write there. Not examined: ACLs and other non-mode permissions, and pathname

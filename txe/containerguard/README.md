@@ -340,10 +340,10 @@ The evidence for each row is bound to that row's exact bytes (TXE-8053):
 - `txe/mutate/fixture-demo.py` (836458c6): `review_evidence` is root's scoped exact-byte source review,
   `msg_8aa61a2eb4f7`, and `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same,
   `msg_47e1330eb699`.
-- `txe/mutate/mutate-sandboxed.py` (afbee4e6, the TXE-8348 bytes with the node seed on top of TXE-8053's
+- `txe/mutate/mutate-sandboxed.py` (67bf0fc7, the TXE-8348 bytes with the node seed on top of TXE-8053's
   `--diagnostic`, `--ro-mount`, chunked file hashing and mount-field refusal): `review_evidence` is root's scoped
-  exact-byte source review of those bytes, `msg_5aa2b7ce9b02`, and `owner_ack` is the custodian's (cc3-s975c73)
-  acknowledgment of the row, `msg_f63bccf283af`.
+  exact-byte source review of those bytes, `msg_00959f1a2c75`, and `owner_ack` is the custodian's (cc3-s975c73)
+  acknowledgment of the row, `msg_15b9f6cb6ce5`.
 Each review accepts the classification and the declared partial guards only. It is not a fixed-argv floor
 attestation, not behavioural acceptance and not adoption or a global pin.
 
@@ -351,6 +351,8 @@ attestation, not behavioural acceptance and not adoption or a global pin.
 - `msg_ff5c217159b5` and `msg_4d5a1be7bc6b` covered the runner's TXE-8053 bytes (c76ed2f7, main before
   TXE-8348). Root's reviews `msg_2158246cee9f` (984f6e0f) and `msg_7f2d145ae0e7` (8206b59c) covered TXE-8348's
   earlier frozen bytes, and asked for the fixes in afbee4e6.
+- `msg_5aa2b7ce9b02` and `msg_f63bccf283af` covered TXE-8348's afbee4e6 bytes. Root's review `msg_c64cb5aa11ec`
+  (9359299d) asked for the seed directory's private mode and the screening wording in 67bf0fc7.
 - `msg_8aa61a2eb4f7` and `msg_47e1330eb699` also covered the runner's earlier TXE-8053 bytes (e9d6e717), which this
   branch no longer has.
 - `msg_590f75e91493` and `msg_e8ac8fe99474` covered the runner's intermediate bytes (7803b411, chunked hashing
