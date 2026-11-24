@@ -419,6 +419,8 @@ func TestNodeSeedLifecycleAllowlist(t *testing.T) {
 		"build with a command":  {[]string{"--node-seed-build", filepath.Join(f.root, "s4"), "--image", "node-image", "--", "sh", "check.sh"}, "takes no command"},
 		"build with mutants":    {[]string{"--node-seed-build", filepath.Join(f.root, "s5"), "--image", "node-image", "--mutants", f.mutants(t, nodeMutants)}, "takes no command"},
 		"build with diagnostic": {[]string{"--node-seed-build", filepath.Join(f.root, "s6"), "--image", "node-image", "--diagnostic"}, "takes no command"},
+		// pnpm rebuild -r selects by name: a workspace project's own scripts must never be reachable.
+		"a workspace project's name": {[]string{"--node-seed-build", filepath.Join(f.root, "s7"), "--image", "node-image", "--node-seed-allow-build", "web"}, "names a workspace project (apps/web/package.json)"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			o := f.raw(t, c.args...)
@@ -455,6 +457,10 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		"manifest swapped for a FIFO": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("fifo"), 0o644))
 		}, "apps/web/package.json is not a regular file", true},
+		// A rebuild of a name nothing installed runs nothing, silently; it is never recorded as allowlisted.
+		"allowlisted name not installed": {func(t *testing.T, f nodeFixture, _ string) {
+			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("allow:nosuchpkg"), 0o644))
+		}, "--node-seed-allow-build nosuchpkg: no installed dependency has that name", true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -465,7 +471,13 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 			} else {
 				c.setup(t, f, seed)
 			}
-			o := f.build(t, seed)
+			var extra []string
+			if mode, err := os.ReadFile(f.pnpmMode); err == nil {
+				if name, ok := strings.CutPrefix(string(mode), "allow:"); ok {
+					extra = []string{"--node-seed-allow-build", name}
+				}
+			}
+			o := f.build(t, seed, extra...)
 			require.Equal(t, 2, o.code, o.stdout+o.stderr)
 			assert.Contains(t, o.stderr, c.want)
 			assert.NoFileExists(t, filepath.Join(seed, "seed.json"), "no seed is written")

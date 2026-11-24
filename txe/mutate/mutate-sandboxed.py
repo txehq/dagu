@@ -1585,7 +1585,7 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
     workspace project's own lifecycle scripts (never run: --ignore-scripts), and each installed
     package's preinstall/install/postinstall (or a binding.gyp, which implies `node-gyp rebuild`),
     marked allowlisted (run by the `pnpm rebuild` step) or skipped."""
-    record: dict = {"workspace_skipped": {}, "dependencies": {}}
+    record: dict = {"workspace_skipped": {}, "dependencies": {}, "installed": []}  # installed: names only, popped by the caller
     for rel in inputs:
         if Path(rel).name == "package.json":
             s = scripts_of(read_json_file(src, rel), WORKSPACE_SCRIPTS)
@@ -1617,6 +1617,7 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
             if not os.path.isfile(src / rel / "package.json"):
                 continue
             data = read_json_file(src, f"{rel}/package.json")
+            record["installed"].append(str(data.get("name", pkg)))
             s = scripts_of(data, DEPENDENCY_SCRIPTS)
             if os.path.lexists(src / rel / "binding.gyp") and "install" not in s and "preinstall" not in s:
                 s["install"] = "node-gyp rebuild (implied by binding.gyp)"
@@ -1682,6 +1683,13 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     inputs = node_inputs(pristine, runner.deadline)
     lock = inputs["pnpm-lock.yaml"]
     allowed = list(args.node_seed_allow_build)
+    # `pnpm rebuild -r NAME` selects by name: a workspace project of that name would have its own
+    # scripts (code from the tree) run. Refused before the container starts.
+    projects = {str(read_json_file(pristine, rel).get("name")): rel for rel in inputs if Path(rel).name == "package.json"}
+    clash = sorted(n for n in allowed if n in projects)
+    if clash:
+        raise Refused(f"--node-seed-allow-build {', '.join(clash)} names a workspace project "
+                      f"({', '.join(projects[n] for n in clash)}), whose own scripts never run; allowlist dependencies only")
     command = ["sh", "-c", NODE_SEED_SCRIPT, "sh", *allowed]
     r = runner.run("node seed", pristine, None, inputs=inputs, command=command, network=args.node_seed_network)
     runner.settle_or_stop(r)
@@ -1709,6 +1717,9 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     limits = (args.max_files, args.max_work_mib * 2**20)
     digests = {nm: tree_digest(src / nm, *limits, runner.deadline)[0] for nm in sorted(dirs)}
     scripts = lifecycle_record(src, inputs, allowed, args.max_files)
+    missing = sorted(set(allowed) - set(scripts.pop("installed")))
+    if missing:  # a rebuild of a name nothing installed does nothing, silently: never a recorded "allowlisted"
+        raise Refused(f"--node-seed-allow-build {', '.join(missing)}: no installed dependency has that name")
     dest = args.node_seed_build
     dest.mkdir()  # exclusive: checked absent before the run, and never a directory something else made
     for nm in sorted(dirs):

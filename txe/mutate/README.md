@@ -283,6 +283,10 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   pnpm 10.33.0 on 2026-11-24: a second package's postinstall and the workspace's own stayed unrun).
   `-r` is what reaches a package that only a workspace project (say `apps/web`) depends on: run at
   the root without it, the rebuild ran nothing there (same pnpm, same day; found in review).
+  Because the rebuild selects by name, a name equal to a workspace project's own `name` is refused
+  before the container starts (that project's scripts are tree code), and a name that no installed
+  dependency has is refused after the install (its rebuild would run nothing, silently), with no
+  seed written. `lifecycle_scripts` records each package by its path as well as its name.
   Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
   rolldown, lightningcss) need no script: the Linux container installs the Linux one.
 - **What ran is recorded.** After the install the host reads every installed package's
