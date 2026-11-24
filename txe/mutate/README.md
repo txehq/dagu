@@ -477,6 +477,10 @@ the controls for them.
   that file can be it: an uncaught exception imports `traceback`, and the `idna` codec imports
   `stringprep`. The code view cannot see such an import. Only imports the program states are
   required to come first. Code meant to be read as data is safest under `python3 -I`.
+- **The hand-mutation rule needs a source extension in the command's text.** A path built by
+  concatenation or formatting still shows one (`"internal/guard" + ".go"`, `f"{b}.go"`,
+  `"%s.go" % b`). An extension split apart (`"." + "go"`) is a name assembled at run time, as in
+  the first limit above.
 - **The hand-mutation rule over-refuses source names in written text.** Take one command that
   writes Markdown naming a source file, runs a test, and mentions a mutation, for example
   `Path("README.md").write_text("Mutation example: tools/guard.py") && go test`. It is refused,

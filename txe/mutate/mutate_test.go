@@ -1265,6 +1265,12 @@ var dataWordsRefused = []string{
 	"python3 - <<'PY' && go test ./internal/... # mutation 16\nfor p in [\"internal/guard.go\"]:\n    open(p, \"w\").write(\"package internal\\n\")\nPY",
 	"F=internal/guard.go; python3 - <<PY && go test ./internal/... # mutation 17\nopen(\"$F\", \"w\").write(\"package internal\\n\")\nPY",
 	"python3 - <<'PY' && go test ./internal/... # mutation 18\nimport shutil\nshutil.copy(\"/tmp/mutant/guard.go\", \"internal/\")\nPY",
+	// A source name built by concatenation or formatting still leaves a `.go` token for the reader
+	// (local security review of ab4d3c7b); only an extension split apart (`"." + "go"`) is a name
+	// assembled at run time, a documented limit.
+	"python3 - <<'PY' && go test ./internal/... # mutation 19\np = \"internal/guard\" + \".go\"\nopen(p, \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 20\nb = \"internal/guard\"\nopen(f\"{b}.go\", \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 21\nopen(\"%s.go\" % \"internal/guard\", \"w\").write(\"package internal\\n\")\nPY",
 	// Local security review of 5f77bb5c: renames, links, copies and touch write their target, an
 	// alias hides the callee, and copyfileobj is unknown. Each fails closed.
 	"python3 - <<'PY' && go test ./internal/... # mutation 11\nfrom pathlib import Path\nPath(\"tmp.txt\").write_text(\"package internal\\n\")\nPath(\"tmp.txt\").rename(\"internal/guard.go\")\nPY",
