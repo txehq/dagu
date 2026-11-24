@@ -1228,10 +1228,6 @@ var dataWordsAllowed = []string{
 	"cp spec.md spec.v1.md && python3 - <<'PY' && go test ./...\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited; see `PATCH /objectives/{id}/links`.\"))\nPY",
 	"cd okr/web && python3 - <<'PY' && python3 -m pytest -q ../../tests\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"  'held-form',\\n\", \"  'held-form',\\n  'mutation',\\n\"))\nPY",
 	"python3 - <<'PY' && go test ./internal/...\np = \"internal/guard.go\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"ok :=\", \"okay :=\"))\nPY",
-	// Connector review of bce44499: a source name inside written Markdown is data; the write
-	// target is README.md.
-	"python3 - <<'PY' && go test ./...\nfrom pathlib import Path\nPath(\"README.md\").write_text(\"Mutation example: tools/guard.py\")\nPY",
-	"python3 - <<'PY' && pytest -q\nimport os\np = \"docs/mutations.md\"\nopen(p + \".tmp\", \"w\").write(\"Run tools/guard.py under mutate-sandboxed.\")\nos.replace(p + \".tmp\", p)\nPY",
 	"cat > m.json <<'EOF'\n[{\"name\": \"mutation 1\", \"file\": \"internal/guard.go\", \"old\": \"if !ok {\", \"new\": \"if false {\"}]\nEOF\nmutate-sandboxed --mutants m.json --tree . --image sha256:abc -- go test ./internal/...",
 	// os is a text module here: its process calls would be names in the code, and there are none.
 	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
@@ -1258,6 +1254,23 @@ var dataWordsRefused = []string{
 	// Write targets the AST reader resolves or falls back on: Path.open, a target from argv, fileinput.
 	"python3 - <<'PY' && go test ./internal/... # mutation 8\nfrom pathlib import Path\nwith Path(\"internal\", ).joinpath(\"guard.go\").open(\"w\") as f:\n    f.write(\"package internal\\n\")\nPY",
 	"python3 - internal/guard.go <<'PY' && go test ./internal/... # mutation 9\nimport sys\nopen(sys.argv[1], \"w\").write(\"package internal\\n\")\nPY",
+	// Documented over-refusal (connector review of bce44499): which file interpreter code writes is
+	// not resolved, so a source name inside written Markdown counts when the same command tests and
+	// names a mutation. Resolving targets drew a bypass per review round (local security reviews of
+	// 5f77bb5c), so the rule fails closed instead.
+	"python3 - <<'PY' && go test ./...\nfrom pathlib import Path\nPath(\"README.md\").write_text(\"Mutation example: tools/guard.py\")\nPY",
+	// The local security reviews' shapes: a starred open mode, a name bound in a loop, a target from
+	// a shell variable in an expanded here-document, and a copy into a directory.
+	"python3 - <<'PY' && go test ./internal/... # mutation 15\na = [\"internal/guard.go\", \"w\"]\nopen(*a).write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 16\nfor p in [\"internal/guard.go\"]:\n    open(p, \"w\").write(\"package internal\\n\")\nPY",
+	"F=internal/guard.go; python3 - <<PY && go test ./internal/... # mutation 17\nopen(\"$F\", \"w\").write(\"package internal\\n\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 18\nimport shutil\nshutil.copy(\"/tmp/mutant/guard.go\", \"internal/\")\nPY",
+	// Local security review of 5f77bb5c: renames, links, copies and touch write their target, an
+	// alias hides the callee, and copyfileobj is unknown. Each fails closed.
+	"python3 - <<'PY' && go test ./internal/... # mutation 11\nfrom pathlib import Path\nPath(\"tmp.txt\").write_text(\"package internal\\n\")\nPath(\"tmp.txt\").rename(\"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 12\nimport shutil as s\ns.copy(\"/tmp/mutant.txt\", \"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && go test ./internal/... # mutation 13\nfrom shutil import copy\nopen(\"notes.md\", \"w\").write(\"x\")\ncopy(\"/tmp/m.txt\", \"internal/guard.go\")\nPY",
+	"python3 - <<'PY' && pytest -q # mutant 14\nfrom pathlib import Path\nopen(\"notes.md\", \"w\").write(\"x\")\nPath(\"tools/guard.py\").symlink_to(\"/tmp/m.py\")\nPY",
 	"python3 - <<'PY' && pytest -q # mutant 10\nimport fileinput\nfor line in fileinput.input(\"tools/guard.py\", inplace=True):\n    print(line.replace(\"return False\", \"return True\"), end=\"\")\nPY",
 	// os's process calls imported by name (allowed before TXE-8351).
 	"python3 - <<'PY'\nfrom os import popen\nmutants = [(\"tools/guard.py\", \"return False\", \"return True\")]\nfor f, old, new in mutants:\n    s = open(f).read()\n    open(f, \"w\").write(s.replace(old, new))\n    print(popen(\"pytest -q\").read())\n    open(f, \"w\").write(s)\nPY",

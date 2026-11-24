@@ -1463,20 +1463,22 @@ class Judge:
 # nothing to run. One command is refused when all three hold (coordinator ruling on PR 306):
 # 1. it writes executable source (.go, .py, .sh): an output redirection or `tee` to such a file, an
 #    in-place `sed -i`/`perl -i`/`ruby -i` of one, or interpreter code (an argument, a here-document
-#    or a here-string) that names one and writes a file;
+#    or a here-string) that may write a file while the command names such a file anywhere. Which
+#    file the code writes is not resolved, so a source name inside written Markdown counts too: an
+#    over-refusal on the safe side (TXE-8351 review);
 # 2. the same command runs a test runner: go test, pytest, python -m pytest, bazel test;
 # 3. its text names a mutant or a mutation (MUTANT_FILE, with mutate-sandboxed's own name removed).
 # An edit of .md or .ts files, an edit with no test, and a test with no mutation word stay allowed;
 # so does a test run by mutate-sandboxed, whose program is the runner, not the test.
 SOURCE_EXT = re.compile(r"\.(?:go|py|sh)$")
 TEST_PROGRAMS = re.compile(r"^(?:pytest(?:-3)?|py\.test)$")
-CODE_WRITES = re.compile(r"""\bopen\s*\([^)]*?,\s*(?:mode\s*=\s*)?[rbt]*['"][^'"]*[wax+]|\.write(?:_text|_bytes|lines)?\s*\("""
-                         r"""|\bos\s*\.\s*(?:replace|rename)\b|\bshutil\s*\.\s*(?:copy\w*|move)\b"""
-                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]"""
-                         r"""|\.open\s*\(\s*['"][^'"]*[wax+]|\binplace\b|\bos\s*\.\s*(?:open|write)\b""")
-# Python writes python_write_targets() does not resolve: their target is unknown.
-PY_UNMODELED_WRITES = re.compile(r"\bfileinput\b|\binplace\b|\bos\s*\.\s*(?:open|write|link|symlink)\b|\bcopytree\b"
-                                 r"|\bsetattr\b|\bexec\b|\beval\b|\b__\w+")
+# Interpreter code that may write a file: a deliberately wide net, matched anywhere in the code's
+# text (fail closed; TXE-8351 review). It is one half of condition 1; the other is a source token
+# anywhere in the command.
+CODE_WRITES = re.compile(r"""\bopen\s*\(|\.write(?:_text|_bytes|lines)?\s*\(|\bwrite\w*\s*\("""
+                         r"""|\.(?:rename|replace|symlink_to|hardlink_to|link_to|touch|truncate)\s*\("""
+                         r"""|\b(?:copy\w*|move|copyfileobj|symlink|link|fileinput|inplace|FileIO|mkstemp)\b"""
+                         r"""|\bwriteFile(?:Sync)?\b|\bFile\s*\.\s*write\b|\bprint\s*\{|>>?\s*['"]""")
 
 
 def program_words(ws: list) -> list:
@@ -1523,10 +1525,12 @@ def runs_tests(cmd: Cmd) -> bool:
     return False
 
 
-def writes_source(cmd: Cmd) -> bool:
+def writes_source(cmd: Cmd, names_source: bool) -> bool:
     """Whether this command writes executable source other than by an output redirection (those
-    are in Parser.writes): tee, an in-place editor, or interpreter code that names a source file
-    and writes a file."""
+    are in Parser.writes): tee or an in-place editor of a source file, or interpreter code that
+    may write a file while the command names source anywhere (`names_source`). Which file the code
+    writes is not resolved: a variable, an argument, a shell expansion or an API not modelled
+    could each hide it, so the guard fails closed (TXE-8351 review)."""
     ws = program_words([w.text for w in cmd.words])
     if not ws:
         return False
@@ -1537,98 +1541,11 @@ def writes_source(cmd: Cmd) -> bool:
                    for a in args)
     if prog in ("sed", "gsed", "perl", "ruby") and in_place and any(SOURCE_EXT.search(a) for a in args):
         return True
-    if PYTHONS.match(prog) or prog in OTHER_INTERPRETERS:
+    if (PYTHONS.match(prog) or prog in OTHER_INTERPRETERS) and names_source:
         texts = list(args) + [src[1] for src in cmd.fds.values()
                               if isinstance(src, (list, tuple)) and src[0] in ("text", "text-expanding")]
-        writing = [t for t in texts if CODE_WRITES.search(t)]
-        if not writing:
-            return False
-        if PYTHONS.match(prog):
-            # Python: the file a call writes, from its AST, so a source name inside written
-            # Markdown is data (TXE-8351 review). A target it cannot resolve falls back below.
-            targets = [python_write_targets(t) for t in writing]
-            if all(ts is not None for ts in targets):
-                return any(SOURCE_EXT.search(x) for ts in targets for x in ts)
-        # Any token naming source, in the code or the interpreter's arguments (`sys.argv[1]`).
-        return any(SOURCE_EXT.search(tok) for t in texts for tok in CODE_TOKEN.findall(t))
+        return any(CODE_WRITES.search(t) for t in texts)
     return False
-
-
-def python_write_targets(code: str):
-    """The files Python code writes, as literal paths, or None when the code does not parse or a
-    target is not a literal, a name bound once to one, Path(...) of one, os.path.join or + of
-    them. Writes: open(X, mode with w/a/x/+), X.write_text/write_bytes, os.replace/rename(_, X),
-    shutil.copy*/move(_, X). Runs nothing: ast.parse only builds a tree."""
-    if PY_UNMODELED_WRITES.search(code):
-        return None  # a write this reader does not resolve: unknown
-    try:
-        tree = ast.parse(code)
-    except Exception:  # noqa: BLE001 - SyntaxError, ValueError, RecursionError: unknown
-        return None
-    bound: dict = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-            name = node.targets[0].id
-            bound[name] = None if name in bound else node.value  # bound twice: unknown
-
-    def resolve(e, seen=0):
-        if seen > 8:
-            return None
-        if isinstance(e, ast.Constant) and isinstance(e.value, str):
-            return e.value
-        if isinstance(e, ast.Name):
-            return resolve(bound[e.id], seen + 1) if bound.get(e.id) is not None else None
-        if isinstance(e, ast.BinOp) and isinstance(e.op, (ast.Add, ast.Div)):
-            a, b = resolve(e.left, seen + 1), resolve(e.right, seen + 1)
-            return None if a is None or b is None else (a + b if isinstance(e.op, ast.Add) else a + "/" + b)
-        if isinstance(e, ast.Call) and not e.keywords:
-            f = e.func
-            fname = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
-            if fname in ("Path", "PurePath", "PosixPath") and len(e.args) == 1:
-                return resolve(e.args[0], seen + 1)
-            if fname == "join" and e.args:
-                parts = [resolve(a, seen + 1) for a in e.args]
-                return None if None in parts else "/".join(parts)
-        return None
-
-    targets = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        f, target = node.func, False
-        if isinstance(f, ast.Name) and f.id == "open":
-            mode = node.args[1] if len(node.args) > 1 else next((k.value for k in node.keywords if k.arg == "mode"), None)
-            if mode is None:
-                continue
-            if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
-                return None  # a computed mode may write
-            if not set(mode.value) & set("wax+"):
-                continue
-            target = node.args[0] if node.args else None
-        elif isinstance(f, ast.Attribute) and f.attr in ("write_text", "write_bytes"):
-            target = f.value
-        elif isinstance(f, ast.Attribute) and f.attr == "open":
-            # Path(x).open("w") writes Path(x); io.open/codecs.open(x, "w") write x; others unknown.
-            is_module = isinstance(f.value, ast.Name) and f.value.id in ("io", "codecs")
-            args = node.args[1:] if is_module else node.args
-            mode = args[0] if args else next((k.value for k in node.keywords if k.arg == "mode"), None)
-            if mode is None:
-                continue
-            if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)):
-                return None
-            if not set(mode.value) & set("wax+"):
-                continue
-            target = (node.args[0] if node.args else None) if is_module else f.value
-        elif isinstance(f, ast.Attribute) and f.attr in ("replace", "rename", "copy", "copy2", "copyfile", "move") \
-                and isinstance(f.value, ast.Name) and f.value.id in ("os", "shutil"):
-            target = node.args[1] if len(node.args) > 1 else None
-        else:
-            continue
-        path = resolve(target) if target is not None else None
-        if path is None:
-            return None
-        targets.append(path)
-    return targets
 
 
 def hand_mutation_run(command: str, cmds: list, writes: list) -> bool:
@@ -1636,7 +1553,11 @@ def hand_mutation_run(command: str, cmds: list, writes: list) -> bool:
         return False
     if not any(runs_tests(c) for c in cmds):
         return False
-    return any(SOURCE_EXT.search(w) for w in writes) or any(writes_source(c) for c in cmds)
+    if any(SOURCE_EXT.search(w) for w in writes):
+        return True
+    # A source name anywhere: in code, a here-document, an argument or a shell variable's value.
+    names_source = any(SOURCE_EXT.search(tok) for tok in CODE_TOKEN.findall(command))
+    return any(writes_source(c, names_source) for c in cmds)
 
 
 def refuses(command: str, depth: int = 0, outer=None) -> bool:

@@ -390,12 +390,13 @@ and process substitution, redirections, here-documents) and judges only what wou
   live tree in the same command is the TXE-7547 shape: `python3 - <<'PY' ... PY && go test ./...`.
   No program in it is named for mutation. One command is refused when all three hold:
   1. it writes `.go`, `.py` or `.sh` source. That means an output redirection or `tee` to such a
-     file, an in-place `sed -i`, `perl -i` or `ruby -i` of one, or interpreter code that names
-     one and writes a file (`open(p, "w")`, `write_text`, `os.replace`, `writeFileSync`, ...).
-     For Python the write targets are read from the AST: literals, names bound once, `Path(...)`,
-     `os.path.join` and `+`. A source name inside written Markdown is data. A target it cannot
-     resolve, or a write it does not model (`fileinput`, `os.open`), falls back to any token
-     naming source, in the code or the interpreter's arguments;
+     file, or an in-place `sed -i`, `perl -i` or `ruby -i` of one. It also counts as writing
+     source when interpreter code may write a file (`open(`, `write_text`, a rename, copy, link
+     or touch, `fileinput`, `writeFileSync`, ...) and the command names a `.go`, `.py` or `.sh`
+     file anywhere: in the code, an argument, or a shell variable's value. Which file the code
+     writes is not resolved. Resolving it drew a new bypass in each review round (a starred
+     `open` mode, a name bound in a loop, a shell-expanded here-document, an aliased `shutil`, a
+     copy into a directory), so the rule fails closed instead;
   2. it runs `go test`, `pytest`, `python -m pytest` or `bazel test`;
   3. its text names a mutant or a mutation (comments included; `mutate-sandboxed` itself does not
      count).
@@ -476,6 +477,11 @@ the controls for them.
   that file can be it: an uncaught exception imports `traceback`, and the `idna` codec imports
   `stringprep`. The code view cannot see such an import. Only imports the program states are
   required to come first. Code meant to be read as data is safest under `python3 -I`.
+- **The hand-mutation rule over-refuses source names in written text.** Take one command that
+  writes Markdown naming a source file, runs a test, and mentions a mutation, for example
+  `Path("README.md").write_text("Mutation example: tools/guard.py") && go test`. It is refused,
+  although only Markdown is written. To proceed, split the edit and the test into two commands,
+  or make the edit with an editor tool.
 - **Edit, then test, in two commands.** The hand-mutation rule (above) judges one command. An edit
   of `.go`, `.py` or `.sh` source in one Bash call followed by `go test` in the next is not refused,
   and neither is a write the rule does not model (`cp`, `mv`, `git apply`). The same applies to a
