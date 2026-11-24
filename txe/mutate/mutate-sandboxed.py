@@ -1664,8 +1664,10 @@ def lifecycle_record(src: Path, inputs: dict[str, str], allowed: list[str], max_
             if s:
                 name = str(data.get("name", pkg))
                 entry = record["dependencies"].setdefault(f"{name}@{data.get('version', '?')}", {
-                    "paths": [], "scripts": s, "ran": "allowlisted" if name in allowed else "skipped"})
-                entry["paths"].append(rel)  # one name@version can be installed at several paths (hoisted)
+                    "ran": "allowlisted" if name in allowed else "skipped", "paths": {}})
+                # Scripts per path: one name@version can be installed at several paths (hoisted), and
+                # nothing makes their bytes equal, so no path's scripts hide behind another's.
+                entry["paths"][rel] = s
     return record
 
 
@@ -1763,7 +1765,16 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     limits = (args.max_files, args.max_work_mib * 2**20)
     digests = {nm: tree_digest(src / nm, *limits, runner.deadline)[0] for nm in sorted(dirs)}
     scripts = lifecycle_record(src, inputs, allowed, args.max_files)
-    missing = sorted(set(allowed) - set(scripts.pop("installed")))
+    installed = set(scripts.pop("installed"))
+    # A workspace package pnpm INJECTS (injectWorkspacePackages, dependenciesMeta.injected) is a copy
+    # of its source in the virtual store, and this install saw manifests only, so the copy is empty.
+    # A linked workspace package is a symlink, which the scan never counts as installed.
+    injected = sorted(installed & set(projects))
+    if injected:
+        raise Refused(f"the seed's install injected the workspace project(s) {', '.join(injected)} as copies "
+                      "(injectWorkspacePackages or dependenciesMeta.injected); the seed sees manifests only, so "
+                      "those copies hold no source: a seed cannot be built for an injected workspace package")
+    missing = sorted(set(allowed) - installed)
     if missing:  # a rebuild of a name nothing installed does nothing, silently: never a recorded "allowlisted"
         raise Refused(f"--node-seed-allow-build {', '.join(missing)}: no installed dependency has that name")
     dest = args.node_seed_build

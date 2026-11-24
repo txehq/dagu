@@ -31,7 +31,8 @@ import (
 // fakePnpm writes pnpm-shaped output into its working directory. Its mode file (when present)
 // picks a failure: "fail" exits 1, "abslink" adds a link out of the tree, "touchlock" edits the
 // lockfile, "fifo" replaces a manifest with a FIFO, "outsidestore" puts the packages in a virtual
-// store outside node_modules, and "hoisted" lays them out as node-linker=hoisted does. Each call is appended to log as JSON: args, the files it could see before it wrote
+// store outside node_modules, "hoisted" lays them out as node-linker=hoisted does, and "injected"
+// adds an injected copy of a workspace project. Each call is appended to log as JSON: args, the files it could see before it wrote
 // anything, and a few environment values.
 const fakePnpm = `#!/usr/bin/env python3
 import json, os, sys
@@ -59,6 +60,9 @@ elif args[0] == "install":
         pkg("node_modules/leftpad", {"name": "leftpad", "version": "1.0.0"})
         write("node_modules/leftpad/index.js", "module.exports = 1\n")
         pkg("node_modules/esbuild", {"name": "esbuild", "version": "0.25.0", "scripts": {"postinstall": "node install.js"}})
+        # a nested copy of the same name@version whose script differs: it must not hide behind the first
+        pkg("node_modules/leftpad/node_modules/esbuild",
+            {"name": "esbuild", "version": "0.25.0", "scripts": {"postinstall": "node other.js"}})
         os.makedirs("apps/web/node_modules", exist_ok=True)
         os.symlink("../../../node_modules/leftpad", "apps/web/node_modules/leftpad")
         sys.exit(0)
@@ -81,6 +85,8 @@ elif args[0] == "install":
         os.symlink("/etc", "node_modules/escape")
     if "touchlock" in mode:
         open("pnpm-lock.yaml", "a").write("# rewritten\n")
+    if "injected" in mode:  # injectWorkspacePackages: a copy of workspace project "web", manifest only
+        pkg(store + "/web@file+apps+web/node_modules/web", {"name": "web"})
     if "fifo" in mode:  # a manifest swapped for a FIFO: a blocking host read would wait forever
         os.remove("apps/web/package.json")
         os.mkfifo("apps/web/package.json")
@@ -283,7 +289,8 @@ func TestNodeSeedBuildAndOfflineRuns(t *testing.T) {
 	scripts := seed["lifecycle_scripts"].(map[string]any)
 	deps := scripts["dependencies"].(map[string]any)
 	assert.Equal(t, "skipped", deps["esbuild@0.25.0"].(map[string]any)["ran"])
-	assert.Equal(t, "node install.js", deps["esbuild@0.25.0"].(map[string]any)["scripts"].(map[string]any)["postinstall"])
+	assert.Equal(t, map[string]any{"node_modules/.pnpm/esbuild@0.25.0/node_modules/esbuild": map[string]any{
+		"postinstall": "node install.js"}}, deps["esbuild@0.25.0"].(map[string]any)["paths"], "scripts are recorded per path")
 	assert.Equal(t, "skipped", deps["@scope/native@2.0.0"].(map[string]any)["ran"], "a binding.gyp implies an install script")
 	assert.NotContains(t, deps, "leftpad@1.0.0", "a package without install scripts is not listed")
 	assert.Contains(t, scripts["workspace_skipped"], "package.json", "the workspace's own postinstall is recorded, not run")
@@ -454,7 +461,9 @@ func TestNodeSeedHoistedLayout(t *testing.T) {
 	deps := readSeed(t, seedDir)["lifecycle_scripts"].(map[string]any)["dependencies"].(map[string]any)
 	esbuild := deps["esbuild@0.25.0"].(map[string]any)
 	assert.Equal(t, "allowlisted", esbuild["ran"])
-	assert.Equal(t, []any{"node_modules/esbuild"}, esbuild["paths"])
+	assert.Equal(t, map[string]any{"node_modules/esbuild": map[string]any{"postinstall": "node install.js"},
+		"node_modules/leftpad/node_modules/esbuild": map[string]any{"postinstall": "node other.js"}}, esbuild["paths"],
+		"two copies of one name@version keep their own scripts")
 	o = f.run(t, f.mutants(t, nodeMutants), "--node-seed", seedDir, "--image", "node-image")
 	require.Equal(t, 0, o.code, o.stdout+o.stderr)
 	assert.Equal(t, "KILLED", o.outcomes()["guard removed"])
@@ -490,6 +499,10 @@ func TestNodeSeedBuildRefusals(t *testing.T) {
 		"virtual store outside node_modules": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("outsidestore"), 0o644))
 		}, "outside every node_modules", true},
+		// An injected workspace package is a copy of its source, which a manifest-only install lacks.
+		"injected workspace package": {func(t *testing.T, f nodeFixture, _ string) {
+			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("injected"), 0o644))
+		}, "injected the workspace project(s) web as copies", true},
 		// A rebuild of a name nothing installed runs nothing, silently; it is never recorded as allowlisted.
 		"allowlisted name not installed": {func(t *testing.T, f nodeFixture, _ string) {
 			require.NoError(t, os.WriteFile(f.pnpmMode, []byte("allow:nosuchpkg"), 0o644))

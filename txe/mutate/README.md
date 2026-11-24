@@ -286,8 +286,9 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   Because the rebuild selects by name, a name equal to a workspace project's own `name` is refused
   before the container starts (that project's scripts are tree code), and a name that no installed
   dependency has is refused after the install (its rebuild would run nothing, silently), with no
-  seed written. `lifecycle_scripts` records each package by name and version with every path it is
-  installed at (`paths`).
+  seed written. `lifecycle_scripts` records each package by name and version, with the scripts of
+  every path it is installed at (`paths`: path to scripts), so copies at two paths cannot hide one
+  another's scripts.
   Packages that ship their native binary as a per-platform optional dependency (esbuild, rollup,
   rolldown, lightningcss) need no script: the Linux container installs the Linux one.
 - **What ran is recorded.** After the install the host reads every installed package's
@@ -302,7 +303,10 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   tree's `.npmrc` or `pnpm-workspace.yaml` can move pnpm's layout (`virtual-store-dir`,
   `modules-dir`), and only `node_modules` is copied, so a layout that puts packages elsewhere is
   refused instead of leaving dangling links (found in review). The lifecycle record finds packages
-  under any `node_modules` directory, so `node-linker=hoisted` is recorded too. It copies each
+  under any `node_modules` directory, so `node-linker=hoisted` is recorded too. A workspace
+  package that pnpm injects (`injectWorkspacePackages`, `dependenciesMeta.injected`) is a copy of
+  its source, which a manifest-only install cannot have, so a seed with one is refused (a linked
+  workspace package is a symlink and is fine). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
   entry's type, name, size and content, and every link's target), and writes `seed.json` last.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.
