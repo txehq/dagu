@@ -77,6 +77,8 @@ elif args[0] == "install":
     pkg(store + "/@scope+native@2.0.0/node_modules/@scope/native", {"name": "@scope/native", "version": "2.0.0"})
     write(store + "/@scope+native@2.0.0/node_modules/@scope/native/binding.gyp", "{}\n")
     os.symlink("../../esbuild@0.25.0/node_modules/esbuild", store + "/leftpad@1.0.0/node_modules/esbuild")
+    write(store + "/leftpad@1.0.0/node_modules/leftpad/bin.js", "#!/usr/bin/env node\n")
+    os.chmod(store + "/leftpad@1.0.0/node_modules/leftpad/bin.js", 0o755)
     leftpad = store + "/leftpad@1.0.0/node_modules/leftpad"
     os.symlink(os.path.relpath(leftpad, "node_modules"), "node_modules/leftpad")
     os.makedirs("apps/web/node_modules", exist_ok=True)
@@ -370,6 +372,9 @@ func TestNodeSeedMismatchRefused(t *testing.T) {
 		"another image": {func(*testing.T, nodeFixture, string) {}, "other-image", "was built with image sha256:"},
 		"seed content changed": {func(t *testing.T, _ nodeFixture, seed string) {
 			appendFile(t, filepath.Join(seed, "tree", "node_modules", ".pnpm", "leftpad@1.0.0", "node_modules", "leftpad", "index.js"), "evil()\n")
+		}, "node-image", "node_modules changed since the seed was built"},
+		"seed executable lost its execute bit": {func(t *testing.T, _ nodeFixture, seed string) {
+			require.NoError(t, os.Chmod(filepath.Join(seed, "tree", "node_modules", ".pnpm", "leftpad@1.0.0", "node_modules", "leftpad", "bin.js"), 0o644))
 		}, "node-image", "node_modules changed since the seed was built"},
 		"seed link changed": {func(t *testing.T, _ nodeFixture, seed string) {
 			link := filepath.Join(seed, "tree", "apps", "web", "node_modules", "leftpad")

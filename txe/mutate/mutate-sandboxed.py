@@ -1486,7 +1486,7 @@ def regular_digest(root: Path, rel: str, deadline: float | None = None) -> str:
 
 def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | None = None) -> tuple[str, int]:
     """(sha256, entries) of a directory a container wrote, never following a link. One line per
-    entry, sorted by its relative path as bytes: "D\\0rel", "F\\0rel\\0size sha256" or
+    entry, sorted by its relative path as bytes: "D\\0rel", "F\\0rel\\0size sha256 x<execute bits, octal>" or
     "L\\0rel\\0target". Each directory is opened relative to its parent's descriptor with
     O_NOFOLLOW. Refused: a special file, a name or link target holding a line break, more than
     max_entries entries or max_bytes bytes."""
@@ -1527,7 +1527,10 @@ def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | 
                         if tally[1] > max_bytes:
                             raise Refused(f"{root} holds over {max_bytes} bytes")
                         h.update(chunk)
-                lines.append(b"F\0" + rel + b"\0" + f"{n} {h.hexdigest()}".encode() + b"\n")
+                # The execute bits too: a seed whose .bin shim or native binary lost +x (an archive or a
+                # filesystem that drops modes) would hash alike and fail only when a run executes it.
+                lines.append(b"F\0" + rel + b"\0" + f"{n} {h.hexdigest()} x{stat.S_IMODE(st.st_mode) & 0o111:o}".encode()
+                             + b"\n")
             elif stat.S_ISLNK(st.st_mode):
                 target = os.fsencode(os.readlink(name, dir_fd=fd))
                 if b"\n" in target or b"\r" in target:

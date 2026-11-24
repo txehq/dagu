@@ -310,7 +310,8 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   byte. A linked workspace package is a symlink and is fine, and so is a published release with a
   project's name (its own `package.json`). It copies each
   project's `node_modules` (root and workspace projects) to `DIR/tree/`, hashes each copy (every
-  entry's type, name, size and content, and every link's target), and writes `seed.json` last.
+  entry's type, name, size and content, each file's execute bits, and every link's target), and
+  writes `seed.json` last.
   An install that fails is exit 2, its log kept in the work directory, and no seed is written.
 - **The run** (`--node-seed DIR`) refuses, before any container, a seed whose `pnpm-lock.yaml`
   sha256 differs from the tree's (the key), whose manifests differ (each one named), whose image
