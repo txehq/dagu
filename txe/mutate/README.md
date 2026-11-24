@@ -378,21 +378,40 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   container runs as yours). A pnpm
   bin shim records absolute paths under `/work/src`, which is where both the install and every run
   see the tree, so `node_modules/.bin/vitest` works in each run.
-- **Where the seed is written: screening, not a guarantee.** The seed is written by pathname, so
-  the build screens where it writes (`check_seed_parent`):
-  - it refuses to run as root;
-  - the destination's parent and every ancestor up to `/` must be owned by you or root, and
-    either writable by no group or other user, or sticky (a sticky directory owned by you or
-    root, as `/tmp` is);
-  - the build requests mode 0700 when it creates the seed directory (`make_seed_dir`); the umask
-    can only remove further bits, never add group or other access. The mode is never widened.
+- **Where the seed is written: relative to a descriptor, never by pathname (TXE-8385).**
+  - The build opens the seed's parent directory `O_DIRECTORY | O_NOFOLLOW` and refuses it unless
+    it is still the directory screened at the start (same device and inode). A rename of it or of
+    an ancestor in between is refused, before anything is written.
+  - It creates the seed directory in that descriptor with `mkdirat`, mode 0700 (`make_seed_dir`),
+    opens it `O_DIRECTORY | O_NOFOLLOW`, and checks the descriptor: the entry it created (`fstat`
+    against an `lstat` of the name, by device and inode), owned by you, mode 0700 exactly (a umask
+    that removes owner bits is refused) and empty (`open_seed_dir`).
+  - Every later write is relative to that descriptor: directories with `mkdirat`, each opened
+    `O_NOFOLLOW` and checked the same way; files created `O_CREAT | O_EXCL | O_NOFOLLOW`; links
+    with `symlinkat`. A descriptor-walking copy (`copy_dir_at`) replaces `shutil.copytree` for the
+    export. It keeps what the old export kept: links as links, each file's and directory's
+    permission bits (setuid, setgid and sticky dropped) and times. Each `node_modules` is hashed
+    again through the same descriptors before `install.log` and, last, `seed.json` are written.
 
-  That is screening by owner uid, POSIX mode bits and the sticky bit. It does not show that
-  nobody else can write there. Not examined: ACLs and other non-mode permissions, and pathname
-  changes made while the build runs. A process of your own uid is trusted. **Prerequisite:** no
-  untrusted party has effective ACL write or delete rights on those directories. Run the seed
-  build in directories only you control. Writing the seed relative to a pinned descriptor,
-  which closes this class, is TXE-8385.
+  So a rename of the seed directory, its parent or any ancestor while the build writes moves the
+  writes with the directory, and none lands where the old pathname now leads. An entry planted
+  in the seed directory (a link at `seed.json`, `install.log` or `tree`) is refused, never
+  followed. The exported seed hashes the same as the old `copytree` export: checked on okr/web's
+  real seed (`TestNodeSeedRealExportHashesAlike`, run with `NODE_SEED_EXPORT_DIR`).
+
+  `check_seed_parent` stays as a second line of defence. It refuses to run as root, and it
+  screens the destination's parent and every ancestor up to `/`: each must be owned by you or
+  root, and either writable by no group or other user, or sticky (as `/tmp` is).
+
+  **Residual risk.** The descriptor fixes where the writes go. It does not make the result private.
+  A party with ACL or other non-mode write or delete rights on the parent can still:
+  - delete or rename the finished seed directory;
+  - put another directory at its pathname after the build, for a later `--node-seed` to read. A
+    run re-checks the seed it reads (lockfile, manifests, image id and each `node_modules` digest),
+    but it trusts `seed.json` itself.
+
+  A process of your own uid is trusted. Run the seed build, and keep the seed, in directories only
+  you control.
 - **Limits.** pnpm workspaces only (no npm or yarn lockfile). The seed trusts pnpm, the image and
   the registry; `--frozen-lockfile` binds it to the lockfile's integrity hashes. A mutant of a
   `package.json` or the lockfile runs against the seed of the unmutated one.

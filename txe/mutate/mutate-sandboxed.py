@@ -1747,12 +1747,13 @@ def regular_digest(root: Path, rel: str, deadline: float | None = None) -> str:
     return h.hexdigest()
 
 
-def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | None = None) -> tuple[str, int]:
-    """(sha256, entries) of a directory a container wrote, never following a link. One line per
-    entry, sorted by its relative path as bytes: "D\\0rel", "F\\0rel\\0size sha256 x<execute bits, octal>" or
-    "L\\0rel\\0target". Each directory is opened relative to its parent's descriptor with
-    O_NOFOLLOW. Refused: a special file, a name or link target holding a line break, more than
-    max_entries entries or max_bytes bytes."""
+def tree_digest_at(top: int, root: str, max_entries: int, max_bytes: int,
+                   deadline: float | None = None) -> tuple[str, int]:
+    """(sha256, entries) of the directory open on descriptor top (root names it in messages), never
+    following a link. One line per entry, sorted by its relative path as bytes: "D\\0rel",
+    "F\\0rel\\0size sha256 x<execute bits, octal>" or "L\\0rel\\0target". Each directory is opened
+    relative to its parent's descriptor with O_NOFOLLOW. Refused: a special file, a name or link
+    target holding a line break, more than max_entries entries or max_bytes bytes. top stays open."""
     lines: list[bytes] = []
     tally = [0, 0]  # entries, bytes
 
@@ -1809,16 +1810,22 @@ def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | 
                               f"(mode {oct(stat.S_IFMT(st.st_mode))})")
 
     try:
+        walk(top, b"", 0)
+    except OSError as e:
+        raise Refused(f"cannot read {root}: {e}") from e
+    return hashlib.sha256(b"".join(lines)).hexdigest(), tally[0]
+
+
+def tree_digest(root: Path, max_entries: int, max_bytes: int, deadline: float | None = None) -> tuple[str, int]:
+    """tree_digest_at on root, opened O_DIRECTORY | O_NOFOLLOW."""
+    try:
         top = os.open(root, DIR_FLAGS)
     except OSError as e:
         raise Refused(f"{root} is not a plain directory: {e}") from e
     try:
-        walk(top, b"", 0)
-    except OSError as e:
-        raise Refused(f"cannot read {root}: {e}") from e
+        return tree_digest_at(top, str(root), max_entries, max_bytes, deadline)
     finally:
         os.close(top)
-    return hashlib.sha256(b"".join(lines)).hexdigest(), tally[0]
 
 
 def read_json_file(root: Path, rel: str) -> dict:
@@ -1963,26 +1970,239 @@ def resolve_image_id(args) -> str:
     return iid
 
 
-def make_seed_dir(dest: Path) -> Path:
-    """Create the seed directory, exclusively (checked absent before the run; never a directory
-    something else made), with mode 0700 at creation (root's review of 1ad1243e): with a
-    permissive umask (0002, 0000) a plain mkdir would make it group- or world-writable, and a
-    peer could plant entries the later pathname writes follow. The mode is never widened after."""
-    dest.mkdir(mode=0o700)
-    return dest
+# ---------------------------------------------------------------- writing the seed (TXE-8385)
+#
+# The seed is written relative to descriptors, never by pathname: the build opens the parent
+# directory it screened (and checks it is still that directory), creates the seed directory in it
+# with mkdirat, opens and verifies it, and every later write is relative to that descriptor:
+# directories with mkdirat, files opened O_CREAT | O_EXCL | O_NOFOLLOW, links with symlinkat. A
+# rename of the seed directory or of any ancestor after it is opened moves the writes with it, never
+# elsewhere; an entry planted inside it is refused, never followed.
+
+SEED_DIR_MODE = 0o700
+SEED_FILE_MODE = 0o644
+NEW_FILE_FLAGS = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_CLOEXEC", 0))
+
+
+def open_dir_at(parent_fd: int, name: str, what: str) -> int:
+    """A descriptor on directory name in parent_fd, opened O_DIRECTORY | O_NOFOLLOW, refused unless
+    it is the entry name holds (fstat against an lstat of name, by device and inode) and is owned by
+    this process's euid."""
+    try:
+        fd = os.open(name, DIR_FLAGS | getattr(os, "O_CLOEXEC", 0), dir_fd=parent_fd)
+    except OSError as e:
+        raise Refused(f"{what}: cannot open {name} as a plain directory: {e}") from e
+    try:
+        st = os.fstat(fd)
+        lst = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino):
+            raise Refused(f"{what}: {name} changed while it was opened")
+        if st.st_uid != os.geteuid():
+            raise Refused(f"{what}: {name} is owned by uid {st.st_uid}, not by the build's")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def open_seed_parent(parent: Path, ident: tuple[int, int]) -> int:
+    """A descriptor on the seed's parent directory, refused unless it is still the directory
+    check_node_mode screened (same device and inode): a rename of it or of an ancestor since then is
+    refused, and one after this open cannot move the writes away from it."""
+    try:
+        fd = os.open(parent, DIR_FLAGS | getattr(os, "O_CLOEXEC", 0))
+    except OSError as e:
+        raise Refused(f"--node-seed-build: cannot open {parent} as a plain directory: {e}") from e
+    st = os.fstat(fd)
+    if (st.st_dev, st.st_ino) != ident:
+        os.close(fd)
+        raise Refused(f"--node-seed-build: {parent} is no longer the directory screened at the start "
+                      "(it or an ancestor was renamed); nothing was written")
+    return fd
+
+
+def make_seed_dir(parent_fd: int, name: str) -> None:
+    """Create the seed directory name in parent_fd, exclusively (checked absent before the run; never
+    a directory something else made), with mode 0700 at creation (root's review of 1ad1243e): with a
+    permissive umask (0002, 0000) a plain mkdir would make it group- or world-writable. The mode is
+    never widened after. A second line of defence since TXE-8385: no write into it is by pathname."""
+    try:
+        os.mkdir(name, SEED_DIR_MODE, dir_fd=parent_fd)
+    except OSError as e:
+        raise Refused(f"--node-seed-build: cannot create the seed directory {name}: {e}") from e
+
+
+def open_seed_dir(parent_fd: int, name: str) -> int:
+    """make_seed_dir, then a verified descriptor on what it made: the entry it created (open_dir_at),
+    with the mode it set, 0700 exactly (a umask that removes owner bits is refused), and empty."""
+    make_seed_dir(parent_fd, name)
+    fd = open_dir_at(parent_fd, name, "--node-seed-build")
+    try:
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode != SEED_DIR_MODE:
+            raise Refused(f"--node-seed-build: the seed directory was created with mode {mode:04o}, not "
+                          f"{SEED_DIR_MODE:04o} (the umask removes owner bits?)")
+        if os.listdir(fd):
+            raise Refused("--node-seed-build: the seed directory was not empty when opened")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def makedirs_at(top: int, parts: list[str], what: str) -> int:
+    """A descriptor on top/parts..., each component created (mode 0755, never a link) when absent
+    and opened with open_dir_at. The caller closes it."""
+    fd = os.dup(top)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            nxt = open_dir_at(fd, part, what)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def write_new_at(dir_fd: int, name: str, chunks, like: os.stat_result | int, deadline: float | None,
+                 what: str) -> str:
+    """Write chunks to the new file name in dir_fd, opened O_CREAT | O_EXCL | O_NOFOLLOW (an entry
+    already there, a planted link included, is refused, never followed). like is the explicit
+    mode, or a source's stat whose mode and times the file keeps (keep_mode_and_times). Returns the
+    sha256 of the bytes written."""
+    try:
+        fd = os.open(name, NEW_FILE_FLAGS, 0o600, dir_fd=dir_fd)
+    except OSError as e:
+        raise Refused(f"{what}: cannot create {name}: {e}") from e
+    h = hashlib.sha256()
+    with os.fdopen(fd, "wb") as f:
+        for chunk in chunks:
+            check_deadline(deadline, what)
+            h.update(chunk)
+            f.write(chunk)
+        f.flush()
+        if isinstance(like, int):
+            os.fchmod(f.fileno(), like)
+        else:
+            keep_mode_and_times(f.fileno(), like)
+    return h.hexdigest()
+
+
+def read_chunks(fd: int):
+    """The bytes of descriptor fd, a MiB at a time; fd is closed at the end."""
+    with os.fdopen(fd, "rb") as f:
+        while chunk := f.read(1 << 20):
+            yield chunk
+
+
+def copy_dir_at(src: int, dst: int, budget: list[int], deadline: float | None, what: str, depth: int = 0) -> None:
+    """Copy every entry of the directory open on src into the empty directory open on dst, never
+    following a link, relative to the two descriptors only: directories with mkdirat (opened with
+    open_dir_at), regular files created O_CREAT | O_EXCL | O_NOFOLLOW, links with symlinkat. As
+    shutil.copytree(symlinks=True) with copy2 did: a link is copied as a link, and a file or
+    directory keeps its permission bits (setuid, setgid and sticky dropped) and its times. Not kept:
+    a link's own mode and times (they grant nothing) and BSD file flags. A special file is refused;
+    so is more than budget[0] entries."""
+    if depth > 256:
+        raise Refused(f"{what}: nested over 256 levels")
+    for name in sorted(os.listdir(src), key=os.fsencode):
+        check_deadline(deadline, what)
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise Refused(f"{what}: over the entry limit")
+        st = os.stat(name, dir_fd=src, follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            os.mkdir(name, 0o700, dir_fd=dst)
+            s = os.open(name, DIR_FLAGS | getattr(os, "O_CLOEXEC", 0), dir_fd=src)
+            try:
+                d = open_dir_at(dst, name, what)
+                try:
+                    copy_dir_at(s, d, budget, deadline, what, depth + 1)
+                    keep_mode_and_times(d, os.fstat(s))
+                finally:
+                    os.close(d)
+            finally:
+                os.close(s)
+        elif stat.S_ISREG(st.st_mode):
+            r = open_regular_at(src, name)
+            write_new_at(dst, name, read_chunks(r), os.fstat(r), deadline, what)
+        elif stat.S_ISLNK(st.st_mode):
+            os.symlink(os.readlink(name, dir_fd=src), name, dir_fd=dst)
+        else:
+            raise Refused(f"{what}: {name} is a special file (mode {oct(stat.S_IFMT(st.st_mode))})")
+
+
+def keep_mode_and_times(fd: int, st: os.stat_result) -> None:
+    """Give the file or directory open on fd the permission bits (setuid, setgid and sticky
+    dropped) and access and modification times of st."""
+    os.fchmod(fd, stat.S_IMODE(st.st_mode) & 0o777)
+    os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def write_seed(dest: Path, parent_ident: tuple[int, int], src: Path, dirs: list[str], digests: dict[str, str],
+               log: Path, limits: tuple[int, int], deadline: float | None) -> tuple[int, str]:
+    """Create the seed directory dest and write into it, relative to its descriptor only: each
+    node_modules in dirs (from src, the install's tree) under tree/, checked against digests by
+    hashing the copy through the same descriptors, then install.log. Returns the seed directory's
+    open descriptor (the caller writes seed.json through it and closes it) and install.log's sha256."""
+    what = "writing the seed"
+    parent_fd = open_seed_parent(dest.parent, parent_ident)
+    try:
+        seed_fd = open_seed_dir(parent_fd, dest.name)
+    finally:
+        os.close(parent_fd)
+    try:
+        for nm in dirs:
+            check_deadline(deadline, what)
+            *above, last = nm.split("/")
+            try:
+                s = os.open(plain_target(src, nm), DIR_FLAGS | getattr(os, "O_CLOEXEC", 0))
+            except OSError as e:
+                raise Refused(f"the seed's {nm} cannot be opened as a plain directory: {e}") from e
+            try:
+                up = makedirs_at(seed_fd, ["tree", *above], what)
+                try:
+                    os.mkdir(last, 0o700, dir_fd=up)
+                    d = open_dir_at(up, last, what)
+                finally:
+                    os.close(up)
+                try:
+                    copy_dir_at(s, d, [limits[0]], deadline, f"{what} ({nm})")
+                    keep_mode_and_times(d, os.fstat(s))
+                    if tree_digest_at(d, f"{dest}/tree/{nm}", *limits, deadline)[0] != digests[nm]:
+                        raise Refused(f"the seed's {nm} changed while it was written to {dest}")
+                finally:
+                    os.close(d)
+            finally:
+                os.close(s)
+        try:
+            lfd = os.open(log, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError as e:
+            raise Refused(f"cannot open the install log {log}: {e}") from e
+        if not stat.S_ISREG(os.fstat(lfd).st_mode):
+            os.close(lfd)
+            raise Refused(f"the install log {log} is not a regular file")
+        log_sha256 = write_new_at(seed_fd, "install.log", read_chunks(lfd), SEED_FILE_MODE, deadline, what)
+    except BaseException:
+        os.close(seed_fd)
+        raise
+    return seed_fd, log_sha256
 
 
 def check_seed_parent(parent: Path, euid: int) -> None:
-    """Screening, not a guarantee: the seed is written by pathname into a directory the build
-    creates, so the parent and every ancestor up to / are screened by owner uid, POSIX mode bits
-    and the sticky bit (security reviews of a63cbc52 and d33fb7db). Each must be owned by the
-    invoker or root, and either writable by no group or other user, or sticky (as /tmp is: only
-    an entry's owner, or the directory's, can rename it, so the directory's owner must be trusted
-    too). The build never runs as root, whose pathname writes would follow a link planted by any
-    user. NOT examined: ACLs and other non-mode permissions, and pathname changes made while the
-    build runs; a process of the same uid is trusted. The build presumes no untrusted party has
-    effective ACL write or delete rights on these directories (README; the class fix, writes
-    relative to a pinned descriptor, is TXE-8385)."""
+    """A second line of defence since TXE-8385, which writes the seed relative to a pinned
+    descriptor (write_seed). Screening, not a guarantee: the parent and every ancestor up to / are
+    screened by owner uid, POSIX mode bits and the sticky bit (security reviews of a63cbc52 and
+    d33fb7db). Each must be owned by the invoker or root, and either writable by no group or other
+    user, or sticky (as /tmp is: only an entry's owner, or the directory's, can rename it, so the
+    directory's owner must be trusted too). The build never runs as root. NOT examined: ACLs and
+    other non-mode permissions; a process of the same uid is trusted (README)."""
     if euid == 0:
         raise Refused("--node-seed-build refuses to run as root: run it as an ordinary user")
     d = Path(parent)
@@ -2018,6 +2238,8 @@ def check_node_mode(args, forbidden: dict[str, Path]) -> None:
         args.node_seed_build = real(out.parent) / out.name
         check_outside(args.node_seed_build, forbidden, "--node-seed-build directory")
         check_seed_parent(args.node_seed_build.parent, os.geteuid())
+        st = os.lstat(args.node_seed_build.parent)
+        args.node_seed_parent_ident = (st.st_dev, st.st_ino)  # the build writes only into this directory
     elif args.node_seed is not None:
         if not (tree / "pnpm-lock.yaml").is_file():
             raise Refused(f"--node-seed is for a pnpm workspace: {tree} has no pnpm-lock.yaml at its root")
@@ -2106,19 +2328,18 @@ def build_node_seed(args, runner: "Runner", pristine: Path, report: dict) -> int
     missing = sorted(set(allowed) - installed)
     if missing:  # a rebuild of a name nothing installed does nothing, silently: never a recorded "allowlisted"
         raise Refused(f"--node-seed-allow-build {', '.join(missing)}: no installed dependency has that name")
-    dest = make_seed_dir(args.node_seed_build)
-    for nm in sorted(dirs):
-        check_deadline(runner.deadline, "writing the seed")
-        shutil.copytree(src / nm, dest / "tree" / nm, symlinks=True,
-                        copy_function=checked_copy(runner.deadline, "writing the seed"))
-        if tree_digest(dest / "tree" / nm, *limits, runner.deadline)[0] != digests[nm]:
-            raise Refused(f"the seed's {nm} changed while it was written to {dest}")
-    shutil.copyfile(r.log, dest / "install.log")
-    seed = {"format": NODE_SEED_FORMAT, "lockfile_sha256": lock, "inputs": inputs, "image": args.image,
-            "image_id": args.image_id, "network": args.node_seed_network, "script": NODE_SEED_SCRIPT,
-            "allow_build": allowed, "lifecycle_scripts": scripts, "node_modules": digests,
-            "install_log_sha256": file_digest(dest / "install.log"), "built_from": str(args.tree)}
-    (dest / "seed.json").write_text(json.dumps(seed, indent=2, sort_keys=True) + "\n")
+    dest = args.node_seed_build
+    seed_fd, log_sha256 = write_seed(dest, args.node_seed_parent_ident, src, sorted(dirs), digests, Path(r.log),
+                                     limits, runner.deadline)
+    try:
+        seed = {"format": NODE_SEED_FORMAT, "lockfile_sha256": lock, "inputs": inputs, "image": args.image,
+                "image_id": args.image_id, "network": args.node_seed_network, "script": NODE_SEED_SCRIPT,
+                "allow_build": allowed, "lifecycle_scripts": scripts, "node_modules": digests,
+                "install_log_sha256": log_sha256, "built_from": str(args.tree)}
+        write_new_at(seed_fd, "seed.json", [(json.dumps(seed, indent=2, sort_keys=True) + "\n").encode()],
+                     SEED_FILE_MODE, runner.deadline, "writing the seed")  # last: a seed without it is no seed
+    finally:
+        os.close(seed_fd)
     report["node_seed"] = {"built": str(dest), **{k: seed[k] for k in ("lockfile_sha256", "image_id", "allow_build",
                                                                        "lifecycle_scripts", "node_modules")}}
     runner.discard(r)
