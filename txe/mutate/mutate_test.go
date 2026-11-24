@@ -1202,6 +1202,91 @@ func TestGuardHookFileEditTools(t *testing.T) {
 	}
 }
 
+// TXE-8351: an editing script carries the text it writes as Python string literals, and that text
+// (Markdown with `code spans`, TypeScript whose writes are mutations) supplied both halves of the
+// run-call rule, so two ordinary edits were refused on 2026-11-24. Run calls are now read from the
+// code, never from its strings or comments; names are still read from both. All inert: the guard
+// only reads the JSON, and nothing in it is executed.
+var dataWordsAllowed = []string{
+	// The two refusals of 2026-11-24, reconstructed from the ticket (the commands were not kept):
+	// the coordinator's spec edit (~12:20 AWST) and the TXE-8341 worker's domains.ts edit (~12:45).
+	"cp spec.md spec.v1.md && python3 - <<'PY'\np = \"spec.md\"\ns = open(p).read()\npairs = [\n    (\"Objectives link to strategies.\", \"Objective strategy-link mutations go through `PATCH /objectives/{id}/links`; the system records each one.\"),\n    (\"Edits are audited.\", \"Every mutation is audited, and a failed mutation leaves the record unchanged.\"),\n]\nfor old, new in pairs:\n    assert s.count(old) == 1, old\n    s = s.replace(old, new)\nopen(p, \"w\").write(s)\nprint(\"ok\")\nPY",
+	"cd okr/web && python3 - <<'PY'\np = \"apps/web/src/data/domains.ts\"\ns = open(p).read()\nold = \"  'flow-firsts': page('flow', ['focus']),\\n\"\nnew = old + \"\"\"  // What a write answered, read back by `useRead` after the mutation settles (TXE-8341).\n  'write-results': page('mutation', ['goals'], { gcTime: GC_DEFAULT }),\n\"\"\"\nassert s.count(old) == 1, old\ns = s.replace(old, new)\nopen(p, \"w\").write(s)\nprint(\"ok\")\nPY",
+	// Import text inside a triple-quoted string (the old string stripper did not know triple quotes).
+	"python3 - <<'PY'\nfrom pathlib import Path\np = Path(\"docs/specs/okr/spec.md\")\ns = p.read_text()\ns = s.replace(\"## Writes\\n\", \"\"\"## Writes\n\nThe system keeps its audit trail as mutations:\nimport mutations from the log, and `load` replays them.\n\"\"\")\np.write_text(s)\nPY",
+	// Run words in a TypeScript string and in a comment, on -c and on a here-document.
+	`python3 -c 'import re, sys; p = sys.argv[1]; s = open(p).read(); open(p, "w").write(re.sub(r"useMutation\(", "useMutation(", s) + "const mutations = require(\"./mutations\");\n")' apps/web/src/hooks.ts`,
+	"python3 - <<'PY'\n# no exec, no subprocess: this only rewrites the mutation docs\np = \"docs/mutations.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"draft\", \"final\"))\nPY",
+	// os is a text module here: its process calls would be names in the code, and there are none.
+	"python3 - <<'PY'\nimport os\np = \"okr/web/apps/web/src/api/mutations.ts\"\ns = open(p).read()\nopen(p + \".tmp\", \"w\").write(s.replace(\"`/v1/`\", \"`/v2/`\"))\nos.replace(p + \".tmp\", p)\nPY",
+}
+
+// The executing counterparts: the same data words with a run call in the code, the mutation runs
+// the ticket names, and every construct that could turn a string the guard blanks into a call.
+var dataWordsRefused = []string{
+	// A here-document program that writes a mutated .go or .py file and runs go test or pytest on
+	// the live tree.
+	"python3 - <<'PY'\nimport subprocess\np = \"internal/guard.go\"\ns = open(p).read()\nfor old, new in [(\"if !ok {\", \"if false {\")]:  # mutation 1: drop the guard\n    open(p, \"w\").write(s.replace(old, new))\n    subprocess.run([\"go\", \"test\", \"./internal/...\"])\nopen(p, \"w\").write(s)\nPY",
+	"python3 - <<'PY'\nimport os\np = \"tools/guard.py\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"return False\", \"return True\"))\nprint(\"mutant 1 applied\")\nos.system(\"pytest -q tests/test_guard.py\")\nopen(p, \"w\").write(s)\nPY",
+	// os's process calls imported by name (allowed before TXE-8351).
+	"python3 - <<'PY'\nfrom os import popen\nmutants = [(\"tools/guard.py\", \"return False\", \"return True\")]\nfor f, old, new in mutants:\n    s = open(f).read()\n    open(f, \"w\").write(s.replace(old, new))\n    print(popen(\"pytest -q\").read())\n    open(f, \"w\").write(s)\nPY",
+	"python3 -c 'from os import execvp; execvp(\"python3\", [\"python3\", \"mutants.py\"])'",
+	// The spec edit, then a real run call: a string still names the file the call runs.
+	"cp spec.md spec.v1.md && python3 - <<'PY'\nimport subprocess\np = \"spec.md\"\ns = open(p).read()\nopen(p, \"w\").write(s.replace(\"Edits are audited.\", \"Every mutation is audited.\"))\nsubprocess.run([\"python3\", \"mutants.py\"])\nPY",
+	// A string turned into a call: a dunder, sys.modules, a frame attribute, help() (it imports a
+	// module by name; allowed before TXE-8351) and an f-string's expression, which is code.
+	"python3 - <<'PY'\nimport os\nos.__dict__[\"system\"](\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport sys\nsys.modules[\"subprocess\"].run([\"python3\", \"mutants.py\"])\nPY",
+	"python3 - <<'PY'\nb = (x for x in ()).gi_frame.f_builtins\nb[\"exec\"](open(\"mutants.py\").read())\nPY",
+	`python3 -c 'help("mutants")'`,
+	"python3 - <<'PY'\nimport os\nprint(f\"{os.system('python3 mutants.py')}\")\nPY",
+	// A module outside the text list keeps the strings: timeit runs one, string.Formatter and
+	// operator look a callable up by its name.
+	"python3 - <<'PY'\nimport timeit\ntimeit.timeit(\"exec(open('mutants.py').read())\", number=1)\nPY",
+	"python3 - <<'PY'\nimport os, string\nf = string.Formatter().get_field(\"0.system\", [os], {})[0]\nf(\"python3 mutants.py\")\nPY",
+	"python3 - <<'PY'\nimport operator, os\noperator.methodcaller(\"system\", \"python3 mutants.py\")(os)\nPY",
+	// Python decodes a utf-7 source first: this comment is code once decoded, so it is not blanked.
+	"python3 - <<'PY'\n# -*- coding: utf-7 -*-\n# x+AAo-import os+ADs-os.system(+ACI-python3 mutants.py+ACI-)\nPY",
+	// Python reads identifiers in NFKC form: the fullwidth name is exec (allowed before TXE-8351).
+	"python3 - <<'PY'\nｅｘｅｃ(open(\"mutants.py\").read())\nPY",
+	// Text the shell expands first is judged whole: after expansion a string may not be a string.
+	`python3 -c "print('mutants.py is exec $X')"`,
+	"python3 - <<PY\nprint(\"mutants.py is exec $X\")\nPY",
+	// A mutation tool or a mutant-named program, the bare words included.
+	"python3 mutants.py",
+	"mutmut run",
+	"mutate",
+	"mutate run ./...",
+	"./mutation --all",
+	"mutation run",
+	"timeout 60 mutate ./internal/...",
+}
+
+func TestGuardHookDataWords(t *testing.T) {
+	for _, c := range dataWordsAllowed {
+		code, stdout, stderr := hook(t, bashInput(t, c))
+		assert.Equal(t, 0, code, "should allow: %s (%s)", c, stderr)
+		assert.Empty(t, stdout+stderr)
+	}
+	for _, c := range dataWordsRefused {
+		code, stdout, stderr := hook(t, bashInput(t, c))
+		assert.Equal(t, 2, code, "should refuse: %s", c)
+		assert.Empty(t, stdout)
+		assert.Contains(t, stderr, "do not rename anything", c)
+	}
+	// From Python 3.12 an f-string's literal text is its own token, so it is blanked like any
+	// string; before 3.12 an f-string is one token and is kept whole.
+	out, err := exec.Command(python(t), "-I", "-c", "import sys; print(sys.version_info >= (3, 12))").Output()
+	require.NoError(t, err)
+	fstring := "python3 - <<'PY'\nn = open(\"src/api.ts\").read().count(\"useMutation\")\nprint(f\"`useMutation` appears {n} times; each mutation is a write\")\nPY"
+	code, _, stderr := hook(t, bashInput(t, fstring))
+	if strings.TrimSpace(string(out)) == "True" {
+		assert.Equal(t, 0, code, stderr)
+	} else {
+		assert.Equal(t, 2, code)
+	}
+}
+
 // Without --no-seed or explicit caches, the runner takes the shared caches from `go env`, seeds an
 // owned module cache on the host from a file proxy over the shared one (HOME unchanged), and
 // offers only that seed to the container, read-only. A fake go stands in for the toolchain.

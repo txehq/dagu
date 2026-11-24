@@ -34,7 +34,12 @@ EXECUTE is judged. A command is a mutation run when, past assignments, keywords 
   in a read mode, print) is data whatever its arguments name; other Python code that may run
   something is refused when any input it is given names a mutant in any path component, whatever
   the extension (`exec(open("mutants.json").read())`, a file under a mutate-sandboxed work
-  directory). With -i, the stdin read after the code is judged as a program.
+  directory). With -i, the stdin read after the code is judged as a program. Whether Python code
+  may run something is read from its code, never from its string literals or comments (TXE-8351):
+  a backtick or `system` in replacement text an editing script writes is data. That holds only
+  for code Python receives exactly as written, that imports only text-handling modules and that
+  has no construct which can turn a string into a call (a dunder, a frame attribute, help(),
+  sys.modules); anything else is judged on its full text, strings included.
 Words that are only data are never judged: a grep or sed pattern, an echo/printf argument, a
 `--body` or `--text` message, a path given to cat or shasum, the body of a here-document written
 to a file, a comment, and code that only mentions the names (prints them, edits text containing
@@ -47,11 +52,14 @@ AGENTS.md rule is the policy.
 """
 import ast
 import builtins
+import io
 import json
 import os
 import re
 import shlex
 import sys
+import tokenize
+import unicodedata
 
 TOOLS = re.compile(r"^(?:mutmut|go-mutesting|gremlins|cosmic-ray|mull-runner|mull-cxx|stryker|"
                    r"mutatest|mutpy|pitest|ooze)$", re.I)
@@ -553,15 +561,33 @@ def source_runs_mutant(src, shell: bool, depth: int, cmd=None, hops: int = 0, la
         return True if fd_of_path(value) is not None else mutant_named(value)
     if kind == "procsub":
         return any(names_mutant_script(c.words) for c in value)
-    if kind == "text-expanding" and lang == "python":
-        lang = "python-strict"  # the shell expands this text first: never cleared (TXE-8183)
+    if kind == "text-expanding" and lang.startswith("python"):
+        # The shell expands this text first: never cleared (TXE-8183), and judged on its full
+        # text, since a string literal here is not the string Python receives (TXE-8351).
+        lang = "python-expanded"
     return refuses(value, depth + 1) if shell else code_runs_mutant(value, lang)
 
 
 def runs_evidence(code: str, lang: str) -> bool:
     """Whether code may run a file or a process. Python code that python_reads_only() could not
-    clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before."""
-    return bool(CODE_RUNS.search(code) or (lang.startswith("python") and PY_EXTRA_RUNS.search(code)))
+    clear is also judged by PY_EXTRA_RUNS, so the Python verdict is never laxer than before. Python
+    code is judged on python_code_view() when it has one: its string literals and comments are
+    data (TXE-8351), and constructs that can turn a string into a call count as run evidence."""
+    view = python_code_view(code) if lang in ("python", "python-strict") else None
+    if view is not None:
+        return bool(CODE_RUNS.search(view) or PY_EXTRA_RUNS.search(view) or PY_RESOLVES.search(view))
+    if lang.startswith("python"):
+        code = unicodedata.normalize("NFKC", code)  # how Python reads identifiers
+        return bool(CODE_RUNS.search(code) or PY_EXTRA_RUNS.search(code))
+    return bool(CODE_RUNS.search(code))
+
+
+def imports_mutant(code: str, lang: str) -> bool:
+    """An import statement of a mutant module, not import text inside a string or a comment.
+    Python code with a python_code_view() is read from that view, which knows Python's string
+    syntax (a triple-quoted string holding "from mutations import x" is data)."""
+    view = python_code_view(code) if lang in ("python", "python-strict") else None
+    return bool(CODE_IMPORTS_MUTANT.search(view if view is not None else CODE_STRING_OR_COMMENT.sub(" ", code)))
 
 
 def mutant_in_path(text: str) -> bool:
@@ -581,8 +607,8 @@ def code_runs_mutant(code: str, lang: str = "other") -> bool:
     python_reads_only() proves non-executing is data, whatever it names."""
     if lang == "python" and python_reads_only(code):
         return False
-    if CODE_IMPORTS_MUTANT.search(CODE_STRING_OR_COMMENT.sub(" ", code)):
-        return True  # an import statement, not import text inside a string or a comment
+    if imports_mutant(code, lang):
+        return True
     if not runs_evidence(code, lang):
         return False
     if lang.startswith("python"):
@@ -636,7 +662,9 @@ PY_CLEAR_WRAPPERS = {"timeout", "gtimeout", "nice", "nohup", "command", "env"}
 PY_EXTRA_RUNS = re.compile(r"\b(?:getattr|setattr|__builtins__|builtins|globals|locals|vars|compile|breakpoint|"
                            r"pickle|cPickle|_pickle|marshal|shelve|dill|cloudpickle|joblib|ctypes|cffi|"
                            r"multiprocessing|pty|importlib|exec_module|load_module|run_path|run_module|"
-                           r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop)\b"
+                           r"startfile|create_subprocess_\w+|InteractiveInterpreter|InteractiveConsole|codeop|"
+                           # os's process calls imported by name (`from os import execv, popen`).
+                           r"exec[lv]\w*|spawn[lv]\w*|posix_spawnp?|popen\w*)\b"
                            r"|\bcode\s*\.\s*interact")
 # A coding declaration on line 1 or 2 makes Python decode a program read as bytes (stdin, a
 # here-document, a descriptor) differently from the text parsed here (utf-7 can hide code).
@@ -765,6 +793,79 @@ def _open_reads_only(node) -> bool:
     if mode is None:
         return True
     return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set("wax+")
+
+
+# ------------------------------------------- Python string literals are data (TXE-8351)
+# An editing script carries the text it writes as string literals: Markdown with `code spans`,
+# TypeScript whose writes are called mutations. Searched as one text, those literals supplied both
+# halves of the run-call rule (a backtick or `system` as the run call, `mutation` as the name),
+# so a script that only replaced text was refused. The run call is therefore looked for in the
+# code itself: python_code_view() is the source with every string literal and comment blanked out,
+# positions kept (tokenize, which runs nothing, knows Python's string syntax: triple quotes,
+# prefixes, f-strings). Names are still looked for in the full text, strings included, because a
+# string is what names the file a real run call runs (`subprocess.run(["python3", "mutants.py"])`).
+#
+# The view exists only when blanking a string cannot hide how a string becomes a call; otherwise
+# the code is judged on its full text, as before:
+# - Python receives the text as written (not "python-expanded"), it tokenizes and parses, and it
+#   has no coding comment, \r or BOM (PY_CODING_COOKIE); the view is judged in NFKC form, the
+#   form in which Python reads identifiers;
+# - every import is of a module in PY_TEXT_MODULES, absolute;
+# - in 3.11 and earlier an f-string is one STRING token, so a string with an f or t prefix is kept.
+# On the view, PY_RESOLVES also counts as run evidence: a dunder, a private attribute, a frame or
+# code attribute, help() (it imports a module by name) and sys.modules can each look up a callable
+# by a name that only a string holds.
+# Text-handling modules whose calls never turn a string into code or a process. os is one: each of
+# its process calls is a name in the code, which CODE_RUNS or PY_EXTRA_RUNS sees.
+PY_TEXT_MODULES = frozenset({"os", "sys", "re", "json", "pathlib", "io", "shutil", "textwrap", "difflib",
+                             "glob", "fnmatch", "hashlib", "tempfile"})
+PY_RESOLVES = re.compile(r"\b__\w+|\.\s*_\w*|\.\s*(?:f|gi|cr|ag|tb|co)_\w+|\b(?:help|modules|_getframe)\b")
+PY_BLANKED = {tokenize.COMMENT} | {getattr(tokenize, n) for n in ("FSTRING_MIDDLE", "TSTRING_MIDDLE")
+                                   if hasattr(tokenize, n)}
+_view_cache: dict = {}
+
+
+def python_code_view(code: str):
+    """Python code with its string literals and comments blanked, or None when that view is not
+    sound for this code (see above)."""
+    if code not in _view_cache:
+        try:
+            _view_cache[code] = _python_code_view(code)
+        except Exception:  # noqa: BLE001 - SyntaxError, TokenError, RecursionError, ...: no view
+            _view_cache[code] = None
+    return _view_cache[code]
+
+
+def _python_code_view(code: str):
+    if PY_CODING_COOKIE.search(code):
+        return None
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.Import):
+            modules = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or not node.module:
+                return None  # a relative import names no module this list can judge
+            modules = [node.module]
+        else:
+            continue
+        if any(m.split(".")[0] not in PY_TEXT_MODULES for m in modules):
+            return None
+    line_starts = [0] + [i + 1 for i, ch in enumerate(code) if ch == "\n"]
+    view = list(code)
+    for tok in tokenize.generate_tokens(io.StringIO(code).readline):
+        if tok.type == tokenize.ERRORTOKEN:
+            return None
+        prefix = re.match(r"[A-Za-z]*", tok.string).group(0).lower() if tok.type == tokenize.STRING else ""
+        if tok.type in PY_BLANKED or (tok.type == tokenize.STRING and not set(prefix) & set("ft")):
+            a = line_starts[tok.start[0] - 1] + tok.start[1]
+            b = line_starts[tok.end[0] - 1] + tok.end[1]
+            if code[a:b] != tok.string:
+                return None  # positions that do not match the text (an escaped {{ in an f-string)
+            for k in range(a, b):
+                if view[k] != "\n":
+                    view[k] = " "
+    # Python reads identifiers in NFKC form, so a fullwidth `ｅｘｅｃ` is exec: judge that form.
+    return unicodedata.normalize("NFKC", "".join(view))
 
 
 def stdin_is_mutant(cmd, shell: bool, depth: int, lang: str = "other") -> bool:
@@ -1008,7 +1109,7 @@ class Judge:
                     lang = self.python_lang(flags, unsupported)
                     code_word = args[j] if t[k + 1:] else (args[j + 1] if j + 1 < len(args) else None)
                     if code_word is None or code_word.expanded:
-                        lang = "python-strict"  # "...$(cmd)..." or $'...': not the text Python gets
+                        lang = "python-expanded"  # "...$(cmd)..." or $'...': not the text Python gets
                     return (code_and_args_run_mutant(code, args[j + (1 if t[k + 1:] else 2):], self.env_values(), lang)
                             or self.interactive_stdin(flags, cmd))
                 if ch == "m":

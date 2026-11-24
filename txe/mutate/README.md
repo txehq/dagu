@@ -338,6 +338,33 @@ and process substitution, redirections, here-documents) and judges only what wou
   - `python3` on PATH is CPython, with an unmodified standard library;
   - its site-packages `.pth` files, which `-I` does not disable, and anything installed system-wide
     are state outside the command.
+- **Python string literals are data (TXE-8351).** An editing script carries the text it writes
+  as string literals. On 2026-11-24 two such scripts were refused: a Markdown spec edit and an OKR
+  web `domains.ts` edit, both on a quoted here-document to `python3`. Their replacement text held
+  both halves of the run-call rule: a backtick (a code span) counted as the run call, and
+  `mutation` (TanStack Query's word for a write) counted as the name. Uncleared Python code now
+  looks for its run call in the code only, via a view of the source with every string literal and
+  comment blanked. `tokenize` builds that view and runs nothing. Names are still read from the full
+  text, strings included, because a string is what names the file a real run call runs:
+  `subprocess.run(["python3", "mutants.py"])` is refused, and so is a here-document program that
+  writes a mutated file and runs `go test` or `pytest`.
+
+  The view is used only when blanking a string cannot hide how a string becomes a call. Otherwise
+  the code is judged on its full text, as before. It needs all of these:
+  - Python receives the text exactly as written: not `"...$X..."`, an unquoted `<<EOF` or `$'...'`;
+  - the code tokenizes and parses, with no coding comment, `\r` or BOM;
+  - every import is absolute and of a text-handling module: `os`, `sys`, `re`, `json`, `pathlib`,
+    `io`, `shutil`, `textwrap`, `difflib`, `glob`, `fnmatch`, `hashlib` or `tempfile`. A module
+    such as `timeit`, `string`, `operator` or `pkgutil` can run a string or look up a callable by
+    its name, so it keeps the strings;
+  - before Python 3.12 an f-string is one token, so an `f`/`t`-prefixed string is never blanked.
+    From 3.12 only its literal text is blanked, and its `{...}` expressions are code.
+
+  On the view, these also count as run calls, since each can look a callable up by a name only a
+  string holds: a dunder (`os.__dict__["system"]`), a private attribute, a frame or code attribute
+  (`gi_frame`, `f_builtins`), `help()` (it imports a module by name) and `sys.modules`. The view is
+  read in NFKC form, as Python reads identifiers, so a fullwidth `ｅｘｅｃ` is `exec`. `os`'s
+  process calls imported by name (`from os import popen, execvp`) are run calls too.
 - **Descriptors:** each command's redirections are tracked per descriptor, left to right (`<`,
   `<>`, output redirections, `<&N`, here-documents, here-strings), so `python3 3< mutants.py <&3`
   and `python3 /dev/fd/3 3< mutants.py` are judged on what they read. A descriptor path the
@@ -397,8 +424,14 @@ the controls for them.
   program, so `< mutants.py` and `cat mutants.py |` are refused. A stdin the command does not
   show, such as a terminal or an inherited descriptor, cannot be judged.
 - **Other languages keep the shared run-call list.** `node -e`, `perl -e` and `ruby -e` code are
-  judged as before, and no read-only grammar clears them. They can still be refused for a word
-  like `load` or `require` used as data.
+  judged as before, and no read-only grammar clears them. Their string literals are not blanked
+  either (TXE-8351 covers Python only), so they can still be refused for a word like `load` or
+  `require` used as data.
+- **An edit followed by a test run in shell.** `python3 - <<'PY' ... PY && go test ./...`, where
+  the here-document applies a mutant and the shell then runs the tests, is allowed. Writing a file
+  runs nothing, and `go test` names no mutant, so neither command is a mutation run on its own.
+  The same two steps inside one Python program are refused when the program names a mutant
+  anywhere, for example a `mutants` list or a `# mutation 1` comment (TXE-8351).
 - **Python's path-component rule over-refuses.** Uncleared Python code that may run something
   is refused when any word names a mutant in any component, for example
   `subprocess.run(["go", "test", "./txe/mutate/..."])`. That code is not a data read; ask your
