@@ -7,6 +7,7 @@ package devtoolsgate
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"os/exec"
 	"os/user"
@@ -128,4 +129,61 @@ func testProfileDirIn(t *testing.T, parent string) string {
 	dir := filepath.Join(parent, "profile")
 	require.NoError(t, os.Mkdir(dir, 0o700))
 	return dir
+}
+
+// A diagnostic, not a check of the gate's rules: for a directory with no
+// list, one with an entry for this user and one with an entry for
+// everyone, it logs what fgetattrlist returned on this Mac (the returned
+// attributes, the owner-UUID slot, and each entry's GUID, kind, flags and
+// rights), so that the owner exemption's failure can be placed: the UUID
+// not returned (H1), or returned but not the GUID chmod wrote for this
+// user (H2). It asserts only that each read and parse succeeds, and it runs
+// only with DAGU_TEST_REAL_ACL=1 and DAGU_TEST_REAL_ACL_DIAG=1.
+func TestRealACLOwnerUUIDDiagnosticOnThisMac(t *testing.T) {
+	if os.Getenv("DAGU_TEST_REAL_ACL_DIAG") != "1" {
+		t.Skip("the owner-UUID diagnostic runs only with DAGU_TEST_REAL_ACL_DIAG=1")
+	}
+	base := realACLDir(t)
+	me, err := user.Current()
+	require.NoError(t, err)
+	t.Logf("user=%s uid=%s", me.Username, me.Uid)
+
+	for _, c := range []struct{ name, ace string }{
+		{"no-list", ""},
+		{"owner-entry", "user:" + me.Username + " allow add_file,delete_child"},
+		{"everyone-entry", "group:everyone allow list"},
+	} {
+		dir := filepath.Join(base, c.name)
+		require.NoError(t, os.Mkdir(dir, 0o700))
+		if c.ace != "" {
+			chmodACL(t, dir, "+a", c.ace)
+		}
+		f, err := os.Open(dir) //nolint:gosec // the fixture's own directory
+		require.NoError(t, err)
+		buf, err := readAttrList(f)
+		require.NoError(t, f.Close())
+		require.NoError(t, err, "%s: fgetattrlist", c.name)
+		le := binary.LittleEndian
+		common := le.Uint32(buf[4:])
+		t.Logf("%s: length=%d returned common=%#08x (returned_attrs=%t extended_security=%t uuid=%t) other groups=%#x/%#x/%#x/%#x",
+			c.name, le.Uint32(buf), common,
+			common&attrCmnReturnedAttrs != 0, common&attrCmnExtendedSecurity != 0, common&attrCmnUUID != 0,
+			le.Uint32(buf[8:]), le.Uint32(buf[12:]), le.Uint32(buf[16:]), le.Uint32(buf[20:]))
+		t.Logf("%s: extended security reference offset=%d length=%d; owner-UUID slot=%x",
+			c.name, int32(le.Uint32(buf[attrRefOffset:])), le.Uint32(buf[attrRefOffset+4:]), buf[attrUUIDAt:attrUUIDAt+16]) //nolint:gosec // a signed field as the kernel writes it
+		acl, err := parseAttrList(buf)
+		require.NoError(t, err, "%s: parse", c.name)
+		t.Logf("%s: ownerKnown=%t owner=%x entries=%d", c.name, acl.ownerKnown, acl.owner, len(acl.entries))
+		for i, e := range acl.entries {
+			verdict := "the owner-UUID slot was not returned (H1)"
+			switch {
+			case acl.ownerKnown && e.guid == acl.owner:
+				verdict = "equals the returned owner UUID"
+			case acl.ownerKnown:
+				verdict = "differs from the returned owner UUID (H2, for an entry naming this user)"
+			}
+			t.Logf("%s: entry %d guid=%x kind=%d flags=%#x rights=%#x: %s",
+				c.name, i, e.guid, e.flags&kauthACEKindMask, e.flags, e.rights, verdict)
+		}
+	}
 }
