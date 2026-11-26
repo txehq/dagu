@@ -1331,7 +1331,7 @@ func TestStagehandWaitsForDownloads(t *testing.T) {
 	t.Parallel()
 	chrometest.Require(t)
 
-	downloads := t.TempDir()
+	downloads := privateTempDir(t)
 	eng := launchBrowser(t, launchOptions{DownloadsDir: downloads, Generate: reportModel})
 	require.NoError(t, eng.Goto(t.Context(), serveReport(t), time.Minute))
 
@@ -1384,7 +1384,7 @@ func serveLoads(t *testing.T) string {
 func TestStagehandGotoEndsWithItsLoad(t *testing.T) {
 	t.Parallel()
 
-	downloads := t.TempDir()
+	downloads := privateTempDir(t)
 	eng := launchBrowser(t, launchOptions{DownloadsDir: downloads, Generate: reportModel})
 	site := serveLoads(t)
 	// A load that never reports would wait out this timeout and fail.
@@ -1815,14 +1815,14 @@ func TestStagehandFailedLaunchEndsBrowser(t *testing.T) {
 	// The wrapper records the browser's arguments and its process ID, which
 	// exec makes the browser's, and disables extensions, so the runtime
 	// extension never starts.
-	wrapper := filepath.Join(t.TempDir(), "chrome")
+	wrapper := filepath.Join(privateTempDir(t), "chrome")
 	chrome := "'" + strings.ReplaceAll(chrometest.Path(), "'", `'\''`) + "'"
 	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$@\" > \"$0.args\"\nprintf '%%s' \"$$\" > \"$0.pid\"\nexec %s \"$@\" --disable-extensions\n", chrome)
 	require.NoError(t, os.WriteFile(wrapper, []byte(script), 0o700))
 
 	// A kept user agent spares the probe, which would wait out the same
 	// minute first.
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	require.NoError(t, keepUserAgent(browserDir, headedUserAgent{Executable: wrapper, Product: "Chrome/1.0.0.0", UserAgent: "Mozilla/5.0 Chrome/1.0.0.0"}))
 	err := withStartupSlot(func() error {
 		_, err := stagehandLauncher{}.Launch(t.Context(), launchOptions{
@@ -1925,7 +1925,7 @@ func loggingWrapper(t *testing.T, failProbe bool) string {
 	if failProbe {
 		probe = `--user-data-dir=*dagu-browser-probe-*) echo probe >> "$0.log"; exit 1;; `
 	}
-	wrapper := filepath.Join(t.TempDir(), "chrome")
+	wrapper := filepath.Join(privateTempDir(t), "chrome")
 	chrome := "'" + strings.ReplaceAll(chrometest.Path(), "'", `'\''`) + "'"
 	script := fmt.Sprintf("#!/bin/sh\nagent=none\nfor arg in \"$@\"; do case \"$arg\" in %s--user-agent=*) agent=\"${arg#--user-agent=}\";; esac; done\n"+
 		"printf '%%s\\n' \"$agent\" >> \"$0.log\"\nexec %s \"$@\"\n", probe, chrome)
@@ -1949,7 +1949,7 @@ func TestStagehandLearnsUserAgentOnce(t *testing.T) {
 	t.Parallel()
 
 	wrapper := loggingWrapper(t, false)
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	pageURL := serveUserAgent(t)
 	logged := 0
 	// launch starts and closes a browser, and returns the user agents its
@@ -2001,7 +2001,7 @@ func TestStagehandLaunchesWhenTheProbeFails(t *testing.T) {
 	wrapper := loggingWrapper(t, true)
 	var warnings []string
 	eng := launchBrowser(t, launchOptions{
-		Executable: wrapper, BrowserDir: t.TempDir(), Generate: (&shopModel{}).generate,
+		Executable: wrapper, BrowserDir: privateTempDir(t), Generate: (&shopModel{}).generate,
 		Warn: func(message string) { warnings = append(warnings, message) },
 	})
 	header, _, _ := pageUserAgent(t, eng, serveUserAgent(t))

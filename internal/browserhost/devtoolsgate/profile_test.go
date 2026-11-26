@@ -28,8 +28,20 @@ func readPrefs(t *testing.T, path string) map[string]any {
 // t.TempDir's own directory takes its mode from the umask.
 func testProfileDir(t *testing.T) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "profile")
+	dir := filepath.Join(privateTempDir(t), "profile")
 	require.NoError(t, os.Mkdir(dir, 0o700))
+	return dir
+}
+
+// privateTempDir is t.TempDir with its symbolic links resolved and made
+// 0700: the gate refuses a profile on a path another account could change
+// (openTrusted), and t.TempDir's own directory takes its mode from the
+// umask, which these tests set group-writable.
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(dir, 0o700))
 	return dir
 }
 

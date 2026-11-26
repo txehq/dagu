@@ -68,8 +68,8 @@ func newTestRun(t *testing.T, answer func(*llmpkg.ChatRequest) (string, error)) 
 	engine := newFakeEngine()
 	return &testRun{
 		t:         t,
-		dataDir:   t.TempDir(),
-		artifacts: t.TempDir(),
+		dataDir:   privateTempDir(t),
+		artifacts: privateTempDir(t),
 		engine:    engine,
 		launcher:  &fakeLauncher{engine: engine},
 		provider:  &scriptedProvider{answer: answer},
@@ -1549,7 +1549,7 @@ func TestProfileHeldByBrowserSessionFailsStep(t *testing.T) {
 func TestProfileWithoutWaiting(t *testing.T) {
 	t.Parallel()
 
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	step, err := acquireProfile(t.Context(), browserDir, "shop", "step-record", true)
 	require.NoError(t, err)
 

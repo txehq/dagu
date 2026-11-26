@@ -41,7 +41,7 @@ func TestHeadedFrom(t *testing.T) {
 func TestKeptUserAgents(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	chrome := headedUserAgent{Executable: "/opt/chrome", Product: "Chrome/155.0.8059.80", UserAgent: "Mozilla/5.0 Chrome/155.0.0.0"}
 	require.NoError(t, keepUserAgent(dir, chrome))
 	kept, ok := loadUserAgent(dir, "/opt/chrome")

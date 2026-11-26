@@ -23,7 +23,7 @@ import (
 func TestDisableOffTheRecordRefusesSymbolicLinks(t *testing.T) {
 	t.Parallel()
 	target := ownedProfile(t)
-	link := filepath.Join(t.TempDir(), "profile")
+	link := filepath.Join(privateTempDir(t), "profile")
 	require.NoError(t, os.Symlink(target, link))
 	assert.ErrorContains(t, claimProfile(link), "symbolic link")
 	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + link}), "symbolic link")

@@ -90,7 +90,7 @@ func readJSON(t *testing.T, path string) map[string]any {
 // first takes it, and is the gate's own.
 func TestAcquireProfileCreatesAnOwnedProfile(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	lease, err := acquireProfile(context.Background(), browserDir, "fresh", "rec", false)
 	require.NoError(t, err)
 	defer lease.release()
@@ -101,7 +101,7 @@ func TestAcquireProfileCreatesAnOwnedProfile(t *testing.T) {
 // the way to claim it, and nothing is written in it.
 func TestAcquireProfileRefusesAnUnclaimedProfileAndWritesNothing(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	dir := oldProfile(t, browserDir, "old", `{"profile":{"name":"old"}}`)
 	before := snapshotDir(t, dir)
 	_, err := acquireProfile(context.Background(), browserDir, "old", "rec", false)
@@ -118,7 +118,7 @@ func TestAcquireProfileRefusesAnUnclaimedProfileAndWritesNothing(t *testing.T) {
 // wrote since and the copy, and removes the mark and the record.
 func TestClaimProfileAndItsUndo(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	original := `{"incognito":{"mode_availability":0,"other":"kept"},"profile":{"name":"old"}}`
 	dir := oldProfile(t, browserDir, "old", original)
 	prefs := filepath.Join(dir, "Default", "Preferences")
@@ -180,7 +180,7 @@ func TestClaimProfileAndItsUndo(t *testing.T) {
 // undo removes the value the gate set.
 func TestClaimProfileWithoutPreferences(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	dir := oldProfile(t, browserDir, "bare", "")
 	report, err := ClaimProfile(browserDir, "bare")
 	require.NoError(t, err)
@@ -197,7 +197,7 @@ func TestClaimProfileWithoutPreferences(t *testing.T) {
 // before the first write.
 func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	_, err := ClaimProfile(browserDir, "../elsewhere")
 	assert.ErrorContains(t, err, "not a profile name")
 	_, err = ClaimProfile(browserDir, "missing")
@@ -240,11 +240,11 @@ func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	// A marker that is a link to a file made for something else claims
 	// nothing, and is not taken for an earlier claim.
 	refuse(t, "linked-mark", "has another link", func(dir string) {
-		other := filepath.Join(t.TempDir(), "other")
+		other := filepath.Join(privateTempDir(t), "other")
 		require.NoError(t, os.WriteFile(other, nil, 0o600))
 		require.NoError(t, os.Link(other, filepath.Join(dir, ".dagu-devtools-gate-profile")))
 	})
-	elsewhere := t.TempDir()
+	elsewhere := privateTempDir(t)
 	require.NoError(t, os.WriteFile(filepath.Join(elsewhere, "Preferences"), []byte(`{"theirs":1}`), 0o600))
 	refuse(t, "linked-prefs", "not a regular file", func(dir string) {
 		require.NoError(t, os.Remove(filepath.Join(dir, "Default", "Preferences")))
@@ -261,7 +261,7 @@ func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	})
 	assert.Equal(t, map[string]any{"theirs": float64(1)}, readJSON(t, filepath.Join(elsewhere, "Preferences")), "a link's target is never written")
 
-	linkedTarget := t.TempDir()
+	linkedTarget := privateTempDir(t)
 	require.NoError(t, os.Symlink(linkedTarget, filepath.Join(browserDir, profilesDirName, "linked")))
 	before := snapshotDir(t, linkedTarget)
 	_, err = ClaimProfile(browserDir, "linked")
@@ -276,7 +276,7 @@ func TestClaimProfileThatFailsLeavesItsEvidence(t *testing.T) {
 	failMark := defaultClaimOps
 	failMark.mark = func(*os.Root) error { return errors.New("the mark failed") }
 
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	original := `{"incognito":{"mode_availability":0}}`
 	dir := oldProfile(t, browserDir, "undone", original)
 	before := snapshotDir(t, dir)
@@ -313,7 +313,7 @@ func TestClaimProfileThatFailsLeavesItsEvidence(t *testing.T) {
 // the record and the copy, and says so.
 func TestUnclaimProfileThatFailsKeepsTheRecord(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	dir := oldProfile(t, browserDir, "half", `{"incognito":{"mode_availability":0}}`)
 	report, err := ClaimProfile(browserDir, "half")
 	require.NoError(t, err)
@@ -350,7 +350,7 @@ func TestClaimProfileWhoseMarkMayBeMadeKeepsItsEvidence(t *testing.T) {
 		}
 		return errors.New("the mark's file could not be closed")
 	}
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	original := `{"incognito":{"mode_availability":0}}`
 	dir := oldProfile(t, browserDir, "marked", original)
 	_, err := claimProfileWith(browserDir, "marked", markThenFail)
@@ -375,7 +375,7 @@ func TestClaimProfileWhoseMarkMayBeMadeKeepsItsEvidence(t *testing.T) {
 // follows a renewal that fails when the lease is no longer its own.
 func TestClaimProfileThatLostItsLeaseWritesNothing(t *testing.T) {
 	t.Parallel()
-	browserDir := t.TempDir()
+	browserDir := privateTempDir(t)
 	dir := oldProfile(t, browserDir, "taken", `{"incognito":{"mode_availability":0}}`)
 	lockDir := dir + profileLockSuffix
 	var other dirlock.DirLock

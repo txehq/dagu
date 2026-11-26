@@ -38,9 +38,19 @@ import (
 //     way to mark a directory that existed before is ClaimExistingProfileRoot,
 //     for an explicit claim a person asks for (dagu browser profile claim),
 //     after its own checks.
-//   - The directory, the profile within it and its Preferences are refused
-//     when any is a symbolic link; on Unix the directory must belong to this
-//     user and be writable by nobody else.
+//   - On Unix the profile is private to this user (privacy_unix.go): the
+//     path to it passes through no symbolic link and through no directory
+//     another account could change; the profile directory is this user's
+//     and 0700, with no access control entry for another account; the
+//     entries the gate and a claim use in it (the profile within it, its
+//     Preferences, the marker, a claim's record and copy) are this user's,
+//     writable by no one else, files with a single link. Each is read from
+//     the open object, and only on a filesystem whose permissions the gate
+//     reads (supportedLinuxFS, supportedDarwinFS); anything it cannot read
+//     is refused. Root and this user's own processes are outside what it
+//     guards. On overlayfs it relies on the overlay's storage being as
+//     trusted as the rest: backing directories no other account can reach,
+//     and no untrusted layer metadata.
 //   - A profile a running browser holds is refused: the gate does not
 //     change preferences under a browser that would write its own back. A
 //     browser still ending, as when a browser is started again on the
@@ -50,9 +60,9 @@ import (
 //   - The previous value is not put back. The profile is the gate's, and the
 //     preference is its policy for every browser it starts there.
 //
-// On Windows the directory's owner and access are not checked
-// (profile_windows.go): the gate's isolation of its own profiles there is
-// unproven.
+// On Windows the owner and access of the profile and its path are not
+// checked (privacy_windows.go): the gate's isolation of its own profiles
+// there is unproven.
 
 // ErrProfileRequired is returned for a browser whose arguments name no
 // profile directory of its own.
@@ -110,8 +120,17 @@ func NewProfile(dir string) error {
 }
 
 // NewTempProfile creates a new temporary profile directory of the gate's
-// own, as os.MkdirTemp does with parent and pattern, and returns it.
+// own, as os.MkdirTemp does with parent and pattern, and returns it. The
+// directory is made in parent with its symbolic links resolved, so the path
+// the browser is started on passes through none (openTrusted).
 func NewTempProfile(parent, pattern string) (string, error) {
+	if parent == "" {
+		parent = os.TempDir()
+	}
+	parent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return "", err
+	}
 	dir, err := os.MkdirTemp(parent, pattern)
 	if err != nil {
 		return "", err
@@ -127,22 +146,63 @@ func NewTempProfile(parent, pattern string) (string, error) {
 	return dir, nil
 }
 
-// ProfileClaimed reports whether dir holds the gate's marker, one that
-// passes checkMarker. A marker that fails it does not count.
-func ProfileClaimed(dir string) bool {
-	path := filepath.Join(dir, profileMarker)
-	info, err := os.Lstat(path)
-	return err == nil && checkMarker(path, info) == nil
+// OpenProfileRoot opens the profile directory dir for the gate's checks
+// and writes: along a path no other account can change, the directory
+// itself this user's alone (openTrusted, on Unix), and as an *os.Root that
+// is that same directory. What is read and written through the Root then
+// cannot be redirected to another directory.
+func OpenProfileRoot(dir string) (*os.Root, error) {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return nil, ErrProfileRequired
+	}
+	walked, err := openTrusted(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = walked.Close() }()
+	return bridgeRoot(walked, dir)
 }
 
-// checkMarker refuses a marker that is not a regular file of this user's
-// alone with a single link: one another account made, or a link to a file
-// made for something else, does not mark a profile as the gate's.
-func checkMarker(path string, info os.FileInfo) error {
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", path)
+// bridgeRoot opens dir as an *os.Root and refuses it unless it is the
+// directory walked, the one the checks read: the os.Root holds no
+// descriptor of its own to check, so the two are proven the same object.
+func bridgeRoot(walked *os.File, dir string) (*os.Root, error) {
+	checked, err := walked.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("devtools gate: the profile directory: %w", err)
 	}
-	return checkEntryOwner(path, info)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("devtools gate: the profile directory: %w", err)
+	}
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, checked) {
+		_ = root.Close()
+		return nil, fmt.Errorf("devtools gate: the profile directory changed while it was opened: %s", dir)
+	}
+	return root, nil
+}
+
+// OpenProfileEntry opens name in root, a profile directory or a directory
+// in it, as an entry the gate or a claim uses: not through a symbolic link,
+// a directory when dir is set and a regular file otherwise, and on Unix
+// this user's, writable by no one else, a file with a single link, read
+// from the open file itself. It returns nil and no error when nothing is
+// there.
+func OpenProfileEntry(root *os.Root, name string, dir bool) (*os.File, error) {
+	return openEntry(root, name, dir)
+}
+
+// ProfileClaimed reports whether dir is a profile directory the gate may
+// use (OpenProfileRoot) that holds the gate's marker (ProfileClaimedRoot).
+// A directory or marker that fails a check does not count.
+func ProfileClaimed(dir string) bool {
+	root, err := OpenProfileRoot(dir)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = root.Close() }()
+	claimed, err := ProfileClaimedRoot(root)
+	return err == nil && claimed
 }
 
 // The explicit claim of a profile that existed before works on the
@@ -151,33 +211,34 @@ func checkMarker(path string, info os.FileInfo) error {
 // and none of it follows a symbolic link.
 
 // CheckProfileRoot refuses the profile directory open as root when the
-// gate would refuse to start a browser on it: on Unix, one another user
-// owns or may write.
+// gate would refuse to start a browser on it, read from the directory the
+// Root holds: on Unix, one that is not this user's alone.
 func CheckProfileRoot(root *os.Root) error {
-	info, err := root.Stat(".")
+	f, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("devtools gate: the profile directory: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("devtools gate: the profile directory: %w", err)
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("devtools gate: the profile directory is not a directory: %s", root.Name())
 	}
-	return checkProfileOwner(root.Name(), info)
+	return checkOpened(f, roleProfile, root.Name())
 }
 
 // ProfileClaimedRoot reports whether the profile directory open as root
-// holds the gate's marker, and refuses a marker that is not a regular file.
+// holds the gate's marker. A marker must be an entry the gate may use
+// (OpenProfileEntry): one another account made, a link to a file made for
+// something else, or anything but a regular file is refused.
 func ProfileClaimedRoot(root *os.Root) (bool, error) {
-	info, err := root.Lstat(profileMarker)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
+	marker, err := openEntry(root, profileMarker, false)
+	if err != nil || marker == nil {
 		return false, err
 	}
-	if err := checkMarker(filepath.Join(root.Name(), profileMarker), info); err != nil {
-		return false, err
-	}
-	return true, nil
+	return true, marker.Close()
 }
 
 // ClaimExistingProfileRoot marks the profile directory open as root, one
@@ -195,12 +256,19 @@ func ClaimExistingProfileRoot(root *os.Root) error {
 	if err != nil || claimed {
 		return err
 	}
+	return createMarker(root)
+}
+
+// createMarker leaves the gate's marker in root, a new file that is then
+// checked as an entry, from the file itself. A marker that fails, or that
+// could not be finished, does not stay as a claim.
+func createMarker(root *os.Root) error {
 	file, err := root.OpenFile(profileMarker, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600)
 	if err != nil {
 		return fmt.Errorf("devtools gate: claim the profile directory: %w", err)
 	}
-	if err := file.Close(); err != nil {
-		// A marker the claim failed to finish does not stay as a claim.
+	checkErr := checkOpened(file, roleEntry, filepath.Join(root.Name(), profileMarker))
+	if err := errors.Join(checkErr, file.Close()); err != nil {
 		return errors.Join(fmt.Errorf("devtools gate: claim the profile directory: %w", err), root.Remove(profileMarker))
 	}
 	return nil
@@ -231,22 +299,16 @@ func ProfileInUseRoot(root *os.Root) bool {
 // claimProfile leaves the gate's marker in dir, after the checks the gate
 // makes before it starts a browser there.
 func claimProfile(dir string) error {
-	if err := checkProfileDir(dir); err != nil {
+	root, err := OpenProfileRoot(dir)
+	if err != nil {
 		return err
 	}
-	marker := filepath.Join(dir, profileMarker)
-	if info, err := os.Lstat(marker); err == nil {
-		return checkMarker(marker, info)
+	defer func() { _ = root.Close() }()
+	claimed, err := ProfileClaimedRoot(root)
+	if err != nil || claimed {
+		return err
 	}
-	file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600) //nolint:gosec // a new file in the directory checked above
-	if err != nil {
-		return fmt.Errorf("devtools gate: claim the profile directory: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		// A marker the claim failed to finish does not stay as a claim.
-		return errors.Join(fmt.Errorf("devtools gate: claim the profile directory: %w", err), os.Remove(marker))
-	}
-	return nil
+	return createMarker(root)
 }
 
 // profileDirs returns the profile directory args name, the last
@@ -265,107 +327,72 @@ func profileDirs(args []string) (userDataDir, profile string) {
 	return userDataDir, profile
 }
 
-// checkProfileDir refuses a profile directory that is not an absolute path
-// to a real directory this user alone may write.
-func checkProfileDir(dir string) error {
-	_, err := checkedProfileDir(dir)
-	return err
-}
-
-// checkedProfileDir is checkProfileDir that also returns what it checked.
-func checkedProfileDir(dir string) (os.FileInfo, error) {
-	if dir == "" || !filepath.IsAbs(dir) {
-		return nil, ErrProfileRequired
-	}
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return nil, fmt.Errorf("devtools gate: the profile directory: %w", err)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("devtools gate: the profile directory is a symbolic link: %s", dir)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("devtools gate: the profile directory is not a directory: %s", dir)
-	}
-	return info, checkProfileOwner(dir, info)
-}
-
-// CheckProfileEntry refuses an entry of a profile, a directory or a file
-// within it the gate reads or writes, on the same terms as the profile
-// directory: on Unix, one another user owns or may write.
-func CheckProfileEntry(path string, info os.FileInfo) error {
-	return checkEntryOwner(path, info)
-}
-
 // disableOffTheRecord sets incognito.mode_availability in the preferences
 // of the profile args name, keeping every other preference as it is, once
-// the profile is found to be the gate's own and not in use. Everything it
-// reads and writes is reached through the profile directory it checked,
-// held open (an *os.Root), so a directory swapped in on the way is not
-// written; and every entry it uses is checked as the directory is.
+// the profile is found to be the gate's own and not in use. The profile
+// directory is opened along a path no other account can change, and the
+// browser is started on that same path after this returns; everything read
+// and written is reached through the directory checked, held open, and
+// every entry used is checked from the open entry itself.
 func disableOffTheRecord(args []string) error {
 	userDataDir, profile := profileDirs(args)
-	checked, err := checkedProfileDir(userDataDir)
-	if err != nil {
-		return err
+	if userDataDir == "" || !filepath.IsAbs(userDataDir) {
+		return ErrProfileRequired
 	}
 	if profile == "" || profile == "." || profile == ".." || filepath.Base(profile) != profile || strings.ContainsAny(profile, `/\`) {
 		return fmt.Errorf("devtools gate: the profile %q is not a single directory name", profile)
 	}
-	root, err := os.OpenRoot(userDataDir)
+	root, err := OpenProfileRoot(userDataDir)
 	if err != nil {
-		return fmt.Errorf("devtools gate: the profile directory: %w", err)
+		return err
 	}
 	defer func() { _ = root.Close() }()
-	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, checked) {
-		return fmt.Errorf("devtools gate: the profile directory changed while it was opened: %s", userDataDir)
-	}
-	if marker, err := root.Lstat(profileMarker); err != nil || checkMarker(filepath.Join(userDataDir, profileMarker), marker) != nil {
+	if claimed, err := ProfileClaimedRoot(root); err != nil {
+		return fmt.Errorf("%w: %s: %w", ErrProfileNotOwned, userDataDir, err)
+	} else if !claimed {
 		return fmt.Errorf("%w: %s", ErrProfileNotOwned, userDataDir)
 	}
 	if !profileReleasedRoot(root) {
 		return fmt.Errorf("%w: %s", ErrProfileInUse, userDataDir)
 	}
 	dir := filepath.Join(userDataDir, profile)
-	info, err := root.Lstat(profile)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
+	opened, err := openEntry(root, profile, true)
+	if err != nil {
+		return err
+	}
+	if opened == nil {
 		if err := root.Mkdir(profile, 0o700); err != nil {
 			return fmt.Errorf("devtools gate: create the profile: %w", err)
 		}
-		if info, err = root.Lstat(profile); err != nil {
-			return fmt.Errorf("devtools gate: the profile: %w", err)
+		if opened, err = openEntry(root, profile, true); err != nil {
+			return err
 		}
-	case err != nil:
+		if opened == nil {
+			return fmt.Errorf("devtools gate: the profile went away as it was made: %s", dir)
+		}
+	}
+	defer func() { _ = opened.Close() }()
+	checked, err := opened.Stat()
+	if err != nil {
 		return fmt.Errorf("devtools gate: the profile: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("devtools gate: the profile is not a directory: %s", dir)
-	}
-	if err := CheckProfileEntry(dir, info); err != nil {
-		return err
 	}
 	profileRoot, err := root.OpenRoot(profile)
 	if err != nil {
 		return fmt.Errorf("devtools gate: the profile: %w", err)
 	}
 	defer func() { _ = profileRoot.Close() }()
-	if opened, err := profileRoot.Stat("."); err != nil || !os.SameFile(opened, info) {
+	if same, err := profileRoot.Stat("."); err != nil || !os.SameFile(same, checked) {
 		return fmt.Errorf("devtools gate: the profile changed while it was opened: %s", dir)
 	}
 	path := filepath.Join(dir, "Preferences")
 	prefs := map[string]any{}
-	switch info, err := profileRoot.Lstat("Preferences"); {
-	case errors.Is(err, os.ErrNotExist):
-	case err != nil:
-		return fmt.Errorf("devtools gate: the profile's preferences: %w", err)
-	case !info.Mode().IsRegular():
-		return fmt.Errorf("devtools gate: the profile's preferences are not a regular file: %s", path)
-	default:
-		if err := CheckProfileEntry(path, info); err != nil {
-			return err
-		}
-		raw, err := readRegularNoFollow(profileRoot, "Preferences")
+	current, err := openEntry(profileRoot, "Preferences", false)
+	if err != nil {
+		return err
+	}
+	if current != nil {
+		raw, err := io.ReadAll(current)
+		_ = current.Close()
 		if err != nil {
 			return fmt.Errorf("devtools gate: read the profile's preferences: %w", err)
 		}
@@ -392,8 +419,11 @@ func disableOffTheRecord(args []string) error {
 		return fmt.Errorf("devtools gate: write the profile's preferences: %w", err)
 	}
 	_, writeErr := file.Write(encoded)
+	// The new preferences are checked as an entry before they replace the
+	// old: an inherited access control list would show here.
+	checkErr := checkOpened(file, roleEntry, filepath.Join(dir, temp))
 	closeErr := file.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
+	if err := errors.Join(writeErr, checkErr, closeErr); err != nil {
 		_ = profileRoot.Remove(temp)
 		return fmt.Errorf("devtools gate: write the profile's preferences: %w", err)
 	}
@@ -402,22 +432,4 @@ func disableOffTheRecord(args []string) error {
 		return fmt.Errorf("devtools gate: write the profile's preferences: %w", err)
 	}
 	return nil
-}
-
-// readRegularNoFollow reads the regular file name in root without following
-// a link.
-func readRegularNoFollow(root *os.Root, name string) ([]byte, error) {
-	file, err := root.OpenFile(name, os.O_RDONLY|openNoFollow, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", name)
-	}
-	return io.ReadAll(file)
 }

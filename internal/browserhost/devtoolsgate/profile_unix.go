@@ -6,7 +6,6 @@
 package devtoolsgate
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,33 +14,6 @@ import (
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/procutil"
 )
-
-// checkProfileOwner refuses a profile directory another user owns, or one
-// another user may write. Owner and mode bits are what is read: an access
-// control list on the directory is not (a known residual, TXE-7856).
-func checkProfileOwner(dir string, info os.FileInfo) error {
-	return checkOwner("the profile directory", dir, info)
-}
-
-// checkEntryOwner refuses an entry of a profile on the same terms.
-func checkEntryOwner(path string, info os.FileInfo) error {
-	return checkOwner("the profile's entry", path, info)
-}
-
-func checkOwner(what, path string, info os.FileInfo) error {
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("devtools gate: %s belongs to another user: %s", what, path)
-	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("devtools gate: others may write %s: %s", what, path)
-	}
-	// A file with another link is also reached by a name outside what was
-	// checked.
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && info.Mode().IsRegular() && stat.Nlink != 1 {
-		return fmt.Errorf("devtools gate: %s has another link: %s", what, path)
-	}
-	return nil
-}
 
 // openNoFollow makes an open refuse a symbolic link.
 const openNoFollow = syscall.O_NOFOLLOW

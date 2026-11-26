@@ -333,28 +333,10 @@ func holdExistingProfile(browserDir, name string) (*heldProfile, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("browser profile %q is not a directory of its own: %s", name, dir)
 	}
-	canonicalDir, err := filepath.EvalSymlinks(dir)
+	// Opened along a path no other account can change, this user's alone,
+	// and held open: every later step works on the directory checked.
+	root, err := devtoolsgate.OpenProfileRoot(dir)
 	if err != nil {
-		return nil, err
-	}
-	canonicalProfiles, err := filepath.EvalSymlinks(profilesDir)
-	if err != nil {
-		return nil, err
-	}
-	if canonicalDir != filepath.Join(canonicalProfiles, name) {
-		return nil, fmt.Errorf("browser profile %q resolves to %s, outside %s", name, canonicalDir, canonicalProfiles)
-	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return nil, err
-	}
-	// The directory opened is the one checked: the same file, still no link.
-	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, info) {
-		_ = root.Close()
-		return nil, fmt.Errorf("browser profile %q changed while it was opened", name)
-	}
-	if err := devtoolsgate.CheckProfileRoot(root); err != nil {
-		_ = root.Close()
 		return nil, fmt.Errorf("browser profile %q: %w", name, err)
 	}
 	lockDir := dir + profileLockSuffix
@@ -411,39 +393,25 @@ func backupPath(dir, backup string) string {
 }
 
 // regularOrAbsent reports whether name is a regular file in root, and
-// refuses anything else that is there: a link, a directory, a device.
+// refuses anything else that is there: a link, a directory, a device, or a
+// file that is not an entry the gate may use (devtoolsgate.OpenProfileEntry:
+// this user's, writable by no one else, a single link).
 func regularOrAbsent(root *os.Root, name string) (bool, error) {
-	info, err := root.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
+	f, err := devtoolsgate.OpenProfileEntry(root, name, false)
+	if err != nil || f == nil {
 		return false, err
 	}
-	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("%s is not a regular file", name)
-	}
-	// What the claim reads or replaces is this user's alone, as the
-	// profile directory is.
-	if err := devtoolsgate.CheckProfileEntry(filepath.Join(root.Name(), filepath.FromSlash(name)), info); err != nil {
-		return false, err
-	}
-	return true, nil
+	return true, f.Close()
 }
 
-// dirOrAbsent refuses name in root unless it is a directory or absent.
+// dirOrAbsent refuses name in root unless it is absent or a directory the
+// gate may use, as regularOrAbsent does for a file.
 func dirOrAbsent(root *os.Root, name string) error {
-	info, err := root.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
+	f, err := devtoolsgate.OpenProfileEntry(root, name, true)
+	if err != nil || f == nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is not a directory", name)
-	}
-	return devtoolsgate.CheckProfileEntry(filepath.Join(root.Name(), filepath.FromSlash(name)), info)
+	return f.Close()
 }
 
 // absent refuses name in root when anything is there.
@@ -457,22 +425,18 @@ func absent(root *os.Root, name string) error {
 	return nil
 }
 
-// readNoFollow reads the regular file name in root without following a
-// link.
+// readNoFollow reads name in root, a regular file the gate may use, from
+// the file it checked.
 func readNoFollow(root *os.Root, name string) ([]byte, error) {
-	file, err := root.OpenFile(name, os.O_RDONLY|openNoFollow, 0)
+	f, err := devtoolsgate.OpenProfileEntry(root, name, false)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
+	if f == nil {
+		return nil, fmt.Errorf("%s: %w", name, os.ErrNotExist)
 	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", name)
-	}
-	return io.ReadAll(file)
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(f)
 }
 
 // writeNewFile writes data to a new file name in root, mode 0600, refusing

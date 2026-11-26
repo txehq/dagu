@@ -52,7 +52,7 @@ func uploadPage(button string) pageSnapshot {
 func TestUploadIntoThePageFileInput(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf", "receipt.png")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf", "receipt.png")
 	run := newTestRun(t, pageModel(nil))
 	execution := run.execute(uploadSteps(t, map[string]any{"files": files}), nil)
 	require.NoError(t, execution.err)
@@ -69,7 +69,7 @@ func TestUploadIntoThePageFileInput(t *testing.T) {
 func TestUploadRecordsTheElementTheModelFinds(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	steps := uploadSteps(t, map[string]any{"files": files[0], "into": "the Upload receipt button"})
 	run := newTestRun(t, pageModel(nil))
 	run.engine.snapshot = uploadPage("Upload receipt")
@@ -103,7 +103,7 @@ func TestUploadRecordsTheElementTheModelFinds(t *testing.T) {
 func TestUploadCacheCanBeDisabled(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	steps := uploadSteps(t, map[string]any{"files": files, "into": "the Upload receipt button", "cache": false})
 	run := newTestRun(t, pageModel(nil))
 	require.NoError(t, run.execute(steps, nil).err)
@@ -117,7 +117,7 @@ func TestUploadCacheCanBeDisabled(t *testing.T) {
 func TestUploadUnderNeverReplaysWithoutModel(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	run := newTestRun(t, pageModel(nil))
 	run.engine.snapshot = uploadPage("Upload receipt")
 	require.NoError(t, run.execute(uploadSteps(t, map[string]any{"files": files[0], "into": "the Upload receipt button"}), nil).err)
@@ -142,7 +142,7 @@ func TestUploadUnderNeverReplaysWithoutModel(t *testing.T) {
 func TestUploadFailureFailsTheStep(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "a.pdf", "b.pdf")
+	files := writeFiles(t, privateTempDir(t), "a.pdf", "b.pdf")
 	steps := uploadSteps(t, map[string]any{"files": files, "into": "the Upload receipt button"})
 	run := newTestRun(t, pageModel(nil))
 	require.NoError(t, run.execute(steps, nil).err)
@@ -160,7 +160,7 @@ func TestUploadFailureFailsTheStep(t *testing.T) {
 func TestUploadOfMissingFileFailsBeforeThePage(t *testing.T) {
 	t.Parallel()
 
-	missing := filepath.Join(t.TempDir(), "missing.pdf")
+	missing := filepath.Join(privateTempDir(t), "missing.pdf")
 	run := newTestRun(t, pageModel(nil))
 	execution := run.execute(uploadSteps(t, map[string]any{"files": missing, "into": "the Upload receipt button"}), nil)
 	require.ErrorContains(t, execution.err, "file "+missing+" does not exist")
@@ -171,7 +171,7 @@ func TestUploadOfMissingFileFailsBeforeThePage(t *testing.T) {
 func TestUploadWithNoMatchingElementNamesTheModel(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	run := newTestRun(t, func(*llmpkg.ChatRequest) (string, error) { return `{"elements":[]}`, nil })
 	execution := run.execute(uploadSteps(t, map[string]any{"files": files, "into": "the receipt box"}), nil)
 	require.ErrorContains(t, execution.err, `the model (test-model) answered that no element on the page matches "the receipt box"`)
@@ -181,7 +181,7 @@ func TestUploadWithNoMatchingElementNamesTheModel(t *testing.T) {
 func TestUploadIntoHoldingSecretIsRejected(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	run := newTestRun(t, pageModel(nil))
 	run.secrets = map[string]string{"ACCOUNT": "acct-7731"}
 	execution := run.execute(uploadSteps(t, map[string]any{"files": files, "into": "the receipt box of acct-7731"}), nil)
@@ -192,7 +192,7 @@ func TestUploadIntoHoldingSecretIsRejected(t *testing.T) {
 func TestResolveUploadFiles(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	paths := writeFiles(t, dir, "invoices/b.pdf", "invoices/a.pdf", "invoices/notes.txt", "receipt.png")
 	b, a, notes, receipt := paths[0], paths[1], paths[2], paths[3]
 	attachments, err := json.Marshal([]map[string]any{
@@ -240,7 +240,7 @@ func TestResolveUploadFiles(t *testing.T) {
 func TestResolveUploadFilesRefuses(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	writeFiles(t, dir, "invoices/a.pdf")
 	large := filepath.Join(dir, "scan.tiff")
 	file, err := os.Create(large)
@@ -272,12 +272,12 @@ func TestResolveUploadFilesRefuses(t *testing.T) {
 }
 
 func TestResolveUploadFilesFromHome(t *testing.T) {
-	home := t.TempDir()
+	home := privateTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	paths := writeFiles(t, home, "Downloads/invoice.pdf")
 
-	files, err := resolveUploadFiles([]string{"~/Downloads/*.pdf"}, t.TempDir())
+	files, err := resolveUploadFiles([]string{"~/Downloads/*.pdf"}, privateTempDir(t))
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	assert.Equal(t, paths[0], files[0].Path)

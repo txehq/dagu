@@ -148,7 +148,7 @@ func TestWriteGateSecretsComeFromTheStep(t *testing.T) {
 	t.Parallel()
 
 	run := newTestRun(t, pageModel(nil))
-	policy := filepath.Join(t.TempDir(), "policy.yaml")
+	policy := filepath.Join(privateTempDir(t), "policy.yaml")
 	require.NoError(t, os.WriteFile(policy, []byte("sign_in:\n  - host: login.example.com\n    path: /session\n    secret: PORTAL_PASSWORD\n"), 0o600))
 	run.hostWritePolicy = policy
 	run.secrets = map[string]string{"PORTAL_PASSWORD": "s3cret"}
@@ -168,7 +168,7 @@ func TestWriteGateKeepsOnlyTheSignInsAStepHolds(t *testing.T) {
 	t.Parallel()
 
 	run := newTestRun(t, pageModel(nil))
-	policy := filepath.Join(t.TempDir(), "policy.yaml")
+	policy := filepath.Join(privateTempDir(t), "policy.yaml")
 	require.NoError(t, os.WriteFile(policy, []byte(`sign_in:
   - host: login.example.com
     secret: PORTAL_PASSWORD

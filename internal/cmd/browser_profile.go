@@ -40,11 +40,15 @@ preference: it keeps a copy of the preferences beside them
 and marks the profile.
 
 The profile must be the directory <data dir>/browser/profiles/<name> itself,
-not in use by a step, a session or a browser, and on Unix this user's alone,
-as must its Default directory and preferences, by their owner and mode bits
-(access control lists are not read). All of that is checked before anything
-is written; a refused claim writes nothing. On Windows the owner and access
-of the profile are not checked.
+not in use by a step, a session or a browser. On Unix it must also be
+private to this user: mode 0700 with no access control entry for another
+account, its Default directory and preferences this user's and writable by
+no one else, and the path to it free of symbolic links and of directories
+another account could change, on a local filesystem whose permissions Dagu
+reads (Linux: ext2/3/4, XFS, Btrfs, tmpfs, overlayfs; macOS: APFS, HFS+).
+A profile that is not is refused, never changed to fit. All of that is
+checked before anything is written; a refused claim writes nothing. On
+Windows the owner and access of the profile are not checked.
 
 Undo with: dagu browser profile unclaim <name>
 

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
@@ -33,4 +34,20 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// privateTempDir is t.TempDir with its symbolic links resolved and made
+// 0700. The DevTools gate starts a browser only on a profile whose path no
+// other account can change, and t.TempDir's own directory takes its mode
+// from the umask (group-writable under 002).
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
