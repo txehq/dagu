@@ -8,6 +8,7 @@ import type { components } from '@/api/v1/schema';
 import {
   canRequestRetry,
   offeredIntents,
+  retryIntentOf,
   retryLabel,
   retryStates,
   sameRetryStates,
@@ -270,5 +271,19 @@ describe('sameRetryStates', () => {
         new Map([['r', st('requested')]])
       )
     ).toBe(true);
+  });
+});
+
+// TXE-8597: retryIntentOf is the one decoder of a stored retry's intent,
+// shared by retryStates and the decision panel's verdict label.
+describe('retryIntentOf', () => {
+  it('decodes the current and the legacy rerun shapes', () => {
+    expect(retryIntentOf({ step: 'run' })).toBe('rerun');
+    expect(retryIntentOf({ rerun: true })).toBe('rerun');
+    expect(retryIntentOf({ rerun: 'true' })).toBe('rerun');
+    expect(retryIntentOf({ step: 'publish' })).toBe('republish');
+    expect(retryIntentOf({ rerun: false })).toBe('unspecified');
+    expect(retryIntentOf({})).toBe('unspecified');
+    expect(retryIntentOf(undefined)).toBe('unspecified');
   });
 });
