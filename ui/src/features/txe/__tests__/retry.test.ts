@@ -349,6 +349,21 @@ describe('offeredIntents with several proposals on one execution', () => {
     expect(offered(second, secondActions, a2)).toEqual(['rerun']);
   });
 
+  it('starts a new job version with no intent used on the execution', () => {
+    // The server derives a retry's proposal from the job version too, so a
+    // republish refused under version 1 may be asked again under version 2.
+    const pub = request('prp_pub', '2026-10-09T12:10:00Z', 'publish');
+    pub.job_version = 1;
+    const proposals = [pub, request('prp_run', '2026-10-09T12:20:00Z', 'run')];
+    const actions = [
+      action('prp_pub', 'failed'),
+      action('prp_run', 'not_applied'),
+    ];
+    expect(
+      offered(proposals, actions, { attemptId: 'run-1-a1', queuedAt: q1 })
+    ).toEqual(['republish']);
+  });
+
   it('resets the used intents when a retry re-queued the same attempt', () => {
     const proposals = [
       request('prp_pub', '2026-10-09T12:10:00Z', 'publish'),

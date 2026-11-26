@@ -62,8 +62,10 @@ export type RetryState = {
   receipt?: string;
   attempt?: number;
   // usedIntents is every intent asked for by a retry of this run bound to
-  // the same execution as this one, the newest included (TXE-8627). A state
-  // without it has used only its own intent.
+  // the same execution, under the same job version, as this one, the newest
+  // included (TXE-8627). The server derives a retry's proposal from the run,
+  // execution, job version and intent, so a new job version starts with no
+  // intent used. A state without it has used only its own intent.
   usedIntents?: RetryIntent[];
 };
 
@@ -114,6 +116,7 @@ export function retryStates(
     if (!cur || a.attempt > cur.attempt) byProposal.set(a.proposal_id, a);
   }
   const out = new Map<string, RetryState>();
+  const versionOf = new Map<string, number>();
   const newestFirst = [...proposals].sort((x, y) =>
     y.created.at.localeCompare(x.created.at)
   );
@@ -142,10 +145,12 @@ export function retryStates(
       attempt: action?.attempt,
       usedIntents: [],
     });
+    versionOf.set(runId, p.job_version);
   }
   // A second pass collects the intents of every retry bound to the
-  // execution of its run's newest one, so an intent used earlier on that
-  // execution is not forgotten once a later request replaced it.
+  // execution and job version of its run's newest one, so an intent used
+  // earlier on that execution is not forgotten once a later request
+  // replaced it.
   for (const p of newestFirst) {
     if (p.action.name !== ACTION_RETRY_RUN) continue;
     const { runId, attemptId, queuedAt, intent } = paramsOf(p);
@@ -154,7 +159,8 @@ export function retryStates(
       !state ||
       intent === 'unspecified' ||
       state.attemptId !== attemptId ||
-      state.queuedAt !== queuedAt
+      state.queuedAt !== queuedAt ||
+      versionOf.get(state.runId) !== p.job_version
     ) {
       continue;
     }
