@@ -5,14 +5,18 @@ package scheduler
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dagucloud/dagu/v2/internal/dispatch"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	"github.com/dagucloud/dagu/v2/internal/persis/file"
+	"github.com/dagucloud/dagu/v2/internal/persis/store"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -133,9 +137,12 @@ func acquireReviewClaim(t *testing.T, f *queueFixture, j txeQueueJob) *registry.
 }
 
 // The grant ends while the retry waits: dispatch refuses it, as today, and
-// records through the run's store that the execution was abandoned before it
-// was dispatched. The registry then never records the retry as succeeded,
-// and records it as not applied.
+// withdraws it from its queue (TXE-8596). It neither marks the execution
+// aborted, which would read as having run, nor records it as never
+// dispatched, which only the coordinator can establish. So the retry is
+// pending: the registry records it neither as succeeded nor as not applied.
+// The coordinator's decision, and what follows from it, is tested in
+// internal/service/coordinator (withdrawn_queued_retry_test.go).
 func TestQueueDispatch_TxeRefusedQueuedRetryIsNeverASuccess(t *testing.T) {
 	f := newQueueFixture(t)
 	j, clock := newRegistryJobWithRuns(t, f)
@@ -148,23 +155,52 @@ func TestQueueDispatch_TxeRefusedQueuedRetryIsNeverASuccess(t *testing.T) {
 	clock.advance(approved.grant.ExpiresAt.Sub(clock.Now()) + time.Second)
 
 	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
-	assertRetryAbandoned(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
+	assertRetryWithdrawn(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
 
 	later := acquireReviewClaim(t, f, j)
 	err := settleRetry(t, f, j, approved, later, registry.ActionSucceeded, ref, nil)
-	assert.Equal(t, registry.CodeInvalid, registry.ErrorCode(err), "abandoned before dispatch: nothing ran, so no success")
-	require.NoError(t, settleRetry(t, f, j, approved, later, registry.ActionNotApplied, "", nil))
+	assert.Equal(t, registry.CodeNotReady, registry.ErrorCode(err), "withdrawn, journaled and still queued: no success")
+	err = settleRetry(t, f, j, approved, later, registry.ActionNotApplied, "", nil)
+	assert.Equal(t, registry.CodeInvalid, registry.ErrorCode(err), "and no not applied without the coordinator's record")
 	job, err := j.store.GetJob(f.ctx, j.job.JobID)
 	require.NoError(t, err)
-	assert.Equal(t, registry.ActionNotApplied, job.Actions[approved.actionID].State)
+	assert.Equal(t, registry.ActionUncertain, job.Actions[approved.actionID].State, "interrupted with its grant, and pending")
 }
 
-// assertRetryAbandoned checks a refused queued retry that carried a retry
-// request: not dispatched, its queue item gone, its execution marked failed
-// with the registry's reason and an execution-scoped abandonment record
-// correlated with the request, the retried execution kept, and the refusal
-// noted on the job.
-func assertRetryAbandoned(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir.DAGRunStatus, admitted bool, code registry.AdmitCode) {
+// The P1 root's review of r2 found. A queued retry was handed off earlier:
+// the coordinator holds a live lease for it, and its status still reads
+// queued because the worker has not reported. Its queue item outlived the
+// handoff (the deletion failed, or the scheduler stopped first), and
+// admission now refuses the retry. Nothing may record the execution as never
+// dispatched: the scheduler cannot read the coordinator's lease, task or
+// active-run stores, so it withdraws the retry and writes no record and no
+// status. (r2 recorded it as abandoned here, from the queued status alone.)
+func TestQueueDispatch_TxeRefusedRetryHandedOffEarlierIsNotRecordedAsNeverRun(t *testing.T) {
+	f := newQueueFixture(t)
+	j, clock := newRegistryJobWithRuns(t, f)
+	approved := approveRerun(t, f, j, "run-failed")
+	queued := cliEnqueueRetry(t, f, j.dag, approved.failed, approved.request)
+	attemptKey := ir.GenerateAttemptKey(queued.Name, queued.DAGRunID, queued.Name, queued.DAGRunID, queued.AttemptID)
+	leases := store.NewDAGRunLeaseStore(file.NewCollection(filepath.Join(t.TempDir(), "leases")))
+	now := time.Now().UTC().UnixMilli()
+	require.NoError(t, leases.Upsert(f.ctx, dispatch.DAGRunLease{
+		AttemptKey: attemptKey, DAGRun: queued.DAGRun(), Root: queued.DAGRun(), AttemptID: queued.AttemptID,
+		ExecutionMarker: queued.QueuedAt, WorkerID: "worker-1", ClaimedAt: now, LastHeartbeatAt: now,
+	}))
+	clock.advance(approved.grant.ExpiresAt.Sub(clock.Now()) + time.Second)
+
+	admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
+	assertRetryWithdrawn(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
+	_, err := leases.Get(f.ctx, attemptKey)
+	require.NoError(t, err, "the coordinator's lease is untouched")
+}
+
+// assertRetryWithdrawn checks a refused queued retry that carried a retry
+// request: not dispatched, its queue item gone, its status unchanged (still
+// queued, no error written), the execution journaled for the coordinator to
+// decide, no abandonment record, the retried execution kept, and the refusal
+// noted on the job with its reason.
+func assertRetryWithdrawn(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir.DAGRunStatus, admitted bool, code registry.AdmitCode) {
 	t.Helper()
 	assert.False(t, admitted)
 	items, err := f.queueStore.List(f.ctx, j.dag.ProcGroup())
@@ -174,19 +210,18 @@ func assertRetryAbandoned(t *testing.T, f *queueFixture, j txeQueueJob, queued *
 	require.NoError(t, err)
 	status, err := attempt.ReadStatus(f.ctx)
 	require.NoError(t, err)
-	assert.Equal(t, ir.Failed, status.Status)
-	assert.Contains(t, status.Error, string(code))
-	assert.Contains(t, status.Error, "not dispatched")
+	assert.Equal(t, ir.Queued, status.Status, "no status is written")
+	assert.Equal(t, queued.QueuedAt, status.QueuedAt)
+	assert.Empty(t, status.Error)
+	prepared, err := f.dagRunRepository.AttemptPrepared(f.ctx, queued.DAGRun(), queued.DAGRun(), queued.AttemptID)
+	require.NoError(t, err)
+	assert.True(t, prepared, "journaled for the coordinator to decide")
 	record, err := f.dagRunRepository.ReadExecutionAbandonment(f.ctx, queued.DAGRun(), queued.DAGRun(), queued.AttemptID, queued.QueuedAt)
 	require.NoError(t, err)
-	require.NotNil(t, record, "the run's store records that the execution never ran")
-	assert.Equal(t, persis.AbandonmentScopeExecution, record.Scope)
-	assert.Equal(t, persis.ExecutionIdentity{AttemptID: queued.AttemptID, QueuedAt: queued.QueuedAt}, record.AbandonedExecution)
-	require.NotNil(t, record.RequestCorrelation)
-	assert.Equal(t, queued.RetryRequest.ID, record.RequestCorrelation.ID)
+	assert.Nil(t, record, "the scheduler never records an execution as not dispatched")
 	match, err := f.dagRunRepository.FindRetryRequest(f.ctx, queued.DAGRun(), queued.RetryRequest.ID)
 	require.NoError(t, err)
-	assert.Equal(t, persis.RetryRequestAbandoned, match.State)
+	assert.Equal(t, persis.RetryRequestAdmitted, match.State)
 	retained, err := f.dagRunRepository.ListRetainedExecutions(f.ctx, queued.DAGRun())
 	require.NoError(t, err)
 	require.Len(t, retained, 1, "the retried execution is kept")

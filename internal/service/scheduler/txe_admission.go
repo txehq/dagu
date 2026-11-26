@@ -15,6 +15,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -77,8 +78,9 @@ func specDigest(dag *ir.DAG) string {
 // admitQueuedRun applies the registry guard to a queued run of any trigger.
 // It returns false when the run must not be dispatched now; a refused run is
 // finalized as aborted with the registry's reason and noted on the job, and
-// a refused retry that carries a retry request is abandoned before dispatch
-// instead (abandonRefusedRetry), so that it is never read as having run.
+// a refused retry that carries a retry request is withdrawn from its queue
+// instead (withdrawRefusedRetry), for the coordinator to decide, so that it
+// is never read as having run.
 func (d *queueDispatcher) admitQueuedRun(
 	ctx context.Context,
 	queueName string,
@@ -118,7 +120,7 @@ func (d *queueDispatcher) admitQueuedRun(
 	reason := fmt.Sprintf("txe: job %s %s: %s", adm.JobID, adm.Code, adm.Reason)
 	drop := d.dropQueuedRun
 	if status.TriggerType == ir.TriggerTypeRetry && status.RetryRequest != nil {
-		drop = d.abandonRefusedRetry
+		drop = d.withdrawRefusedRetry
 	}
 	if err := drop(ctx, queueName, runRef, itemID, attemptID, status, reason); err != nil {
 		logger.Error(ctx, "Failed to drop queued run refused by TXE registry", tag.Error(err))
@@ -184,81 +186,44 @@ func (d *queueDispatcher) admitQueuedRetry(ctx context.Context, jobID string, ru
 	})
 }
 
-// abandonRefusedRetry drops a queued retry that carries a retry request
-// and that admission refused, and records that it never ran (TXE-8596). It
-// is dropQueuedRun with evidence: the execution is abandoned through the
-// run's store with an execution-scoped abandonment record
-// (persis.AbandonmentScopeExecution), the record Dagu keeps for an execution
-// prepared and never handed to a worker, correlated with the retry request.
-// The store writes the record and marks the execution Failed, under its
-// lock, only while the execution is still queued with this marker and no
-// worker. Every reader of a retry's outcome reads that record: the registry
-// (RetryExecution.Abandoned) refuses to record the retry as succeeded and
-// allows it as not applied, and the reviewer (Abandoned) settles it as not
-// dispatched. Without the record an aborted execution reads like one that
-// started and was then stopped, and the retry would be recorded as having
-// run.
+// withdrawRefusedRetry takes a queued retry that carries a retry request,
+// and that admission refused, out of its queue without marking it aborted
+// (TXE-8596). An aborted execution reads like one that started and was then
+// stopped, so the retry could be recorded as having run.
 //
-// The evidence that nothing was dispatched is this dispatcher's own: it
-// holds the queue item and refuses it before dispatching it, so no dispatch
-// task, lease or active run exists for the execution, and the store checks
-// that no worker took it. A store that keeps no such records, or a status
-// that already shows a worker, lease or process, is dropped as before.
-func (d *queueDispatcher) abandonRefusedRetry(
+// Nor does it record the execution as never dispatched: the queue item can
+// outlive an earlier handoff of the same execution (a deletion that failed,
+// or a scheduler that stopped before deleting it), and the coordinator may
+// then hold a live task, lease or active run for it while its status still
+// reads queued. queue.WithdrawQueuedExecution journals the execution and
+// removes the item; the coordinator's reconciliation then fails it with an
+// execution-scoped abandonment record only once its own stores, read under
+// its lock against acknowledgement, show nothing was handed to a worker. Until
+// then the retry is pending: the registry records it neither as succeeded
+// (the execution is queued and journaled) nor as not applied (no record).
+func (d *queueDispatcher) withdrawRefusedRetry(
 	ctx context.Context,
 	queueName string,
 	runRef ir.DAGRunRef,
 	itemID string,
 	attemptID string,
 	status *ir.DAGRunStatus,
-	reason string,
+	_ string,
 ) error {
-	if itemID == "" {
-		return errors.New("delete refused queued retry: missing queue item ID")
-	}
-	if status.QueuedAt == "" || status.WorkerID != "" || status.LeaseAt != 0 || status.PID != 0 {
-		return d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason)
-	}
 	root := status.Root
 	if root.Zero() {
 		root = runRef
 	}
-	request := status.RetryRequest
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := d.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{
-		DAGRun: runRef, RootDAGRun: root,
-		Record: persis.AttemptAbandonment{
-			Schema:             persis.AttemptAbandonmentSchema,
-			Run:                runRef,
-			RootRun:            root,
-			AbandonedAttemptID: attemptID,
-			AbandonedExecution: persis.ExecutionIdentity{AttemptID: attemptID, QueuedAt: status.QueuedAt},
-			Scope:              persis.AbandonmentScopeExecution,
-			RequestCorrelation: &persis.RequestCorrelation{
-				ID: request.ID, ActionID: request.ActionID, ActionAttempt: request.ActionAttempt, BindingDigest: request.BindingDigest,
-			},
-			Reason:    persis.AbandonedRetryPreparation,
-			Detail:    "not dispatched: " + reason,
-			DecidedAt: now,
-			Evidence: persis.AbandonmentEvidence{
-				DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
-				ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent, ObservedAt: now,
-			},
-		},
-	})
-	switch {
-	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
-		return d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason)
-	case errors.Is(err, persis.ErrAttemptNotAbandonable):
-		// The execution is no longer this queued one: superseded, as
-		// dropQueuedRun finds a changed queued state. Only the stale queue
-		// item is removed.
-		logger.Info(ctx, "Removed stale queued TXE retry refused by the registry", tag.Error(err))
-	case err != nil:
-		return fmt.Errorf("abandon refused queued retry: %w", err)
+	withdrawn, err := queuedomain.WithdrawQueuedExecution(ctx, d.dagRunRepository, d.queueStore, queueName, runRef, root, attemptID, status.QueuedAt, itemID)
+	if err != nil {
+		return err
 	}
-	if _, err := d.queueStore.DeleteByItemIDs(ctx, queueName, []string{itemID}); err != nil {
-		return fmt.Errorf("dequeue refused queued retry: %w", err)
+	switch withdrawn {
+	case queuedomain.WithdrawalStale:
+		logger.Info(ctx, "Removed stale queued TXE retry refused by the registry")
+	case queuedomain.WithdrawalUnjournaled:
+		logger.Warn(ctx, "Withdrew a refused queued TXE retry that this store cannot journal; whether it was dispatched stays unknown")
+	case queuedomain.WithdrawalJournaled:
 	}
 	return nil
 }

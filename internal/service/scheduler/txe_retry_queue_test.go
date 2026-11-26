@@ -135,15 +135,15 @@ func queuedItem(t *testing.T, f *queueFixture, dag *ir.DAG) string {
 // queue item gone, its execution aborted with the registry's reason, the
 // retried execution kept, and the refusal noted on the job.
 //
-// A refused retry that carries a retry request is abandoned instead
-// (TXE-8596): its execution is marked failed with an execution-scoped
-// abandonment record, so no reader takes it for an execution that ran and
-// was then aborted. Updated for TXE-8596, which changed that case from
-// aborted; assertRetryAbandoned checks it.
+// A refused retry that carries a retry request is withdrawn instead
+// (TXE-8596): its queue item is removed, its status left queued, and the
+// execution journaled for the coordinator to decide, so no reader takes it
+// for an execution that ran and was then aborted. Updated for TXE-8596,
+// which changed that case from aborted; assertRetryWithdrawn checks it.
 func assertRetryDropped(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir.DAGRunStatus, admitted bool, code registry.AdmitCode) {
 	t.Helper()
 	if queued.RetryRequest != nil {
-		assertRetryAbandoned(t, f, j, queued, admitted, code)
+		assertRetryWithdrawn(t, f, j, queued, admitted, code)
 		return
 	}
 	assert.False(t, admitted)

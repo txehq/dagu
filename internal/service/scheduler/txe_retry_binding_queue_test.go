@@ -114,8 +114,9 @@ func TestQueueDispatch_TxeApprovedRetryIsAdmitted(t *testing.T) {
 
 // The grant is read when the queue dispatches, not when the retry was
 // queued: a grant that expired while the retry waited refuses it. The run's
-// execution is abandoned before dispatch with the reason (TXE-8596; it was
-// aborted before) and the retried execution kept; the refusal is
+// execution is withdrawn from its queue for the coordinator to decide
+// (TXE-8596; it was aborted before) and the retried execution kept; the
+// refusal, with its reason, is
 // recorded on the job, in a commit that also turns the action whose grant
 // lapsed uncertain, so it is not left approved and executing and a person
 // is asked what to do with it.
@@ -132,11 +133,20 @@ func TestQueueDispatch_TxeExpiredGrantIsRefusedAndReconciled(t *testing.T) {
 	job, err := j.store.GetJob(f.ctx, j.job.JobID)
 	require.NoError(t, err)
 	assert.Equal(t, registry.ActionUncertain, job.Actions[approved.actionID].State)
-	attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
+	// The reason is on the job's event: a withdrawn retry's status is not
+	// written (TXE-8596).
+	assert.Contains(t, droppedDetail(t, f, j), "live grant")
+}
+
+// droppedDetail is the detail of the job's latest event, the refusal of a
+// queued run.
+func droppedDetail(t *testing.T, f *queueFixture, j txeQueueJob) string {
+	t.Helper()
+	events, err := j.store.ListEvents(f.ctx, j.job.JobID, 10)
 	require.NoError(t, err)
-	status, err := attempt.ReadStatus(f.ctx)
-	require.NoError(t, err)
-	assert.Contains(t, status.Error, "live grant")
+	require.NotEmpty(t, events)
+	require.Equal(t, registry.EventRunDropped, events[0].Kind)
+	return events[0].Detail
 }
 
 // A person's approval of a republish or of an explicit rerun, with its
@@ -160,12 +170,9 @@ func TestQueueDispatch_TxeExplicitFormsAreRefused(t *testing.T) {
 			admitted := distributedDispatcher(f, j.store).admitQueuedRun(f.ctx, j.dag.ProcGroup(), queued.DAGRun(), queuedItem(t, f, j.dag), queued.AttemptID, queued, j.dag)
 
 			assertRetryDropped(t, f, j, queued, admitted, registry.AdmitRetryNotApproved)
-			attempt, err := f.dagRunRepository.FindAttempt(f.ctx, queued.DAGRun())
-			require.NoError(t, err)
-			status, err := attempt.ReadStatus(f.ctx)
-			require.NoError(t, err)
-			assert.Contains(t, status.Error, "not applied")
-			assert.Contains(t, status.Error, tc.reason)
+			detail := droppedDetail(t, f, j)
+			assert.Contains(t, detail, "not applied")
+			assert.Contains(t, detail, tc.reason)
 		})
 	}
 }

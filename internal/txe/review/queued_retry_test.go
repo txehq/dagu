@@ -19,7 +19,8 @@ import (
 // admitted at dispatch only while its action is executing under a live
 // grant. The reviewer must not settle it before then, and must settle it
 // from what the run then shows: dispatched is the retry; abandoned before
-// dispatch, as queue admission records a refused one, is not.
+// dispatch, as the coordinator records a refused one the queue withdrew once
+// nothing of it was handed to a worker, is not.
 
 // dispatchRun moves the run's latest execution from its queue to running,
 // as queue dispatch and a worker do.
@@ -188,8 +189,8 @@ func TestQueuedRetryStillQueuedIsHeldAndSettledAfterDispatch(t *testing.T) {
 }
 
 // The service records that it abandoned the queued execution before
-// dispatch, as queue admission does for a retry it refuses: the retry is
-// settled as not applied, never as succeeded.
+// dispatch, as the coordinator does for a refused retry the queue withdrew:
+// the retry is settled as not applied, never as succeeded.
 func TestQueuedRetryAbandonedBeforeDispatchIsNotApplied(t *testing.T) {
 	f := newRetryFixture(t)
 	succeeded := 0
@@ -219,8 +220,9 @@ func TestQueuedRetryStartedThenAbortedIsItsOutcome(t *testing.T) {
 // The grant ends while the execution still waits: the registry interrupts
 // the action, as today, and queue dispatch refuses the retry. The reviewer
 // never records it as succeeded: while it is queued it stays uncertain, and
-// once queue admission records that it abandoned the execution, it is not
-// applied. (TXE-8596, the admission-aborted false success.)
+// once the coordinator records that the withdrawn execution was abandoned
+// before dispatch, it is not applied. (TXE-8596, the admission-aborted false
+// success.)
 func TestQueuedRetryGrantLapseIsNeverASuccess(t *testing.T) {
 	f := newRetryFixture(t)
 	succeeded, refused := 0, 0
@@ -231,8 +233,9 @@ func TestQueuedRetryGrantLapseIsNeverASuccess(t *testing.T) {
 	assert.Equal(t, queued, lapsed.AdmittedRef)
 	assert.Zero(t, succeeded, "a queued execution is never offered as a success")
 
-	// Queue admission refuses it and records it as abandoned before
-	// dispatch, marked failed.
+	// Queue admission refuses and withdraws it; the coordinator, finding
+	// nothing of it with a worker, records it as abandoned before dispatch,
+	// marked failed.
 	f.runs.abandonedRefs = map[string]bool{queued: true}
 	setStatus(f.runs, "run-1", "failed", false)
 	settled := reviewOnce(t, f, "reviewer-c", time.Minute, &succeeded, &refused)
