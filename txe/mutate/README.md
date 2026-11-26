@@ -58,11 +58,11 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   resolved GOPROXY/GOSUMDB/GOPRIVATE/GONOPROXY/GONOSUMDB/GOINSECURE/GOTOOLCHAIN, the owned caches,
   and `GOWORK=off`, `GOENV=off`, so no caller variable can point Go at a live file. `--no-seed` skips
   this for a tree with no module dependencies.
-- **Host checks after every run.** The identity (device, inode and birth time) of the shared
-  GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the live tree; that at least one of
-  the entries each of those directories held when the run began is still there, unchanged (a
-  directory removed and recreated holds none of them, even with its inode handed back: TXE-8535);
-  that no entry directly inside the shared GOMODCACHE, its `cache/download` or GOCACHE disappeared
+- **Host checks after every run.** The identity (device, inode and, where the filesystem records
+  one, birth time) of the shared GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the
+  live tree; for each of those that held readable entries at the first check, that at least one of
+  those entries is still there under its name with the same identity (TXE-8535; its limits are
+  under Limits); that no entry directly inside the shared GOMODCACHE, its `cache/download` or GOCACHE disappeared
   or was replaced (new entries are fine: other sessions fill the caches); the content of a fixture
   sentinel file where one exists; and the content of each live-tree file a mutant names. Any
   change stops the run at once with exit 3 and a banner; the work directory is kept as evidence
@@ -454,18 +454,26 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   breaking guards in the caller's own tree, not a hostile tree. For a tree you do not trust, run
   with `--no-seed`: nothing is read from the shared module cache and the sandbox has
   `GOPROXY=off`.
-- **A recreated directory can keep its inode** (TXE-8535). ext4 hands a freed inode straight back:
-  on remote-dev, `rmtree` then `mkdir` of a directory under `~` got the same inode on the first
-  try. Device and inode alone then match, so the identity also carries the birth time: `st_birthtime`
-  on macOS, `statx(2)`'s `stx_btime` on Linux (Python's `os.stat` has none there), each where the
-  filesystem records one. The top-level check covers a filesystem that records none: it fires when
-  none of a watched directory's original entries is still there, which a directory removed and
-  recreated cannot avoid, while ordinary churn (entries added, some removed or replaced) leaves
-  the rest in place. It would also fire on a directory every one of whose entries was removed or
-  replaced during the run, which none of the watched ones sees in normal use. A watched directory
-  that was empty, on a filesystem with no birth
-  time, recreated with its inode reused, is not seen. ctime is not compared: it changes whenever
-  an entry is added, which the checks must allow.
+- **A path removed and recreated can keep its inode** (TXE-8535). ext4 hands a freed inode
+  straight back: on remote-dev, `rmtree` then `mkdir` of a directory under `~` got the same inode
+  on the first try. The identity of a watched directory, and of each entry directly inside a
+  shared cache, therefore also carries the birth time where the filesystem records one:
+  `st_birthtime` on macOS, `statx(2)`'s `stx_btime` on Linux (Python's `os.stat` has none there).
+  Where it is recorded, a recreated path differs by birth time even with its inode reused.
+- **The top-level check, exactly.** At the first check the runner records, for each watched
+  directory it can list, every entry directly inside it with that entry's device, inode and birth
+  time where recorded. A later check fails when not one of those names is present with the same
+  identity. Nothing more is claimed for it. In particular, where no birth time is recorded:
+  - an entry recreated under the same name with the same device and inode matches, both here and
+    in the one-level check of the shared caches;
+  - an entry moved out of a watched directory and back into the recreated directory keeps its
+    identity, and matches;
+  - a single matching entry passes the whole check, whatever happened to the directory;
+  - a directory that was empty, or could not be listed, at the first check has no recorded
+    entries, so this check never fires for it.
+  The check also fails, with no recreation at all, when every recorded entry was removed or
+  replaced during the run. ctime is not compared: it changes whenever an entry is added, which
+  the checks must allow.
 - **The host checks are an alarm, not proof that nothing changed.** They see a watched directory
   replaced, an entry one level inside a shared cache removed or replaced, and a sentinel's content
   changed. They do not see a deletion deeper inside a cache (one module's files, one build-cache
