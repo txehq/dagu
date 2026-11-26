@@ -61,6 +61,10 @@ export type RetryState = {
   status: RetryStatus;
   receipt?: string;
   attempt?: number;
+  // usedIntents is every intent asked for by a retry of this run bound to
+  // the same execution as this one, the newest included (TXE-8627). A state
+  // without it has used only its own intent.
+  usedIntents?: RetryIntent[];
 };
 
 function paramsOf(p: ApiProposal): {
@@ -97,7 +101,8 @@ function statusOf(a: ApiAction): RetryStatus {
 }
 
 // retryStates derives, for each run with a retry proposal, the state of its
-// newest retry from the proposal and the registry's action journal.
+// newest retry from the proposal and the registry's action journal, with
+// every intent asked for on the execution that retry was bound to.
 export function retryStates(
   proposals: ApiProposal[],
   actions: ApiAction[]
@@ -135,7 +140,26 @@ export function retryStates(
       status,
       receipt: action?.receipt,
       attempt: action?.attempt,
+      usedIntents: [],
     });
+  }
+  // A second pass collects the intents of every retry bound to the
+  // execution of its run's newest one, so an intent used earlier on that
+  // execution is not forgotten once a later request replaced it.
+  for (const p of newestFirst) {
+    if (p.action.name !== ACTION_RETRY_RUN) continue;
+    const { runId, attemptId, queuedAt, intent } = paramsOf(p);
+    const state = runId ? out.get(runId) : undefined;
+    if (
+      !state ||
+      intent === 'unspecified' ||
+      state.attemptId !== attemptId ||
+      state.queuedAt !== queuedAt
+    ) {
+      continue;
+    }
+    const used = (state.usedIntents ??= []);
+    if (!used.includes(intent)) used.push(intent);
   }
   return out;
 }
@@ -182,9 +206,12 @@ export function retryLabel(state: RetryState): string {
 // superseded) leaves the intents it did not ask for (TXE-7515): an
 // unspecified retry the job's machine refused for a sealed execution leaves
 // both, a republish that could not publish leaves the rerun. A request still
-// waiting, being dispatched, unresolved or dispatched leaves none. A native
-// retry starts a new execution, so once a retried execution has failed too,
-// the run is offered again.
+// waiting, being dispatched, unresolved or dispatched leaves none. Every
+// intent already asked for on that execution stays used, not only the newest
+// request's (TXE-8627): a republish and then a rerun that were both not
+// applied leave none. A native retry starts a new execution, so once a
+// retried execution has failed too, the run is offered again, with no intent
+// used.
 export function offeredIntents(
   runStatus: string,
   execution: Execution | undefined,
@@ -208,7 +235,9 @@ export function offeredIntents(
     state.status === 'not-applied' ||
     state.status === 'rejected';
   if (!settledWithNothingRun) return [];
-  return all.filter((intent) => intent !== state.intent);
+  const used = new Set<RetryState['intent']>(state.usedIntents);
+  used.add(state.intent);
+  return all.filter((intent) => !used.has(intent));
 }
 
 // canRequestRetry reports whether the dashboard offers any request for a
