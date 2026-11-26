@@ -246,6 +246,139 @@ describe('offeredIntents', () => {
   });
 });
 
+// TXE-8627: every intent already used on the current execution stays used,
+// not only the newest proposal's; a new execution starts with none used.
+describe('offeredIntents with several proposals on one execution', () => {
+  const q1 = '2026-10-09T12:00:00Z';
+  const q2 = '2026-10-09T13:00:00Z';
+  const request = (
+    id: string,
+    at: string,
+    step: 'publish' | 'run' | undefined,
+    attemptId = 'run-1-a1',
+    queuedAt = q1
+  ): ApiProposal => {
+    const p = proposal(id, 'run-1', at);
+    p.action.params = {
+      ...(p.action.params as object),
+      attempt_id: attemptId,
+      queued_at: queuedAt,
+      ...(step ? { step } : {}),
+    };
+    return p;
+  };
+  const offered = (
+    proposals: ApiProposal[],
+    actions: ApiAction[],
+    exec: { attemptId: string; queuedAt: string }
+  ) =>
+    offeredIntents(
+      'failed',
+      exec,
+      retryStates(proposals, actions).get('run-1')
+    );
+
+  it('offers neither after a republish then a rerun were not applied', () => {
+    const proposals = [
+      request('prp_pub', '2026-10-09T12:10:00Z', 'publish'),
+      request('prp_run', '2026-10-09T12:20:00Z', 'run'),
+    ];
+    const actions = [
+      action('prp_pub', 'not_applied'),
+      action('prp_run', 'not_applied'),
+    ];
+    const exec = { attemptId: 'run-1-a1', queuedAt: q1 };
+    expect(offered(proposals, actions, exec)).toEqual([]);
+    expect(
+      canRequestRetry(
+        'failed',
+        exec,
+        retryStates(proposals, actions).get('run-1')
+      )
+    ).toBe(false);
+  });
+
+  it('offers neither after a rerun then a republish were not applied', () => {
+    const proposals = [
+      request('prp_run', '2026-10-09T12:10:00Z', 'run'),
+      request('prp_pub', '2026-10-09T12:20:00Z', 'publish'),
+    ];
+    const actions = [
+      action('prp_run', 'failed'),
+      action('prp_pub', 'not_applied'),
+    ];
+    expect(
+      offered(proposals, actions, { attemptId: 'run-1-a1', queuedAt: q1 })
+    ).toEqual([]);
+  });
+
+  it('keeps an intent used before an unspecified retry was refused', () => {
+    const proposals = [
+      request('prp_pub', '2026-10-09T12:10:00Z', 'publish'),
+      request('prp_any', '2026-10-09T12:20:00Z', undefined),
+    ];
+    const actions = [
+      action('prp_pub', 'not_applied'),
+      action('prp_any', 'not_applied'),
+    ];
+    expect(
+      offered(proposals, actions, { attemptId: 'run-1-a1', queuedAt: q1 })
+    ).toEqual(['rerun']);
+  });
+
+  it('offers an intent used on an earlier execution again on a new one', () => {
+    // Execution a1: republish not applied, then rerun dispatched, which
+    // started execution a2. On a2 republish is offered again, and once a2's
+    // republish was not applied, the rerun is still offered.
+    const first = [
+      request('prp_pub1', '2026-10-09T12:10:00Z', 'publish'),
+      request('prp_run1', '2026-10-09T12:20:00Z', 'run'),
+    ];
+    const firstActions = [
+      action('prp_pub1', 'not_applied'),
+      action('prp_run1', 'succeeded', 'run-1-a2'),
+    ];
+    const a2 = { attemptId: 'run-1-a2', queuedAt: q2 };
+    expect(offered(first, firstActions, a2)).toEqual(['republish', 'rerun']);
+
+    const second = [
+      ...first,
+      request('prp_pub2', '2026-10-09T13:10:00Z', 'publish', 'run-1-a2', q2),
+    ];
+    const secondActions = [...firstActions, action('prp_pub2', 'not_applied')];
+    expect(offered(second, secondActions, a2)).toEqual(['rerun']);
+  });
+
+  it('starts a new job version with no intent used on the execution', () => {
+    // The server derives a retry's proposal from the job version too, so a
+    // republish refused under version 1 may be asked again under version 2.
+    const pub = request('prp_pub', '2026-10-09T12:10:00Z', 'publish');
+    pub.job_version = 1;
+    const proposals = [pub, request('prp_run', '2026-10-09T12:20:00Z', 'run')];
+    const actions = [
+      action('prp_pub', 'failed'),
+      action('prp_run', 'not_applied'),
+    ];
+    expect(
+      offered(proposals, actions, { attemptId: 'run-1-a1', queuedAt: q1 })
+    ).toEqual(['republish']);
+  });
+
+  it('resets the used intents when a retry re-queued the same attempt', () => {
+    const proposals = [
+      request('prp_pub', '2026-10-09T12:10:00Z', 'publish'),
+      request('prp_run', '2026-10-09T12:20:00Z', 'run'),
+    ];
+    const actions = [
+      action('prp_pub', 'not_applied'),
+      action('prp_run', 'not_applied'),
+    ];
+    expect(
+      offered(proposals, actions, { attemptId: 'run-1-a1', queuedAt: q2 })
+    ).toEqual(['republish', 'rerun']);
+  });
+});
+
 describe('sameRetryStates', () => {
   const st = (status: RetryState['status']): RetryState => ({
     runId: 'r',
