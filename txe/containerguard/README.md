@@ -340,12 +340,13 @@ The evidence for each row is bound to that row's exact bytes (TXE-8053):
 - `txe/mutate/fixture-demo.py` (836458c6): `review_evidence` is root's scoped exact-byte source review,
   `msg_8aa61a2eb4f7`, and `owner_ack` is the current custodian's (cc3-s975c73) acknowledgment of the same,
   `msg_47e1330eb699`.
-- `txe/mutate/mutate-sandboxed.py` (0ee57919, the TXE-8535 bytes: the shared-state Watch also compares a birth
+- `txe/mutate/mutate-sandboxed.py` (33332da5, the TXE-8535 bytes: the shared-state Watch also compares a birth
   time from statx on Linux and checks that a watched directory keeps one of its first-seen entries, on top of
   TXE-8374's lockfile-link bin refusal, TXE-8385's descriptor-relative seed writes, TXE-8348's node seed and
   TXE-8053's `--diagnostic`, `--ro-mount`, chunked file hashing and mount-field refusal): `review_evidence` is root's
-  scoped exact-byte source review of those bytes, `msg_b0c57dd8eafe`, and `owner_ack` is the custodian's (cc3)
-  acknowledgment of the row, PENDING-owner-ack.
+  scoped exact-byte review of those bytes, `msg_1bb5db2567b9`. It is a delta review of their documentation-only
+  change from 0ee57919, and it carries forward the qualifications of root's review of 0ee57919,
+  `msg_b0c57dd8eafe`. `owner_ack` is the custodian's (cc3-s975c73) acknowledgment of the row, `msg_7384b226a84b`.
 Each review accepts the classification and the declared partial guards only. It is not a fixed-argv floor
 attestation, not behavioural acceptance and not adoption or a global pin.
 
