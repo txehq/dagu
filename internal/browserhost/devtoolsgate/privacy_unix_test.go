@@ -154,3 +154,25 @@ func TestEntriesThatAreFIFOsAreRefusedWithoutWaiting(t *testing.T) {
 	})
 	assert.ErrorContains(t, err, "not a regular file")
 }
+
+// The Root the gate writes through must be the directory it walked and
+// checked: bridging a walk of one directory to another directory's name is
+// refused, with no Root, and bridging a directory to itself succeeds. This
+// is the comparison every caller of OpenProfileRoot relies on, whatever the
+// filesystem.
+func TestBridgeRootRefusesAnotherDirectory(t *testing.T) {
+	t.Parallel()
+	a, b := testProfileDir(t), testProfileDir(t)
+	walked, err := openTrusted(a)
+	require.NoError(t, err)
+	defer func() { _ = walked.Close() }()
+
+	root, err := bridgeRoot(walked, b)
+	assert.Nil(t, root, "no Root for a directory that is not the one walked")
+	assert.ErrorContains(t, err, "the profile directory changed while it was opened")
+
+	root, err = bridgeRoot(walked, a)
+	require.NoError(t, err, "the directory walked bridges to itself")
+	require.NotNil(t, root)
+	require.NoError(t, root.Close())
+}
