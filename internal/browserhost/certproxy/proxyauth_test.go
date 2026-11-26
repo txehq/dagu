@@ -181,3 +181,43 @@ func TestTunnelToTheBrowsersGateNeedsNoCredential(t *testing.T) {
 	_ = conn.Close()
 	assert.Equal(t, http.StatusProxyAuthRequired, status, "another spelling of the gate's address")
 }
+
+// The proxy knows the gate of a browser its configuration names before it
+// reports ready (TXE-8558). Serve took cfg.CDPURL only after calling ready,
+// so a tunnel to the gate opened as soon as the proxy was ready could arrive
+// before the gate was known and be refused 407 like any other loopback port,
+// as it was once on a loaded CI runner. The tunnel here is opened inside the
+// ready callback, before Serve can go on, which makes that window certain
+// instead of rare.
+func TestGateIsKnownWhenTheProxyIsReady(t *testing.T) {
+	t.Parallel()
+
+	gate, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = gate.Close() })
+	go func() {
+		for {
+			conn, err := gate.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+
+	ca := newTestCA(t, "corp CA")
+	cfg := testConfig(t, "", ca.clientEntry(t, testLabel, "127.0.0.1"))
+	cfg.CDPURL = "http://" + gate.Addr().String() + "/" + testGateToken
+	status := make(chan int, 1)
+	runProxy(t, func(ctx context.Context, ready func(Ready)) error {
+		return Serve(ctx, cfg, func(r Ready) {
+			conn, code, err := connectWith(fmt.Sprintf("127.0.0.1:%d", r.Port), gate.Addr().String(), "")
+			if err == nil {
+				_ = conn.Close()
+			}
+			status <- code
+			ready(r)
+		})
+	})
+	assert.Equal(t, http.StatusOK, <-status, "a tunnel to the gate opened as soon as the proxy reports ready")
+}
