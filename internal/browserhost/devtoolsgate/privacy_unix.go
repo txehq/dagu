@@ -62,7 +62,7 @@ func openTrusted(path string) (*os.File, error) {
 			return nil, fmt.Errorf("devtools gate: the profile path is not canonical: %s", path)
 		}
 	}
-	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("devtools gate: open /: %w", err)
 	}
@@ -74,7 +74,7 @@ func openTrusted(path string) (*os.File, error) {
 	for i, name := range names {
 		walked := "/" + strings.Join(names[:i+1], "/")
 		parent := int(current.Fd()) //nolint:gosec // a descriptor number
-		next, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		next, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
 			// Which of the two a link gives depends on the system: look.
 			var st unix.Stat_t
@@ -108,19 +108,20 @@ func openTrusted(path string) (*os.File, error) {
 // directory when dir is set, a regular file otherwise. It returns nil and
 // no error when nothing is there.
 func openEntry(root *os.Root, name string, dir bool) (*os.File, error) {
-	flags := os.O_RDONLY | unix.O_NOFOLLOW
+	// O_NONBLOCK: opening a FIFO, or a device, must not wait for a
+	// writer; what was opened is refused below unless it is a directory or
+	// a regular file, where O_NONBLOCK changes nothing.
+	flags := os.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK
 	if dir {
 		flags |= unix.O_DIRECTORY
 	}
 	path := root.Name() + "/" + name
-	// A symbolic link is refused by name first: os.Root answers one that
-	// points out of the directory with an error of its own. The open below
-	// refuses one that appears after this look all the same (O_NOFOLLOW).
-	if info, err := root.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		if dir {
-			return nil, fmt.Errorf("devtools gate: %s is not a directory (a symbolic link is not followed): %s", roleEntry, path)
-		}
-		return nil, fmt.Errorf("devtools gate: %s is not a regular file (a symbolic link is not followed): %s", roleEntry, path)
+	// What is there is refused by name first when it is not of the kind
+	// wanted: a symbolic link (os.Root answers one that points out of the
+	// directory with an error of its own), a FIFO, a socket, a device. The
+	// open below refuses one that appears after this look all the same.
+	if info, err := root.Lstat(name); err == nil && !entryKindWanted(info.Mode(), dir) {
+		return nil, entryKindError(info.Mode(), dir, path)
 	}
 	f, err := root.OpenFile(name, flags, 0)
 	switch {
@@ -138,16 +139,35 @@ func openEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("devtools gate: %s: %w", roleEntry, err)
 	}
-	if dir != info.IsDir() || (!dir && !info.Mode().IsRegular()) {
+	if !entryKindWanted(info.Mode(), dir) {
 		_ = f.Close()
-		if dir {
-			return nil, fmt.Errorf("devtools gate: %s is not a directory: %s", roleEntry, path)
-		}
-		return nil, fmt.Errorf("devtools gate: %s is not a regular file: %s", roleEntry, path)
+		return nil, entryKindError(info.Mode(), dir, path)
 	}
 	if err := checkOpened(f, roleEntry, path); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	return f, nil
+}
+
+// entryKindWanted reports whether mode is a directory, when dir is set, or
+// a regular file otherwise.
+func entryKindWanted(mode os.FileMode, dir bool) bool {
+	if dir {
+		return mode.IsDir()
+	}
+	return mode.IsRegular()
+}
+
+// entryKindError refuses an entry at path of the kind mode, which is not
+// the kind wanted.
+func entryKindError(mode os.FileMode, dir bool, path string) error {
+	what := "a regular file"
+	if dir {
+		what = "a directory"
+	}
+	if mode&os.ModeSymlink != 0 {
+		return fmt.Errorf("devtools gate: %s is not %s (a symbolic link is not followed): %s", roleEntry, what, path)
+	}
+	return fmt.Errorf("devtools gate: %s is not %s: %s", roleEntry, what, path)
 }

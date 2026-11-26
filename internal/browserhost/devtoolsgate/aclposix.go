@@ -36,11 +36,14 @@ type posixEntry struct {
 // read as a valid one.
 var errUnreadableACL = errors.New("an access control list the gate cannot read")
 
-// parsePOSIXACL parses and validates a list as acl(5) defines a valid one:
-// exactly one owner, owning group and other entry; named user and group
-// entries each with a distinct qualifier; a mask entry, at most one, which
-// must be there when a named entry is and may be there without one;
-// permissions within read, write and execute. Anything else is refused.
+// parsePOSIXACL parses and validates a list as acl(5) defines a valid one,
+// in the form the kernel keeps it (posix_acl_valid): exactly one owner,
+// owning group and other entry; named user and group entries, each with a
+// defined qualifier, in ascending order of it, so none twice; a mask entry,
+// at most one, which must be there when a named entry is and may be there
+// without one; permissions within read, write and execute; and the entries
+// in canonical order (owner, named users, owning group, named groups, mask,
+// other). Anything else is refused.
 func parsePOSIXACL(b []byte) ([]posixEntry, error) {
 	if len(b) < 4 || (len(b)-4)%8 != 0 {
 		return nil, fmt.Errorf("%w: %d bytes", errUnreadableACL, len(b))
@@ -51,6 +54,7 @@ func parsePOSIXACL(b []byte) ([]posixEntry, error) {
 	entries := make([]posixEntry, 0, (len(b)-4)/8)
 	counts := map[uint16]int{}
 	users, groups := map[uint32]bool{}, map[uint32]bool{}
+	var prev *posixEntry
 	for off := 4; off < len(b); off += 8 {
 		e := posixEntry{
 			tag:  binary.LittleEndian.Uint16(b[off:]),
@@ -65,21 +69,26 @@ func parsePOSIXACL(b []byte) ([]posixEntry, error) {
 			if e.id != posixUndefinedID {
 				return nil, fmt.Errorf("%w: a qualifier on tag %#x", errUnreadableACL, e.tag)
 			}
-		case posixUser:
-			if users[e.id] {
-				return nil, fmt.Errorf("%w: user %d twice", errUnreadableACL, e.id)
+		case posixUser, posixGroup:
+			if e.id == posixUndefinedID {
+				return nil, fmt.Errorf("%w: a named entry without a qualifier", errUnreadableACL)
 			}
-			users[e.id] = true
-		case posixGroup:
-			if groups[e.id] {
-				return nil, fmt.Errorf("%w: group %d twice", errUnreadableACL, e.id)
+			if e.tag == posixUser {
+				users[e.id] = true
+			} else {
+				groups[e.id] = true
 			}
-			groups[e.id] = true
 		default:
 			return nil, fmt.Errorf("%w: tag %#x", errUnreadableACL, e.tag)
 		}
+		// The tag values ascend in canonical order; named entries of one
+		// tag ascend by qualifier, which also refuses one twice.
+		if prev != nil && (e.tag < prev.tag || (e.tag == prev.tag && (e.tag&(posixUser|posixGroup) == 0 || e.id <= prev.id))) {
+			return nil, fmt.Errorf("%w: entries out of order", errUnreadableACL)
+		}
 		counts[e.tag]++
 		entries = append(entries, e)
+		prev = &entries[len(entries)-1]
 	}
 	for _, tag := range []uint16{posixUserObj, posixGroupObj, posixOther} {
 		if counts[tag] != 1 {

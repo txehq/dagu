@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // The path to a profile is opened one directory at a time from "/", with
@@ -102,4 +104,49 @@ func TestOpenEntryChecksWhatItOpened(t *testing.T) {
 	require.NoError(t, os.Symlink("f", filepath.Join(dir, "lf")))
 	_, err = OpenProfileEntry(root, "lf", false)
 	assert.ErrorContains(t, err, "a symbolic link is not followed")
+}
+
+// A FIFO where the gate wants a regular file is refused without waiting
+// for a writer: as the marker, as the preferences and as any entry. Each
+// call runs against a deadline, so a hang fails instead of stalling.
+func TestEntriesThatAreFIFOsAreRefusedWithoutWaiting(t *testing.T) {
+	t.Parallel()
+	within := func(name string, call func() error) error {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- call() }()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: still waiting after 10s", name)
+			return nil
+		}
+	}
+
+	marked := testProfileDir(t)
+	require.NoError(t, unix.Mkfifo(filepath.Join(marked, profileMarker), 0o600))
+	assert.False(t, ProfileClaimed(marked), "a FIFO marks nothing")
+	err := within("claim", func() error { return claimProfile(marked) })
+	assert.ErrorContains(t, err, "not a regular file")
+	err = within("start", func() error { return disableOffTheRecord([]string{"--user-data-dir=" + marked}) })
+	assert.ErrorIs(t, err, ErrProfileNotOwned)
+
+	prefs := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(prefs, "Default"), 0o700))
+	require.NoError(t, unix.Mkfifo(filepath.Join(prefs, "Default", "Preferences"), 0o600))
+	err = within("preferences", func() error { return disableOffTheRecord([]string{"--user-data-dir=" + prefs}) })
+	assert.ErrorContains(t, err, "not a regular file")
+
+	root, err := OpenProfileRoot(prefs)
+	require.NoError(t, err)
+	defer func() { _ = root.Close() }()
+	err = within("entry", func() error {
+		f, err := OpenProfileEntry(root, "Default/Preferences", false)
+		if f != nil {
+			_ = f.Close()
+		}
+		return err
+	})
+	assert.ErrorContains(t, err, "not a regular file")
 }

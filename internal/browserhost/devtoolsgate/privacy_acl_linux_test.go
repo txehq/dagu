@@ -38,7 +38,11 @@ func realACLDir(t *testing.T) string {
 	}
 	dir, err := os.MkdirTemp(parent, "acl-")
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("remove the fixture %s: %v", dir, err)
+		}
+	})
 	require.NoError(t, os.Chmod(dir, 0o700))
 	if want := os.Getenv("DAGU_TEST_REAL_ACL_FS"); want != "" {
 		var fs unix.Statfs_t
@@ -65,25 +69,45 @@ func setACL(t *testing.T, path, name string, entries ...posixEntry) {
 	require.NoError(t, unix.Setxattr(path, name, posixACL(entries...), 0), "set %s on %s", name, path)
 }
 
-// A profile whose own list grants only its owner passes, read from the
-// kernel through the gate's reader; a named entry for another account,
-// even one the mask hides, is refused on the profile directory and on an
-// entry; an inheritable write in a directory's default list is refused.
+// Read from the kernel through the gate's own reader:
+//   - a list that only repeats the mode bits is not kept (the kernel
+//     folds it into the mode), so the profile reads as having none, and
+//     passes;
+//   - a list the kernel keeps, with a named entry for this user under a
+//     mask that grants nothing, passes: an extended list that lets no
+//     one else in;
+//   - a named entry for another account, even one the mask hides, is
+//     refused on the profile directory and on an entry;
+//   - an inheritable write in a directory's default list is refused.
 func TestRealACLReaderOnThisFilesystem(t *testing.T) {
 	t.Parallel()
 	const nobody = 65534
+	euid := uint32(os.Geteuid()) //nolint:gosec // a uid
+	require.NotZero(t, euid, "the fixtures run as an ordinary user")
 	none := func(tag uint16) posixEntry { return posixEntry{tag, 0, posixUndefinedID} }
 
-	profile := filepath.Join(realACLDir(t), "profile")
-	require.NoError(t, os.Mkdir(profile, 0o700))
-	setACL(t, profile, "system.posix_acl_access", posixEntry{posixUserObj, 7, posixUndefinedID}, none(posixGroupObj), none(posixOther))
-	f, err := openTrusted(profile)
-	require.NoError(t, err, "a list that grants only the owner")
+	folded := filepath.Join(realACLDir(t), "profile")
+	require.NoError(t, os.Mkdir(folded, 0o700))
+	setACL(t, folded, "system.posix_acl_access", posixEntry{posixUserObj, 7, posixUndefinedID}, none(posixGroupObj), none(posixOther))
+	f, err := openTrusted(folded)
+	require.NoError(t, err, "a list that only repeats the mode")
+	_, present, err := getXattr(int(f.Fd()), "system.posix_acl_access") //nolint:gosec // a descriptor
+	require.NoError(t, err)
+	assert.False(t, present, "the kernel folded the list into the mode")
+	require.NoError(t, f.Close())
+
+	kept := filepath.Join(realACLDir(t), "profile")
+	require.NoError(t, os.Mkdir(kept, 0o700))
+	setACL(t, kept, "system.posix_acl_access",
+		posixEntry{posixUserObj, 7, posixUndefinedID}, namedUser(euid, 7), none(posixGroupObj), mask(0), none(posixOther))
+	f, err = openTrusted(kept)
+	require.NoError(t, err, "an extended list that lets no one else in")
 	raw, present, err := getXattr(int(f.Fd()), "system.posix_acl_access") //nolint:gosec // a descriptor
 	require.NoError(t, err)
-	require.True(t, present, "the kernel kept a list on this filesystem")
-	_, err = parsePOSIXACL(raw)
+	require.True(t, present, "the kernel kept the extended list")
+	entries, err := parsePOSIXACL(raw)
 	require.NoError(t, err)
+	assert.Contains(t, entries, namedUser(euid, 7), "the reader read the list the kernel kept")
 	require.NoError(t, f.Close())
 
 	opened := filepath.Join(realACLDir(t), "profile")
@@ -160,8 +184,12 @@ func TestRealOverlayCopyUpKeepsTheProfileChecked(t *testing.T) {
 	defer func() { _ = stale.Close() }()
 
 	marker := filepath.Join(lower, "copy-up")
+	t.Cleanup(func() {
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove %s: %v", marker, err)
+		}
+	})
 	require.NoError(t, os.WriteFile(marker, []byte("x"), 0o600))
-	t.Cleanup(func() { _ = os.Remove(marker) })
 	after, err := os.Stat(lower)
 	require.NoError(t, err)
 	kept := os.SameFile(before, after)

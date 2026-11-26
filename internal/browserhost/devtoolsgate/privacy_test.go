@@ -108,20 +108,26 @@ func TestParsePOSIXACLValidity(t *testing.T) {
 	}
 	short := posixACL(userObj, groupObj, other)
 	invalid := map[string][]byte{
-		"empty":                      nil,
-		"header only":                binary.LittleEndian.AppendUint32(nil, posixACLVersion),
-		"a partial entry":            short[:len(short)-3],
-		"version 1":                  append(binary.LittleEndian.AppendUint32(nil, 1), short[4:]...),
-		"no owner entry":             posixACL(groupObj, other, mask(0)),
-		"two owner entries":          posixACL(userObj, userObj, groupObj, other),
-		"no other entry":             posixACL(userObj, groupObj, mask(0)),
-		"a named entry and no mask":  posixACL(userObj, namedUser(2000, 4), groupObj, other),
-		"two masks":                  posixACL(userObj, groupObj, mask(5), mask(5), other),
-		"a user twice":               posixACL(userObj, namedUser(2000, 4), namedUser(2000, 5), groupObj, mask(5), other),
-		"a group twice":              posixACL(userObj, groupObj, namedGroup(3000, 4), namedGroup(3000, 4), mask(5), other),
-		"a qualifier on the owner":   posixACL(posixEntry{posixUserObj, 7, 0}, groupObj, other),
-		"a permission bit not known": posixACL(posixEntry{posixUserObj, 0o17, posixUndefinedID}, groupObj, other),
-		"an unknown tag":             posixACL(userObj, groupObj, other, posixEntry{0x40, 0, posixUndefinedID}),
+		"empty":                       nil,
+		"header only":                 binary.LittleEndian.AppendUint32(nil, posixACLVersion),
+		"a partial entry":             short[:len(short)-3],
+		"version 1":                   append(binary.LittleEndian.AppendUint32(nil, 1), short[4:]...),
+		"no owner entry":              posixACL(groupObj, other, mask(0)),
+		"two owner entries":           posixACL(userObj, userObj, groupObj, other),
+		"no other entry":              posixACL(userObj, groupObj, mask(0)),
+		"a named entry and no mask":   posixACL(userObj, namedUser(2000, 4), groupObj, other),
+		"two masks":                   posixACL(userObj, groupObj, mask(5), mask(5), other),
+		"a user twice":                posixACL(userObj, namedUser(2000, 4), namedUser(2000, 5), groupObj, mask(5), other),
+		"a group twice":               posixACL(userObj, groupObj, namedGroup(3000, 4), namedGroup(3000, 4), mask(5), other),
+		"a qualifier on the owner":    posixACL(posixEntry{posixUserObj, 7, 0}, groupObj, other),
+		"a permission bit not known":  posixACL(posixEntry{posixUserObj, 0o17, posixUndefinedID}, groupObj, other),
+		"an unknown tag":              posixACL(userObj, groupObj, other, posixEntry{0x40, 0, posixUndefinedID}),
+		"the owning group first":      posixACL(groupObj, userObj, other),
+		"other before the mask":       posixACL(userObj, groupObj, other, mask(5)),
+		"named users descending":      posixACL(userObj, namedUser(3000, 4), namedUser(2000, 4), groupObj, mask(5), other),
+		"a named user after a group":  posixACL(userObj, groupObj, namedUser(2000, 4), mask(5), other),
+		"a named user without an id":  posixACL(userObj, namedUser(posixUndefinedID, 4), groupObj, mask(5), other),
+		"a named group without an id": posixACL(userObj, groupObj, namedGroup(posixUndefinedID, 4), mask(5), other),
 	}
 	for name, b := range invalid {
 		_, err := parsePOSIXACL(b)
@@ -140,7 +146,7 @@ func TestPOSIXAccessACLRules(t *testing.T) {
 	assert.NoError(t, check(roleEntry, userObj, namedUser(2000, 5), groupObj, mask(5), other), "a named read")
 	assert.ErrorContains(t, check(roleEntry, userObj, namedUser(2000, 7), groupObj, mask(5), other),
 		"lets another account change", "a named write the mask hides is refused all the same")
-	assert.ErrorContains(t, check(roleAncestor, userObj, namedGroup(3000, 2), groupObj, mask(7), other), "lets another account change")
+	assert.ErrorContains(t, check(roleAncestor, userObj, groupObj, namedGroup(3000, 2), mask(7), other), "lets another account change")
 	assert.NoError(t, check(roleEntry, userObj, namedUser(testEUID, 7), groupObj, mask(7), other), "this user's own named entry")
 	assert.NoError(t, check(roleAncestor, userObj, namedUser(0, 7), groupObj, mask(7), other), "root's named entry")
 	assert.NoError(t, check(roleEntry, userObj, groupObj, mask(7), other),

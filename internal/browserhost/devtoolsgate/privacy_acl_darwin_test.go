@@ -74,8 +74,10 @@ func TestRealACLReaderOnThisMac(t *testing.T) {
 		{"everyone deny delete", "group:everyone deny delete", false, ""},
 		{"everyone allow read", "group:everyone allow list,search", false, "opens the profile directory"},
 		{"the owner's own grant", "user:" + me.Username + " allow add_file,delete_child", false, ""},
-		{"everyone allow add and delete", "group:everyone allow add_file,delete_child", false, "lets another account change"},
-		{"an inheritable add", "group:everyone allow add_file,file_inherit,directory_inherit", false, "lets another account change"},
+		// On the profile directory any grant to another account is refused
+		// as opening it, whatever the right.
+		{"everyone allow add and delete", "group:everyone allow add_file,delete_child", false, "opens the profile directory"},
+		{"an inheritable add", "group:everyone allow add_file,file_inherit,directory_inherit", false, "opens the profile directory"},
 	}
 	for _, c := range cases {
 		dir := filepath.Join(base, "p-"+filepath.Base(c.name))
@@ -92,8 +94,10 @@ func TestRealACLReaderOnThisMac(t *testing.T) {
 		}
 	}
 
-	// An entry: write security on the marker lets another account change
-	// the list itself.
+	// An entry: a grant to change it is refused as such. Write security
+	// on the marker lets another account change the list itself; add and
+	// delete on the profile's Default directory let it replace what is in
+	// it; read alone is allowed on an entry.
 	profile := testProfileDirIn(t, base)
 	root, err := OpenProfileRoot(profile)
 	require.NoError(t, err)
@@ -103,6 +107,19 @@ func TestRealACLReaderOnThisMac(t *testing.T) {
 	chmodACL(t, marker, "+a", "group:everyone allow writesecurity")
 	_, err = OpenProfileEntry(root, profileMarker, false)
 	assert.ErrorContains(t, err, "lets another account change")
+
+	inside := filepath.Join(profile, "Default")
+	require.NoError(t, os.Mkdir(inside, 0o700))
+	chmodACL(t, inside, "+a", "group:everyone allow add_file,delete_child")
+	_, err = OpenProfileEntry(root, "Default", true)
+	assert.ErrorContains(t, err, "lets another account change")
+
+	readable := filepath.Join(profile, "Readable")
+	require.NoError(t, os.Mkdir(readable, 0o700))
+	chmodACL(t, readable, "+a", "group:everyone allow list,search")
+	f, err = OpenProfileEntry(root, "Readable", true)
+	require.NoError(t, err, "read and search on an entry")
+	require.NoError(t, f.Close())
 }
 
 // testProfileDirIn is testProfileDir in parent.
