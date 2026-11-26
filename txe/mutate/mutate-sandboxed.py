@@ -19,9 +19,12 @@ runner owns the boundary, so no single test has to:
   proxy>`. Go only reads a file proxy, and `go mod download` runs no project code. `--no-seed`
   skips it: then nothing reads the shared module cache and the container has GOPROXY=off.
 - After every sandboxed command the runner checks the host: the identity (device, inode and,
-  where the OS has one, birth time) of the shared GOMODCACHE, its cache/download, GOCACHE, GOPATH,
-  HOME and the live tree; that no entry directly inside the shared GOMODCACHE, its cache/download
-  or GOCACHE disappeared or was replaced; the content of a fixture sentinel file where one exists;
+  where the filesystem records one, birth time: st_birthtime on macOS, statx on Linux) of the
+  shared GOMODCACHE, its cache/download, GOCACHE, GOPATH, HOME and the live tree; that at least one
+  entry each of those held when the run began is still there, unchanged (a directory removed and
+  recreated with its inode handed back holds none: TXE-8535); that no entry directly inside the
+  shared GOMODCACHE, its cache/download or GOCACHE disappeared or was replaced; the content of a
+  fixture sentinel file where one exists;
   and the content of every live-tree file a mutant names. Any change stops the run at once with
   exit 3. These checks are the alarm, not the boundary: a deletion deeper inside a cache leaves
   them unchanged. The container's mounts are the boundary.
@@ -74,6 +77,7 @@ import secrets
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -140,6 +144,55 @@ def stop_on_signal(signum, _frame):
 # ---------------------------------------------------------------- identity
 
 
+# statx(2) (TXE-8535): Python's os.stat reports no birth time on Linux, and ext4 hands a freed inode
+# straight back, so a directory removed and recreated there can match by device and inode alone.
+STATX_BTIME, STATX_AT_FDCWD, STATX_AT_SYMLINK_NOFOLLOW = 0x800, -100, 0x100
+STATX_SIZE, STATX_BTIME_OFFSET = 256, 80  # struct statx; stx_btime is {s64 tv_sec; u32 tv_nsec}
+_statx: list = []  # [(ctypes, the libc function), or None where there is none], loaded on first use
+
+
+def _statx_function():
+    if not _statx:
+        found = None
+        if sys.platform.startswith("linux"):
+            import ctypes
+            try:
+                fn = ctypes.CDLL(None, use_errno=True).statx
+            except (OSError, AttributeError):  # no libc statx (glibc before 2.28, say)
+                pass
+            else:
+                # Declared, never left to ctypes' defaults: an undeclared call read a wrong birth time
+                # in the TXE-8535 probe.
+                fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+                fn.restype = ctypes.c_int
+                found = (ctypes, fn)
+        _statx.append(found)
+    return _statx[0]
+
+
+def statx_birth(path) -> int | None:
+    """The birth time of path itself (never followed through a final symlink), in nanoseconds, from
+    statx(2); None where there is no statx, it fails, or the filesystem records no birth time."""
+    found = _statx_function()
+    if found is None:
+        return None
+    ctypes, fn = found
+    buf = ctypes.create_string_buffer(STATX_SIZE)
+    if fn(STATX_AT_FDCWD, os.fsencode(path), STATX_AT_SYMLINK_NOFOLLOW, STATX_BTIME, buf) != 0:
+        return None
+    (mask,) = struct.unpack_from("=I", buf, 0)  # stx_mask: the fields the filesystem filled
+    if not mask & STATX_BTIME:
+        return None
+    sec, nsec = struct.unpack_from("=qI", buf, STATX_BTIME_OFFSET)
+    return sec * 1_000_000_000 + nsec
+
+
+def birth_time(path, st: os.stat_result):
+    """path's birth time: st_birthtime where the OS reports one (macOS), else statx's (Linux)."""
+    birth = getattr(st, "st_birthtime", None)
+    return birth if birth is not None else statx_birth(path)
+
+
 def identity(path: Path) -> dict | None:
     """The identity of path itself (never followed through a final symlink), or None if absent."""
     try:
@@ -149,7 +202,7 @@ def identity(path: Path) -> dict | None:
     except OSError as e:  # unreadable is a distinct state, so a change to it is seen, never skipped
         return {"unreadable": e.errno}
     ident = {"dev": st.st_dev, "ino": st.st_ino, "symlink": os.path.islink(path)}
-    birth = getattr(st, "st_birthtime", None)
+    birth = birth_time(path, st)
     if birth is not None:
         ident["birth"] = birth
     return ident
@@ -179,8 +232,19 @@ class Watch:
     # Directories whose existing entries must neither disappear nor be replaced. New entries are
     # fine: other sessions fill the shared caches while a run is in progress.
     children: dict[str, Path] = field(default_factory=dict)
+    # The entries directly inside each watched directory when the Watch first looked (TXE-8535). A
+    # directory removed and recreated holds none of them, even when its device, inode and every
+    # time it reports match. Entries added, and some removed or replaced, are fine: HOME and the
+    # live tree change during a run. Kept out of snapshot(), so a report's identity is not a listing.
+    anchors: dict[str, dict] | None = field(default=None, init=False)
 
     def snapshot(self) -> dict:
+        if self.anchors is None:
+            self.anchors = {}
+            for name, p in self.dirs.items():
+                top = entries(p)
+                if top and "<unreadable>" not in top:  # an unreadable one is the identity's to see
+                    self.anchors[name] = top
         snap: dict = {name: identity(p) for name, p in self.dirs.items()}
         for name, p in self.files.items():
             snap[name] = {"identity": identity(p), "sha256": file_digest(p)}
@@ -200,8 +264,14 @@ class Watch:
                     after = {**after, k: {e: after.get(k, {}).get(e) for e in lost}}
             elif before[k] != after.get(k):
                 changed.append(k)
-        if changed:
-            lines = [f"  {k}: {self.describe(k)}\n    before {before[k]}\n    after  {after.get(k)}" for k in changed]
+        lines = [f"  {k}: {self.describe(k)}\n    before {before[k]}\n    after  {after.get(k)}" for k in changed]
+        for name, top in sorted((self.anchors or {}).items()):
+            now = entries(self.dirs[name])
+            if not any(now.get(e) == v for e, v in top.items()):  # names are never printed: HOME's are private
+                lines.append(f"  top level of {name}: {self.dirs[name]}\n    none of the {len(top)} entries it held "
+                             "when the run began is still there, unchanged: it was removed and recreated, or "
+                             f"cannot be read ({len(now)} entries now)")
+        if lines:
             raise SharedStateChanged(f"after {when}:\n" + "\n".join(lines))
 
     def describe(self, key: str) -> str:
@@ -209,7 +279,8 @@ class Watch:
 
 
 def entries(d: Path) -> dict:
-    """The identity of each entry directly inside d (empty when d is absent or unreadable)."""
+    """The identity (device, inode and, where there is one, birth time) of each entry directly
+    inside d (empty when d is absent or unreadable)."""
     out = {}
     try:
         with os.scandir(d) as it:
@@ -218,7 +289,8 @@ def entries(d: Path) -> dict:
                     st = e.stat(follow_symlinks=False)
                 except FileNotFoundError:
                     continue
-                out[e.name] = [st.st_dev, st.st_ino]
+                birth = birth_time(e.path, st)
+                out[e.name] = [st.st_dev, st.st_ino] + ([] if birth is None else [birth])
     except FileNotFoundError:
         pass
     except OSError as e:  # every entry read before then counts as lost: the check fails closed

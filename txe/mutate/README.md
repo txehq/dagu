@@ -58,10 +58,12 @@ mutate-sandboxed --mutants mutants.json --tree . --image sha256:<local image id>
   resolved GOPROXY/GOSUMDB/GOPRIVATE/GONOPROXY/GONOSUMDB/GOINSECURE/GOTOOLCHAIN, the owned caches,
   and `GOWORK=off`, `GOENV=off`, so no caller variable can point Go at a live file. `--no-seed` skips
   this for a tree with no module dependencies.
-- **Host checks after every run.** The identity (device, inode and, on macOS, birth time) of the
-  shared GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the live tree; that no entry
-  directly inside the shared GOMODCACHE, its `cache/download` or GOCACHE disappeared or was
-  replaced (new entries are fine: other sessions fill the caches); the content of a fixture
+- **Host checks after every run.** The identity (device, inode and birth time) of the shared
+  GOMODCACHE, its `cache/download`, GOCACHE, GOPATH, HOME and the live tree; that at least one of
+  the entries each of those directories held when the run began is still there, unchanged (a
+  directory removed and recreated holds none of them, even with its inode handed back: TXE-8535);
+  that no entry directly inside the shared GOMODCACHE, its `cache/download` or GOCACHE disappeared
+  or was replaced (new entries are fine: other sessions fill the caches); the content of a fixture
   sentinel file where one exists; and the content of each live-tree file a mutant names. Any
   change stops the run at once with exit 3 and a banner; the work directory is kept as evidence
   and that run gets no verdict.
@@ -452,7 +454,18 @@ mutate-sandboxed --node-seed /abs/new-seed-dir --no-seed --tree okr/web --image 
   breaking guards in the caller's own tree, not a hostile tree. For a tree you do not trust, run
   with `--no-seed`: nothing is read from the shared module cache and the sandbox has
   `GOPROXY=off`.
-- On Linux the identity is device and inode only: Python's `os.stat` has no birth time there.
+- **A recreated directory can keep its inode** (TXE-8535). ext4 hands a freed inode straight back:
+  on remote-dev, `rmtree` then `mkdir` of a directory under `~` got the same inode on the first
+  try. Device and inode alone then match, so the identity also carries the birth time: `st_birthtime`
+  on macOS, `statx(2)`'s `stx_btime` on Linux (Python's `os.stat` has none there), each where the
+  filesystem records one. The top-level check covers a filesystem that records none: it fires when
+  none of a watched directory's original entries is still there, which a directory removed and
+  recreated cannot avoid, while ordinary churn (entries added, some removed or replaced) leaves
+  the rest in place. It would also fire on a directory every one of whose entries was removed or
+  replaced during the run, which none of the watched ones sees in normal use. A watched directory
+  that was empty, on a filesystem with no birth
+  time, recreated with its inode reused, is not seen. ctime is not compared: it changes whenever
+  an entry is added, which the checks must allow.
 - **The host checks are an alarm, not proof that nothing changed.** They see a watched directory
   replaced, an entry one level inside a shared cache removed or replaced, and a sentinel's content
   changed. They do not see a deletion deeper inside a cache (one module's files, one build-cache
