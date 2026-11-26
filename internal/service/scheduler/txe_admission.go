@@ -15,6 +15,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	queuedomain "github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/txe/registry"
 )
 
@@ -76,7 +77,10 @@ func specDigest(dag *ir.DAG) string {
 
 // admitQueuedRun applies the registry guard to a queued run of any trigger.
 // It returns false when the run must not be dispatched now; a refused run is
-// finalized as aborted with the registry's reason and noted on the job.
+// finalized as aborted with the registry's reason and noted on the job, and
+// a refused retry that carries a retry request is withdrawn from its queue
+// instead (withdrawRefusedRetry), for the coordinator to decide, so that it
+// is never read as having run.
 func (d *queueDispatcher) admitQueuedRun(
 	ctx context.Context,
 	queueName string,
@@ -114,7 +118,11 @@ func (d *queueDispatcher) admitQueuedRun(
 		return true
 	}
 	reason := fmt.Sprintf("txe: job %s %s: %s", adm.JobID, adm.Code, adm.Reason)
-	if err := d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason); err != nil {
+	drop := d.dropQueuedRun
+	if status.TriggerType == ir.TriggerTypeRetry && status.RetryRequest != nil {
+		drop = d.withdrawRefusedRetry
+	}
+	if err := drop(ctx, queueName, runRef, itemID, attemptID, status, reason); err != nil {
 		logger.Error(ctx, "Failed to drop queued run refused by TXE registry", tag.Error(err))
 		return false
 	}
@@ -176,6 +184,48 @@ func (d *queueDispatcher) admitQueuedRetry(ctx context.Context, jobID string, ru
 	return d.runAdmitter.AdmitQueuedRetry(ctx, jobID, registry.QueuedRetry{
 		RunID: run.ID, AttemptID: retried.AttemptID, QueuedAt: retried.QueuedAt, Request: *request,
 	})
+}
+
+// withdrawRefusedRetry takes a queued retry that carries a retry request,
+// and that admission refused, out of its queue without marking it aborted
+// (TXE-8596). An aborted execution reads like one that started and was then
+// stopped, so the retry could be recorded as having run.
+//
+// Nor does it record the execution as never dispatched: the queue item can
+// outlive an earlier handoff of the same execution (a deletion that failed,
+// or a scheduler that stopped before deleting it), and the coordinator may
+// then hold a live task, lease or active run for it while its status still
+// reads queued. queue.WithdrawQueuedExecution journals the execution and
+// removes the item; the coordinator's reconciliation then fails it with an
+// execution-scoped abandonment record only once its own stores, read under
+// its lock against acknowledgement, show nothing was handed to a worker. Until
+// then the retry is pending: the registry records it neither as succeeded
+// (the execution is queued and journaled) nor as not applied (no record).
+func (d *queueDispatcher) withdrawRefusedRetry(
+	ctx context.Context,
+	queueName string,
+	runRef ir.DAGRunRef,
+	itemID string,
+	attemptID string,
+	status *ir.DAGRunStatus,
+	_ string,
+) error {
+	root := status.Root
+	if root.Zero() {
+		root = runRef
+	}
+	withdrawn, err := queuedomain.WithdrawQueuedExecution(ctx, d.dagRunRepository, d.queueStore, queueName, runRef, root, attemptID, status.QueuedAt, itemID)
+	if err != nil {
+		return err
+	}
+	switch withdrawn {
+	case queuedomain.WithdrawalStale:
+		logger.Info(ctx, "Removed stale queued TXE retry refused by the registry")
+	case queuedomain.WithdrawalUnjournaled:
+		logger.Warn(ctx, "Withdrew a refused queued TXE retry that this store cannot journal; whether it was dispatched stays unknown")
+	case queuedomain.WithdrawalJournaled:
+	}
+	return nil
 }
 
 // startTxeReconciler keeps the registry and Dagu converged: it indexes the

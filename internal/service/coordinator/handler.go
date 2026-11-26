@@ -1659,6 +1659,9 @@ func (h *Handler) recordTaskClaim(ctx context.Context, task *coordinatorv1.Task,
 	if err := h.attemptOwnership().recordTaskClaim(ctx, task, workerID); err != nil {
 		return err
 	}
+	if taskClaimRecordedHook != nil {
+		taskClaimRecordedHook(run, task.GetAttemptId())
+	}
 	// The execution now has a lease, so it can no longer be proven
 	// undispatched: end its preparation entry under the same lock that
 	// abandonment takes. If ending fails, or the coordinator stops first, the

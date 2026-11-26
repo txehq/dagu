@@ -446,12 +446,32 @@ func (tx *JobTx) AcquireClaim(kind ClaimKind, r Reviewer, ttl time.Duration) (*C
 
 // interruptClaim interrupts the actions claimID left executing. Once its
 // claim is gone no holder can settle them, so they are reconciled instead.
+// A retry whose request was admitted and recorded is the exception: it is
+// held by its grant, not by its claim (holdsGrantPastClaim).
 func (tx *JobTx) interruptClaim(claimID string) {
 	for _, a := range tx.Job.Actions {
-		if a.ClaimID == claimID && a.State == ActionExecuting {
+		if a.ClaimID == claimID && a.State == ActionExecuting && !holdsGrantPastClaim(a) {
 			tx.interrupt(a)
 		}
 	}
+}
+
+// holdsGrantPastClaim reports whether an executing action stays executing
+// when the claim it ran under ends: a dagu.retry_run whose outcome records
+// the execution its request admitted (TXE-8596). The request has left the
+// holder, which can do nothing more to it, and the admitted execution may
+// still be waiting in a queue, whose dispatch admits it only while the
+// action is executing under a live grant (CheckRetryRun). Interrupting it
+// with its claim would make that dispatch refuse an approved retry. The
+// grant still bounds it: sweep interrupts it when the grant ends, and a
+// later claim settles it once the execution is dispatched (checkRetryReceipt
+// refuses success until then).
+func holdsGrantPastClaim(a *Action) bool {
+	if a.Spec.Name != ActionRetryRun {
+		return false
+	}
+	ref, err := admittedExecutionOf(a.Outcome)
+	return err == nil && ref != ""
 }
 
 // interrupt marks an executing action whose holder is gone. Its effect may
@@ -1401,9 +1421,10 @@ type Settlement struct {
 // action ID is not enough. A reconcile claim can settle after retirement so
 // that in-flight outcomes are never lost.
 //
-// An uncertain retry of a run may be settled as uncertain again only to
-// record the execution its request admitted (recordAdmittedExecution); once
-// recorded, that execution binds every later settlement of the attempt.
+// An uncertain retry of a run may be settled as uncertain again, and an
+// executing one as executing again, only to record the execution its
+// request admitted (recordAdmittedExecution); once recorded, that execution
+// binds every later settlement of the attempt.
 func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	j := tx.Job
 	if err := tx.CheckClaim(s.ClaimID, s.Fence); err != nil {
@@ -1419,7 +1440,8 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	allowed := false
 	switch a.State {
 	case ActionExecuting:
-		allowed = s.State == ActionSucceeded || s.State == ActionFailed || s.State == ActionUncertain || s.State == ActionNotApplied
+		allowed = s.State == ActionSucceeded || s.State == ActionFailed || s.State == ActionUncertain || s.State == ActionNotApplied ||
+			(s.State == ActionExecuting && a.Spec.Name == ActionRetryRun)
 	case ActionUncertain:
 		allowed = s.State == ActionSucceeded || s.State == ActionNotApplied || s.State == ActionEscalated ||
 			(s.State == ActionUncertain && a.Spec.Name == ActionRetryRun)
@@ -1428,7 +1450,9 @@ func (tx *JobTx) SettleAction(s Settlement) (*Action, error) {
 	if !allowed {
 		return nil, &Error{Code: CodeActionState, Message: fmt.Sprintf("cannot settle %s action as %s", a.State, s.State), Current: a}
 	}
-	if a.State == ActionUncertain && s.State == ActionUncertain {
+	if a.State == s.State {
+		// Uncertain or executing again, as allowed above: only to record
+		// the execution the retry's request admitted.
 		return tx.recordAdmittedExecution(a, s)
 	}
 	if s.State == ActionSucceeded && s.Receipt == "" {

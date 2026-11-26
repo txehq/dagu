@@ -259,14 +259,18 @@ func (c *runControl) LatestAttempt(ctx context.Context, job, runID string) (regi
 // RetryExecution is the service's record of which execution a retry
 // request admitted. Preparation is not modelled here: an execution the fake
 // admitted is dispatched unless the fake recorded it as abandoned.
-func (c *runControl) RetryExecution(_ context.Context, _, _, requestID string) (registry.RetryExecution, error) {
+func (c *runControl) RetryExecution(_ context.Context, _, runID, requestID string) (registry.RetryExecution, error) {
 	c.runs.mu.Lock()
 	defer c.runs.mu.Unlock()
 	rec, ok := c.runs.recorded[requestID]
 	if !ok {
 		return registry.RetryExecution{}, registry.ErrRunNotFound
 	}
-	return registry.RetryExecution{Ref: rec.ref, Request: rec.request, Abandoned: c.runs.abandonedRefs[rec.ref]}, nil
+	// As runcontrol derives it: queued while the run's latest execution is
+	// this one and waits in its queue.
+	now := c.runs.state[runID]
+	queued := now.Execution().Ref() == rec.ref && now.Status == "queued"
+	return registry.RetryExecution{Ref: rec.ref, Request: rec.request, Abandoned: c.runs.abandonedRefs[rec.ref], Queued: queued}, nil
 }
 
 func writeAPIError(w http.ResponseWriter, _ *http.Request, err error) {
@@ -2273,13 +2277,76 @@ func TestRemoteRequestedRetryIsExecutedByTheTick(t *testing.T) {
 	assert.Equal(t, registry.CodeStaleBinding, registry.ErrorCode(err))
 }
 
+// assertHeldForDispatch checks a retry whose execution was left queued: the
+// reviewer reports it executing with the execution recorded and no receipt,
+// and the registry holds it so after the review's claim ended (TXE-8596).
+func assertHeldForDispatch(t *testing.T, f *remoteFixture, action review.Action, queued string) {
+	t.Helper()
+	assert.Equal(t, review.ActionExecuting, action.State, "queued, not dispatched: not settled")
+	assert.Empty(t, action.Receipt)
+	assert.Equal(t, queued, action.AdmittedRef)
+	assert.Contains(t, action.Detail, "queued and not yet dispatched")
+	job, err := f.store.GetJob(context.Background(), f.jobID)
+	require.NoError(t, err)
+	held := job.Actions[action.ID]
+	require.NotNil(t, held)
+	assert.Equal(t, registry.ActionExecuting, held.State, "the end of the review's claim does not interrupt it")
+	assert.Equal(t, registry.ClaimReleased, job.Claim.State, "the review released its claim")
+}
+
+// dispatch moves the run's latest execution from its queue to running, as
+// queue dispatch and a worker do.
+func dispatch(service *runs, runID string) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	state := service.state[runID]
+	state.Status, state.Active = "running", true
+	service.state[runID] = state
+}
+
+// settleByReview runs one review of the job and returns the action as the
+// registry then holds it, in flight or archived.
+func settleByReview(t *testing.T, f *remoteFixture, service *runs, holder, actionID string) registry.Action {
+	t.Helper()
+	ctx := context.Background()
+	r := f.retrying(holder, service)
+	prepared, err := r.Prepare(ctx, f.jobID)
+	require.NoError(t, err)
+	if prepared.Skipped == "" {
+		_, err = r.Apply(ctx, prepared, review.AgentDecision{Outcome: review.OutcomeContinue, Reasoning: "waiting", EvidenceRunIDs: prepared.Packet.RunIDs()})
+		require.NoError(t, err)
+	}
+	job, err := f.store.GetJob(ctx, f.jobID)
+	require.NoError(t, err)
+	if a := job.Actions[actionID]; a != nil {
+		return *a
+	}
+	archived, err := f.store.ListArchivedActions(ctx, f.jobID, 100)
+	require.NoError(t, err)
+	for _, a := range archived {
+		if a.ActionID == actionID {
+			return *a
+		}
+	}
+	t.Fatalf("action %s is neither in flight nor archived", actionID)
+	return registry.Action{}
+}
+
 // On Dagu's queued path a retry runs the latest attempt again under the same
 // attempt id with a later queue marker. Against the real registry: the
-// decision is bound to (attempt, queued marker); the retry is recorded with
-// the reference of the execution observed afterwards, which has the same
+// decision is bound to (attempt, queued marker); while the execution waits
+// in its queue the action stays executing under its grant, past the end of
+// the review's claim, with the execution recorded (TXE-8596: queue dispatch
+// admits it only so); once the execution is dispatched the next review
+// records the retry with that execution's reference, which has the same
 // attempt id; and when that execution fails too, a fresh decision about it
 // is a different proposal and runs once, while one that still names the
 // first execution of the attempt is refused.
+//
+// Updated for TXE-8596: this test asserted ActionSucceeded right after the
+// retry was seen queued. That settlement is what made queue dispatch refuse
+// the retry (retry_not_approved), so it is now the held, executing state,
+// settled after dispatch.
 func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
 	f := newRemoteFixture(t)
 	ctx := context.Background()
@@ -2311,13 +2378,17 @@ func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, done, 1)
 	require.Empty(t, done[0].Executed.Skipped)
-	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
 	second := service.state["run-7"].Execution()
 	assert.Equal(t, "att-1", second.AttemptID, "the queued path keeps the attempt id")
 	assert.NotEmpty(t, second.QueuedAt)
-	assert.Equal(t, second.Ref(), done[0].Executed.Action.Receipt, "the registry accepted the observed execution's reference as the receipt")
 	assert.NotEqual(t, first.Ref(), second.Ref())
-	assert.Contains(t, done[0].Executed.Action.Detail, "queued", "the record says the execution was queued, not that anything succeeded")
+	assertHeldForDispatch(t, f, done[0].Executed.Action, second.Ref())
+
+	// The queue dispatches it, and the next review records the retry.
+	dispatch(service, "run-7")
+	settled := settleByReview(t, f, service, "settle-1", done[0].Executed.Action.ID)
+	assert.Equal(t, registry.ActionSucceeded, settled.State)
+	assert.Equal(t, second.Ref(), settled.Receipt, "the registry accepted the dispatched execution's reference as the receipt")
 
 	// That execution fails as well.
 	state := service.state["run-7"]
@@ -2337,9 +2408,12 @@ func TestRemoteQueuedPathRetryIsBoundByTheQueueMarker(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, done, 1)
 	assert.Equal(t, laterDecision.DecisionID, done[0].DecisionID)
-	assert.Equal(t, review.ActionSucceeded, done[0].Executed.Action.State)
 	third := service.state["run-7"].Execution()
-	assert.Equal(t, third.Ref(), done[0].Executed.Action.Receipt)
+	assertHeldForDispatch(t, f, done[0].Executed.Action, third.Ref())
+	dispatch(service, "run-7")
+	settled = settleByReview(t, f, service, "settle-2", done[0].Executed.Action.ID)
+	assert.Equal(t, registry.ActionSucceeded, settled.State)
+	assert.Equal(t, third.Ref(), settled.Receipt)
 	assert.Len(t, service.retried, 2)
 
 	again, err := f.retrying("tick-3", service).RunRequestedRetries(ctx, f.remote.MachineID)

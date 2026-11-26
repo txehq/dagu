@@ -297,6 +297,13 @@ func (r *Registry) ReleaseClaim(_ context.Context, claim review.Claim) error {
 	})
 }
 
+// HoldsGrantPastClaim reports whether an executing action stays executing
+// when its claim ends, as the registry decides it: a retry that records the
+// execution its request admitted (TXE-8596).
+func HoldsGrantPastClaim(a review.Action) bool {
+	return a.Name == review.RetryRunAction && a.AdmittedRef != ""
+}
+
 // RunsAfter implements review.Registry.
 func (r *Registry) RunsAfter(_ context.Context, jobID, cursor string) ([]review.RunEvidence, error) {
 	var out []review.RunEvidence
@@ -663,7 +670,7 @@ func (s *State) checkDecision(job review.Job, req review.BeginRequest) *review.G
 }
 
 var allowedTransitions = map[review.ActionState][]review.ActionState{
-	review.ActionExecuting: {review.ActionSucceeded, review.ActionFailed, review.ActionUncertain},
+	review.ActionExecuting: {review.ActionSucceeded, review.ActionFailed, review.ActionUncertain, review.ActionNotApplied},
 	review.ActionUncertain: {review.ActionSucceeded, review.ActionNotApplied, review.ActionEscalated},
 }
 
@@ -755,13 +762,15 @@ func (s *State) finish(req review.FinishRequest, now time.Time) error {
 				return fmt.Errorf("%w: wrong grant for action %s", review.ErrConflict, req.ActionID)
 			}
 			known := actions[i].AdmittedRef
-			if actions[i].Name == review.RetryRunAction && actions[i].State == review.ActionUncertain && req.State == review.ActionUncertain {
+			if actions[i].Name == review.RetryRunAction && actions[i].State == req.State &&
+				(req.State == review.ActionUncertain || req.State == review.ActionExecuting) {
 				// As the registry does: an uncertain retry is settled as
-				// uncertain again only to record the execution its request
+				// uncertain again, and an executing one as executing again
+				// (TXE-8596), only to record the execution its request
 				// admitted, once, and never to replace it.
 				switch {
 				case req.AdmittedRef == "" || req.Receipt != "":
-					return fmt.Errorf("%w: an uncertain action %s is settled as uncertain only to record its admitted execution", review.ErrConflict, req.ActionID)
+					return fmt.Errorf("%w: an %s action %s is settled as %s only to record its admitted execution", review.ErrConflict, req.State, req.ActionID, req.State)
 				case known == "":
 					actions[i].Detail = req.Detail
 					actions[i].Admitted, actions[i].AdmittedRef = true, req.AdmittedRef
@@ -925,7 +934,7 @@ func (r *Registry) PutJob(job review.Job) error {
 			if claim, held := s.Claims[job.ID]; held && claim.Kind == review.ClaimReview {
 				actions := s.Actions[job.ID]
 				for i := range actions {
-					if actions[i].State == review.ActionExecuting && actions[i].ClaimID == claim.ID {
+					if actions[i].State == review.ActionExecuting && actions[i].ClaimID == claim.ID && !HoldsGrantPastClaim(actions[i]) {
 						actions[i].State = review.ActionUncertain
 						if s.ReadOnlyAttempts[actions[i].ID] {
 							actions[i].State = review.ActionFailed
