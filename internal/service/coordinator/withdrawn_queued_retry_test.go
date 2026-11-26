@@ -164,6 +164,11 @@ func TestAWithdrawnQueuedRetryNeverHandedOffIsAbandonedWithARecord(t *testing.T)
 // finishing proves nothing more than the lock already does.
 const fenceWait = 200 * time.Millisecond
 
+// joinWait bounds the wait for the other side once the fence is released.
+// Past it the test fails; the goroutine is not stopped, and the test binary's
+// own timeout still applies to it.
+const joinWait = 30 * time.Second
+
 // Abandonment first. Reconciliation has established that nothing holds the
 // withdrawn execution and holds the run's write lock; at that moment a task
 // for it is published elsewhere, claimed, and acknowledged. The
@@ -178,7 +183,11 @@ func TestAnAcknowledgementDuringAWithdrawnRetrysAbandonmentIsRefused(t *testing.
 	queueName, itemID := f.enqueueQueued(t)
 	f.withdraw(t, queueName, itemID, queued, marker)
 
+	// The acknowledgement's result is received exactly once: by the barrier
+	// if it completes early (a regression, kept in early), otherwise by the
+	// final join.
 	acked := make(chan *coordinatorv1.AckTaskClaimResponse, 1)
+	var early *coordinatorv1.AckTaskClaimResponse
 	fired := false
 	abandonEvidenceCheckedHook = func(run ir.DAGRunRef, attemptID string) {
 		if fired || run != f.ref || attemptID != queued {
@@ -202,7 +211,7 @@ func TestAnAcknowledgementDuringAWithdrawnRetrysAbandonmentIsRefused(t *testing.
 			acked <- resp
 		}()
 		select {
-		case <-acked:
+		case early = <-acked:
 			t.Error("the acknowledgement completed while the abandonment held the run's lock")
 		case <-time.After(fenceWait):
 		}
@@ -212,7 +221,14 @@ func TestAnAcknowledgementDuringAWithdrawnRetrysAbandonmentIsRefused(t *testing.
 	f.h.reconcileAbandonedPreparations(t.Context(), later())
 	require.True(t, fired)
 	require.NotNil(t, f.executionRecord(t, queued, marker))
-	resp := <-acked
+	resp := early
+	if resp == nil {
+		select {
+		case resp = <-acked:
+		case <-time.After(joinWait):
+			t.Fatal("the acknowledgement did not finish after the abandonment released the run's lock")
+		}
+	}
 	assert.False(t, resp.Accepted)
 	assert.Equal(t, errAttemptAbandoned.Error(), resp.Error)
 	_, err := f.leases.Get(t.Context(), f.attemptKey(queued))
@@ -238,6 +254,8 @@ func TestAWithdrawnRetrysAbandonmentDuringAnAcknowledgementLeavesIt(t *testing.T
 	require.NoError(t, err)
 	require.NotNil(t, claimed)
 
+	// reconciled is closed once, when the reconciliation returns; both the
+	// barrier and the final join only observe the close.
 	reconciled := make(chan struct{})
 	fired := false
 	taskClaimRecordedHook = func(run ir.DAGRunRef, attemptID string) {
@@ -263,7 +281,11 @@ func TestAWithdrawnRetrysAbandonmentDuringAnAcknowledgementLeavesIt(t *testing.T
 	require.NoError(t, err)
 	require.True(t, fired)
 	assert.True(t, resp.Accepted, resp.Error)
-	<-reconciled
+	select {
+	case <-reconciled:
+	case <-time.After(joinWait):
+		t.Fatal("reconciliation did not finish after the acknowledgement released the run's lock")
+	}
 	assert.Nil(t, f.executionRecord(t, queued, marker), "no false abandonment")
 	assert.Empty(t, f.records(t))
 	_, err = f.leases.Get(t.Context(), f.attemptKey(queued))
