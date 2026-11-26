@@ -20,9 +20,9 @@ runner owns the boundary, so no single test has to:
   skips it: then nothing reads the shared module cache and the container has GOPROXY=off.
 - After every sandboxed command the runner checks the host: the identity (device, inode and,
   where the filesystem records one, birth time: st_birthtime on macOS, statx on Linux) of the
-  shared GOMODCACHE, its cache/download, GOCACHE, GOPATH, HOME and the live tree; that at least one
-  entry each of those held when the run began is still there, unchanged (a directory removed and
-  recreated with its inode handed back holds none: TXE-8535); that no entry directly inside the
+  shared GOMODCACHE, its cache/download, GOCACHE, GOPATH, HOME and the live tree; for each of those
+  that was listable at the first check, that one entry it held then is still present by name with
+  the same identity (TXE-8535; what that misses: README, Limits); that no entry directly inside the
   shared GOMODCACHE, its cache/download or GOCACHE disappeared or was replaced; the content of a
   fixture sentinel file where one exists;
   and the content of every live-tree file a mutant names. Any change stops the run at once with
@@ -232,10 +232,10 @@ class Watch:
     # Directories whose existing entries must neither disappear nor be replaced. New entries are
     # fine: other sessions fill the shared caches while a run is in progress.
     children: dict[str, Path] = field(default_factory=dict)
-    # The entries directly inside each watched directory when the Watch first looked (TXE-8535). A
-    # directory removed and recreated holds none of them, even when its device, inode and every
-    # time it reports match. Entries added, and some removed or replaced, are fine: HOME and the
-    # live tree change during a run. Kept out of snapshot(), so a report's identity is not a listing.
+    # The entries directly inside each listable watched directory at the first snapshot (TXE-8535).
+    # verify fails only when not one is present by name with the same device, inode and recorded birth
+    # time; that is all it measures (README, Limits: what still matches with no birth time). Entries
+    # added, and some removed or replaced, are fine. Kept out of snapshot(): a report has no listing.
     anchors: dict[str, dict] | None = field(default=None, init=False)
 
     def snapshot(self) -> dict:
