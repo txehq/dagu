@@ -23,10 +23,20 @@ func readPrefs(t *testing.T, path string) map[string]any {
 	return prefs
 }
 
+// testProfileDir is a new, empty profile directory only this user may
+// write, as the gate's own profiles are made (0700), whatever the umask:
+// t.TempDir's own directory takes its mode from the umask.
+func testProfileDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "profile")
+	require.NoError(t, os.Mkdir(dir, 0o700))
+	return dir
+}
+
 // ownedProfile is a profile directory created for the gate and claimed.
 func ownedProfile(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := testProfileDir(t)
 	require.NoError(t, claimProfile(dir))
 	return dir
 }
@@ -76,7 +86,7 @@ func TestDisableOffTheRecordRefusesAProfileThatIsNotTheGates(t *testing.T) {
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=relative/profile"}), ErrProfileRequired)
 	assert.ErrorIs(t, claimProfile("relative/profile"), ErrProfileRequired)
 
-	persons := t.TempDir()
+	persons := testProfileDir(t)
 	require.NoError(t, os.MkdirAll(filepath.Join(persons, "Default"), 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(persons, "Default", "Preferences"), []byte(`{"a":1}`), 0o600))
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + persons}), ErrProfileNotOwned)

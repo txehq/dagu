@@ -42,7 +42,7 @@ func TestDisableOffTheRecordRefusesSymbolicLinks(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"kept":true}`, string(raw), "the link's target is left as it was")
 
-	unmarked := t.TempDir()
+	unmarked := testProfileDir(t)
 	require.NoError(t, os.Symlink(filepath.Join(target, profileMarker), filepath.Join(unmarked, profileMarker)))
 	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + unmarked}), ErrProfileNotOwned)
 }

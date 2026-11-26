@@ -55,6 +55,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	fakeProfiles = dir
+	groupWritableUmask()
 	code := m.Run()
 	_ = os.RemoveAll(fakeProfiles)
 	os.Exit(code)
