@@ -123,10 +123,21 @@ const (
 	RetryRunQueuedParam  = "queued_at"
 	// RetryRunStepParam, set to RetryStepPublish, makes the retry a
 	// republish: only the job's publish step runs, for the result the failed
-	// execution sealed, and the job does not run again. The reviewer sets it,
-	// never the agent, and only when that seal is on this machine.
+	// execution sealed, and the job does not run again. The reviewer sets it
+	// when that seal is on this machine, and a person may ask for it; the
+	// agent never does. Set to RetryStepRun, it is a person's explicit
+	// request to run the job again as a new execution, even when the
+	// retried execution sealed a result (TXE-7515); only a person asks for
+	// it. A retry with no step is unspecified, and runs the job again only
+	// for an execution that sealed nothing.
 	RetryRunStepParam = "step"
 	RetryStepPublish  = registry.RetryStepPublish
+	RetryStepRun      = registry.RetryStepRun
+	// RetryRunRerunParam is the key an unreleased build stored a person's
+	// rerun under before it became step RetryStepRun (TXE-7629). The
+	// registry no longer writes it, and a decision naming it is refused as
+	// not dispatched; it is kept only to refuse it.
+	RetryRunRerunParam = "rerun"
 	// CapabilityRepublishSealed is what the service's installation lists
 	// when it runs a retry of only the publish step for a sealed result.
 	CapabilityRepublishSealed = registry.CapabilityRepublishSealed
@@ -338,9 +349,38 @@ type RunEvidence struct {
 	FinishedAt time.Time         `json:"finished_at,omitzero"`
 	Outputs    map[string]string `json:"outputs,omitempty"`
 	Artifacts  []string          `json:"artifacts,omitempty"`
-	Error      string            `json:"error,omitempty"` // Steps carry the end of each step's own output, which is where a
+	// Error is the reason the service recorded for the run's end, such as
+	// a lost lease, sanitized and bounded. It is the service's text, not the
+	// script's output.
+	Error string `json:"error,omitempty"`
+	// Seal is set when this machine holds the result this execution sealed
+	// and the run never published it; see SealMarker.
+	Seal *SealMarker `json:"seal,omitempty"`
+	// Steps carry the end of each step's own output, which is where a
 	// script's result usually is.
 	Steps []StepEvidence `json:"steps,omitempty"`
+}
+
+// SealUnpublished is the one state a SealMarker has.
+const SealUnpublished = "sealed_unpublished"
+
+// SealMarker says that execution Execution of a run that did not succeed
+// sealed its result on this machine, the result is still the run's latest
+// and intact, and the run never published it. It is metadata only: no
+// path, no file name and no content. A run carries one only when the seal
+// is bound to the execution the evidence is of and to the job's current
+// version; a seal of another execution, of an older version, one changed
+// since it was sealed, or one that cannot be read gives the run none.
+//
+// It informs the agent and decides nothing. Whether a retry of the run is
+// proposed as a republish is checked again when the agent asks for one.
+type SealMarker struct {
+	State string `json:"state"`
+	// Execution is the reference of the sealing execution.
+	Execution  string `json:"execution"`
+	JobVersion int    `json:"job_version"`
+	// Files is how many files the seal recorded.
+	Files int `json:"files"`
 }
 
 // outputTruncated reports whether any step of the run printed more than the
@@ -365,6 +405,9 @@ type StepEvidence struct {
 	Status string `json:"status"`
 	Stdout string `json:"stdout_tail,omitempty"`
 	Stderr string `json:"stderr_tail,omitempty"`
+	// Error is the service's recorded error for the step, sanitized and
+	// bounded.
+	Error string `json:"error,omitempty"`
 	// Truncated is true when the step printed more than is shown here.
 	Truncated bool `json:"truncated,omitempty"`
 }

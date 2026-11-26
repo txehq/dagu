@@ -1,9 +1,10 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { Status, StatusLabel } from '@/api/v1/schema';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import DAGRunActions from '../DAGRunActions';
 import {
   getDAGRunTerminateAction,
@@ -24,6 +25,8 @@ vi.mock('@/features/txe/runAccess', () => ({
   ViewOnly: () => <span>View only</span>,
 }));
 
+const postMock = vi.hoisted(() => vi.fn());
+
 vi.mock('../../../../../contexts/ConfigContext', () => ({
   useConfig: () => ({
     permissions: {
@@ -34,7 +37,7 @@ vi.mock('../../../../../contexts/ConfigContext', () => ({
 
 vi.mock('../../../../../hooks/api', () => ({
   useClient: () => ({
-    POST: vi.fn(),
+    POST: postMock,
     GET: vi.fn(),
   }),
 }));
@@ -252,5 +255,61 @@ describe('DAGRunActions', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Stop' })).toBeDisabled();
+  });
+
+  // TXE-7517: the hub refuses a generic retry of a registered TXE job's
+  // run, so the page offers no Retry that would be refused: the job's TXE
+  // page, where Run again and Publish sealed result are, stands in for it.
+  const failedRun = {
+    dagRunId: 'run-1',
+    status: Status.Failed,
+    statusLabel: StatusLabel.failed,
+    artifactsAvailable: false,
+    autoRetryCount: 0,
+    autoRetryLimit: 0,
+    startedAt: '',
+    finishedAt: '',
+  };
+
+  it('sends a TXE job run to its job page instead of a Retry', () => {
+    const job = 'job_01M4XEETKWKZX504BK65ADBVYB';
+    postMock.mockReset();
+    render(
+      <MemoryRouter initialEntries={['/dag-runs']}>
+        <Routes>
+          <Route
+            path="/dag-runs"
+            element={
+              <DAGRunActions
+                dagRun={{ ...failedRun, name: job }}
+                name={job}
+                displayMode="full"
+              />
+            }
+          />
+          <Route path="/txe/jobs/:jobId" element={<p>txe job page</p>} />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Retry' })
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry in TXE' }));
+    expect(screen.getByText('txe job page')).toBeInTheDocument();
+    expect(postMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps Retry on any other DAG run', () => {
+    render(
+      <DAGRunActions
+        dagRun={{ ...failedRun, name: 'etl' }}
+        name="etl"
+        displayMode="full"
+      />
+    );
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Retry in TXE' })
+    ).not.toBeInTheDocument();
   });
 });

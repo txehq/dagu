@@ -165,15 +165,19 @@ func TestTXEReviewSealsAreThePublishCheck(t *testing.T) {
 	_, err = outputs.Seal(jobID, runID, sealed)
 	require.NoError(t, err)
 
-	require.NoError(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"}))
-	publishOnly := seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0b0b0b"})
+	files, err := seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"})
+	require.NoError(t, err)
+	assert.Equal(t, 1, files, "the count of files the seal recorded")
+	_, publishOnly := seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0b0b0b"})
 	require.ErrorIs(t, publishOnly, txeclient.ErrNotRetriedSeal, "an execution that ran no job, as a failed republish, leaves the seal in force")
 	require.NotErrorIs(t, publishOnly, review.ErrNotSealed)
 	unsealed := txeclient.Execution{AttemptID: "0c0c0c"}
 	_, err = outputs.Begin(jobID, runID, unsealed)
 	require.NoError(t, err)
-	require.ErrorIs(t, seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0c0c0c"}), review.ErrNotSealed, "it ran the job and sealed nothing")
-	require.ErrorIs(t, seals.RetriedSeal(jobID, "run-0002", review.Execution{AttemptID: "0a0a0a"}), review.ErrNotSealed)
+	_, err = seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0c0c0c"})
+	require.ErrorIs(t, err, review.ErrNotSealed, "it ran the job and sealed nothing")
+	_, err = seals.RetriedSeal(jobID, "run-0002", review.Execution{AttemptID: "0a0a0a"})
+	require.ErrorIs(t, err, review.ErrNotSealed)
 
 	seal, err := outputs.Sealed(jobID, runID)
 	require.NoError(t, err)
@@ -183,7 +187,7 @@ func TestTXEReviewSealsAreThePublishCheck(t *testing.T) {
 		}
 		return err
 	}))
-	err = seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"})
+	_, err = seals.RetriedSeal(jobID, runID, review.Execution{AttemptID: "0a0a0a"})
 	require.ErrorIs(t, err, txeclient.ErrChangedAfterSeal)
 	require.NotErrorIs(t, err, review.ErrNotSealed)
 }

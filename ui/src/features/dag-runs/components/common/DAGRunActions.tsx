@@ -35,6 +35,8 @@ import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
+import { TxeJobRetryButton } from '@/features/txe/components/TxeJobRetryButton';
 
 /**
  * Props for the DAGRunActions component
@@ -260,33 +262,44 @@ function DAGRunActions({
           </Tooltip>
         )}
 
+        {/* A registered TXE job's run is retried only through a TXE
+            decision (TXE-7517): its job page stands in for Retry. */}
+        {isRootLevel && isTxeJobDAGName(rootName) && (
+          <TxeJobRetryButton
+            jobId={rootName}
+            label={displayMode !== 'compact'}
+          />
+        )}
+
         {/* Retry Button */}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span>
-              <ActionButton
-                label={displayMode !== 'compact'}
-                icon={<RefreshCw className="h-4 w-4" />}
-                disabled={!buttonState['retry']}
-                onClick={() => setIsRetryModal(true)}
-                className="cursor-pointer"
-              >
-                <I18nText text={'Retry'} />
-              </ActionButton>
-            </span>
-          </TooltipTrigger>
-          <TooltipContent>
-            <p>
-              {isRootLevel ? (
-                <I18nText text={'Retry DAGRun execution'} />
-              ) : (
-                <I18nText
-                  text={'Retry action only available at root dagRun level'}
-                />
-              )}
-            </p>
-          </TooltipContent>
-        </Tooltip>
+        {!(isRootLevel && isTxeJobDAGName(rootName)) && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span>
+                <ActionButton
+                  label={displayMode !== 'compact'}
+                  icon={<RefreshCw className="h-4 w-4" />}
+                  disabled={!buttonState['retry']}
+                  onClick={() => setIsRetryModal(true)}
+                  className="cursor-pointer"
+                >
+                  <I18nText text={'Retry'} />
+                </ActionButton>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>
+                {isRootLevel ? (
+                  <I18nText text={'Retry DAGRun execution'} />
+                ) : (
+                  <I18nText
+                    text={'Retry action only available at root dagRun level'}
+                  />
+                )}
+              </p>
+            </TooltipContent>
+          </Tooltip>
+        )}
 
         {/* Dequeue Button */}
         <Tooltip>

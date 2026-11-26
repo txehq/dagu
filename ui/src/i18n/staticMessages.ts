@@ -1349,6 +1349,9 @@ const english = {
   Retry: 'Retry',
   'Retry action only available at root dagRun level':
     'Retry action only available at root dagRun level',
+  'Retry in TXE': 'Retry in TXE',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    "A TXE job's run is retried from its job page: Run again or Publish sealed result",
   'Retry as a new run': 'Retry as a new run',
   'Retry continues the existing OpenCode conversation and sends the step prompt again. Use “Start clean session” in the Agent session tab to begin a new conversation.':
     'Retry continues the existing OpenCode conversation and sends the step prompt again. Use “Start clean session” in the Agent session tab to begin a new conversation.',
@@ -3744,6 +3747,9 @@ const chinese = {
   Retry: '重试',
   'Retry action only available at root dagRun level':
     '重试操作仅在根 dagRun 层级可用',
+  'Retry in TXE': '在 TXE 中重试',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    'TXE 作业的运行需在其作业页面重试：再次运行或发布已封存的结果',
   'Retry as a new run': '作为新运行重试',
   'Retry continues the existing OpenCode conversation and sends the step prompt again. Use “Start clean session” in the Agent session tab to begin a new conversation.':
     '重试将继续现有的 OpenCode 对话并重新发送步骤提示。要开始新对话，请在 Agent 会话选项卡中使用“开始新会话”。',
@@ -6148,6 +6154,9 @@ const japanese = {
   Retry: '再試行',
   'Retry action only available at root dagRun level':
     '再試行アクションはルート dagRun レベルでのみ利用可能です',
+  'Retry in TXE': 'TXE で再試行',
+  "A TXE job's run is retried from its job page: Run again or Publish sealed result":
+    'TXE ジョブの実行はジョブページから再試行します：再実行、または封印済みの結果を公開',
   'Retry as a new run': '新しい実行として再試行',
   'Retry continues the existing OpenCode conversation and sends the step prompt again. Use “Start clean session” in the Agent session tab to begin a new conversation.':
     '再試行は既存の OpenCode 会話を継続し、ステップのプロンプトを再送信します。新しい会話を開始するには、Agent セッションタブで「クリーンセッションを開始」を使用してください。',

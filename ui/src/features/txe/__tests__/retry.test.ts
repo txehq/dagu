@@ -7,6 +7,8 @@ import type { components } from '@/api/v1/schema';
 
 import {
   canRequestRetry,
+  offeredIntents,
+  retryIntentOf,
   retryLabel,
   retryStates,
   sameRetryStates,
@@ -118,12 +120,42 @@ describe('retryStates', () => {
   });
 });
 
+// TXE-7515: a retry's intent is read from its stored parameters, and a
+// republish is labelled as one.
+describe('retry intent', () => {
+  const withParams = (extra: Record<string, unknown>): ApiProposal => {
+    const p = proposal('prp_i', 'run-i', '2026-10-09T12:00:00Z');
+    p.action.params = { ...(p.action.params as object), ...extra };
+    return p;
+  };
+  it('reads republish, rerun and unspecified', () => {
+    expect(
+      retryStates([withParams({ step: 'publish' })], []).get('run-i')?.intent
+    ).toBe('republish');
+    expect(
+      retryStates([withParams({ rerun: true })], []).get('run-i')?.intent
+    ).toBe('rerun');
+    expect(retryStates([withParams({})], []).get('run-i')?.intent).toBe(
+      'unspecified'
+    );
+  });
+  it('labels a republish as one', () => {
+    const state = retryStates([withParams({ step: 'publish' })], []).get(
+      'run-i'
+    )!;
+    expect(retryLabel(state)).toMatch(/^Republish requested/);
+    const rerun = retryStates([withParams({ rerun: true })], []).get('run-i')!;
+    expect(retryLabel(rerun)).toMatch(/^Retry requested/);
+  });
+});
+
 describe('canRequestRetry', () => {
   const q1 = '2026-10-09T12:00:00Z';
   const q2 = '2026-10-09T12:00:05Z';
   const exec = (attemptId: string, queuedAt = q1) => ({ attemptId, queuedAt });
   const bound = (status: RetryState['status']): RetryState => ({
     runId: 'r',
+    intent: 'unspecified',
     proposalId: 'p',
     attemptId: 'a1',
     queuedAt: q1,
@@ -141,12 +173,12 @@ describe('canRequestRetry', () => {
     expect(canRequestRetry('failed', undefined, undefined)).toBe(false);
   });
 
-  it('allows one retry per execution', () => {
+  it('allows one request per execution while it may run', () => {
     for (const status of [
       'requested',
       'executing',
       'uncertain',
-      'failed',
+      'succeeded',
     ] as const) {
       expect(canRequestRetry('failed', exec('a1'), bound(status))).toBe(false);
     }
@@ -161,9 +193,63 @@ describe('canRequestRetry', () => {
   });
 });
 
+// TXE-7515: a request settled with nothing run leaves the intents it did
+// not ask for.
+describe('offeredIntents', () => {
+  const q1 = '2026-10-09T12:00:00Z';
+  const exec = { attemptId: 'a1', queuedAt: q1 };
+  const settled = (
+    intent: RetryState['intent'],
+    status: RetryState['status']
+  ): RetryState => ({
+    runId: 'r',
+    intent,
+    proposalId: 'p',
+    attemptId: 'a1',
+    queuedAt: q1,
+    status,
+  });
+
+  it('offers both with nothing bound', () => {
+    expect(offeredIntents('failed', exec, undefined)).toEqual([
+      'republish',
+      'rerun',
+    ]);
+    expect(offeredIntents('succeeded', exec, undefined)).toEqual([]);
+  });
+
+  it('leaves the other intents after a request with nothing run', () => {
+    for (const status of ['failed', 'not-applied', 'rejected'] as const) {
+      expect(
+        offeredIntents('failed', exec, settled('unspecified', status))
+      ).toEqual(['republish', 'rerun']);
+      expect(
+        offeredIntents('failed', exec, settled('republish', status))
+      ).toEqual(['rerun']);
+      expect(offeredIntents('failed', exec, settled('rerun', status))).toEqual([
+        'republish',
+      ]);
+    }
+  });
+
+  it('offers nothing while a request may run', () => {
+    for (const status of [
+      'requested',
+      'executing',
+      'uncertain',
+      'succeeded',
+    ] as const) {
+      expect(
+        offeredIntents('failed', exec, settled('republish', status))
+      ).toEqual([]);
+    }
+  });
+});
+
 describe('sameRetryStates', () => {
   const st = (status: RetryState['status']): RetryState => ({
     runId: 'r',
+    intent: 'unspecified',
     proposalId: 'p',
     attemptId: 'a1',
     queuedAt: '',
@@ -185,5 +271,19 @@ describe('sameRetryStates', () => {
         new Map([['r', st('requested')]])
       )
     ).toBe(true);
+  });
+});
+
+// TXE-8597: retryIntentOf is the one decoder of a stored retry's intent,
+// shared by retryStates and the decision panel's verdict label.
+describe('retryIntentOf', () => {
+  it('decodes the current and the legacy rerun shapes', () => {
+    expect(retryIntentOf({ step: 'run' })).toBe('rerun');
+    expect(retryIntentOf({ rerun: true })).toBe('rerun');
+    expect(retryIntentOf({ rerun: 'true' })).toBe('rerun');
+    expect(retryIntentOf({ step: 'publish' })).toBe('republish');
+    expect(retryIntentOf({ rerun: false })).toBe('unspecified');
+    expect(retryIntentOf({})).toBe('unspecified');
+    expect(retryIntentOf(undefined)).toBe('unspecified');
   });
 });

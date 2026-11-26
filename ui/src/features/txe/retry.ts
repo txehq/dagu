@@ -23,8 +23,35 @@ export type RetryStatus =
   | 'not-applied'
   | 'rejected';
 
+// RetryIntent is what a person asks a retry to do: publish the result the
+// execution sealed without running the job ("republish"), or run the job
+// again on purpose ("rerun"). A retry recorded with neither is
+// "unspecified": the job's machine runs it again only for an execution that
+// sealed nothing.
+export type RetryIntent = 'republish' | 'rerun';
+
+// The stored steps of a dagu.retry_run (registry.RetryStepPublish and
+// registry.RetryStepRun). Since TXE-7629 a person's explicit rerun is stored
+// as step "run"; a record written before it carries rerun: true instead.
+export const RETRY_STEP_PUBLISH = 'publish';
+export const RETRY_STEP_RUN = 'run';
+
+// retryIntentOf is the one decoder of a stored retry's intent, for every
+// reader of dagu.retry_run params. It reads step "publish" as a republish,
+// step "run" or the legacy rerun field as a rerun, and anything else as
+// unspecified, as registry.RetryRunParams.Intent does.
+export function retryIntentOf(
+  params: Record<string, unknown> | undefined
+): RetryIntent | 'unspecified' {
+  if (params?.step === RETRY_STEP_PUBLISH) return 'republish';
+  if (params?.step === RETRY_STEP_RUN) return 'rerun';
+  if (params?.rerun === true || params?.rerun === 'true') return 'rerun';
+  return 'unspecified';
+}
+
 export type RetryState = {
   runId: string;
+  intent: RetryIntent | 'unspecified';
   // attemptId and queuedAt name the failed execution this retry was bound
   // to; a proposal recorded before queue markers were bound has none, which
   // the hub stored as never queued.
@@ -40,11 +67,11 @@ function paramsOf(p: ApiProposal): {
   runId?: string;
   attemptId?: string;
   queuedAt: string;
+  intent: RetryState['intent'];
 } {
-  const params = p.action.params as
-    | { run_id?: unknown; attempt_id?: unknown; queued_at?: unknown }
-    | undefined;
+  const params = p.action.params as Record<string, unknown> | undefined;
   return {
+    intent: retryIntentOf(params),
     runId: typeof params?.run_id === 'string' ? params.run_id : undefined,
     attemptId:
       typeof params?.attempt_id === 'string' ? params.attempt_id : undefined,
@@ -87,7 +114,7 @@ export function retryStates(
   );
   for (const p of newestFirst) {
     if (p.action.name !== ACTION_RETRY_RUN) continue;
-    const { runId, attemptId, queuedAt } = paramsOf(p);
+    const { runId, attemptId, queuedAt, intent } = paramsOf(p);
     if (!runId || out.has(runId)) continue;
     const action = byProposal.get(p.proposal_id);
     let status: RetryStatus = 'requested';
@@ -101,6 +128,7 @@ export function retryStates(
     }
     out.set(runId, {
       runId,
+      intent,
       attemptId,
       queuedAt,
       proposalId: p.proposal_id,
@@ -126,31 +154,71 @@ const LABELS: Record<RetryStatus, string> = {
   rejected: 'Retry not performed',
 };
 
+// A republish publishes a sealed result and never runs the job, so its
+// labels say republish, not retry.
+const REPUBLISH_LABELS: Record<RetryStatus, string> = {
+  requested:
+    "Republish requested; waiting for the job's machine to dispatch it",
+  executing: 'Republish being dispatched',
+  succeeded: 'Republish dispatched',
+  failed: 'Republish dispatch failed',
+  uncertain:
+    'Republish dispatch outcome unknown; it will be reconciled before any repeat',
+  'not-applied': 'Republish was not dispatched',
+  rejected: 'Republish not performed',
+};
+
 export function retryLabel(state: RetryState): string {
-  return LABELS[state.status];
+  return state.intent === 'republish'
+    ? REPUBLISH_LABELS[state.status]
+    : LABELS[state.status];
 }
 
-// canRequestRetry reports whether the dashboard offers a retry of a run: its
-// latest execution must have finished without success (the server counts a
-// partial success as success) and no retry may be bound to that execution
-// yet. A native retry starts a new execution, so once a retried execution has
-// failed too, the run may be retried again; the registry allows one retry per
-// execution.
+// offeredIntents is what the dashboard offers for a run: its latest
+// execution must have finished without success (the server counts a partial
+// success as success). With no request bound to that execution, both intents
+// are offered. A request bound to it that was settled with nothing run (its
+// dispatch failed or was not applied, or the proposal was rejected or
+// superseded) leaves the intents it did not ask for (TXE-7515): an
+// unspecified retry the job's machine refused for a sealed execution leaves
+// both, a republish that could not publish leaves the rerun. A request still
+// waiting, being dispatched, unresolved or dispatched leaves none. A native
+// retry starts a new execution, so once a retried execution has failed too,
+// the run is offered again.
+export function offeredIntents(
+  runStatus: string,
+  execution: Execution | undefined,
+  state: RetryState | undefined
+): RetryIntent[] {
+  const finishedUnsuccessfully =
+    runStatus === 'failed' ||
+    runStatus === 'aborted' ||
+    runStatus === 'rejected';
+  if (!finishedUnsuccessfully || !execution) return [];
+  const all: RetryIntent[] = ['republish', 'rerun'];
+  if (
+    !state ||
+    state.attemptId !== execution.attemptId ||
+    state.queuedAt !== execution.queuedAt
+  ) {
+    return all;
+  }
+  const settledWithNothingRun =
+    state.status === 'failed' ||
+    state.status === 'not-applied' ||
+    state.status === 'rejected';
+  if (!settledWithNothingRun) return [];
+  return all.filter((intent) => intent !== state.intent);
+}
+
+// canRequestRetry reports whether the dashboard offers any request for a
+// run (see offeredIntents).
 export function canRequestRetry(
   runStatus: string,
   execution: Execution | undefined,
   state: RetryState | undefined
 ): boolean {
-  const finishedUnsuccessfully =
-    runStatus === 'failed' ||
-    runStatus === 'aborted' ||
-    runStatus === 'rejected';
-  if (!finishedUnsuccessfully || !execution) return false;
-  return (
-    !state ||
-    state.attemptId !== execution.attemptId ||
-    state.queuedAt !== execution.queuedAt
-  );
+  return offeredIntents(runStatus, execution, state).length > 0;
 }
 
 // sameRetryStates reports whether two loads of retry states are the same, so

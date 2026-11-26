@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { I18nText } from '@/i18n/I18nText';
 
 import { buildDecisionRequest } from '../inbox';
+import { retryIntentOf } from '../retry';
 import type { DecisionRequest, Verdict, Proposal } from '../types';
 
 export type DecisionSubmitResult =
@@ -42,10 +43,6 @@ const RESPONSE_LABELS: Record<Verdict, string> = {
 export const ACTION_RETRY_RUN = 'dagu.retry_run';
 export const ACTION_UNCERTAIN_EFFECT = 'txe.uncertain_effect';
 
-// RETRY_STEP_PUBLISH is the step of a run retry that republishes the result
-// the failed execution sealed, without running the job again.
-export const RETRY_STEP_PUBLISH = 'publish';
-
 // verdictLabel names what a verdict does for this proposal. Retry means
 // different things, and the person must see which one they are choosing:
 // a run retry either runs the job again or only republishes a sealed result.
@@ -54,7 +51,7 @@ export function verdictLabel(
   action: { name: string; params?: Record<string, unknown> }
 ): string {
   if (verdict === 'retry' && action.name === ACTION_RETRY_RUN) {
-    return action.params?.step === RETRY_STEP_PUBLISH
+    return retryIntentOf(action.params) === 'republish'
       ? 'Republish sealed result (job not run again)'
       : 'Retry this run (the job runs again)';
   }

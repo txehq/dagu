@@ -259,3 +259,39 @@ func TestRetryExecutionNeverReportsAnAbandonedPreparationAsDispatched(t *testing
 	assert.True(t, got.Abandoned, "abandoned meanwhile, read again")
 	assert.False(t, got.Preparing)
 }
+
+// A queued retry's execution is reported queued while its stored status is
+// queued, and not once it runs (TXE-8596): the registry does not settle the
+// retry before queue dispatch admits it.
+func TestRetryExecutionReportsAQueuedExecution(t *testing.T) {
+	ctx := t.Context()
+	runs := testutil.NewFileDAGRunRepository(filepath.Join(t.TempDir(), "runs"), persis.DAGRunRepositoryOptions{})
+	c := &Control{Runs: runs}
+	dag := &ir.DAG{Name: "job", YamlData: []byte("steps:\n  - name: s\n    run: true\n")}
+	attempt, err := runs.CreateAttempt(ctx, dag, time.Now(), "run-1", persis.DAGRunCreateAttemptOptions{})
+	require.NoError(t, err)
+	run := ir.NewDAGRunRef("job", "run-1")
+	request, err := ir.NewRetryRequest(run, attempt.ID(), "", "act-1", "1", "d")
+	require.NoError(t, err)
+	write := func(st ir.Status) {
+		t.Helper()
+		status := ir.InitialStatus(dag)
+		status.DAGRunID, status.AttemptID, status.Status = "run-1", attempt.ID(), st
+		status.QueuedAt, status.TriggerType, status.RetryRequest = "2026-11-26T08:00:00Z", ir.TriggerTypeRetry, request
+		require.NoError(t, attempt.Open(ctx))
+		require.NoError(t, attempt.Write(ctx, status))
+		require.NoError(t, attempt.Close(ctx))
+	}
+
+	write(ir.Queued)
+	got, err := c.RetryExecution(ctx, "job", "run-1", request.ID)
+	require.NoError(t, err)
+	assert.Equal(t, ir.ExecutionRef(attempt.ID(), "2026-11-26T08:00:00Z"), got.Ref)
+	assert.True(t, got.Queued)
+	assert.False(t, got.Abandoned)
+
+	write(ir.Running)
+	got, err = c.RetryExecution(ctx, "job", "run-1", request.ID)
+	require.NoError(t, err)
+	assert.False(t, got.Queued, "dispatched")
+}

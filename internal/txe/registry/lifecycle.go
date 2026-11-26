@@ -243,6 +243,12 @@ type RetryExecution struct {
 	// Preparing is true while it is a preparation not known to be settled
 	// (see RunAttempt.Preparing).
 	Preparing bool
+	// Queued is true while the execution waits in a queue and has not been
+	// dispatched: Dagu stores it with status queued. It is derived from the
+	// stored status, never stored by the registry. A queued retry is still
+	// to be admitted at dispatch, which needs its action executing under a
+	// live grant, so the action is not settled while it is queued.
+	Queued bool
 }
 
 // RunAttempt is the latest execution of a run as Dagu stored it. A direct

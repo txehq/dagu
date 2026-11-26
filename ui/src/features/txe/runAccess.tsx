@@ -9,12 +9,10 @@ import { I18nText } from '@/i18n/I18nText';
 import { useI18n } from '@/i18n/I18nProvider';
 
 import { isTxePerson, useTxeIdentity } from './identity';
+import { JOB_DAG_NAME } from './jobDagName';
 
 // How often the job's access is read again while a page is open.
 export const ACCESS_REFRESH_MS = 10_000;
-
-// A job's DAG is named by its job id.
-const JOB_DAG_NAME = /^job_[0-9A-Z]{26}$/;
 
 // useJobRunAllowed is whether the hub lets the caller run, stop and retry the
 // job DAG `name`. It is false only when the hub's own answer for the job

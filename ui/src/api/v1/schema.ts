@@ -4643,7 +4643,10 @@ export interface paths {
     };
     "/txe/jobs/{jobId}/runs/{runId}/retry-requests": {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
             header?: never;
             path: {
                 jobId: components["parameters"]["TxeJobId"];
@@ -4658,6 +4661,32 @@ export interface paths {
          * @description Records a person's retry of one Dagu run of the job as a dagu.retry_run proposal decided with a retry verdict, in one commit and without a review claim. The run must be of the job's DAG and of its current version and package; an older run is refused with 409 stale_binding rather than retried on other code. While the run's latest execution is not yet known to be dispatched or abandoned (the coordinator's preparation of it is not settled), proposing, authorizing or settling the retry is refused with 409 not_ready, details.current {run_id, execution}: ask again once that is settled; such a run is neither treated as moved on nor as retried. The executor performs it under an execution claim; the receipt is the new execution, once it is known to be dispatched. A replayed idempotency_key returns the stored decision.
          */
         post: operations["requestTxeRunRetry"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/txe/jobs/{jobId}/runs/{runId}/republish-requests": {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Request the republish of a run's sealed result
+         * @description Records a person's request to publish the result one execution of the job's run sealed, without running the job again (TXE-7515), as a dagu.retry_run proposal with step publish decided with a retry verdict, in one commit and without a review claim. It is a separate endpoint so that a hub without it answers 404 and never records a re-run in its place; a hub that has it lists the owner_republish capability. The execution must be the run's latest, finished unsuccessfully, of the job's current version and package, as for a retry. The job's machine publishes only when that execution's sealed result is still intact and the run's latest; otherwise the action is not carried out and nothing runs. A retry with another intent of the same execution that is open or decided and not yet settled is refused with 409 retry_intent_conflict. A replayed idempotency_key returns the stored decision; one used for another request is refused with 409 idempotency_mismatch.
+         */
+        post: operations["requestTxeRunRepublish"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4813,7 +4842,7 @@ export interface paths {
         get?: never;
         /**
          * Settle an action
-         * @description Records an attempt's outcome. Requires the caller's live claim and the action's current grant. An uncertain dagu.retry_run may be settled as uncertain again only to record the execution its request admitted, as outcome.admitted_execution, with no receipt: it must be the execution run history holds for this attempt's retry request, admitted and not abandoned (it may not be dispatched yet). Once recorded it is never replaced, recording it again changes nothing, and it binds later settlements: succeeded must name it, not_applied needs run history to show it was abandoned, and every later outcome keeps it. On every settlement of a dagu.retry_run, an outcome.admitted_execution not yet recorded must likewise be this attempt's execution; an abandoned one is refused with uncertain or succeeded, and one not abandoned is refused with not_applied; the field must appear once, spelled exactly, and an outcome that names it is stored as an object with admitted_execution and admitted true (admitted false is refused), not byte for byte.
+         * @description Records an attempt's outcome. Requires the caller's live claim and the action's current grant. An uncertain dagu.retry_run may be settled as uncertain again, and an executing one as executing again, only to record the execution its request admitted, as outcome.admitted_execution, with no receipt: it must be the execution run history holds for this attempt's retry request, admitted and not abandoned (it may not be dispatched yet). Once recorded it is never replaced, recording it again changes nothing, and it binds later settlements: succeeded must name it, not_applied needs run history to show it was abandoned, and every later outcome keeps it. On every settlement of a dagu.retry_run, an outcome.admitted_execution not yet recorded must likewise be this attempt's execution; an abandoned one is refused with uncertain or succeeded, and one not abandoned is refused with not_applied; the field must appear once, spelled exactly, and an outcome that names it is stored as an object with admitted_execution and admitted true (admitted false is refused), not byte for byte. An executing dagu.retry_run that records its admitted execution stays executing when the claim it ran under ends, so that queue dispatch can still admit it; its grant still ends it, and it is then uncertain. A dagu.retry_run is not settled as succeeded while the execution its request admitted waits in a queue: that is refused with 409 not_ready, details.current {run_id, execution}: ask again once the execution is dispatched.
          */
         put: operations["settleTxeAction"];
         post?: never;
@@ -9313,6 +9342,25 @@ export interface components {
             /** @description The job version the person saw; refused with 409 when the job moved on */
             expected_job_version: number;
             /** @description The run attempt the person reviewed. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409 */
+            attempt_id?: string;
+            /** @description The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409 */
+            queued_at?: string;
+            /** @description The run's DAG snapshot digest; when omitted the server reads it from the run */
+            run_spec_sha256?: string;
+            /** @description The run's package digest; when omitted the server reads it from the run */
+            package_digest?: string;
+            /**
+             * @description rerun asks to run the job again as a new execution on purpose, even when the execution sealed a result, which is then superseded and never published. Omitted, the retry is unspecified: the job's machine runs it again only when the execution sealed nothing, and otherwise does not carry it out (ask for rerun, or use republish-requests). A republish is never asked for here: a hub that does not know this field ignores it, so republish has its own endpoint.
+             * @enum {string}
+             */
+            mode?: TxeRetryRequestMode;
+            actor?: components["schemas"]["TxeActor"];
+        };
+        TxeRepublishRequest: {
+            idempotency_key: string;
+            /** @description The job version the person saw; refused with 409 when the job moved on */
+            expected_job_version: number;
+            /** @description The run attempt whose sealed result the person asks to republish. Required by the handler (absent is 400); a run whose latest execution is another is refused with 409 */
             attempt_id?: string;
             /** @description The queue marker of the execution the person reviewed (the run's queuedAt, empty when it was never queued). Required by the handler (absent is 400); with attempt_id it names the execution, and a different latest execution is refused with 409 */
             queued_at?: string;
@@ -23313,7 +23361,10 @@ export interface operations {
     };
     getTxeInstallation: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -25430,7 +25481,10 @@ export interface operations {
     };
     requestTxeRunRetry: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
             header?: never;
             path: {
                 jobId: components["parameters"]["TxeJobId"];
@@ -25441,6 +25495,99 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["TxeRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TxeDecisionResponse"];
+                };
+            };
+            /** @description Invalid request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not authorized */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Conflict; details.code is the registry refusal code and details.current the record to re-read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not implemented yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Generic error response */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    requestTxeRunRepublish: {
+        parameters: {
+            query?: {
+                /** @description name of the remote node */
+                remoteNode?: components["parameters"]["RemoteNode"];
+            };
+            header?: never;
+            path: {
+                jobId: components["parameters"]["TxeJobId"];
+                runId: components["parameters"]["TxeRunId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TxeRepublishRequest"];
             };
         };
         responses: {
@@ -26841,6 +26988,9 @@ export enum TxeArtifactStatus {
 export enum TxeAbandonmentOutcome {
     hidden = "hidden",
     marked_failed = "marked_failed"
+}
+export enum TxeRetryRequestMode {
+    rerun = "rerun"
 }
 export enum ComponentsParametersEventLogPaginationMode {
     offset = "offset",

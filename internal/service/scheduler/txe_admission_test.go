@@ -26,6 +26,9 @@ type fakeAdmitter struct {
 	err     error
 	dropped []string
 	checked []string
+	// retryAdm, when set, is the binding's answer for a queued retry.
+	retryAdm *registry.Admission
+	retries  []registry.QueuedRetry
 }
 
 func (f *fakeAdmitter) AdmitRun(_ context.Context, name, spec string) (registry.Admission, error) {
@@ -33,6 +36,16 @@ func (f *fakeAdmitter) AdmitRun(_ context.Context, name, spec string) (registry.
 	defer f.mu.Unlock()
 	f.checked = append(f.checked, name+"|"+spec)
 	return f.adm, f.err
+}
+
+func (f *fakeAdmitter) AdmitQueuedRetry(_ context.Context, jobID string, q registry.QueuedRetry) (registry.Admission, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retries = append(f.retries, q)
+	if f.retryAdm != nil {
+		return *f.retryAdm, nil
+	}
+	return registry.Admission{Admit: true, JobID: jobID}, nil
 }
 
 func (f *fakeAdmitter) RecordDroppedRun(_ context.Context, jobID, runID string, _ registry.Admission) error {

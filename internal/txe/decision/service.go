@@ -321,6 +321,27 @@ type RetryRequest struct {
 	// unchanged, since the package can differ.
 	RunStartedAt   time.Time
 	IdempotencyKey string
+	// Intent is what the person asks for: registry.RetryIntentRepublish
+	// (publish what the execution sealed, never run the job),
+	// registry.RetryIntentRerun (run the job again on purpose), or
+	// registry.RetryIntentUnspecified, which the job's machine carries out
+	// only for an execution that sealed nothing.
+	Intent string
+}
+
+// params are the dagu.retry_run parameters the request's intent stores.
+func (r RetryRequest) params(j *registry.Job) registry.RetryRunParams {
+	p := registry.RetryRunParams{
+		RunID: r.RunID, AttemptID: r.AttemptID, QueuedAt: r.QueuedAt,
+		RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest,
+	}
+	switch r.Intent {
+	case registry.RetryIntentRepublish:
+		p.Step = registry.RetryStepPublish
+	case registry.RetryIntentRerun:
+		p.Step = registry.RetryStepRun
+	}
+	return p
 }
 
 // CodeRunStale refuses a retry of a run that is not of the job's current
@@ -336,6 +357,11 @@ const CodeRunStale registry.Code = "run_stale"
 func (r RetryRequest) ValidateShape() error {
 	if r.RunID == "" || r.AttemptID == "" {
 		return fmt.Errorf("%w: run id and attempt id are required", ErrInvalid)
+	}
+	switch r.Intent {
+	case registry.RetryIntentUnspecified, registry.RetryIntentRepublish, registry.RetryIntentRerun:
+	default:
+		return fmt.Errorf("%w: unknown retry intent %q", ErrInvalid, r.Intent)
 	}
 	if !idempotencyKeyPattern.MatchString(r.IdempotencyKey) {
 		return fmt.Errorf("%w: idempotencyKey must be 8-128 characters of [A-Za-z0-9._:-]", ErrInvalid)
@@ -379,10 +405,7 @@ func (s *Service) RequestRetry(ctx context.Context, jobID string, req RetryReque
 			return &registry.Error{Code: CodeRunStale,
 				Message: fmt.Sprintf("run %s is of an earlier version of this job; retrying it would run version %d's code, so start a new run instead", req.RunID, j.Version)}
 		}
-		p, d, err := tx.ProposeRetry(registry.RetryRunParams{
-			RunID: req.RunID, AttemptID: req.AttemptID, QueuedAt: req.QueuedAt,
-			RunSpecSHA256: j.DAGSpecSHA256, PackageDigest: j.PackageDigest,
-		}, req.IdempotencyKey)
+		p, d, err := tx.ProposeRetry(req.params(j), req.IdempotencyKey)
 		if err != nil {
 			return err
 		}
@@ -448,12 +471,17 @@ func (s *Service) ReplayRetry(ctx context.Context, jobID string, req RetryReques
 			RunID     string  `json:"run_id"`
 			AttemptID string  `json:"attempt_id"`
 			QueuedAt  *string `json:"queued_at"`
+			Step      string  `json:"step"`
 		}
 		if err := json.Unmarshal(p.Action.Params, &params); err != nil {
 			return nil, true, fmt.Errorf("decision: retry proposal %s params: %w", p.ProposalID, err)
 		}
+		// The intent is part of the request: a key used to ask for a
+		// re-run never replays as a republish, nor the reverse.
+		stored := registry.RetryRunParams{Step: params.Step}
 		same = params.RunID == req.RunID && params.AttemptID == req.AttemptID &&
-			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion
+			params.QueuedAt != nil && *params.QueuedAt == req.QueuedAt && p.JobVersion == req.ExpectedJobVersion &&
+			stored.Intent() == req.Intent
 	}
 	// The stored decision is not returned with the refusal: it may retry a
 	// run the caller cannot see.

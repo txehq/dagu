@@ -766,11 +766,18 @@ const (
 	// that decision both ways, and gives it only to a worker that can run it
 	// (TXE-5067). A client sends such a retry only to a hub that names this.
 	CapabilityRepublishSealed = "republish_sealed"
+	// CapabilityOwnerRepublish: a person may ask for the republish of a
+	// sealed result through the hub's own republish request endpoint
+	// (TXE-7515), and may ask for an explicit re-run with mode "rerun". A
+	// client offers a person's republish only to a hub that names this: an
+	// older hub has no such endpoint, and never turns the request into a
+	// re-run.
+	CapabilityOwnerRepublish = "owner_republish"
 )
 
 // Capabilities is what this registry enforces.
 func Capabilities() []string {
-	return []string{CapabilityParamSchema, CapabilityRepublishSealed}
+	return []string{CapabilityParamSchema, CapabilityRepublishSealed, CapabilityOwnerRepublish}
 }
 
 // ApplyVersionDefaults returns v with exactly the defaults and derived

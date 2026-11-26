@@ -41,6 +41,8 @@ import { I18nText } from '@/i18n/I18nText';
 import { I18nProps } from '@/i18n/I18nProps';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useJobRunAllowed, ViewOnly } from '@/features/txe/runAccess';
+import { isTxeJobDAGName } from '@/features/txe/jobDagName';
+import { TxeJobRetryButton } from '@/features/txe/components/TxeJobRetryButton';
 
 // startUnconfirmedRunId is the run the hub handed over without seeing it
 // start (504 start_unconfirmed, TXE-4712), or undefined for any other answer.
@@ -394,8 +396,17 @@ function DAGActions({
           </Tooltip>
         )}
 
+        {/* A registered TXE job's run is retried only through a TXE
+            decision (TXE-7517): its job page stands in for Retry. */}
+        {!isSubDAGRun && isTxeJobDAGName(fileName) && (
+          <TxeJobRetryButton
+            jobId={fileName}
+            label={displayMode !== 'compact'}
+          />
+        )}
+
         {/* Retry Button */}
-        {!isSubDAGRun && (
+        {!isSubDAGRun && !isTxeJobDAGName(fileName) && (
           <Tooltip>
             <TooltipTrigger asChild>
               <ActionButton

@@ -539,6 +539,105 @@ func retryBody(key string, version int, attemptID, queuedAt string) map[string]a
 	return map[string]any{"idempotency_key": key, "expected_job_version": version, "attempt_id": attemptID, "queued_at": queuedAt}
 }
 
+// TXE-7515: a person asks for the republish of a run's sealed result
+// through its own endpoint, and for an explicit rerun with mode rerun on the
+// retry endpoint. Each records a decided dagu.retry_run with its intent's
+// parameters; intents of one execution do not mix, a key does not move
+// between them, and the retry endpoint never takes a republish.
+func TestTxeRunRepublishAndRerunRequests(t *testing.T) {
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
+	seedFailedTxeRun(t, server, jobID, "run-sealed-1")
+	seen, queued := txeExecution(t, c, jobID, "run-sealed-1")
+	var job api.TxeJob
+	c.Get("/api/v1/txe/jobs/"+jobID).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &job)
+	republishPath := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/republish-requests", jobID, "run-sealed-1")
+	retryPath := fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-sealed-1")
+
+	// The retry endpoint never takes a republish, or anything but rerun.
+	for _, mode := range []string{"republish", "publish", ""} {
+		b := retryBody("dashboard-mode-1", job.Version, seen, queued)
+		b["mode"] = mode
+		c.Post(retryPath, b).ExpectStatus(http.StatusBadRequest).Send(t)
+	}
+
+	body := retryBody("dashboard-republish-1", job.Version, seen, queued)
+	var first api.TxeDecisionResponse
+	c.Post(republishPath, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &first)
+	require.False(t, first.Replayed)
+	require.NotNil(t, first.Proposal)
+	require.Equal(t, api.TxeProposalState("decided"), first.Proposal.State)
+	require.Equal(t, decision.ActionRetryRun, first.Proposal.Action.Name)
+	require.Contains(t, string(first.Proposal.Action.Params), `"step":"publish"`)
+	require.NotContains(t, string(first.Proposal.Action.Params), `"rerun"`)
+
+	var again api.TxeDecisionResponse
+	c.Post(republishPath, body).ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &again)
+	require.True(t, again.Replayed)
+	require.Equal(t, first.Decision.DecisionId, again.Decision.DecisionId)
+
+	// The republish's key never replays as a retry.
+	var mismatch api.Error
+	c.Post(retryPath, body).ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &mismatch)
+	require.NotNil(t, mismatch.Details)
+	require.Equal(t, string(decision.CodeIdempotencyMismatch), (*mismatch.Details)["code"])
+
+	// A rerun of the execution whose republish is decided is a conflict.
+	rerun := retryBody("dashboard-rerun-1", job.Version, seen, queued)
+	rerun["mode"] = "rerun"
+	var conflict api.Error
+	c.Post(retryPath, rerun).ExpectStatus(http.StatusConflict).Send(t).Unmarshal(t, &conflict)
+	require.NotNil(t, conflict.Details)
+	require.Equal(t, string(registry.CodeRetryIntentConflict), (*conflict.Details)["code"])
+
+	// On another run, an explicit rerun is recorded as one.
+	seedFailedTxeRun(t, server, jobID, "run-rerun-1")
+	seen2, queued2 := txeExecution(t, c, jobID, "run-rerun-1")
+	rerun2 := retryBody("dashboard-rerun-2", job.Version, seen2, queued2)
+	rerun2["mode"] = "rerun"
+	var reran api.TxeDecisionResponse
+	c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/retry-requests", jobID, "run-rerun-1"), rerun2).
+		ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &reran)
+	require.NotNil(t, reran.Proposal)
+	// TXE-7629: stored as the job's step, with no rerun key, so the
+	// rollback floors, which decode these params strictly, read it.
+	require.Contains(t, string(reran.Proposal.Action.Params), `"step":"run"`)
+	require.NotContains(t, string(reran.Proposal.Action.Params), `"rerun"`)
+
+	// What is on disk, read by a fresh registry over the same data
+	// directory, is that encoding too.
+	reopened, err := registry.NewFileStore(server.Config.Paths.DataDir)
+	require.NoError(t, err)
+	stored, err := reopened.GetJob(t.Context(), jobID)
+	require.NoError(t, err)
+	onDisk := stored.Proposals[reran.Proposal.ProposalId]
+	require.NotNil(t, onDisk, "the rerun's proposal is not on disk")
+	require.Contains(t, string(onDisk.Action.Params), `"step":"run"`)
+	require.NotContains(t, string(onDisk.Action.Params), `"rerun"`)
+	var params registry.RetryRunParams
+	require.NoError(t, json.Unmarshal(onDisk.Action.Params, &params))
+	require.Equal(t, registry.RetryIntentRerun, params.Intent())
+}
+
+// TXE-7515: a hub without the republish endpoint must answer a request for
+// it with a refusal that records nothing, never the UI's page or a retry.
+// This pins what an unrouted API path answers, which is what an older hub
+// answers for republish-requests.
+func TestTxeUnroutedAPIPathIsNotFound(t *testing.T) {
+	server := builtinServer(t)
+	c := txeAuthedClient{c: server.Client(), token: loginAndGetToken(t, server, "admin", "adminpass")}
+	jobID := registerTxeJobHTTP(t, c)
+	seedFailedTxeRun(t, server, jobID, "run-unrouted-1")
+	seen, queued := txeExecution(t, c, jobID, "run-unrouted-1")
+	resp := c.Post(fmt.Sprintf("/api/v1/txe/jobs/%s/runs/%s/no-such-requests", jobID, "run-unrouted-1"),
+		retryBody("dashboard-unrouted-1", 1, seen, queued)).ExpectStatus(http.StatusNotFound).Send(t)
+	require.NotContains(t, strings.ToLower(resp.Body), "<html", "an unrouted API path is not the UI's page")
+	var none api.TxeDecisionList
+	c.Get("/api/v1/txe/jobs/"+jobID+"/decisions").ExpectStatus(http.StatusOK).Send(t).Unmarshal(t, &none)
+	require.Empty(t, none.Decisions)
+}
+
 // Retrying one exact failed run records a decided dagu.retry_run proposal
 // bound to that run; it is idempotent and refuses a stale snapshot or a run
 // that is not the job's.

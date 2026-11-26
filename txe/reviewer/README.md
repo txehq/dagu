@@ -333,8 +333,50 @@ files.
   after the seal and the capability are checked again; otherwise nothing is
   sent. A seal that cannot be republished, because it changed, cannot be
   read, or the service lacks the capability, is put to the owner as a
-  question. It is never offered as a re-run. A person's own retry from the
-  dashboard always re-runs the job.
+  question. It is never offered as a re-run. A reviewer with no seal reader
+  cannot tell, so its retry is a question too.
+  A person asks the hub for one of two things (TXE-7515): a republish of an
+  execution's sealed result (`republish-requests`, stored as
+  `step: publish`), or an explicit rerun (`retry-requests` with
+  `mode: rerun`, stored as `step: run`, TXE-7629), which runs the job again
+  even when a result was sealed; that result is superseded and never
+  published. Only a person asks for a rerun: the registry refuses a
+  reviewer's proposal of `step: run`. The rerun is a step rather than a
+  field of its own so that the rollback floors (-17, -19), which decode
+  retry parameters strictly and know `step`, read its records; their own
+  code does not carry it out (their binding and executor accept only
+  `step: publish`). A decision naming the legacy `rerun` key is not
+  dispatched, and the hub refuses it in every form.
+  A retry that names neither is unspecified: the job's machine runs it
+  again only for an execution known to have sealed nothing. A sealed,
+  changed or unreadable seal, or no seal reader, leaves it not dispatched,
+  and the detail names the two explicit requests. A retry of another intent
+  of the same execution while one is open or decided and not settled is
+  refused (`retry_intent_conflict`); one settled with nothing run releases
+  the execution. An older worker's executor does not have this rule.
+  The service retries a registered job's run only this way (TXE-7517).
+  `POST /dag-runs/{name}/{dagRunId}/retry` for a job's run, of the whole
+  run or of any step, is refused before anything is queued or created
+  unless it carries the `retryRequest` of a person's approved
+  `dagu.retry_run` that is executing its current attempt under a live
+  grant, for this run's execution, the job's current version and binding,
+  and in the one form that decision approved: a republish as
+  `stepName: publish` with `acceptFailedPrerequisites`; an explicit rerun
+  (`step: run`) as `stepName: run` with `includeDownstream`, so the job
+  runs again even when its step had succeeded; a retry naming neither with
+  no step. A rerun sent with no step is refused: Dagu would keep a job step that succeeded and only
+  publish the old seal again. A request with no `retryRequest` is 409
+  `txe_decision_required`, naming the job's TXE page, where a person
+  chooses "Run again" or "Publish sealed result". One that does not carry
+  its decision out as approved is 400
+  `accept_failed_prerequisites_unsupported` (with `details.reason`
+  `retry_unbound` unless it was a republish), which every reviewer build
+  reads as "nothing started", so the action is recorded as not applied.
+  The run page offers no generic Retry on a job's run; it links to the TXE
+  page. This holds only on a service with this change: an older service
+  admits a direct generic retry of a job's run as before, and nothing here
+  protects it. A retry queued from the hub's own command line, outside the
+  API, is not covered here either (TXE-7518).
   The request also says which attempt of which action it is made for
   (`retryRequest`: the registry's action id, the attempt number, the
   action's binding digest, all taken from the registry's record). The
@@ -345,6 +387,29 @@ files.
   names this request's execution only if it carries the request's id
   (`retryRequestId`, derived by the service's own function); an answer
   without it, or with another id, names none.
+  A retry the service queues, instead of handing it to the coordinator,
+  is bound again when the queue dispatches it, from the request it
+  recorded (TXE-7518). The run starts only if that request was derived
+  for the execution the retry replaced, and if the registry still binds
+  it at that moment: an approved `dagu.retry_run` to re-run that execution,
+  of the job's current version, executing its current attempt under a
+  live grant. A grant that expired while the retry waited refuses it. A
+  queued retry names no step, so it carries out only a retry that names
+  no intent: an approved republish, or an approved explicit rerun (sent
+  only as a retry of step `run` with its downstream), is refused there as
+  not applied, never carried out as a whole-run retry. A refused retry
+  ends aborted with the reason, is noted on the job, and leaves the
+  retried execution as it was; an action whose grant lapsed becomes
+  uncertain and is put to the owner. A retry queued with no request is
+  refused the same way. On the host that holds the service's data, the
+  `dagu retry` command does not queue a retry of a job's run either. A
+  plain `dagu retry` was already refused by the worker-selector rule. The
+  path that reached the queue needed the worker's `--worker-id` and
+  `--attempt-id` flags and a global queue, configured by hand, named for
+  the job's queue group; a default installation has none. That path now
+  refuses before anything is written and names the job's controls. None
+  of this guards against someone who can write the service's data or run
+  code on its host.
   When the answer is lost (the request fails, the service says the
   dispatch is uncertain, the reviewer dies first, or the answer names no
   execution), the reviewer asks the service for its record of the request
@@ -514,6 +579,21 @@ files.
   returned that time, so the status of one execution is never paired with
   the output of another. No review names it, so the next review meets the
   run's latest execution.
+- A run's evidence carries the error the service recorded for the run and
+  for each step (`error`, such as a lost lease), on one line and at most
+  1 KiB each, and the job version the run's DAG was rendered for
+  (`job_version`, from its `txe.version` label; 0 when the labels name none
+  or more than one).
+- A run that did not succeed carries `seal` (`state: sealed_unpublished`,
+  `execution`, `job_version`, `files`) when this machine holds the result
+  that exact execution sealed, the seal is the run's latest and its files
+  still have their sealed digests, the run ran the job's current version
+  and snapshot, and its publish step did not succeed. The reviewer reads it
+  with the same seal reader that decides a republish. It names no path, file
+  or content. A seal of another execution, one that changed, one that cannot
+  be read, or a run of another or unknown version gives no marker. The
+  marker only informs the agent: whether a retry is proposed as a republish
+  is decided again when the agent asks for one, and nothing runs from it.
 - Evidence that does not fit is shortened, never dropped silently: a run
   with more than 12 steps keeps failed, aborted and rejected steps first
   (the earliest of them always), then any other status that is not a plain
