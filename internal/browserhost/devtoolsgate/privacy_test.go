@@ -356,6 +356,14 @@ func TestKauthACLRules(t *testing.T) {
 		kauthACE{otherUUID, kauthACEDeny, rightAddFile}, permit(otherUUID, rightAddFile)),
 		"lets another account change", "a grant is refused even after a deny")
 	assert.NoError(t, check(roleEntry, ownerUUID, allCommon, permit(ownerUUID, rightAddFile|rightDelete)), "the owner's own entry")
+	assert.NoError(t, check(roleProfile, ownerUUID, allCommon, permit(ownerUUID, rightAddFile|rightDeleteChild)),
+		"the owner's own entry on the profile directory, with a returned non-null owner UUID")
+	assert.ErrorContains(t, check(roleProfile, [16]byte{}, allCommon, permit(ownerUUID, rightAddFile|rightDeleteChild)),
+		"opens the profile directory", "an owner UUID returned but null (as APFS gives it) is no owner: refused")
+	assert.ErrorContains(t, check(roleProfile, [16]byte{}, allCommon, permit([16]byte{}, rightAddFile)),
+		"opens the profile directory", "a null entry GUID never matches a null owner UUID")
+	assert.ErrorContains(t, check(roleProfile, ownerUUID, allCommon, permit(otherUUID, rightAddFile|rightDeleteChild)),
+		"opens the profile directory", "a non-null owner UUID that is another GUID")
 	assert.ErrorContains(t, check(roleEntry, ownerUUID, attrCmnReturnedAttrs|attrCmnExtendedSecurity, permit(ownerUUID, rightAddFile)),
 		"lets another account change", "without a returned owner UUID there is no owner exemption")
 	assert.ErrorContains(t, check(roleProfile, ownerUUID, allCommon, permit(otherUUID, rightRead)),

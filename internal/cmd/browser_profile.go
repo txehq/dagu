@@ -46,7 +46,9 @@ account, its Default directory and preferences this user's and writable by
 no one else, and the path to it free of symbolic links and of directories
 another account could change, on a local filesystem whose permissions Dagu
 reads (Linux: ext2/3/4, XFS, Btrfs, tmpfs, overlayfs; macOS: APFS, HFS+).
-A profile that is not is refused, never changed to fit. All of that is
+A profile that is not is refused, never changed to fit. On a macOS volume
+that reports no owner identity for a file (APFS does not), an access control
+entry that names the profile's own owner is refused as well. All of that is
 checked before anything is written; a refused claim writes nothing. On
 Windows the owner and access of the profile are not checked.
 

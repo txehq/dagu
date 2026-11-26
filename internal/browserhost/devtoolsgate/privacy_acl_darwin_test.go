@@ -69,12 +69,12 @@ func TestRealACLReaderOnThisMac(t *testing.T) {
 
 	cases := []struct {
 		name, ace string
-		file      bool
+		owner     bool   // the expectation follows what the kernel reports of the owner
 		want      string // "" when allowed
 	}{
 		{"everyone deny delete", "group:everyone deny delete", false, ""},
 		{"everyone allow read", "group:everyone allow list,search", false, "opens the profile directory"},
-		{"the owner's own grant", "user:" + me.Username + " allow add_file,delete_child", false, ""},
+		{"the owner's own grant", "user:" + me.Username + " allow add_file,delete_child", true, ""},
 		// On the profile directory any grant to another account is refused
 		// as opening it, whatever the right.
 		{"everyone allow add and delete", "group:everyone allow add_file,delete_child", false, "opens the profile directory"},
@@ -84,6 +84,9 @@ func TestRealACLReaderOnThisMac(t *testing.T) {
 		dir := filepath.Join(base, "p-"+filepath.Base(c.name))
 		require.NoError(t, os.Mkdir(dir, 0o700))
 		chmodACL(t, dir, "+a", c.ace)
+		if c.owner {
+			c.want = ownerGrantExpectation(t, dir)
+		}
 		f, err := openTrusted(dir)
 		if c.want == "" {
 			assert.NoError(t, err, c.name)
@@ -174,16 +177,61 @@ func TestRealACLOwnerUUIDDiagnosticOnThisMac(t *testing.T) {
 		acl, err := parseAttrList(buf)
 		require.NoError(t, err, "%s: parse", c.name)
 		t.Logf("%s: ownerKnown=%t owner=%x entries=%d", c.name, acl.ownerKnown, acl.owner, len(acl.entries))
+		state := ownerUUIDState(buf)
+		t.Logf("%s: owner UUID %s", c.name, state)
 		for i, e := range acl.entries {
-			verdict := "the owner-UUID slot was not returned (H1)"
+			verdict := "no owner UUID to compare with (" + state + ")"
 			switch {
 			case acl.ownerKnown && e.guid == acl.owner:
 				verdict = "equals the returned owner UUID"
 			case acl.ownerKnown:
-				verdict = "differs from the returned owner UUID (H2, for an entry naming this user)"
+				verdict = "differs from the returned owner UUID"
 			}
 			t.Logf("%s: entry %d guid=%x kind=%d flags=%#x rights=%#x: %s",
 				c.name, i, e.guid, e.flags&kauthACEKindMask, e.flags, e.rights, verdict)
 		}
 	}
+}
+
+// ownerUUIDState names what an fgetattrlist buffer says of the owner's
+// UUID: not returned (the attribute's bit unset), returned but null (all
+// zeros), or returned and non-null.
+func ownerUUIDState(buf []byte) string {
+	switch {
+	case binary.LittleEndian.Uint32(buf[4:])&attrCmnUUID == 0:
+		return "not returned"
+	case [16]byte(buf[attrUUIDAt:attrUUIDAt+16]) == [16]byte{}:
+		return "returned but null (all zeros)"
+	default:
+		return "returned and non-null"
+	}
+}
+
+// ownerGrantExpectation reads, from the directory dir, what the kernel
+// reports of its owner and of the one entry the test granted there (a
+// permit of add_file and delete_child naming this user), and returns what
+// the gate must do with it: allow it ("") only when the kernel returned a
+// non-null owner UUID that is the entry's GUID; refuse it ("opens the
+// profile directory") when the UUID is not returned, null or another. It
+// logs which case held.
+func ownerGrantExpectation(t *testing.T, dir string) string {
+	t.Helper()
+	f, err := os.Open(dir) //nolint:gosec // the fixture's own directory
+	require.NoError(t, err)
+	buf, err := readAttrList(f)
+	require.NoError(t, f.Close())
+	require.NoError(t, err, "fgetattrlist on the owner-grant directory")
+	acl, err := parseAttrList(buf)
+	require.NoError(t, err, "parse the owner-grant directory's list")
+	require.Len(t, acl.entries, 1, "the one entry the test granted")
+	e := acl.entries[0]
+	require.Equal(t, uint32(kauthACEPermit), e.flags&kauthACEKindMask, "the granted entry permits")
+	require.Equal(t, uint32(rightAddFile|rightDeleteChild), e.rights, "the granted entry's rights")
+	state := ownerUUIDState(buf)
+	if acl.ownerKnown && e.guid == acl.owner {
+		t.Logf("owner grant: owner UUID %s and equal to the entry's GUID %x: the gate must allow it", state, e.guid)
+		return ""
+	}
+	t.Logf("owner grant: owner UUID %s (%x), entry GUID %x: the gate must refuse it", state, acl.owner, e.guid)
+	return "opens the profile directory"
 }

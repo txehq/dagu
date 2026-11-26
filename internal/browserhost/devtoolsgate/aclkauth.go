@@ -145,7 +145,10 @@ func parseAttrList(b []byte) (kauthACL, error) {
 // whatever the group, since membership is not read. Entries that only
 // govern what is created in a directory later count as well. An entry of a
 // kind, with a flag or with a right the gate does not know is refused. The
-// owner is recognised only by the UUID the kernel returned for it.
+// owner is recognised only by the UUID the kernel returned for it: when
+// that is not returned, or returned null (all zeros, as on the APFS volumes
+// measured, TXE-7856), no entry is the owner's, and an entry naming the
+// owner is refused like any other.
 func checkKauthACL(acl kauthACL, r role, path string) error {
 	for _, e := range acl.entries {
 		if e.flags&^kauthACEKnownFlags != 0 {
