@@ -30,6 +30,25 @@ export type RetryStatus =
 // sealed nothing.
 export type RetryIntent = 'republish' | 'rerun';
 
+// The stored steps of a dagu.retry_run (registry.RetryStepPublish and
+// registry.RetryStepRun). Since TXE-7629 a person's explicit rerun is stored
+// as step "run"; a record written before it carries rerun: true instead.
+export const RETRY_STEP_PUBLISH = 'publish';
+export const RETRY_STEP_RUN = 'run';
+
+// retryIntentOf is the one decoder of a stored retry's intent, for every
+// reader of dagu.retry_run params. It reads step "publish" as a republish,
+// step "run" or the legacy rerun field as a rerun, and anything else as
+// unspecified, as registry.RetryRunParams.Intent does.
+export function retryIntentOf(
+  params: Record<string, unknown> | undefined
+): RetryIntent | 'unspecified' {
+  if (params?.step === RETRY_STEP_PUBLISH) return 'republish';
+  if (params?.step === RETRY_STEP_RUN) return 'rerun';
+  if (params?.rerun === true || params?.rerun === 'true') return 'rerun';
+  return 'unspecified';
+}
+
 export type RetryState = {
   runId: string;
   intent: RetryIntent | 'unspecified';
@@ -50,20 +69,9 @@ function paramsOf(p: ApiProposal): {
   queuedAt: string;
   intent: RetryState['intent'];
 } {
-  const params = p.action.params as
-    | {
-        run_id?: unknown;
-        attempt_id?: unknown;
-        queued_at?: unknown;
-        step?: unknown;
-        rerun?: unknown;
-      }
-    | undefined;
-  let intent: RetryState['intent'] = 'unspecified';
-  if (params?.step === 'publish') intent = 'republish';
-  else if (params?.rerun === true || params?.rerun === 'true') intent = 'rerun';
+  const params = p.action.params as Record<string, unknown> | undefined;
   return {
-    intent,
+    intent: retryIntentOf(params),
     runId: typeof params?.run_id === 'string' ? params.run_id : undefined,
     attemptId:
       typeof params?.attempt_id === 'string' ? params.attempt_id : undefined,
