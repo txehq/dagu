@@ -108,7 +108,9 @@ func TestOpenEntryChecksWhatItOpened(t *testing.T) {
 
 // A FIFO where the gate wants a regular file is refused without waiting
 // for a writer: as the marker, as the preferences and as any entry. Each
-// call runs against a deadline, so a hang fails instead of stalling.
+// call runs against a 10-second deadline, which fails the test when the
+// call hangs. The deadline cannot end the hung call's goroutine: what
+// bounds the process is the package's -test.timeout.
 func TestEntriesThatAreFIFOsAreRefusedWithoutWaiting(t *testing.T) {
 	t.Parallel()
 	within := func(name string, call func() error) error {
@@ -126,7 +128,9 @@ func TestEntriesThatAreFIFOsAreRefusedWithoutWaiting(t *testing.T) {
 
 	marked := testProfileDir(t)
 	require.NoError(t, unix.Mkfifo(filepath.Join(marked, profileMarker), 0o600))
-	assert.False(t, ProfileClaimed(marked), "a FIFO marks nothing")
+	var claimed bool
+	require.NoError(t, within("claimed", func() error { claimed = ProfileClaimed(marked); return nil }))
+	assert.False(t, claimed, "a FIFO marks nothing")
 	err := within("claim", func() error { return claimProfile(marked) })
 	assert.ErrorContains(t, err, "not a regular file")
 	err = within("start", func() error { return disableOffTheRecord([]string{"--user-data-dir=" + marked}) })
