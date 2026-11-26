@@ -152,6 +152,13 @@ func serve(ctx context.Context, cfg Config, public *x509.CertPool, ready func(Re
 		carryAll:    manual,
 	}
 	s.forward = newForwarder(s)
+	// A browser the configuration names is the proxy's before it serves or
+	// reports ready (TXE-8558): set after ready, a tunnel to its DevTools gate
+	// opened at once could arrive before the gate was known, and be refused
+	// like any other loopback port. s.browser holds it for the watch below.
+	if cfg.CDPURL != "" {
+		s.setBrowser(cfg.CDPURL)
+	}
 	script := composePAC(port, guardPort, cfg.routedHosts(), system)
 	pacURL, served := pacLocation(script, controlURL(port, cfg.Token)+"/"+pacPath)
 	if served {
@@ -171,9 +178,6 @@ func serve(ctx context.Context, cfg Config, public *x509.CertPool, ready func(Re
 	grace := time.Duration(cfg.GraceSeconds) * time.Second
 	if grace <= 0 {
 		grace = defaultGrace
-	}
-	if cfg.CDPURL != "" {
-		s.setBrowser(cfg.CDPURL)
 	}
 	watched := make(chan struct{})
 	go func() {
