@@ -240,6 +240,9 @@ func (c *Control) RetryExecution(ctx context.Context, dagName, runID, requestID 
 		if out.Abandoned || match.Retained {
 			return out, nil
 		}
+		// A retained copy is of an execution a later queued retry replaced,
+		// so it is no longer waiting in a queue whatever it stored.
+		out.Queued = match.Status.Status == ir.Queued
 		if c.afterRetryRead != nil {
 			c.afterRetryRead()
 		}

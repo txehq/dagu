@@ -373,6 +373,11 @@ func (tx *JobTx) checkRunBinding(rp RetryRunParams, retain bool) error {
 // is no receipt, and one whose dispatch is not yet known is refused for now
 // (once settled as dispatched it runs or fails, but is never withdrawn). An
 // accepted request alone is no receipt.
+//
+// An execution waiting in a queue is refused for now too (TXE-8596): queue
+// dispatch admits it only while its action is executing under a live grant
+// (CheckRetryRun), so settling the action before then would make the
+// dispatch refuse the very retry it settled, and nothing would run.
 func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	execution, runID, err := tx.admittedRetry(a, receipt)
 	if err != nil {
@@ -384,6 +389,9 @@ func (tx *JobTx) checkRetryReceipt(a *Action, receipt string) error {
 	case execution.Preparing:
 		return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: runID, Execution: execution.Ref},
 			Message: fmt.Sprintf("execution %s of run %s is not yet known to be dispatched or abandoned; settle the retry once that is settled", execution.Ref, runID)}
+	case execution.Queued:
+		return &Error{Code: CodeNotReady, Current: ExecutionPreparing{RunID: runID, Execution: execution.Ref},
+			Message: fmt.Sprintf("execution %s of run %s is queued and not yet dispatched; queue dispatch admits it only while the action is executing under its grant, so settle the retry once it is dispatched", execution.Ref, runID)}
 	}
 	return nil
 }
@@ -470,21 +478,24 @@ func admittedExecutionOf(outcome json.RawMessage) (string, error) {
 
 // recordAdmittedExecution settles an uncertain retry of a run as uncertain
 // to record the execution its request admitted, recovered after the answer
-// was lost. Only that: no receipt, the state and attempt stay, and it must
+// was lost, or an executing one as executing to record the execution its
+// request admitted while that execution still waits to be dispatched
+// (TXE-8596; see holdsGrantPastClaim). Only that: no receipt, the state and
+// attempt stay, and it must
 // be the execution run history holds for this attempt's request, admitted
 // and not abandoned, though possibly not yet dispatched. Once recorded it is
 // never replaced; recording it again changes nothing and needs no lookup, so
 // it survives the run history losing it.
 func (tx *JobTx) recordAdmittedExecution(a *Action, s Settlement) (*Action, error) {
 	if s.Receipt != "" {
-		return nil, refuse(CodeInvalid, "an uncertain action has no receipt")
+		return nil, refuse(CodeInvalid, "an %s action has no receipt", a.State)
 	}
 	next, err := admittedExecutionOf(s.Outcome)
 	if err != nil {
 		return nil, err
 	}
 	if next == "" {
-		return nil, refuse(CodeInvalid, "settling an uncertain action as uncertain records only the execution its request admitted (%s)", admittedExecutionKey)
+		return nil, refuse(CodeInvalid, "settling an %s action as %s records only the execution its request admitted (%s)", a.State, a.State, admittedExecutionKey)
 	}
 	known, err := admittedExecutionOf(a.Outcome)
 	if err != nil {

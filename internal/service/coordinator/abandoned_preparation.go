@@ -173,6 +173,9 @@ func (h *Handler) abandonExecutionLocked(ctx context.Context, run, root ir.DAGRu
 	if err != nil {
 		return nil, err
 	}
+	if abandonEvidenceCheckedHook != nil {
+		abandonEvidenceCheckedHook(run, attemptID)
+	}
 	// A queued execution is failed only when a queue read shows that no
 	// queue holds its run, and the queues have not changed since. Its age
 	// alone never fails it: the queue keeps a run whose dispatch failed and
@@ -409,10 +412,11 @@ func (h *Handler) reconcileAbandonedPreparations(ctx context.Context, now time.T
 }
 
 // abandonedPreparationDetail is the reason an abandoned attempt records and
-// its run shows. It covers both ways a prepared attempt is never handed to a
-// worker, and tells the owner the run may be started again.
+// its run shows. It covers every way a prepared attempt is never handed to a
+// worker (a queue withdraws an execution it refused to dispatch, TXE-8596),
+// and tells the owner the run may be started again.
 const abandonedPreparationDetail = "not dispatched: no worker claimed it before its dispatch expired, " +
-	"or the coordinator stopped before publishing it; nothing ran, so it can be started again"
+	"the coordinator stopped before publishing it, or its queue withdrew it; nothing ran, so it can be started again"
 
 // preparationKey identifies a journal entry for in-memory bookkeeping.
 func preparationKey(p persis.AttemptPreparation) string {
@@ -499,6 +503,16 @@ func taskRootRef(task *coordinatorv1.Task) ir.DAGRunRef {
 	}
 	return root
 }
+
+// abandonEvidenceCheckedHook, when set by a test, runs in an abandonment
+// after its absence evidence was established and before its record is
+// written, with the root run's write lock held.
+var abandonEvidenceCheckedHook func(run ir.DAGRunRef, attemptID string)
+
+// taskClaimRecordedHook, when set by a test, runs in an acknowledgement after
+// its claim (lease and active run) was recorded, with the root run's write
+// lock held.
+var taskClaimRecordedHook func(run ir.DAGRunRef, attemptID string)
 
 // dispatchPublishHook, when set by a test, runs in Dispatch after the attempt
 // is prepared and before its task is published, with the run's write lock
