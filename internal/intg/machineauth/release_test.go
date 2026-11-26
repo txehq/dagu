@@ -66,6 +66,7 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 	// provenance record to its build. A build that does not hold stops the run.
 	builds := map[string]build{}
 	scopes := map[string]buildScope{}
+	narrowed := map[string]*narrowedScope{}
 	var workerOnly []build
 	for _, mb := range m.Builds {
 		b := build{name: mb.Name, path: mb.Path, sha256: mb.SHA256}
@@ -73,6 +74,13 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 		s, n, err := resolveScope(mb)
 		require.NoError(t, err)
 		scopes[mb.Name] = s
+		narrowed[mb.Name] = n
+		// A narrowed hub's configuration is held to the keys its source reads,
+		// before any cell: an older build ignores a key it does not know.
+		if s.hub() {
+			shape := renderHubConfig(hubConfigInput{Scope: s, HubPort: 1, CoordPort: 2, IssuerURL: "http://127.0.0.1:3", MachineIDs: []string{"mch_shape"}})
+			require.NoError(t, checkHubConfigKeys(mb.Name, n, shape), "the hub's configuration does not hold for its build")
+		}
 		c := probeCapability(t, mb.Path)
 		version := mb.Version
 		if spec == "source" {
@@ -94,12 +102,16 @@ func TestMachineAuthReleaseMatrix(t *testing.T) {
 			workerOnly = append(workerOnly, b)
 		}
 	}
+	// The scope of every build heads the run as well as ending it.
+	for _, line := range scopeSummary(res) {
+		t.Log(line)
+	}
 	for _, mb := range m.Builds {
 		if !scopes[mb.Name].hub() {
 			continue
 		}
 		b := builds[mb.Name]
-		run := newMatrixRun(t, b, res.versionOf(b.name), resultsDir, record, workerOnly)
+		run := newMatrixRun(t, b, scopes[mb.Name], narrowed[mb.Name], res.versionOf(b.name), resultsDir, record, workerOnly)
 		run.cells()
 		// The pairs and the worker-only builds run while A's credential is still
 		// good at the issuer: the long cells end with the provider refusing it.
@@ -219,6 +231,8 @@ type matrixRun struct {
 	b       build
 	r       *rig
 	version string
+	// scope is the hub build's scope: the cells it runs and the probe's routes.
+	scope buildScope
 	// wantVersion is what the binary said of itself (dagu version) before
 	// the run; the hub must say the same on /health.
 	wantVersion string
@@ -228,9 +242,9 @@ type matrixRun struct {
 	ok bool
 }
 
-func newMatrixRun(t *testing.T, b build, version, resultsDir string, record func(cellResult), workerOnly []build) *matrixRun {
+func newMatrixRun(t *testing.T, b build, scope buildScope, n *narrowedScope, version, resultsDir string, record func(cellResult), workerOnly []build) *matrixRun {
 	t.Helper()
-	run := &matrixRun{t: t, b: b, r: newRig(t, workerOnly...), wantVersion: version, record: record, resultsDir: resultsDir, ok: true}
+	run := &matrixRun{t: t, b: b, scope: scope, r: newRig(t, scope, n, workerOnly...), wantVersion: version, record: record, resultsDir: resultsDir, ok: true}
 	run.cell("setup", run.setup)
 	return run
 }
@@ -321,11 +335,18 @@ func (run *matrixRun) a() subject {
 	return subject{m: run.r.A(), b: run.b, pin: "pin-a", hold: "hold-a"}
 }
 
-// cells runs every short cell of one build.
+// cells runs every short cell of one build. A cell of a route the hub's scope
+// lacks (routeCells) is not run and not recorded: it is absent from the
+// result, as it is from the set the verifier derives for the scope, and never
+// a pass.
 func (run *matrixRun) cells() {
-	run.cell("pos-native", func() string { return run.pinnedRun("a-native", run.b, "native") })
-	run.cell("pos-channel-http", func() string { return run.pinnedRun("a-channel", run.b, "channel") })
-	run.cell("pos-channel-tls", func() string { return run.pinnedRun("a-tls", run.b, "tls") })
+	run.cell("pos-native", func() string { return run.pinnedRun("a-native", run.b, routeNative) })
+	if run.scope.has(routeChannel) {
+		run.cell("pos-channel-http", func() string { return run.pinnedRun("a-channel", run.b, routeChannel) })
+	}
+	if run.scope.has(routeTLS) {
+		run.cell("pos-channel-tls", func() string { return run.pinnedRun("a-tls", run.b, routeTLS) })
+	}
 	run.cell("pos-two-owners", run.twoOwners)
 	run.cell("pos-probe-control", run.probeControl)
 	for _, class := range refusalClasses {
@@ -460,8 +481,15 @@ func (run *matrixRun) setup() string {
 		require.Equal(t, m.owner, created["owner_id"])
 		run.enrol(m, "worker")
 		run.enrol(m, "reviewer")
-		check := lastJSON(t, r.cli(m, "txe", "enrol", "check", "--json", "--hub-url", r.hubURL()))
-		require.Equal(t, "SERVING", check["channel"], "enrol check through the channel")
+		if run.scope.has(routeChannel) {
+			check := lastJSON(t, r.cli(m, "txe", "enrol", "check", "--json", "--hub-url", r.hubURL()))
+			require.Equal(t, "SERVING", check["channel"], "enrol check through the channel")
+		} else {
+			// A native-only build's CLI has no --hub-url: enrol check loads
+			// the credential as its worker does.
+			check := lastJSON(t, r.cli(m, "txe", "enrol", "check", "--json"))
+			require.Equal(t, m.id, check["machine_id"], "enrol check of %s", name)
+		}
 	}
 	r.writeDAG("pin-a", r.A(), `echo "pinned to A"`, "sleep 2", "echo done-a")
 	r.writeDAG("pin-b", r.B(), `echo "pinned to B"`, "sleep 2", "echo done-b")
@@ -578,20 +606,27 @@ func (run *matrixRun) probeToken(kind string) string {
 }
 
 // probeControl: the probe with A's own credential, id and label is accepted on
-// both routes, so a refusal below is the class's doing.
+// every route the hub has (probeRoutes), so a refusal below is the class's
+// doing.
 func (run *matrixRun) probeControl() string {
 	r := run.r
 	t := r.t
 	token := run.probeToken("worker-a")
-	code, msg := r.probeCall("grpc", "heartbeat", token, "", r.A().id, r.A().id)
-	require.Equal(t, "OK", code, "gRPC heartbeat with A's credential: %s", msg)
-	code, msg = r.probeCall("channel", "heartbeat", token, "", r.A().id, r.A().id)
-	require.Equal(t, "200", code, "channel heartbeat with A's credential: %s", msg)
-	return "A's own credential accepted on both routes"
+	routes := probeRoutes(run.scope)
+	for _, route := range routes {
+		code, msg := r.probeCall(route, "heartbeat", token, "", r.A().id, r.A().id)
+		if route == "grpc" {
+			require.Equal(t, "OK", code, "gRPC heartbeat with A's credential: %s", msg)
+		} else {
+			require.Equal(t, "200", code, "channel heartbeat with A's credential: %s", msg)
+		}
+	}
+	return "A's own credential accepted over " + strings.Join(routes, " and ")
 }
 
-// probeClass sends one refusal class over both routes and requires the hub to
-// refuse each and to log the class's reason once per route.
+// probeClass sends one refusal class over every route the hub has and
+// requires the hub to refuse each and to log the class's reason once per
+// route.
 func (run *matrixRun) probeClass(class refusalClass) string {
 	r := run.r
 	t := r.t
@@ -604,7 +639,8 @@ func (run *matrixRun) probeClass(class refusalClass) string {
 	}
 	token := run.probeToken(class.Token)
 	var notes []string
-	for _, route := range []string{"grpc", "channel"} {
+	routes := probeRoutes(run.scope)
+	for _, route := range routes {
 		code, msg := r.probeCall(route, class.Method, token, class.Scheme, id, label)
 		if route == "grpc" {
 			require.NotEqual(t, "OK", code, "%s over gRPC was accepted", class.Name)
@@ -615,8 +651,8 @@ func (run *matrixRun) probeClass(class refusalClass) string {
 		_ = msg
 	}
 	counts := r.refusalsSinceMark()
-	require.GreaterOrEqualf(t, counts[string(class.Reason)], 2, "the hub logged reason %s %d time(s) for %s (both routes); refusals since mark: %v",
-		class.Reason, counts[string(class.Reason)], class.Name, counts)
+	require.GreaterOrEqualf(t, counts[string(class.Reason)], len(routes), "the hub logged reason %s %d time(s) for %s (routes %v); refusals since mark: %v",
+		class.Reason, counts[string(class.Reason)], class.Name, routes, counts)
 	return fmt.Sprintf("%s; hub reason %s ×%d", strings.Join(notes, " "), class.Reason, counts[string(class.Reason)])
 }
 

@@ -23,6 +23,10 @@ or URL with a query is ever logged.
   rule) and every surface is covered or named by the matrix.
 - `TestVerify*` — the result verifier fails closed on every way a result can fall short.
 
+- `TestRequiredHubCellsFollowTheScope`, `TestStageOneShapeStillDerives78Cells`,
+  `TestNativeOnlyHubConfigHoldsToItsSource` — the required set per hub scope (28 full, 26
+  native-only), stage 1's shape still at 78 cells, and -17's configuration held to its keys.
+
 These check the definition, not that a negative path ran: that is the heavy test's job,
 and its results file is the only record of it.
 
@@ -59,12 +63,34 @@ stops the run.
 
 **Scope.** A build runs the full scope: hub and worker, over native gRPC, the channel and
 the channel through TLS. Only a build listed in `narrowedScopes` (`scope_test.go`, keyed by
-the version it reports and the source commit its record must name) may declare `roles`
-and `routes`, and only exactly as listed. The reason is the file's, reviewed with it; a
-manifest cannot give one. Today the only entry is `txe-v2.18.2-18`, the worker the Mac
-runs: it predates the worker channel, so it is a worker over native gRPC only. The
-capability probe corroborates a scope but never sets one. A full build whose worker
+the version it reports) may declare `roles` and `routes`, and only exactly as listed: a
+listed version declared with the full scope is refused too. The reason is the file's,
+reviewed with it; a manifest cannot give one. Each entry names its source commit and the
+**provenance kind** its record must be. There are two entries, and both predate the worker
+channel (#197, #198 and #213 landed in -19):
+
+| Version | Scope | Provenance |
+|---|---|---|
+| `2.18.2-txe.18` | worker only, native gRPC: the worker the Mac runs | `source`: a record of the controlled build of commit `5b011eba…`, module `github.com/dagucloud/dagu/v2` |
+| `2.18.2-txe.17` | hub and worker, native gRPC only: the hub's fallback (TXE-7523 R9, TXE-8590) | `image`: a record read out of index `sha256:d625b509…` (commit `4d164866…`) |
+
+-17's source has no `--worker.hub-url` and no `coordinator.worker_channel`. A hub rolled
+back to -17 therefore serves native-gRPC workers only; a worker configured with
+`--worker.hub-url` cannot work against it.
+
+The capability probe corroborates a scope but never sets one. A full build whose worker
 lacks `--worker.hub-url` fails, and a narrowed one whose worker has it fails too.
+
+**A native-only hub** runs every hub cell under the same name except the two that exist
+only to prove a route it lacks, `pos-channel-http` and `pos-channel-tls`: 26 cells with the
+long ones, against a full hub's 28. `pos-probe-control` and each refusal class run over gRPC
+only. Setup's `txe enrol check` runs without `--hub-url` and is held to the machine id. A
+cell of a route the hub lacks is not run and not recorded: it is absent from the result, never
+a pass, and the verifier derives the same set from the scope. The hub's configuration has no
+`coordinator.worker_channel` block and no TLS edge is started. The configuration is held to
+the keys the entry lists from the build's own source (`HubConfigKeys`), before any cell: an
+older build ignores a key it does not know rather than refusing it, so the harness refuses
+instead. A narrowed hub entry without that list is refused.
 
 For each hub build the test runs the cells below with that build as hub and as worker,
 and the pair cell (`pair-native`) with every other build as worker. A worker-only build
@@ -76,8 +102,8 @@ Its issuer revocation refuses only its own machine's client.
 The test writes `machineauth-results-<utc>.json` (schema 2): the manifest's sha256; for
 each build its digest, version, scope, the binary's own account, its provenance reference
 and, for a narrowed build, what it excludes and why; and the status of every cell: `pass`,
-`fail` or `not_run`. It prints one `SCOPE` line per build at the end, NARROWED with its
-exclusions where they apply. "FULL" means full **for the manifest's scope**. The test fails
+`fail` or `not_run`. It prints one `SCOPE` line per build before the first cell and again at
+the end, NARROWED with its exclusions where they apply, so a narrowed scope heads the result. "FULL" means full **for the manifest's scope**. The test fails
 on any failed cell. With `long: false` the long cells are recorded `not_run` and the result
 is **partial**: a smoke of the build, never release acceptance. The source mode is a smoke
 too, because it has no manifest or provenance.
@@ -180,7 +206,11 @@ and to `narrowedScopes`. It fails on any of these:
 - a reported version, a recorded scope, its exclusions or reason, or the binary's own
   account that does not agree with the manifest and `narrowedScopes`;
 - a provenance record that is not the bound one, or not for the build's binary;
-- a narrowed build whose record is not a source record of the listed commit;
+- a narrowed build whose record is not the listed provenance kind for the listed commit: a
+  source record of that commit from the controlled build, or an image record of the listed
+  index;
+- a hub build with a cell its scope does not have (a native-only hub's `pos-channel-*`), or
+  without a cell its scope derives;
 - a cell that failed or was not run;
 - a missing, unknown or duplicated cell, a cell attributed to two builds, or a missing pair;
 - a worker-only build recorded as a hub, or a missing worker-only cell under any hub;
@@ -196,13 +226,14 @@ scope.
 Positive: `setup` (the real enrolment protocol: browser-SSO persons, binding requests and
 the administrator's approvals, `txe login`, `txe machine create`, `txe enrol` for the
 worker and reviewer classes through the issuer, the persons' approvals, `txe enrol check`
-over the channel), `pos-native`, `pos-channel-http`, `pos-channel-tls` (through a TLS edge
+over the channel, or without it for a native-only hub), `pos-native`, `pos-channel-http`, `pos-channel-tls` (through a TLS edge
 whose CA the worker trusts by `SSL_CERT_FILE`), `pos-two-owners`, `pos-probe-control`,
 `cancel`, `revoke-owner` (the step stops at the worker's bound, every late write refused),
 `reenrol` (a new generation; the revoked one stays), `neg-worker-start` (the binary refuses a
 reviewer credential, another machine's id or label), `neg-worker-nocred`.
 
-Negative, each over gRPC and the channel, each held to the reason the hub logs:
+Negative, each over gRPC and the channel (gRPC only for a native-only hub), each held to the
+reason the hub logs:
 `neg-no-credential`, `neg-hub-scheme-with-token`, `neg-garbage-token`, `neg-cli-token`,
 `neg-reviewer-token`, `neg-other-machine-id`, `neg-other-machine-label`,
 `neg-expired-token`, `neg-not-yet-valid-token`, `neg-wrong-audience`,

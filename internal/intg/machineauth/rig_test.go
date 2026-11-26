@@ -92,19 +92,22 @@ type rig struct {
 	coordPort     int
 	hub           *proc
 	hubBuild      build
-	edge          *httptest.Server
-	caFile        string
-	tokens        map[string]string // admin, alice, bob: hub session tokens
-	procs         []*proc
-	mu            sync.Mutex
-	logMark       int64
-	http          *http.Client
+	// hubScope is the hub build's scope: the configuration, the routes a
+	// worker may take and the probe's routes follow it.
+	hubScope buildScope
+	// hubNarrowed is the hub build's narrowedScopes entry, nil for a full one.
+	hubNarrowed *narrowedScope
+	edge        *httptest.Server
+	caFile      string
+	tokens      map[string]string // admin, alice, bob: hub session tokens
+	procs       []*proc
+	mu          sync.Mutex
+	logMark     int64
+	http        *http.Client
 }
 
 const (
-	cliClient     = "dagu-cli-rig"
-	browserClient = "dagu-hub-browser"
-	rigPath       = "/usr/local/bin:/usr/bin:/bin"
+	rigPath = "/usr/local/bin:/usr/bin:/bin"
 )
 
 func randomSecret(t *testing.T) string {
@@ -228,10 +231,13 @@ func startLoopbackServer(t *testing.T, h http.Handler, tls bool) *httptest.Serve
 // newRig makes the directories, mints two owners and two machines, and starts
 // the issuer that knows their clients. Each worker-only build gets a machine
 // of its own, owned by B's owner and enrolled through the build's own CLI, so
-// its cells (the issuer's revocation among them) never touch A or B.
-func newRig(t *testing.T, workerOnly ...build) *rig {
+// its cells (the issuer's revocation among them) never touch A or B. The hub
+// build's scope (and its narrowedScopes entry, nil for a full build) decides
+// its configuration and the routes its workers may take.
+func newRig(t *testing.T, hubScope buildScope, hubNarrowed *narrowedScope, workerOnly ...build) *rig {
 	t.Helper()
 	r := &rig{t: t, dir: t.TempDir(), machines: map[string]*machineHome{}, tokens: map[string]string{},
+		hubScope: hubScope, hubNarrowed: hubNarrowed,
 		adminPassword: randomSecret(t), browserSecret: randomSecret(t),
 		http: &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	for _, m := range []struct{ name, person string }{{"A", "alice"}, {"B", "bob"}} {
@@ -282,53 +288,13 @@ func (r *rig) machineNames() []string {
 
 func (r *rig) workerClient(m *machineHome) string { return "dagu-worker-" + m.id }
 
-// hubConfig is the hub's configuration: builtin person auth with the browser
-// SSO at the issuer, the fork's licence policy for SSO, the coordinator in
-// enforce advertising loopback, the worker channel on, and txe.authn naming the
-// issuer, the CLI client and one worker and one reviewer client per machine.
+// hubConfig is the hub's configuration for this rig (renderHubConfig).
 func (r *rig) hubConfig() string {
-	var clients strings.Builder
-	fmt.Fprintf(&clients, "      - id: %s\n        class: cli\n", cliClient)
+	var ids []string
 	for _, name := range r.machineNames() {
-		m := r.machines[name]
-		fmt.Fprintf(&clients, "      - id: dagu-worker-%s\n        class: worker\n      - id: dagu-reviewer-%s\n        class: reviewer\n", m.id, m.id)
+		ids = append(ids, r.machines[name].id)
 	}
-	return fmt.Sprintf(`host: 127.0.0.1
-port: %d
-auth:
-  mode: builtin
-  builtin:
-    initial_admin:
-      username: rig-admin
-  oidc:
-    client_id: %s
-    client_url: %s
-    issuer: %s
-    scopes: [openid, profile, email]
-    auto_signup: true
-    allowed_domains: [rig.test]
-    pkce: true
-license:
-  fork_policy:
-    features: [sso]
-coordinator:
-  host: 127.0.0.1
-  advertise: 127.0.0.1
-  port: %d
-  auth:
-    mode: enforce
-  worker_channel:
-    enabled: true
-txe:
-  authn:
-    issuer: %s
-    audience: dagu-hub
-    jwks_url: %s/jwks
-    cli_client: %s
-    clients:
-%s  authz:
-    mode: enforce
-`, r.hubPort, browserClient, r.hubURL(), r.issuer.url(), r.coordPort, r.issuer.url(), r.issuer.url(), cliClient, clients.String())
+	return renderHubConfig(hubConfigInput{Scope: r.hubScope, HubPort: r.hubPort, CoordPort: r.coordPort, IssuerURL: r.issuer.url(), MachineIDs: ids})
 }
 
 // start runs one process detached in its own group, output to a log file.
@@ -413,7 +379,9 @@ func (r *rig) logTail(p *proc, n int) string {
 func (r *rig) startHub(b build) {
 	r.t.Helper()
 	configPath := filepath.Join(r.dir, "hub", "config.yaml")
-	require.NoError(r.t, os.WriteFile(configPath, []byte(r.hubConfig()), 0o600))
+	config := r.hubConfig()
+	require.NoError(r.t, checkHubConfigKeys(b.name, r.hubNarrowed, config), "the hub is not started with a key its source does not read")
+	require.NoError(r.t, os.WriteFile(configPath, []byte(config), 0o600))
 	env := []string{"PATH=" + rigPath, "HOME=" + filepath.Join(r.dir, "hub", "home"), "DAGU_HOME=" + filepath.Join(r.dir, "hub"),
 		"DAGU_AUTH_BUILTIN_INITIAL_ADMIN_PASSWORD=" + r.adminPassword, "DAGU_AUTH_OIDC_CLIENT_SECRET=" + r.browserSecret}
 	r.hub = r.start("hub-"+b.name, env, b.path, "start-all", "--config", configPath, "--dagu-home", filepath.Join(r.dir, "hub"))
@@ -919,6 +887,9 @@ func (r *rig) startWorker(name string, b build, m *machineHome, route string, o 
 	args := []string{"worker", "--worker.id", id, "--worker.labels", "txe.machine=" + label, fmt.Sprintf("--worker.health-port=%d", healthPort)}
 	if o.maxRuns > 0 {
 		args = append(args, "--worker.max-active-runs", fmt.Sprint(o.maxRuns))
+	}
+	if route != routeNative && !r.hubScope.has(route) {
+		r.t.Fatalf("worker %s over %s: the hub build %s's scope is %s", name, route, r.hubBuild.name, r.hubScope)
 	}
 	switch route {
 	case "native":

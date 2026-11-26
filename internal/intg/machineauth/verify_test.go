@@ -270,7 +270,15 @@ func verifyResults(m *manifest, r *results, checkDisk bool) []string {
 		}
 		return set
 	}
+	// Each hub's required set is its scope's: a native-only hub's result never
+	// holds a channel cell, and the verifier derives the same set the run did.
 	fullSet, workerOnlySet := setOf(requiredCells(true)), setOf(requiredWorkerOnlyCells(true))
+	hubSets := map[string]map[string]bool{}
+	for name, s := range scopes {
+		if s.hub() {
+			hubSets[name] = setOf(requiredHubCells(s, true))
+		}
+	}
 	type key struct{ name, hub, worker string }
 	seen := map[key]bool{}
 	notRun := 0
@@ -302,6 +310,8 @@ func verifyResults(m *manifest, r *results, checkDisk bool) []string {
 				}
 			case !fullSet[c.Name]:
 				add("cell %s is not a cell of this matrix", c.Name)
+			case !hubSets[c.HubBuild][c.Name]:
+				add("cell %s is not a cell of hub build %s, whose scope is %s", c.Name, c.HubBuild, scopes[c.HubBuild])
 			case c.HubBuild != c.WorkerBuild:
 				add("cell %s recorded with hub %s and worker %s; a build's cell runs both as the same build", c.Name, c.HubBuild, c.WorkerBuild)
 			}
@@ -321,7 +331,7 @@ func verifyResults(m *manifest, r *results, checkDisk bool) []string {
 		if !scopes[hub].hub() {
 			continue
 		}
-		for _, cell := range requiredCells(true) {
+		for _, cell := range requiredHubCells(scopes[hub], true) {
 			if !seen[key{cell, hub, hub}] {
 				add("cell %s missing for build %s", cell, hub)
 			}
@@ -375,8 +385,9 @@ func verifyBuildScope(mb manifestBuild, b resultBuild, s buildScope, add func(st
 }
 
 // verifyProvenance reads a build's record from disk: it must be the bound
-// record, for the build's binary, and a narrowed build's must be a source
-// record of the commit narrowedScopes names.
+// record, for the build's binary, and a narrowed build's must be of the
+// provenance kind narrowedScopes lists for it: a source record of the listed
+// commit, or an image record of the listed index.
 func verifyProvenance(mb manifestBuild, add func(string, ...any)) {
 	if mb.Provenance == nil {
 		return
@@ -386,12 +397,36 @@ func verifyProvenance(mb manifestBuild, add func(string, ...any)) {
 		add("build %s: %v", mb.Name, err)
 		return
 	}
-	_, n, _ := resolveScope(mb)
-	if n == nil {
-		return
+	if _, n, _ := resolveScope(mb); n != nil {
+		verifyNarrowedRecord(mb, n, rec, add)
 	}
+}
+
+// verifyNarrowedRecord holds a narrowed build's record to its entry's kind.
+func verifyNarrowedRecord(mb manifestBuild, n *narrowedScope, rec *provenanceRecord, add func(string, ...any)) {
+	switch n.Provenance {
+	case provenanceSource:
+		verifySourceProvenance(mb, n, rec, add)
+	case provenanceImage:
+		switch {
+		case rec.Kind != provenanceImage:
+			add("build %s runs narrowed as version %s, which needs an image record of index %s (commit %s); its record is a %s record%s",
+				mb.Name, mb.Version, n.Index, n.Commit, rec.Kind, commitSuffix(rec))
+		case rec.Image.Index != n.Index:
+			add("build %s runs narrowed as version %s, which needs an image record of index %s (commit %s); its record is of index %s",
+				mb.Name, mb.Version, n.Index, n.Commit, rec.Image.Index)
+		}
+	default:
+		add("build %s runs narrowed as version %s, whose entry lists provenance kind %q, not %s or %s",
+			mb.Name, mb.Version, n.Provenance, provenanceSource, provenanceImage)
+	}
+}
+
+// verifySourceProvenance holds a record to a source entry: a source record of
+// the listed commit, written by the controlled build, of the listed module.
+func verifySourceProvenance(mb manifestBuild, n *narrowedScope, rec *provenanceRecord, add func(string, ...any)) {
 	switch {
-	case rec.Kind != "source" || rec.Source.Commit != n.Commit:
+	case rec.Kind != provenanceSource || rec.Source.Commit != n.Commit:
 		add("build %s runs narrowed as version %s, which needs a source record of commit %s; its record is a %s record%s",
 			mb.Name, mb.Version, n.Commit, rec.Kind, commitSuffix(rec))
 	case rec.Source.Builder != controlledBuilder:
@@ -430,7 +465,7 @@ func fullResults(m *manifest) *results {
 		if !scopes[b.Name].hub() {
 			continue
 		}
-		for _, cell := range requiredCells(m.Long) {
+		for _, cell := range requiredHubCells(scopes[b.Name], m.Long) {
 			r.Cells = append(r.Cells, cellResult{Name: cell, HubBuild: b.Name, WorkerBuild: b.Name, Status: statusPass})
 		}
 		for _, o := range m.Builds {
