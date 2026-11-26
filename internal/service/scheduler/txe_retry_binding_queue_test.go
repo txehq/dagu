@@ -113,8 +113,9 @@ func TestQueueDispatch_TxeApprovedRetryIsAdmitted(t *testing.T) {
 }
 
 // The grant is read when the queue dispatches, not when the retry was
-// queued: a grant that expired while the retry waited refuses it. The run is
-// aborted with the reason and the retried execution kept; the refusal is
+// queued: a grant that expired while the retry waited refuses it. The run's
+// execution is abandoned before dispatch with the reason (TXE-8596; it was
+// aborted before) and the retried execution kept; the refusal is
 // recorded on the job, in a commit that also turns the action whose grant
 // lapsed uncertain, so it is not left approved and executing and a person
 // is asked what to do with it.

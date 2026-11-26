@@ -49,6 +49,12 @@ type EffectResult struct {
 	// Pending is true for an unknown outcome that later looks can still
 	// settle: the admitted effect has not shown up yet and still may.
 	Pending bool
+	// Queued is true for a pending outcome whose admitted execution was last
+	// seen waiting in a queue, not yet dispatched (TXE-8596). The retry is
+	// not settled then: queue dispatch admits it only while its action is
+	// executing under a live grant, so the action is left executing with
+	// the execution recorded, and settled once that is dispatched.
+	Queued bool
 	// Unasked is true for an unknown outcome whose one source of an answer
 	// could not be asked this time, as distinct from one that was asked and
 	// had none. It is asked again before the owner is.

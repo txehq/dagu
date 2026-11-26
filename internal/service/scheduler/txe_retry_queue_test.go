@@ -134,8 +134,18 @@ func queuedItem(t *testing.T, f *queueFixture, dag *ir.DAG) string {
 // assertRetryDropped checks a refused queued retry: not dispatched, its
 // queue item gone, its execution aborted with the registry's reason, the
 // retried execution kept, and the refusal noted on the job.
+//
+// A refused retry that carries a retry request is abandoned instead
+// (TXE-8596): its execution is marked failed with an execution-scoped
+// abandonment record, so no reader takes it for an execution that ran and
+// was then aborted. Updated for TXE-8596, which changed that case from
+// aborted; assertRetryAbandoned checks it.
 func assertRetryDropped(t *testing.T, f *queueFixture, j txeQueueJob, queued *ir.DAGRunStatus, admitted bool, code registry.AdmitCode) {
 	t.Helper()
+	if queued.RetryRequest != nil {
+		assertRetryAbandoned(t, f, j, queued, admitted, code)
+		return
+	}
 	assert.False(t, admitted)
 	items, err := f.queueStore.List(f.ctx, j.dag.ProcGroup())
 	require.NoError(t, err)

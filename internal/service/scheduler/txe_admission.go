@@ -76,7 +76,9 @@ func specDigest(dag *ir.DAG) string {
 
 // admitQueuedRun applies the registry guard to a queued run of any trigger.
 // It returns false when the run must not be dispatched now; a refused run is
-// finalized as aborted with the registry's reason and noted on the job.
+// finalized as aborted with the registry's reason and noted on the job, and
+// a refused retry that carries a retry request is abandoned before dispatch
+// instead (abandonRefusedRetry), so that it is never read as having run.
 func (d *queueDispatcher) admitQueuedRun(
 	ctx context.Context,
 	queueName string,
@@ -114,7 +116,11 @@ func (d *queueDispatcher) admitQueuedRun(
 		return true
 	}
 	reason := fmt.Sprintf("txe: job %s %s: %s", adm.JobID, adm.Code, adm.Reason)
-	if err := d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason); err != nil {
+	drop := d.dropQueuedRun
+	if status.TriggerType == ir.TriggerTypeRetry && status.RetryRequest != nil {
+		drop = d.abandonRefusedRetry
+	}
+	if err := drop(ctx, queueName, runRef, itemID, attemptID, status, reason); err != nil {
 		logger.Error(ctx, "Failed to drop queued run refused by TXE registry", tag.Error(err))
 		return false
 	}
@@ -176,6 +182,85 @@ func (d *queueDispatcher) admitQueuedRetry(ctx context.Context, jobID string, ru
 	return d.runAdmitter.AdmitQueuedRetry(ctx, jobID, registry.QueuedRetry{
 		RunID: run.ID, AttemptID: retried.AttemptID, QueuedAt: retried.QueuedAt, Request: *request,
 	})
+}
+
+// abandonRefusedRetry drops a queued retry that carries a retry request
+// and that admission refused, and records that it never ran (TXE-8596). It
+// is dropQueuedRun with evidence: the execution is abandoned through the
+// run's store with an execution-scoped abandonment record
+// (persis.AbandonmentScopeExecution), the record Dagu keeps for an execution
+// prepared and never handed to a worker, correlated with the retry request.
+// The store writes the record and marks the execution Failed, under its
+// lock, only while the execution is still queued with this marker and no
+// worker. Every reader of a retry's outcome reads that record: the registry
+// (RetryExecution.Abandoned) refuses to record the retry as succeeded and
+// allows it as not applied, and the reviewer (Abandoned) settles it as not
+// dispatched. Without the record an aborted execution reads like one that
+// started and was then stopped, and the retry would be recorded as having
+// run.
+//
+// The evidence that nothing was dispatched is this dispatcher's own: it
+// holds the queue item and refuses it before dispatching it, so no dispatch
+// task, lease or active run exists for the execution, and the store checks
+// that no worker took it. A store that keeps no such records, or a status
+// that already shows a worker, lease or process, is dropped as before.
+func (d *queueDispatcher) abandonRefusedRetry(
+	ctx context.Context,
+	queueName string,
+	runRef ir.DAGRunRef,
+	itemID string,
+	attemptID string,
+	status *ir.DAGRunStatus,
+	reason string,
+) error {
+	if itemID == "" {
+		return errors.New("delete refused queued retry: missing queue item ID")
+	}
+	if status.QueuedAt == "" || status.WorkerID != "" || status.LeaseAt != 0 || status.PID != 0 {
+		return d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason)
+	}
+	root := status.Root
+	if root.Zero() {
+		root = runRef
+	}
+	request := status.RetryRequest
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := d.dagRunRepository.AbandonAttempt(ctx, persis.AbandonAttemptRequest{
+		DAGRun: runRef, RootDAGRun: root,
+		Record: persis.AttemptAbandonment{
+			Schema:             persis.AttemptAbandonmentSchema,
+			Run:                runRef,
+			RootRun:            root,
+			AbandonedAttemptID: attemptID,
+			AbandonedExecution: persis.ExecutionIdentity{AttemptID: attemptID, QueuedAt: status.QueuedAt},
+			Scope:              persis.AbandonmentScopeExecution,
+			RequestCorrelation: &persis.RequestCorrelation{
+				ID: request.ID, ActionID: request.ActionID, ActionAttempt: request.ActionAttempt, BindingDigest: request.BindingDigest,
+			},
+			Reason:    persis.AbandonedRetryPreparation,
+			Detail:    "not dispatched: " + reason,
+			DecidedAt: now,
+			Evidence: persis.AbandonmentEvidence{
+				DispatchTask: persis.EvidenceAbsent, Lease: persis.EvidenceAbsent,
+				ActiveRun: persis.EvidenceAbsent, Worker: persis.EvidenceAbsent, ObservedAt: now,
+			},
+		},
+	})
+	switch {
+	case errors.Is(err, persis.ErrAttemptAbandonmentUnsupported):
+		return d.dropQueuedRun(ctx, queueName, runRef, itemID, attemptID, status, reason)
+	case errors.Is(err, persis.ErrAttemptNotAbandonable):
+		// The execution is no longer this queued one: superseded, as
+		// dropQueuedRun finds a changed queued state. Only the stale queue
+		// item is removed.
+		logger.Info(ctx, "Removed stale queued TXE retry refused by the registry", tag.Error(err))
+	case err != nil:
+		return fmt.Errorf("abandon refused queued retry: %w", err)
+	}
+	if _, err := d.queueStore.DeleteByItemIDs(ctx, queueName, []string{itemID}); err != nil {
+		return fmt.Errorf("dequeue refused queued retry: %w", err)
+	}
+	return nil
 }
 
 // startTxeReconciler keeps the registry and Dagu converged: it indexes the

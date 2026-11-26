@@ -593,7 +593,14 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		// about to perform the effect. A probe now could see nothing and
 		// settle as absent an effect that then lands, so the attempt is
 		// left alone and stays in the packet as unresolved.
+		//
+		// A retry held for its queue's dispatch is the exception: its
+		// holder recorded the admitted execution and is done with it, so it
+		// is looked at once (settleHeldRetry).
 		if r.now().Before(action.GrantExpiresAt.Add(leaseMargin)) {
+			if action.Name == RetryRunAction && action.AdmittedRef != "" {
+				return r.settleHeldRetry(ctx, job, action, finish)
+			}
 			return nil
 		}
 		// The interrupted attempt is recorded as uncertain before anything
@@ -791,6 +798,37 @@ func (r *Reviewer) reconcileOne(ctx context.Context, claim Claim, job Job, actio
 		return err
 	}
 	return finish(ActionEscalated, res)
+}
+
+// settleHeldRetry settles a retry left executing while its admitted
+// execution waited in a queue (TXE-8596), from one look at the run: running
+// or over is the retry, recorded as succeeded with that execution; the
+// service's record that it abandoned the execution before dispatch is
+// proof that nothing ran; anything else (still queued, not readable, not
+// known) leaves it executing under its grant for a later review. A registry
+// that still does not take the execution as dispatched leaves it so too.
+// When the grant ends first, the registry interrupts the action and it is
+// reconciled like any other interrupted retry.
+func (r *Reviewer) settleHeldRetry(ctx context.Context, job Job, action Action, finish func(ActionState, EffectResult) error) error {
+	runID := action.Params[RetryRunParam]
+	bound, complete := retriedExecution(action.Params)
+	if r.Runs == nil || !complete {
+		return nil
+	}
+	res := r.observeRetry(ctx, job.ID, runID, bound, action.AdmittedRef, 0, "")
+	switch res.Status {
+	case EffectApplied:
+		res.Detail = "reconciled: " + res.Detail
+		err := finish(ActionSucceeded, res)
+		if errors.Is(err, ErrNotReady) {
+			return nil
+		}
+		return err
+	case EffectNotApplied:
+		return finish(ActionNotApplied, res)
+	case EffectUnknown:
+	}
+	return nil
 }
 
 // escalate asks the owner how to settle an attempt whose effect is unknown.
@@ -1348,14 +1386,25 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 		Claim: claim, JobID: job.ID, ActionID: action.ID, GrantID: action.GrantID,
 		State: state, Receipt: res.Receipt, Detail: res.Detail, Admitted: res.Admitted, AdmittedRef: res.AdmittedRef,
 	}
-	err := r.Registry.FinishAction(ctx, record)
+	var err error
+	if action.Name == RetryRunAction && res.Queued && res.AdmittedRef != "" {
+		// The admitted execution waits in a queue. Its dispatch admits it
+		// only while this action is executing under its grant, so the
+		// action is not settled: the execution is recorded on it and it
+		// stays executing (TXE-8596).
+		state, record, err = r.holdForDispatch(ctx, record, res.Detail)
+	} else {
+		err = r.Registry.FinishAction(ctx, record)
+	}
 	if err != nil && state == ActionSucceeded && action.Name == RetryRunAction && errors.Is(err, ErrNotReady) {
 		// The run shows the admitted execution dispatched and the registry
 		// does not take it yet: by its own record that execution's
 		// preparation is not settled. That says nothing against the retry.
-		// What the service answered is recorded now, as an outcome not yet
-		// settled, so that later reviews look at exactly this execution
-		// again; losing it here would leave an attempt nobody can settle.
+		// (It is not a queued execution: the run was seen past queued, and
+		// an execution does not go back to waiting in the queue.) What the
+		// service answered is recorded now, as an outcome not yet settled,
+		// so that later reviews look at exactly this execution again;
+		// losing it here would leave an attempt nobody can settle.
 		state = ActionUncertain
 		res.Receipt = ""
 		res.Detail = fmt.Sprintf("%s; the registry does not record execution %s as dispatched yet, so the retry is settled by a later review", res.Detail, res.AdmittedRef)
@@ -1375,6 +1424,25 @@ func (r *Reviewer) runJournaled(ctx context.Context, claim Claim, job Job, decla
 	action.State, action.Receipt, action.Detail = state, res.Receipt, res.Detail
 	action.Admitted, action.AdmittedRef = res.Admitted, res.AdmittedRef
 	return action, nil
+}
+
+// holdForDispatch records, on a retry that is still executing, the execution
+// its request admitted, and leaves it executing under its grant (TXE-8596).
+// The registry then keeps it executing past the end of this review's claim,
+// so queue dispatch still admits the execution, and a later review settles
+// it once the execution is dispatched (reconcileOne). A registry that does
+// not take an executing outcome, as one from before this rule, is given the
+// uncertain outcome it took before, with the same execution: the retry is
+// then refused at queue dispatch as before, and is not lost.
+func (r *Reviewer) holdForDispatch(ctx context.Context, record FinishRequest, detail string) (ActionState, FinishRequest, error) {
+	record.State, record.Receipt, record.Detail = ActionExecuting, "", detail
+	record.Admitted = true
+	err := r.Registry.FinishAction(ctx, record)
+	if te, ok := errors.AsType[*TransportError](err); ok && te.Code == codeActionState {
+		record.State = ActionUncertain
+		err = r.Registry.FinishAction(ctx, record)
+	}
+	return record.State, record, err
 }
 
 // outcomeHeld reports whether an outcome whose record failed is the outcome
@@ -1957,15 +2025,22 @@ func (r *Reviewer) seenOnRun(ctx context.Context, jobID, runID string, bound Exe
 // not waited on, because the latest execution will not turn back into the
 // admitted one.
 //
-// The named execution shows the retry dispatched only once it is queued,
-// running or over. While it is not started, it is a reservation: the
-// service creates the new attempt before it hands it to a worker, which may
-// not have taken it yet, and the service can stop in between. A reservation
-// is reported as such, never as the retry, and the outcome is pending:
-// later reviews look again.
+// The named execution shows the retry dispatched only once it is running
+// or over. While it is not started, it is a reservation: the service
+// creates the new attempt before it hands it to a worker, which may not
+// have taken it yet, and the service can stop in between. A reservation is
+// reported as such, never as the retry, and the outcome is pending: later
+// reviews look again.
+//
+// While it is queued it is not dispatched either (TXE-8596): queue
+// dispatch admits it only while the action is executing under a live grant,
+// so it is watched like a reservation, and an execution still queued when
+// the watch ends is reported pending and Queued. The registry refuses to
+// settle the retry as succeeded until then, whatever reviewer asks.
 func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound Execution, named string, watch time.Duration, cause string) EffectResult {
 	until := time.Now().Add(watch)
 	reserved := ""
+	queued := false
 	read := false
 	var readErr error
 	for {
@@ -1997,13 +2072,13 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 					}
 				}
 				fallthrough
-			case state.Status != runNotStarted && state.Status != "":
+			case state.Status != runNotStarted && state.Status != "" && state.Status != runQueued:
 				return EffectResult{
 					Status: EffectApplied, Receipt: ref, Admitted: true, AdmittedRef: named,
 					Detail: fmt.Sprintf("run %s was retried as execution %s (attempt %s), which was %s when observed", runID, ref, now.AttemptID, state.Status),
 				}
 			}
-			reserved = ref
+			reserved, queued = ref, state.Status == runQueued
 		}
 		left := time.Until(until)
 		if left > 0 {
@@ -2036,6 +2111,13 @@ func (r *Reviewer) observeRetry(ctx context.Context, jobID, runID string, bound 
 			detail = cause + ": " + detail
 		}
 		return EffectResult{Status: EffectUnknown, Unasked: true, Detail: detail, Admitted: true, AdmittedRef: named}
+	}
+	if queued {
+		detail := fmt.Sprintf("the service admitted the retry of run %s as execution %s, which is queued and not yet dispatched; it is settled once it is dispatched", runID, named)
+		if cause != "" {
+			detail = cause + ": " + detail
+		}
+		return EffectResult{Status: EffectUnknown, Detail: detail, Admitted: true, AdmittedRef: named, Pending: true, Queued: true}
 	}
 	detail := fmt.Sprintf("no execution of run %s after %s was seen queued or started", runID, bound.Ref())
 	if reserved != "" {
@@ -2070,10 +2152,12 @@ func runAnswered(err error) bool {
 }
 
 // runNotStarted is the service's status of an attempt that exists but has
-// not been queued or started, and runFailed of one that failed, which
-// includes one the service marked failed without ever dispatching it.
+// not been queued or started, runQueued of one waiting in a queue to be
+// dispatched, and runFailed of one that failed, which includes one the
+// service marked failed without ever dispatching it.
 const (
 	runNotStarted = "not_started"
+	runQueued     = "queued"
 	runFailed     = "failed"
 )
 

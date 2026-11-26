@@ -1740,8 +1740,14 @@ func TestRetryRunNeedsTheWholeExecutionTheDecisionIsAbout(t *testing.T) {
 
 // On Dagu's queued path a retry re-runs the latest attempt under the same
 // attempt id; only its queued time changes. That is a new execution: it is
-// observed and recorded as the retry's effect, and a decision about the
-// earlier execution of that attempt no longer applies to it.
+// observed by that queued time, recorded as the retry's admitted execution,
+// and, once it is dispatched, as its effect; a decision about the earlier
+// execution of that attempt no longer applies to it.
+//
+// Updated for TXE-8596: this test asserted ActionSucceeded while the
+// execution was still queued. That settlement made queue dispatch refuse
+// the retry, so the action now stays executing until the execution is
+// dispatched, and the receipt is recorded by the review that sees it run.
 func TestRetryRunOnTheQueuedPathIsObservedByItsQueuedTime(t *testing.T) {
 	f := newRetryFixture(t)
 	f.runs.retry = func(runID string) error {
@@ -1749,11 +1755,17 @@ func TestRetryRunOnTheQueuedPathIsObservedByItsQueuedTime(t *testing.T) {
 		return nil
 	}
 	out := f.execute("executor")
-	assert.Equal(t, review.ActionSucceeded, out.Action.State)
-	assert.Equal(t, f.runs.ref("run-1"), out.Action.Receipt)
-	assert.NotEqual(t, review.ExecutionRef("att-1", ""), out.Action.Receipt, "the same attempt id, queued again, is another execution")
-	assert.Contains(t, out.Action.Detail, "queued", "the receipt describes what was observed, not a success")
+	queued := f.runs.ref("run-1")
+	assert.Equal(t, review.ActionExecuting, out.Action.State)
+	assert.Equal(t, queued, out.Action.AdmittedRef)
+	assert.NotEqual(t, review.ExecutionRef("att-1", ""), queued, "the same attempt id, queued again, is another execution")
+	assert.Contains(t, out.Action.Detail, "queued", "the record describes what was observed, not a success")
 	assert.Equal(t, "att-1", f.runs.state["run-1"].AttemptID)
+
+	dispatchRun(f.runs, "run-1")
+	settled := reviewOnce(t, f, "reviewer-b", time.Minute)
+	assert.Equal(t, review.ActionSucceeded, settled.State)
+	assert.Equal(t, queued, settled.Receipt)
 
 	// A second decision that still names the first execution of att-1 is
 	// stale once the attempt has been queued again and failed again.
