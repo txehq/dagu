@@ -41,9 +41,10 @@ and marks the profile.
 
 The profile must be the directory <data dir>/browser/profiles/<name> itself,
 not in use by a step, a session or a browser, and on Unix this user's alone,
-as must its Default directory and preferences. All of that is checked before
-anything is written; a refused claim writes nothing. On Windows the owner
-and access of the profile are not checked.
+as must its Default directory and preferences, by their owner and mode bits
+(access control lists are not read). All of that is checked before anything
+is written; a refused claim writes nothing. On Windows the owner and access
+of the profile are not checked.
 
 Undo with: dagu browser profile unclaim <name>
 

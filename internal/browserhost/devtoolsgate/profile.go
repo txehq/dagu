@@ -127,10 +127,22 @@ func NewTempProfile(parent, pattern string) (string, error) {
 	return dir, nil
 }
 
-// ProfileClaimed reports whether dir holds the gate's marker.
+// ProfileClaimed reports whether dir holds the gate's marker, one that
+// passes checkMarker. A marker that fails it does not count.
 func ProfileClaimed(dir string) bool {
-	info, err := os.Lstat(filepath.Join(dir, profileMarker))
-	return err == nil && info.Mode().IsRegular()
+	path := filepath.Join(dir, profileMarker)
+	info, err := os.Lstat(path)
+	return err == nil && checkMarker(path, info) == nil
+}
+
+// checkMarker refuses a marker that is not a regular file of this user's
+// alone with a single link: one another account made, or a link to a file
+// made for something else, does not mark a profile as the gate's.
+func checkMarker(path string, info os.FileInfo) error {
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", path)
+	}
+	return checkEntryOwner(path, info)
 }
 
 // The explicit claim of a profile that existed before works on the
@@ -162,8 +174,8 @@ func ProfileClaimedRoot(root *os.Root) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !info.Mode().IsRegular() {
-		return false, fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", filepath.Join(root.Name(), profileMarker))
+	if err := checkMarker(filepath.Join(root.Name(), profileMarker), info); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -224,10 +236,7 @@ func claimProfile(dir string) error {
 	}
 	marker := filepath.Join(dir, profileMarker)
 	if info, err := os.Lstat(marker); err == nil {
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("devtools gate: the profile marker is not a regular file: %s", marker)
-		}
-		return nil
+		return checkMarker(marker, info)
 	}
 	file, err := os.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL|openNoFollow, 0o600) //nolint:gosec // a new file in the directory checked above
 	if err != nil {
@@ -311,7 +320,7 @@ func disableOffTheRecord(args []string) error {
 	if opened, err := root.Stat("."); err != nil || !os.SameFile(opened, checked) {
 		return fmt.Errorf("devtools gate: the profile directory changed while it was opened: %s", userDataDir)
 	}
-	if marker, err := root.Lstat(profileMarker); err != nil || !marker.Mode().IsRegular() {
+	if marker, err := root.Lstat(profileMarker); err != nil || checkMarker(filepath.Join(userDataDir, profileMarker), marker) != nil {
 		return fmt.Errorf("%w: %s", ErrProfileNotOwned, userDataDir)
 	}
 	if !profileReleasedRoot(root) {

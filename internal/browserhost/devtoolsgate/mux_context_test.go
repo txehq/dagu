@@ -67,7 +67,7 @@ func TestMuxAttachesNoClientToATargetOutsideTheBrowsersOwnContext(t *testing.T) 
 	}, "the gate asked to close the target off the record")
 
 	_, err := c.call("", "Target.attachToTarget", map[string]any{"targetId": foreign, "flatten": true})
-	assert.ErrorContains(t, err, "the gate serves only targets in the browser's own context")
+	assert.EqualError(t, err, errNoTarget.Error())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -245,14 +245,33 @@ func TestMuxHidesATargetOutsideTheBrowsersOwnContext(t *testing.T) {
 	}
 	assert.NotEmpty(t, listed.TargetInfos, "the browser's own targets are listed")
 	// A client that knows the hidden target's id can neither act on it nor
-	// tell it from a target that never existed: the gate answers exactly as
-	// the browser does for an unknown id, and passes nothing on.
-	for _, method := range []string{"Target.getTargetInfo", "Target.activateTarget", "Target.closeTarget"} {
-		hidden := c.callReply("", method, map[string]any{"targetId": foreign})
-		missing := c.callReply("", method, map[string]any{"targetId": "NO-SUCH-TARGET"})
+	// tell it from a target that never existed: every Target command that
+	// takes a targetId, passed on or handled by the gate, is answered exactly
+	// as for an unknown id, error object for error object.
+	var addressing []string
+	for method, policy := range forwardedTargetMethods {
+		if slices.Contains(policy.passed, "targetId") {
+			addressing = append(addressing, method)
+		}
+	}
+	for method, policy := range handledTargetMethods {
+		if slices.Contains(policy.passed, "targetId") {
+			addressing = append(addressing, method)
+		}
+	}
+	require.Subset(t, addressing, []string{"Target.getTargetInfo", "Target.activateTarget", "Target.closeTarget", "Target.attachToTarget"})
+	for _, method := range addressing {
+		params := func(id string) map[string]any {
+			p := map[string]any{"targetId": id}
+			if slices.Contains(handledTargetMethods[method].passed, "flatten") {
+				p["flatten"] = true
+			}
+			return p
+		}
+		hidden := c.callReply("", method, params(foreign))
+		missing := c.callReply("", method, params("NO-SUCH-TARGET"))
 		require.NotEmpty(t, hidden.Error, method)
 		assert.JSONEq(t, string(missing.Error), string(hidden.Error), method)
-		assert.JSONEq(t, `{"code":-32602,"message":"No target with given id found"}`, string(hidden.Error), method)
 	}
 	for _, sent := range append(sentOf(tg.state(c), "Target.activateTarget"), sentOf(tg.state(c), "Target.getTargetInfo")...) {
 		assert.NotContains(t, sent, foreign, "no client command on the hidden target reaches the browser")

@@ -237,6 +237,13 @@ func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	refuse(t, "shared-prefs", "others may write", func(dir string) {
 		require.NoError(t, os.Chmod(filepath.Join(dir, "Default", "Preferences"), 0o666))
 	})
+	// A marker that is a link to a file made for something else claims
+	// nothing, and is not taken for an earlier claim.
+	refuse(t, "linked-mark", "has another link", func(dir string) {
+		other := filepath.Join(t.TempDir(), "other")
+		require.NoError(t, os.WriteFile(other, nil, 0o600))
+		require.NoError(t, os.Link(other, filepath.Join(dir, ".dagu-devtools-gate-profile")))
+	})
 	elsewhere := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(elsewhere, "Preferences"), []byte(`{"theirs":1}`), 0o600))
 	refuse(t, "linked-prefs", "not a regular file", func(dir string) {

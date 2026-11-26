@@ -1487,9 +1487,10 @@ func (m *mux) checkContextLocked(method string, params json.RawMessage) error {
 }
 
 // errNoTarget is the browser's own answer to a command naming a target it
-// does not know. The gate answers a command naming a target it hid in the
-// same words, so a client cannot tell a hidden target from one that never
-// existed, nor act on it.
+// does not know. Every command that names a target, passed on or handled by
+// the gate, is answered in the same words and code for a target the gate
+// hid, so a client cannot tell a hidden target from one that never existed,
+// nor act on it.
 var errNoTarget = errors.New("No target with given id found") //nolint:staticcheck // the browser's own wording
 
 // noTargetCode is the error code the browser answers errNoTarget with.
@@ -1741,7 +1742,7 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 		return
 	}
 	if m.foreignTargetLocked(params.TargetID, message{}) {
-		c.deliverError(msg.ID, sessionID, "Target.attachToTarget: "+errForeignContext.Error())
+		c.deliverError(msg.ID, sessionID, errNoTarget.Error())
 		return
 	}
 	m.attaching[params.TargetID] = append(m.attaching[params.TargetID], &attachRequest{client: c, explicit: true})
@@ -1762,7 +1763,7 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 			event := m.dropStashedLocked(params.TargetID, session)
 			if m.foreignTargetLocked(params.TargetID, event) {
 				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
-				c.deliverError(msg.ID, sessionID, "Target.attachToTarget: "+errForeignContext.Error())
+				c.deliverError(msg.ID, sessionID, errNoTarget.Error())
 				return
 			}
 			if !m.clientAlive(c) {
@@ -1932,7 +1933,7 @@ func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error 
 	m.mu.Lock()
 	if m.foreignTargetLocked(targetID, message{}) {
 		m.mu.Unlock()
-		return fmt.Errorf("Target.attachToTarget: %w", errForeignContext)
+		return errNoTarget
 	}
 	m.attaching[targetID] = append(m.attaching[targetID], &attachRequest{client: c, explicit: true})
 	m.mu.Unlock()
@@ -1950,7 +1951,7 @@ func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error 
 	}
 	if m.foreignTargetLocked(targetID, event) {
 		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
-		return fmt.Errorf("Target.attachToTarget: %w", errForeignContext)
+		return errNoTarget
 	}
 	c.root = session
 	m.explicitSessions[session] = c

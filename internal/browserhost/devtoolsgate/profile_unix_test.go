@@ -71,6 +71,31 @@ func TestDisableOffTheRecordRefusesASharedOrRunningProfile(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"kept":true}`, string(raw), "a refused profile's preferences are left as they were")
 
+	// A file with another link is reached by a name outside the profile:
+	// as preferences it is refused, and as the marker it marks nothing.
+	linkedPrefs := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(linkedPrefs, "Default"), 0o700))
+	outside := filepath.Join(t.TempDir(), "Preferences")
+	require.NoError(t, os.WriteFile(outside, []byte(`{"outside":true}`), 0o600))
+	require.NoError(t, os.Link(outside, filepath.Join(linkedPrefs, "Default", "Preferences")))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + linkedPrefs}), "has another link")
+	raw, err = os.ReadFile(outside)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"outside":true}`, string(raw), "the other name's file is left as it was")
+
+	linkedMark := testProfileDir(t)
+	markFile := filepath.Join(t.TempDir(), "made-for-something-else")
+	require.NoError(t, os.WriteFile(markFile, nil, 0o600))
+	require.NoError(t, os.Link(markFile, filepath.Join(linkedMark, profileMarker)))
+	assert.False(t, ProfileClaimed(linkedMark), "a linked marker marks nothing")
+	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + linkedMark}), ErrProfileNotOwned)
+	assert.ErrorContains(t, claimProfile(linkedMark), "has another link")
+	root, err := os.OpenRoot(linkedMark)
+	require.NoError(t, err)
+	defer func() { _ = root.Close() }()
+	_, err = ProfileClaimedRoot(root)
+	assert.ErrorContains(t, err, "has another link")
+
 	host, err := os.Hostname()
 	require.NoError(t, err)
 	running := ownedProfile(t)

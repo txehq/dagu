@@ -34,7 +34,10 @@ import (
 //     A refused claim writes nothing in the profile.
 //   - The lease is kept alive while the claim works, and every write comes
 //     after a renewal that fails once another holder took it: a claim that
-//     lost the profile writes nothing more.
+//     finds its lease lost writes nothing more. The renewal and the write
+//     after it are not one step, so a claim paused for longer than the
+//     lease's 30 seconds between the two is not covered (a known residual,
+//     TXE-7856).
 //   - A mark that may have been made is never undone by removing what it
 //     would be undone with: the record and the copy stay unless the mark is
 //     known to be absent.
@@ -305,8 +308,8 @@ type heldProfile struct {
 	root    *os.Root
 	release func()
 	// lease renews the lease and fails once another holder took it: every
-	// write of a claim or an unclaim comes after it, so none is made by an
-	// operation that lost the profile.
+	// write of a claim or an unclaim comes after it, so an operation that
+	// finds it lost the profile makes no further write.
 	lease func() error
 }
 
