@@ -28,16 +28,45 @@ name: codex-review
 # when the connector posted neither a review of the head nor a receipt, a person resolving its live
 # P0/P1 thread (TXE-4791) runs nothing either; re-run then too. Drafts are skipped: the connector
 # does not review a draft.
+#
+# MAINTENANCE BASES (TXE-7556). A PR into a declared maintenance branch, maint/txe-v<x.y.z>-<n>, is
+# judged by the same check. pull_request_target runs the BASE's copy of this file, and there
+# github.sha is the base's tip, so the scripts are never taken from it: they come from
+# CODEX_REVIEW_GATE_SHA below, a main commit named by its full id (immutable, and on main, so it
+# was merged through this gate). The first step refuses any other base name and a pin that main
+# does not reach. main's merge wrapper refuses to merge into a base whose copy of this file is not
+# main's byte for byte, and checks this run names the PR on that base (README.md "Maintenance
+# bases"). On main nothing changes: github.sha is main's tip. test-gate-pin.sh keeps the pin
+# current with main's copy of the files the gate runs, and fails CI when it is not.
 
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled]
-    # The gate is main's copy only: on another base, github.sha would be that branch's scripts.
-    branches: [main]
+    # main runs main's tip; a maintenance base runs the pinned main commit below, never its own.
+    branches: [main, 'maint/txe-v*']
 
+env:
+  # The main commit whose .github/codex-review a maintenance base runs: a full id, bumped by a PR
+  # to the main commit that last changed the files the gate runs (test-gate-pin.sh says which).
+  CODEX_REVIEW_GATE_SHA: efd1c83e1f0cda165cfcfb9df5e0b931ea6b8607
+
+# CONCURRENCY (TXE-7843). One group per PR. Only an incoming run whose event action is
+# `synchronize` cancels the run in progress; on a push that run judged a head nobody can merge any
+# more. Every other event (`edited`, `labeled`, `unlabeled`, `reopened`, `ready_for_review`,
+# `opened`) never cancels it; it waits as `pending` and runs when the active run ends, reading the
+# PR's labels and review state then. GitHub keeps at most one pending run per group and cancels an
+# older pending run when a newer one arrives (docs: "Control the concurrency of workflows and
+# jobs", queue `single`), so of several rapid re-checks the newest runs, and it reads the newest
+# state. The replaced run never started, so it leaves no check run on the head (measured,
+# README.md "Same-head re-checks"). The merge wrapper takes the newest gate run on the exact head
+# and refuses while it is pending or running, so a newer re-check it can see blocks an older
+# success. Before TXE-7843 every event cancelled the run in progress, and the cancelled check run
+# on the same head refused the merge. A re-run keeps its event's action: re-running an old
+# synchronize run still cancels an active re-check on the same head, which costs a re-run of that
+# check, never a pass.
 concurrency:
   group: codex-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event.action == 'synchronize' }}
 
 permissions:
   contents: read
@@ -50,10 +79,37 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      # Main's scripts only (pull_request_target's default ref), never the PR's head or merge ref.
+      # The base is main or a declared maintenance base; on a maintenance base the pin is a main
+      # commit. Reads the API only; nothing from the PR or the base runs. test-gate-pin.sh runs
+      # this block with a stand-in gh.
+      - name: The base and the gate's pinned scripts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # >>> base-guard
+          set -euo pipefail
+          if [ "$BASE_REF" = main ]; then
+            echo "base main: the gate runs main's tip"
+          elif [[ "$BASE_REF" =~ ^maint/txe-v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
+            [[ "$CODEX_REVIEW_GATE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::CODEX_REVIEW_GATE_SHA is not a full commit id"; exit 1; }
+            reach="$(gh api "repos/$GH_REPO/compare/$CODEX_REVIEW_GATE_SHA...main?per_page=1" --jq .status)" \
+              || { echo "::error::could not read whether main reaches $CODEX_REVIEW_GATE_SHA"; exit 1; }
+            case "$reach" in
+              ahead|identical) echo "base $BASE_REF: the gate runs main's commit $CODEX_REVIEW_GATE_SHA" ;;
+              *) echo "::error::the gate pin $CODEX_REVIEW_GATE_SHA is not a main commit (compare says $reach)"; exit 1 ;;
+            esac
+          else
+            echo "::error::base '$BASE_REF' is neither main nor maint/txe-v<x.y.z>-<n>"; exit 1
+          fi
+          # <<< base-guard
+
+      # main's tip on main; the pinned main commit on a maintenance base. Never the PR's head or
+      # merge ref, and never a maintenance base's own scripts.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.base_ref == 'main' && github.sha || env.CODEX_REVIEW_GATE_SHA }}
           persist-credentials: false
           sparse-checkout: .github/codex-review
 
