@@ -49,32 +49,106 @@ func (s buildScope) String() string {
 	return fmt.Sprintf("roles %s, routes %s", strings.Join(s.Roles, "+"), strings.Join(s.Routes, "+"))
 }
 
+// A narrowed build's provenance record must be of the kind its entry lists.
+const (
+	// provenanceSource: a record of the controlled build of Commit from a fresh
+	// clone of its tag (controlledBuilder), for Module.
+	provenanceSource = "source"
+	// provenanceImage: a record of the binary read out of the published image
+	// index Index (index → the platform's manifest → config and layers → the
+	// file, every link checked by digest), as candidate C and -19 are. Commit is
+	// the source the index was built from, shown with the result; the record
+	// itself names no commit, so the index digest is what binds it.
+	provenanceImage = "image"
+)
+
 // narrowedScope is one build that may run with less than the full scope.
 type narrowedScope struct {
 	// Version is what the binary reports (dagu version) and the manifest names.
 	Version string
-	// Commit is the source commit the build's provenance record must name.
+	// Commit is the source commit of the build: the commit a source record must
+	// name, and the commit an image's index was built from.
 	Commit string
-	// Module is the main module the record's controlled build must have built.
+	// Provenance is the kind of record the build must have: provenanceSource or
+	// provenanceImage.
+	Provenance string
+	// Module is the main module a source record's controlled build must have
+	// built (source only).
 	Module string
-	Scope  buildScope
+	// Index is the image index digest an image record must name (image only).
+	Index string
+	Scope buildScope
+	// HubConfigKeys are, for a build that is a hub, every key of the hub's
+	// configuration the build's own source reads, as rendered by
+	// renderHubConfig (rig_test.go): one dotted path per leaf, "[]" for a list
+	// of entries. The rig refuses to start the hub, before any cell, when its
+	// configuration writes a key outside this list: a build older than the
+	// template ignores a key it does not know rather than refusing it.
+	HubConfigKeys []string
 	// Reason says why, from the source: shown with every result of the build.
 	Reason string
 }
 
-// narrowedScopes are the only builds a manifest may narrow. txe-v2.18.2-18 is
-// the worker the Mac runs (TXE-5506): it predates the worker channel, which
-// arrived in -19 (TXE-5598 #197 the hub's channel, TXE-5602 #198
-// worker.hub_url, TXE-5665 #213 the channel check), so it runs as a worker over
-// native gRPC under every hub of the manifest, and is never a hub.
+// narrowedScopes are the only builds a manifest may narrow. Both predate the
+// worker channel, which arrived in -19 (TXE-5598 #197 the hub's channel,
+// TXE-5602 #198 worker.hub_url, TXE-5665 #213 the channel check).
+//
+//   - txe-v2.18.2-18 is the worker the Mac runs (TXE-5506): a worker over
+//     native gRPC under every hub of the manifest, never a hub, bound by a
+//     source record of its tag's commit.
+//   - txe-v2.18.2-17 is the hub's fallback (TXE-7523 R9, TXE-8590): the hub
+//     image 2.18.2-txe.17@sha256:d625b509…. It runs as a hub and a worker, over
+//     native gRPC only, bound by an image record of that index. Its source has
+//     no --worker.hub-url and no coordinator.worker_channel, so a hub rolled
+//     back to -17 serves native-gRPC workers only.
 var narrowedScopes = []narrowedScope{
 	{
-		Version: "2.18.2-txe.18",
-		Commit:  "5b011eba3a30e224be14a5c81bd15cd9ab90c956",
-		Module:  "github.com/dagucloud/dagu/v2",
-		Scope:   buildScope{Roles: []string{roleWorker}, Routes: []string{routeNative}},
+		Version:    "2.18.2-txe.18",
+		Commit:     "5b011eba3a30e224be14a5c81bd15cd9ab90c956",
+		Provenance: provenanceSource,
+		Module:     "github.com/dagucloud/dagu/v2",
+		Scope:      buildScope{Roles: []string{roleWorker}, Routes: []string{routeNative}},
 		Reason: "txe-v2.18.2-18 predates the worker channel (#197, #198 and #213 landed in -19): " +
 			"it runs as a worker over native gRPC under every hub build, never as a hub",
+	},
+	{
+		Version:    "2.18.2-txe.17",
+		Commit:     "4d164866b07195346610588a37390a38960e5bb7",
+		Provenance: provenanceImage,
+		Index:      "sha256:d625b509af2a8fdbfb771c7d3dcb89b8b4a345680fcf2c2e91d62c5e66f33d9b",
+		Scope:      buildScope{Roles: []string{roleHub, roleWorker}, Routes: []string{routeNative}},
+		// Read from 4d164866's source: internal/cmn/config/definition.go (host,
+		// port, auth, auth.builtin.initial_admin, auth.oidc, license.fork_policy,
+		// coordinator), transport_auth.go (coordinator.auth: mode, hub_key_file)
+		// and txe.go (txe.authn, txe.authz, an authn client's id and class).
+		HubConfigKeys: []string{
+			"auth.builtin.initial_admin.username",
+			"auth.mode",
+			"auth.oidc.allowed_domains",
+			"auth.oidc.auto_signup",
+			"auth.oidc.client_id",
+			"auth.oidc.client_url",
+			"auth.oidc.issuer",
+			"auth.oidc.pkce",
+			"auth.oidc.scopes",
+			"coordinator.advertise",
+			"coordinator.auth.mode",
+			"coordinator.host",
+			"coordinator.port",
+			"host",
+			"license.fork_policy.features",
+			"port",
+			"txe.authn.audience",
+			"txe.authn.cli_client",
+			"txe.authn.clients[].class",
+			"txe.authn.clients[].id",
+			"txe.authn.issuer",
+			"txe.authn.jwks_url",
+			"txe.authz.mode",
+		},
+		Reason: "txe-v2.18.2-17 predates the worker channel (#197, #198 and #213 landed in -19; its source has no " +
+			"--worker.hub-url and no coordinator.worker_channel): it runs as a hub and a worker over native gRPC only, " +
+			"so the channel routes are not proven for it and a hub rolled back to -17 serves native-gRPC workers only",
 	},
 }
 
@@ -128,19 +202,21 @@ func resolveScope(b manifestBuild) (buildScope, *narrowedScope, error) {
 	if err != nil {
 		return buildScope{}, nil, fmt.Errorf("build %q: %w", b.Name, err)
 	}
-	if s.full() {
-		return s, nil, nil
-	}
 	for i := range narrowedScopes {
 		n := &narrowedScopes[i]
 		if n.Version != b.Version {
 			continue
 		}
+		// A listed version runs exactly its listed scope, never the full one:
+		// its source lacks what the full scope proves.
 		if !slices.Equal(n.Scope.Roles, s.Roles) || !slices.Equal(n.Scope.Routes, s.Routes) {
 			return buildScope{}, nil, fmt.Errorf("build %q (version %s) declares %s; the only narrowed scope listed for that version is %s",
 				b.Name, b.Version, s, n.Scope)
 		}
 		return s, n, nil
+	}
+	if s.full() {
+		return s, nil, nil
 	}
 	return buildScope{}, nil, fmt.Errorf("build %q (version %q) declares %s, but only the builds listed in narrowedScopes may run narrowed; every other build runs %s",
 		b.Name, b.Version, s, fullScope)
@@ -209,6 +285,22 @@ func excludedCells(s buildScope) []string {
 	for _, r := range allRoutes {
 		if !s.has(r) {
 			out = append(out, "route "+r)
+		}
+	}
+	if s.hub() {
+		required := requiredHubCells(s, true)
+		var dropped []string
+		for _, c := range requiredCells(true) {
+			if !slices.Contains(required, c) {
+				dropped = append(dropped, c)
+			}
+		}
+		if len(dropped) > 0 {
+			out = append(out, "hub cells "+strings.Join(dropped, ", "))
+		}
+		if routes := probeRoutes(s); len(routes) < len(probeRoutes(fullScope)) {
+			out = append(out, "with this build as hub, pos-probe-control and every neg- probe run over "+strings.Join(routes, "+")+
+				" only, and setup's enrol check does not take the channel")
 		}
 	}
 	return out

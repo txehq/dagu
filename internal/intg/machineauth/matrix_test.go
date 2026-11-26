@@ -116,9 +116,31 @@ var longCells = []string{
 	"stale",         // a frozen worker's attempt expires at the production lease threshold; its late writes are refused as stale
 }
 
-// requiredCells lists what a complete result holds for one build.
+// routeCells are the cells that exist only to prove one route: a hub whose
+// scope lacks the route does not run them, and its result never holds them.
+var routeCells = map[string]string{
+	"pos-channel-http": routeChannel,
+	"pos-channel-tls":  routeTLS,
+}
+
+// requiredCells lists what a complete result holds for one full-scope build.
 func requiredCells(long bool) []string {
-	cells := append([]string{}, positiveCells...)
+	return requiredHubCells(fullScope, long)
+}
+
+// requiredHubCells lists what a complete result holds for one hub build of
+// scope s, with that build as hub and as worker. A full hub has every cell. A
+// hub without a route drops that route's own cells (routeCells) and keeps
+// every other cell under the same name: pos-probe-control and each refusal
+// class still run, over the routes the hub has (probeRoutes).
+func requiredHubCells(s buildScope, long bool) []string {
+	var cells []string
+	for _, c := range positiveCells {
+		if route, only := routeCells[c]; only && !s.has(route) {
+			continue
+		}
+		cells = append(cells, c)
+	}
 	for _, c := range refusalClasses {
 		cells = append(cells, "neg-"+c.Name)
 	}
@@ -126,6 +148,16 @@ func requiredCells(long bool) []string {
 		cells = append(cells, longCells...)
 	}
 	return cells
+}
+
+// probeRoutes are the routes the probe sends each class over for a hub of
+// scope s: gRPC always (native), the channel when the hub serves it.
+func probeRoutes(s buildScope) []string {
+	routes := []string{"grpc"}
+	if s.has(routeChannel) {
+		routes = append(routes, "channel")
+	}
+	return routes
 }
 
 // pairCell is the cell every hub×worker pair of different builds runs.
@@ -296,4 +328,33 @@ func TestRequiredCellsAreDistinct(t *testing.T) {
 		assert.Equal(t, long, seen["stale"])
 	}
 	assert.Len(t, requiredCells(true), len(requiredCells(false))+len(longCells))
+	for cell, route := range routeCells {
+		assert.Contains(t, positiveCells, cell, "route cell %s is not a positive cell", cell)
+		assert.Contains(t, allRoutes, route, "route cell %s names route %q", cell, route)
+	}
+}
+
+// A hub scope derives its required set from the full one: a full hub keeps
+// all 28, a native-only hub drops exactly the two channel positives and keeps
+// every other cell under the same name.
+func TestRequiredHubCellsFollowTheScope(t *testing.T) {
+	t.Parallel()
+	assert.Len(t, requiredCells(true), 28, "a full hub's set")
+	assert.Equal(t, requiredCells(true), requiredHubCells(fullScope, true))
+	native := buildScope{Roles: allRoles, Routes: []string{routeNative}}
+	for _, long := range []bool{false, true} {
+		got := requiredHubCells(native, long)
+		var want []string
+		for _, c := range requiredCells(long) {
+			if c != "pos-channel-http" && c != "pos-channel-tls" {
+				want = append(want, c)
+			}
+		}
+		assert.Equal(t, want, got, "long=%v", long)
+	}
+	assert.Len(t, requiredHubCells(native, true), 26)
+	assert.Contains(t, requiredHubCells(native, true), "pos-probe-control", "the probe's native leg stays")
+	assert.Contains(t, requiredHubCells(native, true), "neg-no-credential", "every refusal class stays")
+	assert.Equal(t, []string{"grpc", "channel"}, probeRoutes(fullScope))
+	assert.Equal(t, []string{"grpc"}, probeRoutes(native))
 }

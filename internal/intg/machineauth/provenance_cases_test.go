@@ -738,3 +738,83 @@ func ownedGoDirsExcept(t *testing.T, skip ...string) []string {
 	}
 	return env
 }
+
+// With the records at hand, the native-only hub (txe-v2.18.2-17) needs an
+// image record of the index narrowedScopes names, for the build's binary: a
+// source record, even of its own commit, is the wrong kind, and an image record
+// of another index is another build. -18 is still held to its source record.
+func TestVerifyHoldsTheNativeOnlyHubToItsImageIndex(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writeBinary := func(name string) (string, string) {
+		p := dir + "/" + name
+		require.NoError(t, os.WriteFile(p, []byte("binary "+name), 0o600))
+		sum, err := fileSHA256(p)
+		require.NoError(t, err)
+		return p, sum
+	}
+	var n17, n18 *narrowedScope
+	for i := range narrowedScopes {
+		switch narrowedScopes[i].Version {
+		case "2.18.2-txe.17":
+			n17 = &narrowedScopes[i]
+		case "2.18.2-txe.18":
+			n18 = &narrowedScopes[i]
+		}
+	}
+	require.NotNil(t, n17)
+	require.NotNil(t, n18)
+	fullPath, fullSum := writeBinary("full")
+	fPath, fSum := writeBinary("f17")
+	wPath, wSum := writeBinary("w18")
+	image := func(index string) provenanceRecord {
+		rec := imageRecordFor("f17", fSum)
+		rec.Image.Index = index
+		return rec
+	}
+	w18Source := provenanceRecord{Schema: provenanceSchema, Kind: provenanceSource, Name: "w18", BinarySHA256: wSum,
+		Source: &sourceProvenance{Builder: controlledBuilder, Tag: "txe-v2.18.2-18", Commit: n18.Commit, Module: n18.Module, GOOS: "linux", GOARCH: "amd64"}}
+	n := 0
+	mk := func(fRec, wRec provenanceRecord) *manifest {
+		n++
+		return &manifest{Long: true, Builds: []manifestBuild{
+			{Name: "full", Path: fullPath, SHA256: fullSum, Version: "9.9.9", Provenance: writeRecord(t, dir, fmt.Sprintf("full-%d", n), imageRecordFor("full", fullSum))},
+			{Name: "f17", Path: fPath, SHA256: fSum, Version: n17.Version, Routes: []string{routeNative},
+				Provenance: writeRecord(t, dir, fmt.Sprintf("f17-%d", n), fRec)},
+			{Name: "w18", Path: wPath, SHA256: wSum, Version: n18.Version, Roles: []string{roleWorker}, Routes: []string{routeNative},
+				Provenance: writeRecord(t, dir, fmt.Sprintf("w18-%d", n), wRec)},
+		}}
+	}
+	good := mk(image(n17.Index), w18Source)
+	assert.Empty(t, verifyResults(good, fullResults(good), true))
+
+	for name, tc := range map[string]struct {
+		m    *manifest
+		want string
+	}{
+		"a source record of -17's own commit": {mk(provenanceRecord{Schema: provenanceSchema, Kind: provenanceSource, Name: "f17", BinarySHA256: fSum,
+			Source: &sourceProvenance{Builder: controlledBuilder, Tag: "txe-v2.18.2-17", Commit: n17.Commit, Module: n18.Module, GOOS: "linux", GOARCH: "amd64"}}, w18Source),
+			"needs an image record of index " + n17.Index + " (commit " + n17.Commit + "); its record is a source record of commit " + n17.Commit},
+		"an image record of another index": {mk(image("sha256:"+strings.Repeat("3", 64)), w18Source),
+			"its record is of index sha256:" + strings.Repeat("3", 64)},
+		"an image record of another binary": {mk(func() provenanceRecord {
+			r := image(n17.Index)
+			r.BinarySHA256 = strings.Repeat("0", 64)
+			return r
+		}(), w18Source), "is for binary sha256 0000"},
+		"-18 with an image record": {mk(image(n17.Index), imageRecordFor("w18", wSum)),
+			"build w18 runs narrowed as version 2.18.2-txe.18, which needs a source record of commit 5b011eba"},
+	} {
+		problems := verifyResults(tc.m, fullResults(tc.m), true)
+		assert.Contains(t, strings.Join(problems, "\n"), tc.want, name)
+	}
+
+	// An entry with an unknown provenance kind binds nothing and is refused.
+	rec, err := readProvenance(good.Builds[1].Provenance, fSum)
+	require.NoError(t, err)
+	var problems []string
+	bad := *n17
+	bad.Provenance = "installed"
+	verifyNarrowedRecord(good.Builds[1], &bad, rec, func(f string, a ...any) { problems = append(problems, fmt.Sprintf(f, a...)) })
+	assert.Contains(t, strings.Join(problems, "\n"), `whose entry lists provenance kind "installed"`)
+}
