@@ -240,6 +240,19 @@ func (c *cdpConn) read() {
 // call sends a command and returns its result, or the browser's error.
 func (c *cdpConn) call(sessionID, method string, params any) (json.RawMessage, error) {
 	c.t.Helper()
+	reply := c.callReply(sessionID, method, params)
+	if len(reply.Error) > 0 {
+		var cdpErr cdpError
+		_ = json.Unmarshal(reply.Error, &cdpErr)
+		return nil, errors.New(cdpErr.Message)
+	}
+	return reply.Result, nil
+}
+
+// callReply sends a command and returns its whole reply, the error's code
+// included.
+func (c *cdpConn) callReply(sessionID, method string, params any) message {
+	c.t.Helper()
 	c.mu.Lock()
 	c.nextID++
 	id := c.nextID
@@ -260,15 +273,10 @@ func (c *cdpConn) call(sessionID, method string, params any) (json.RawMessage, e
 	require.NoError(c.t, c.conn.Write(ctx, websocket.MessageText, data))
 	select {
 	case reply := <-ch:
-		if len(reply.Error) > 0 {
-			var cdpErr cdpError
-			_ = json.Unmarshal(reply.Error, &cdpErr)
-			return nil, errors.New(cdpErr.Message)
-		}
-		return reply.Result, nil
+		return reply
 	case <-ctx.Done():
 		c.t.Fatalf("no reply to %s within 10s", method)
-		return nil, nil
+		return message{}
 	}
 }
 

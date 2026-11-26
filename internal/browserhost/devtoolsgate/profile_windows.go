@@ -19,6 +19,11 @@ func checkProfileOwner(string, os.FileInfo) error {
 	return nil
 }
 
+// checkEntryOwner accepts an entry of a profile, for the same reason.
+func checkEntryOwner(string, os.FileInfo) error {
+	return nil
+}
+
 // openNoFollow is 0 on Windows, where an os.Root open does not follow a
 // link out of the directory, and Lstat checks come first.
 const openNoFollow = 0

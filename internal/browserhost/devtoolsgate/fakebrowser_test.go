@@ -12,6 +12,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,6 +114,11 @@ type fakeBrowser struct {
 	// unnamedContext makes Target.getBrowserContexts name no default
 	// context, as an older browser's does.
 	unnamedContext bool
+	// firstPage, when set, is where the first page is as the root
+	// auto-attach is asked for: "unnamed", a page whose info names no
+	// context, or "offTheRecord", a page off the record, with no page in
+	// the browser's own context.
+	firstPage string
 	// failStart makes the browser exit before answering, as a browser
 	// that cannot adopt its pipes does.
 	failStart bool
@@ -420,6 +426,14 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.autoAttach.on = boolean("autoAttach")
 		f.autoAttach.wait = boolean("waitForDebuggerOnStart")
 		if f.autoAttach.on {
+			if first, ok := f.targets["T1"]; ok {
+				switch f.firstPage {
+				case "unnamed":
+					first.context = ""
+				case "offTheRecord":
+					first.context = fakeOffTheRecordContext
+				}
+			}
 			var opening *fakeTarget
 			if f.offTheRecordAtStart {
 				// A page off the record that opens as the auto-attach is
@@ -697,12 +711,25 @@ func (f *fakeBrowser) handle(data []byte) {
 	case "Target.createBrowserContext":
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextId": "CTX1"})
 	case "Target.getBrowserContexts":
+		// The browser names every context but its default among the others.
+		others := []string{}
+		for _, t := range f.sortedTargets() {
+			if t.context != "" && t.context != fakeOwnContext && !slices.Contains(others, t.context) {
+				others = append(others, t.context)
+			}
+		}
 		if f.unnamedContext {
-			f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}})
+			f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": others})
 			return
 		}
-		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": []string{}, "defaultBrowserContextId": fakeOwnContext})
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{"browserContextIds": others, "defaultBrowserContextId": fakeOwnContext})
 	case "Target.disposeBrowserContext":
+		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
+	case "Target.activateTarget":
+		if _, ok := f.targets[str("targetId")]; !ok {
+			f.replyError(cmd.ID, cmd.SessionID, -32602, "No target with given id found")
+			return
+		}
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{})
 	case "Target.getTargetInfo":
 		t, ok := f.targets[str("targetId")]
@@ -756,7 +783,7 @@ func (f *fakeBrowser) handle(data []byte) {
 		f.reply(cmd.ID, cmd.SessionID, map[string]any{"argv": f.argv})
 	default:
 		if strings.HasSuffix(cmd.Method, ".enable") || strings.HasSuffix(cmd.Method, ".disable") ||
-			cmd.Method == "Runtime.addBinding" || cmd.Method == "Target.activateTarget" {
+			cmd.Method == "Runtime.addBinding" {
 			if cmd.SessionID != "" {
 				if _, ok := f.sessions[cmd.SessionID]; !ok {
 					f.replyError(cmd.ID, cmd.SessionID, -32001, "Session with given id not found.")

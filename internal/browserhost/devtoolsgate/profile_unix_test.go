@@ -56,6 +56,21 @@ func TestDisableOffTheRecordRefusesASharedOrRunningProfile(t *testing.T) {
 	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + shared}), "others may write")
 	assert.ErrorContains(t, claimProfile(shared), "others may write")
 
+	// Each entry the gate reads or writes is held to the same terms.
+	sharedDefault := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(sharedDefault, "Default"), 0o700))
+	require.NoError(t, os.Chmod(filepath.Join(sharedDefault, "Default"), 0o777))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + sharedDefault}), "others may write the profile's entry")
+	sharedPrefs := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(sharedPrefs, "Default"), 0o700))
+	prefsPath := filepath.Join(sharedPrefs, "Default", "Preferences")
+	require.NoError(t, os.WriteFile(prefsPath, []byte(`{"kept":true}`), 0o600))
+	require.NoError(t, os.Chmod(prefsPath, 0o666))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + sharedPrefs}), "others may write the profile's entry")
+	raw, err := os.ReadFile(prefsPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"kept":true}`, string(raw), "a refused profile's preferences are left as they were")
+
 	host, err := os.Hostname()
 	require.NoError(t, err)
 	running := ownedProfile(t)

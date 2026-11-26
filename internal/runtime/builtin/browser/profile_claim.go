@@ -5,6 +5,7 @@ package browser
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,7 +30,14 @@ import (
 //     profile is <browserDir>/profiles/<name> itself and no link, that it is
 //     this user's alone, that no step, session or browser holds it (under
 //     its lease), and that each file the claim reads or writes is a regular
-//     file or absent. A refused claim writes nothing in the profile.
+//     file or absent, and, like each directory it uses, this user's alone.
+//     A refused claim writes nothing in the profile.
+//   - The lease is kept alive while the claim works, and every write comes
+//     after a renewal that fails once another holder took it: a claim that
+//     lost the profile writes nothing more.
+//   - A mark that may have been made is never undone by removing what it
+//     would be undone with: the record and the copy stay unless the mark is
+//     known to be absent.
 //   - The profile is opened once (an *os.Root) and every later step works on
 //     that open directory: a directory swapped in after the checks cannot
 //     receive the writes, and no step follows a symbolic link.
@@ -181,18 +189,34 @@ func claimProfileWith(browserDir, name string, ops claimOps) (ProfileClaimReport
 		}
 		return cause
 	}
+	if err := held.lease(); err != nil {
+		return report, err
+	}
 	if present {
 		if err := writeNewFile(root, record.Backup, prefs); err != nil {
 			return report, fmt.Errorf("browser profile %q: keep a copy of its preferences: %w", name, err)
 		}
 		written = append(written, record.Backup)
+		if err := held.lease(); err != nil {
+			return report, keptAfter(err, held.dir, written)
+		}
 	}
 	if err := writeNewFile(root, claimRecordName, encoded); err != nil {
 		return report, undo(fmt.Errorf("browser profile %q: record the claim: %w", name, err))
 	}
 	written = append(written, claimRecordName)
+	if err := held.lease(); err != nil {
+		return report, keptAfter(err, held.dir, written)
+	}
 	if err := ops.mark(root); err != nil {
-		return report, undo(fmt.Errorf("browser profile %q: %w", name, err))
+		cause := fmt.Errorf("browser profile %q: %w", name, err)
+		// The mark is what lets a browser change the profile. Unless it is
+		// known to be absent, the record and the copy of the preferences it
+		// would be undone with stay.
+		if marked, readErr := devtoolsgate.ProfileClaimedRoot(root); readErr != nil || marked {
+			return report, keptAfter(fmt.Errorf("%w; the profile may be marked as claimed", cause), held.dir, written)
+		}
+		return report, undo(cause)
 	}
 	report.Claimed, report.Changed, report.PreviousValue = true, true, record.PreviousValue
 	report.Backup = backupPath(held.dir, record.Backup)
@@ -247,10 +271,16 @@ func unclaimProfileWith(browserDir, name string, ops claimOps) (ProfileClaimRepo
 	}
 
 	// The writes: the preference first, then the mark, then the record.
+	if err := held.lease(); err != nil {
+		return report, err
+	}
 	if present {
 		if err := replaceFile(root, claimPreferences, restored); err != nil {
 			return report, fmt.Errorf("browser profile %q: put its preference back: %w", name, err)
 		}
+	}
+	if err := held.lease(); err != nil {
+		return report, fmt.Errorf("%w; its preference was already put back, and the mark, the claim record and the copy of its preferences are kept", err)
 	}
 	if err := ops.release(root); err != nil {
 		// The preference is back but the mark stays, so the next browser
@@ -258,6 +288,9 @@ func unclaimProfileWith(browserDir, name string, ops claimOps) (ProfileClaimRepo
 		return report, fmt.Errorf("browser profile %q: its preference was put back, but its mark could not be removed (%w); the claim record and the copy of its preferences are kept", name, err)
 	}
 	if recordPresent {
+		if err := held.lease(); err != nil {
+			return report, fmt.Errorf("%w; it is unclaimed, and its claim record %s is kept", err, filepath.Join(held.dir, claimRecordName))
+		}
 		if err := ops.remove(root, claimRecordName); err != nil {
 			return report, fmt.Errorf("browser profile %q: unclaimed, but its claim record %s could not be removed: %w", name, filepath.Join(held.dir, claimRecordName), err)
 		}
@@ -271,6 +304,10 @@ type heldProfile struct {
 	dir     string
 	root    *os.Root
 	release func()
+	// lease renews the lease and fails once another holder took it: every
+	// write of a claim or an unclaim comes after it, so none is made by an
+	// operation that lost the profile.
+	lease func() error
 }
 
 // holdExistingProfile checks the named profile exists exactly where it is
@@ -330,7 +367,9 @@ func holdExistingProfile(browserDir, name string) (*heldProfile, error) {
 		}
 		return nil, fmt.Errorf("lock browser profile %q: %w", name, err)
 	}
+	stop := agentstep.KeepLockAlive(context.Background(), lock)
 	release := func() {
+		stop()
 		_ = lock.Unlock()
 		_ = root.Close()
 	}
@@ -342,7 +381,23 @@ func holdExistingProfile(browserDir, name string) (*heldProfile, error) {
 		release()
 		return nil, &profileHeldError{message: fmt.Sprintf("browser profile %q is open in a running browser", name)}
 	}
-	return &heldProfile{dir: dir, root: root, release: release}, nil
+	lease := func() error {
+		if err := lock.Heartbeat(context.Background()); err != nil {
+			return fmt.Errorf("browser profile %q: its lease was lost before the next write (%w); nothing more was written", name, err)
+		}
+		return nil
+	}
+	return &heldProfile{dir: dir, root: root, release: release, lease: lease}, nil
+}
+
+// keptAfter reports a claim that stopped after writing the files written,
+// which are kept as they are: evidence of what it did.
+func keptAfter(cause error, dir string, written []string) error {
+	kept := make([]string, 0, len(written))
+	for _, file := range written {
+		kept = append(kept, filepath.Join(dir, filepath.FromSlash(file)))
+	}
+	return fmt.Errorf("%w; the claim left %s, which are kept as they are", cause, strings.Join(kept, ", "))
 }
 
 func backupPath(dir, backup string) string {
@@ -365,6 +420,11 @@ func regularOrAbsent(root *os.Root, name string) (bool, error) {
 	if !info.Mode().IsRegular() {
 		return false, fmt.Errorf("%s is not a regular file", name)
 	}
+	// What the claim reads or replaces is this user's alone, as the
+	// profile directory is.
+	if err := devtoolsgate.CheckProfileEntry(filepath.Join(root.Name(), filepath.FromSlash(name)), info); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 
@@ -380,7 +440,7 @@ func dirOrAbsent(root *os.Root, name string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("%s is not a directory", name)
 	}
-	return nil
+	return devtoolsgate.CheckProfileEntry(filepath.Join(root.Name(), filepath.FromSlash(name)), info)
 }
 
 // absent refuses name in root when anything is there.

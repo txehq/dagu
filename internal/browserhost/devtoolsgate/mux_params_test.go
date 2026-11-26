@@ -5,8 +5,12 @@ package devtoolsgate
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -54,6 +58,82 @@ func TestMuxForwardedTargetMethodsHaveAuditedParamPolicies(t *testing.T) {
 		assert.NotContains(t, forwardedTargetMethods, method)
 	}
 	assert.ElementsMatch(t, []string{"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"}, clientAutoAttachParams.passed)
+	for method, policy := range handledTargetMethods {
+		assert.ElementsMatch(t, auditedHandledTargetParams[method], policy.passed, "%s accepts exactly its audited params", method)
+	}
+	assert.ElementsMatch(t, slices.Collect(maps.Keys(auditedHandledTargetParams)), slices.Collect(maps.Keys(handledTargetMethods)))
+}
+
+// auditedHandledTargetParams is the audit of the Target commands the gate
+// handles itself: the params the DevTools protocol defines for each.
+var auditedHandledTargetParams = map[string][]string{
+	"Target.setAutoAttach":      {"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"},
+	"Target.setDiscoverTargets": {"discover", "filter"},
+	"Target.attachToTarget":     {"targetId", "flatten"},
+	"Target.detachFromTarget":   {"sessionId", "targetId"},
+}
+
+// Every Target command the gate accepts is held to a param policy, whether
+// it passes the command on or handles it itself: each case of
+// handleClientCommand that names a Target command either has a policy in
+// handledTargetMethods or refuses the command whole. A Target command the
+// gate starts to handle without a policy fails here.
+func TestMuxEveryAcceptedTargetMethodHasAParamPolicy(t *testing.T) {
+	t.Parallel()
+	refusedWhole := []string{"Target.attachToBrowserTarget"}
+	file, err := parser.ParseFile(token.NewFileSet(), "mux.go", nil, 0)
+	require.NoError(t, err)
+	var cased []string
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "handleClientCommand" {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			clause, ok := n.(*ast.CaseClause)
+			if !ok {
+				return true
+			}
+			for _, expr := range clause.List {
+				if lit, ok := expr.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					name, err := strconv.Unquote(lit.Value)
+					require.NoError(t, err)
+					if strings.HasPrefix(name, "Target.") {
+						cased = append(cased, name)
+					}
+				}
+			}
+			return true
+		})
+	}
+	require.NotEmpty(t, cased, "handleClientCommand names the Target commands it handles")
+	for _, method := range cased {
+		_, handled := handledTargetMethods[method]
+		assert.True(t, handled || slices.Contains(refusedWhole, method), "%s is handled by the gate without a param policy", method)
+	}
+}
+
+// A param outside the policy of a Target command the gate handles itself is
+// refused too, on the browser's session as on any other, and the browser
+// never receives a command for it.
+func TestMuxRefusesUnknownParamsOnTheTargetCommandsItHandles(t *testing.T) {
+	t.Parallel()
+	tg := startTestGate(t)
+	c := tg.dial("")
+	for method, params := range map[string]map[string]any{
+		"Target.setAutoAttach":      {"autoAttach": false, "someFutureParam": true},
+		"Target.setDiscoverTargets": {"discover": true, "someFutureParam": true},
+		"Target.attachToTarget":     {"targetId": "T1", "flatten": true, "someFutureParam": true},
+		"Target.detachFromTarget":   {"sessionId": "S", "someFutureParam": true},
+	} {
+		_, err := c.call("", method, params)
+		assert.ErrorContains(t, err, "the gate does not pass on "+method+` with the param "someFutureParam"`)
+	}
+	for _, s := range tg.state(c).TargetParams {
+		assert.NotContains(t, s, "someFutureParam")
+	}
+	assert.Empty(t, sentOf(tg.state(c), "Target.setDiscoverTargets"), "the refused discovery never reached the browser")
+	c.mustCall("", "Target.setDiscoverTargets", map[string]any{"discover": true, "filter": []map[string]any{{}}})
 }
 
 // No client creates a browser context, whatever it asks of it, and the

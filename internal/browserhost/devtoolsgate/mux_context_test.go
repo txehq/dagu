@@ -167,6 +167,32 @@ func TestMuxStartResumesNoTargetOutsideTheBrowsersOwnContext(t *testing.T) {
 	assert.False(t, resumed, "nothing held is let go")
 }
 
+// A browser that does not name its own context starts only when its first
+// targets prove one: each names the same context, and the browser does not
+// list that context among its others. A first target that names no context
+// beside one off the record, or first targets all in a context the browser
+// lists as not its default, are not taken for the browser's own, and
+// nothing held is let go.
+func TestMuxStartTakesNoUnprovenContextForTheBrowsersOwn(t *testing.T) {
+	t.Parallel()
+	for name, setup := range map[string]func(f *fakeBrowser){
+		"a first target names no context": func(f *fakeBrowser) {
+			f.unnamedContext, f.firstPage, f.offTheRecordAtStart = true, "unnamed", true
+		},
+		"the one context is listed as not the default": func(f *fakeBrowser) {
+			f.unnamedContext, f.firstPage, f.offTheRecordAtStart = true, "offTheRecord", true
+		},
+	} {
+		fake, err := startMux(t, setup)
+		require.Error(t, err, name)
+		time.Sleep(200 * time.Millisecond)
+		_, resumed := fakeTargetState(fake, "T2")
+		assert.False(t, resumed, "%s: nothing held is let go", name)
+	}
+	_, err := startMux(t, func(f *fakeBrowser) { f.unnamedContext = true })
+	assert.NoError(t, err, "first targets that agree on a context the browser does not list start")
+}
+
 // A child in another context that the browser attaches under a session a
 // client attached itself reaches no client, and its session is let go of
 // on the session it was attached under, where the browser keeps it.
@@ -218,8 +244,19 @@ func TestMuxHidesATargetOutsideTheBrowsersOwnContext(t *testing.T) {
 		assert.NotEqual(t, foreign, info.TargetID)
 	}
 	assert.NotEmpty(t, listed.TargetInfos, "the browser's own targets are listed")
-	_, err := c.call("", "Target.getTargetInfo", map[string]any{"targetId": foreign})
-	assert.ErrorContains(t, err, "the gate serves only targets in the browser's own context")
+	// A client that knows the hidden target's id can neither act on it nor
+	// tell it from a target that never existed: the gate answers exactly as
+	// the browser does for an unknown id, and passes nothing on.
+	for _, method := range []string{"Target.getTargetInfo", "Target.activateTarget", "Target.closeTarget"} {
+		hidden := c.callReply("", method, map[string]any{"targetId": foreign})
+		missing := c.callReply("", method, map[string]any{"targetId": "NO-SUCH-TARGET"})
+		require.NotEmpty(t, hidden.Error, method)
+		assert.JSONEq(t, string(missing.Error), string(hidden.Error), method)
+		assert.JSONEq(t, `{"code":-32602,"message":"No target with given id found"}`, string(hidden.Error), method)
+	}
+	for _, sent := range append(sentOf(tg.state(c), "Target.activateTarget"), sentOf(tg.state(c), "Target.getTargetInfo")...) {
+		assert.NotContains(t, sent, foreign, "no client command on the hidden target reaches the browser")
+	}
 	// The gate's HTTP discovery lists the same targets a client hears of.
 	for _, path := range []string{"/json", "/json/list"} {
 		status, body := get(t, tg.baseURL()+path)

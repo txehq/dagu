@@ -40,8 +40,10 @@ preference: it keeps a copy of the preferences beside them
 and marks the profile.
 
 The profile must be the directory <data dir>/browser/profiles/<name> itself,
-this user's alone, and not in use by a step, a session or a browser. All of
-that is checked before anything is written; a refused claim writes nothing.
+not in use by a step, a session or a browser, and on Unix this user's alone,
+as must its Default directory and preferences. All of that is checked before
+anything is written; a refused claim writes nothing. On Windows the owner
+and access of the profile are not checked.
 
 Undo with: dagu browser profile unclaim <name>
 

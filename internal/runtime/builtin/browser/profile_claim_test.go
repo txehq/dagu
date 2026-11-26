@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/browserhost/devtoolsgate"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -229,6 +230,13 @@ func TestClaimProfileRefusalsWriteNothing(t *testing.T) {
 	refuse(t, "shared", "others may write", func(dir string) {
 		require.NoError(t, os.Chmod(dir, 0o777))
 	})
+	// Not only the profile directory: each entry the claim reads or writes.
+	refuse(t, "shared-default", "others may write", func(dir string) {
+		require.NoError(t, os.Chmod(filepath.Join(dir, "Default"), 0o777))
+	})
+	refuse(t, "shared-prefs", "others may write", func(dir string) {
+		require.NoError(t, os.Chmod(filepath.Join(dir, "Default", "Preferences"), 0o666))
+	})
 	elsewhere := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(elsewhere, "Preferences"), []byte(`{"theirs":1}`), 0o600))
 	refuse(t, "linked-prefs", "not a regular file", func(dir string) {
@@ -320,4 +328,65 @@ func TestUnclaimProfileThatFailsKeepsTheRecord(t *testing.T) {
 	_, err = UnclaimProfile(browserDir, "half")
 	require.NoError(t, err)
 	assert.False(t, devtoolsgate.ProfileClaimed(dir))
+}
+
+// A mark that was made but whose claim then failed (its file could not be
+// closed, say) leaves a profile a browser may change. The claim then keeps
+// the record and the copy of the preferences, so the undo still restores
+// what the profile had.
+func TestClaimProfileWhoseMarkMayBeMadeKeepsItsEvidence(t *testing.T) {
+	t.Parallel()
+	markThenFail := defaultClaimOps
+	markThenFail.mark = func(root *os.Root) error {
+		if err := devtoolsgate.ClaimExistingProfileRoot(root); err != nil {
+			return err
+		}
+		return errors.New("the mark's file could not be closed")
+	}
+	browserDir := t.TempDir()
+	original := `{"incognito":{"mode_availability":0}}`
+	dir := oldProfile(t, browserDir, "marked", original)
+	_, err := claimProfileWith(browserDir, "marked", markThenFail)
+	assert.ErrorContains(t, err, "the mark's file could not be closed")
+	assert.ErrorContains(t, err, "may be marked as claimed")
+	assert.ErrorContains(t, err, "which are kept as they are")
+	assert.True(t, devtoolsgate.ProfileClaimed(dir))
+	_, err = os.Lstat(filepath.Join(dir, claimRecordName))
+	require.NoError(t, err, "the record stays with the mark")
+
+	// A browser changes the profile, and the undo puts back what it had.
+	prefs := filepath.Join(dir, "Default", "Preferences")
+	require.NoError(t, os.WriteFile(prefs, []byte(`{"incognito":{"mode_availability":1}}`), 0o600))
+	_, err = UnclaimProfile(browserDir, "marked")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"mode_availability": float64(0)}, readJSON(t, prefs)["incognito"])
+	assert.False(t, devtoolsgate.ProfileClaimed(dir))
+}
+
+// A claim keeps its lease while it works, and writes nothing once another
+// holder took the lease from it: its checks run first, and every write
+// follows a renewal that fails when the lease is no longer its own.
+func TestClaimProfileThatLostItsLeaseWritesNothing(t *testing.T) {
+	t.Parallel()
+	browserDir := t.TempDir()
+	dir := oldProfile(t, browserDir, "taken", `{"incognito":{"mode_availability":0}}`)
+	lockDir := dir + profileLockSuffix
+	var other dirlock.DirLock
+	takeLease := defaultClaimOps
+	takeLease.now = func() time.Time {
+		// Another holder takes the lease while the claim is checking, as
+		// one may once a lease that was not renewed went stale.
+		require.NoError(t, os.RemoveAll(filepath.Join(lockDir, dirlock.LockDirectoryName)))
+		other = dirlock.New(lockDir, nil)
+		require.NoError(t, other.TryLock())
+		return time.Now()
+	}
+	before := snapshotDir(t, dir)
+	_, err := claimProfileWith(browserDir, "taken", takeLease)
+	assert.ErrorContains(t, err, "its lease was lost before the next write")
+	assert.Equal(t, before, snapshotDir(t, dir), "nothing in the profile was written")
+	assert.False(t, devtoolsgate.ProfileClaimed(dir))
+	require.NotNil(t, other)
+	assert.True(t, other.IsHeldByMe(), "the other holder keeps the lease")
+	require.NoError(t, other.Unlock())
 }
