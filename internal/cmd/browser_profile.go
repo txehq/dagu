@@ -1,0 +1,98 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package cmd
+
+import (
+	"path/filepath"
+
+	"github.com/dagucloud/dagu/v2/internal/browserhost"
+	"github.com/dagucloud/dagu/v2/internal/runtime/builtin/browser"
+	"github.com/spf13/cobra"
+)
+
+// browserProfileCommand is the command group for the named browser
+// profiles steps and sessions use.
+func browserProfileCommand() *cobra.Command {
+	cmd := NewCommand(&cobra.Command{
+		Use:   "profile",
+		Short: "Manage the named browser profiles steps and sessions use",
+	}, nil, func(ctx *Context, _ []string) error {
+		return ctx.Command.Help()
+	})
+	cmd.AddCommand(browserProfileClaimCommand(), browserProfileUnclaimCommand())
+	return cmd
+}
+
+func browserProfileClaimCommand() *cobra.Command {
+	return NewCommand(&cobra.Command{
+		Use:   "claim <name>",
+		Short: "Let Dagu's browsers use a named profile made before they marked their profiles",
+		Long: `Claim a named browser profile that was made before Dagu marked the profiles
+its browsers may change. A step or session refuses such a profile and leaves
+it as it is, with its logins and cookies, until it is claimed.
+
+Dagu's browsers set incognito.mode_availability = 1 in the profile's
+Default/Preferences each time they start, so the browser opens no window off
+the record; nothing else in the profile is changed. The claim itself changes no
+preference: it keeps a copy of the preferences beside them
+(Preferences.dagu-before-claim-<time>) and the value it found, prints both,
+and marks the profile.
+
+The profile must be the directory <data dir>/browser/profiles/<name> itself,
+not in use by a step, a session or a browser. On Unix it must also be
+private to this user: mode 0700 with no access control entry for another
+account, its Default directory and preferences this user's and writable by
+no one else, and the path to it free of symbolic links and of directories
+another account could change, on a local filesystem whose permissions Dagu
+reads (Linux: ext2/3/4, XFS, Btrfs, tmpfs, overlayfs; macOS: APFS, HFS+).
+A profile that is not is refused, never changed to fit. On a macOS volume
+that reports no owner identity for a file (APFS does not), an access control
+entry that names the profile's own owner is refused as well. All of that is
+checked before anything is written; a refused claim writes nothing. On
+Windows the owner and access of the profile are not checked.
+
+Undo with: dagu browser profile unclaim <name>
+
+Example:
+  dagu browser profile claim shop
+`,
+		Args: cobra.ExactArgs(1),
+	}, nil, runBrowserProfileClaim)
+}
+
+func browserProfileUnclaimCommand() *cobra.Command {
+	return NewCommand(&cobra.Command{
+		Use:   "unclaim <name>",
+		Short: "Undo a profile claim",
+		Long: `Undo "dagu browser profile claim": Dagu's browsers no longer use the profile,
+and incognito.mode_availability is put back as it was before the claim,
+every other preference staying as the browser left it. The copy of the
+preferences the claim kept stays, and is printed.
+
+Example:
+  dagu browser profile unclaim shop
+`,
+		Args: cobra.ExactArgs(1),
+	}, nil, runBrowserProfileUnclaim)
+}
+
+func browserDataDir(ctx *Context) string {
+	return filepath.Join(ctx.Config.Paths.DataDir, browserhost.DataDirName)
+}
+
+func runBrowserProfileClaim(ctx *Context, args []string) error {
+	report, err := browser.ClaimProfile(browserDataDir(ctx), args[0])
+	if err != nil {
+		return err
+	}
+	return writeIndentedJSON(ctx.Command.OutOrStdout(), report)
+}
+
+func runBrowserProfileUnclaim(ctx *Context, args []string) error {
+	report, err := browser.UnclaimProfile(browserDataDir(ctx), args[0])
+	if err != nil {
+		return err
+	}
+	return writeIndentedJSON(ctx.Command.OutOrStdout(), report)
+}

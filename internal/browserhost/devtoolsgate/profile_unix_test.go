@@ -1,0 +1,131 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//go:build !windows
+
+package devtoolsgate
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// A symbolic link is never followed: not for the profile directory, the
+// profile within it, its Preferences or the marker; what a link points to
+// is left as it was.
+func TestDisableOffTheRecordRefusesSymbolicLinks(t *testing.T) {
+	t.Parallel()
+	target := ownedProfile(t)
+	link := filepath.Join(privateTempDir(t), "profile")
+	require.NoError(t, os.Symlink(target, link))
+	assert.ErrorContains(t, claimProfile(link), "symbolic link")
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + link}), "symbolic link")
+
+	elsewhere := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(elsewhere, "Preferences"), []byte(`{"kept":true}`), 0o600))
+	dir := ownedProfile(t)
+	require.NoError(t, os.Symlink(elsewhere, filepath.Join(dir, "Default")))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + dir}), "not a directory")
+
+	dir = ownedProfile(t)
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "Default"), 0o700))
+	require.NoError(t, os.Symlink(filepath.Join(elsewhere, "Preferences"), filepath.Join(dir, "Default", "Preferences")))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + dir}), "not a regular file")
+	raw, err := os.ReadFile(filepath.Join(elsewhere, "Preferences"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"kept":true}`, string(raw), "the link's target is left as it was")
+
+	unmarked := testProfileDir(t)
+	require.NoError(t, os.Symlink(filepath.Join(target, profileMarker), filepath.Join(unmarked, profileMarker)))
+	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + unmarked}), ErrProfileNotOwned)
+}
+
+// A profile another user may write, or one a running browser holds, is
+// refused; a lock a browser left when it ended is not.
+func TestDisableOffTheRecordRefusesASharedOrRunningProfile(t *testing.T) {
+	t.Parallel()
+	shared := ownedProfile(t)
+	require.NoError(t, os.Chmod(shared, 0o777))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + shared}), "others may write")
+	assert.ErrorContains(t, claimProfile(shared), "others may write")
+
+	// Each entry the gate reads or writes is held to the same terms.
+	sharedDefault := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(sharedDefault, "Default"), 0o700))
+	require.NoError(t, os.Chmod(filepath.Join(sharedDefault, "Default"), 0o777))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + sharedDefault}), "others may write the profile's entry")
+	sharedPrefs := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(sharedPrefs, "Default"), 0o700))
+	prefsPath := filepath.Join(sharedPrefs, "Default", "Preferences")
+	require.NoError(t, os.WriteFile(prefsPath, []byte(`{"kept":true}`), 0o600))
+	require.NoError(t, os.Chmod(prefsPath, 0o666))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + sharedPrefs}), "others may write the profile's entry")
+	raw, err := os.ReadFile(prefsPath)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"kept":true}`, string(raw), "a refused profile's preferences are left as they were")
+
+	// A file with another link is reached by a name outside the profile:
+	// as preferences it is refused, and as the marker it marks nothing.
+	linkedPrefs := ownedProfile(t)
+	require.NoError(t, os.Mkdir(filepath.Join(linkedPrefs, "Default"), 0o700))
+	outside := filepath.Join(t.TempDir(), "Preferences")
+	require.NoError(t, os.WriteFile(outside, []byte(`{"outside":true}`), 0o600))
+	require.NoError(t, os.Link(outside, filepath.Join(linkedPrefs, "Default", "Preferences")))
+	assert.ErrorContains(t, disableOffTheRecord([]string{"--user-data-dir=" + linkedPrefs}), "has another link")
+	raw, err = os.ReadFile(outside)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"outside":true}`, string(raw), "the other name's file is left as it was")
+
+	linkedMark := testProfileDir(t)
+	markFile := filepath.Join(t.TempDir(), "made-for-something-else")
+	require.NoError(t, os.WriteFile(markFile, nil, 0o600))
+	require.NoError(t, os.Link(markFile, filepath.Join(linkedMark, profileMarker)))
+	assert.False(t, ProfileClaimed(linkedMark), "a linked marker marks nothing")
+	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + linkedMark}), ErrProfileNotOwned)
+	assert.ErrorContains(t, claimProfile(linkedMark), "has another link")
+	root, err := os.OpenRoot(linkedMark)
+	require.NoError(t, err)
+	defer func() { _ = root.Close() }()
+	_, err = ProfileClaimedRoot(root)
+	assert.ErrorContains(t, err, "has another link")
+
+	host, err := os.Hostname()
+	require.NoError(t, err)
+	running := ownedProfile(t)
+	require.NoError(t, os.Symlink(fmt.Sprintf("%s-%d", host, os.Getpid()), filepath.Join(running, "SingletonLock")))
+	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + running}), ErrProfileInUse)
+	_, err = os.Lstat(filepath.Join(running, "Default", "Preferences"))
+	assert.ErrorIs(t, err, os.ErrNotExist, "nothing is written under a running browser")
+
+	elsewhere := ownedProfile(t)
+	require.NoError(t, os.Symlink("another-host-1", filepath.Join(elsewhere, "SingletonLock")))
+	assert.ErrorIs(t, disableOffTheRecord([]string{"--user-data-dir=" + elsewhere}), ErrProfileInUse)
+
+	ended := ownedProfile(t)
+	// No process has id 0x7ffffffe.
+	require.NoError(t, os.Symlink(fmt.Sprintf("%s-%d", host, 0x7ffffffe), filepath.Join(ended, "SingletonLock")))
+	require.NoError(t, disableOffTheRecord([]string{"--user-data-dir=" + ended}))
+}
+
+// A browser still ending when the gate starts another on its profile, as
+// the browser step does after it learns its user agent, is waited for.
+func TestDisableOffTheRecordWaitsForAnEndingBrowser(t *testing.T) {
+	t.Parallel()
+	host, err := os.Hostname()
+	require.NoError(t, err)
+	ending := exec.Command("sleep", "1")
+	require.NoError(t, ending.Start())
+	go func() { _ = ending.Wait() }()
+	dir := ownedProfile(t)
+	require.NoError(t, os.Symlink(fmt.Sprintf("%s-%d", host, ending.Process.Pid), filepath.Join(dir, "SingletonLock")))
+	started := time.Now()
+	require.NoError(t, disableOffTheRecord([]string{"--user-data-dir=" + dir}))
+	assert.Less(t, time.Since(started), profileReleaseWait, "the gate went on once the browser let go")
+}

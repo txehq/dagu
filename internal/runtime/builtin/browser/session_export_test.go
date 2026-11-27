@@ -266,7 +266,7 @@ func TestExportedStepAsYAML(t *testing.T) {
 func TestExportedStepReplaysUploads(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	ts := newTestSessions(t, pageModel(nil))
 	ts.engine.snapshot = uploadPage("Upload receipt")
 	opened := ts.open(SessionOptions{URL: "https://books.example.com/receipts", LLM: testModel})

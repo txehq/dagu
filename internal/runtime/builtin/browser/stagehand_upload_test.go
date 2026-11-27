@@ -77,7 +77,7 @@ func serveReceipts(t *testing.T) (receipts, framed string) {
 // receiptFiles writes files to upload and returns them.
 func receiptFiles(t *testing.T, names ...string) []uploadFile {
 	t.Helper()
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	files := make([]uploadFile, 0, len(names))
 	for _, name := range names {
 		path := filepath.Join(dir, name)

@@ -39,7 +39,11 @@ import (
 //     address it;
 //   - a Target command the gate neither handles nor lists in
 //     forwardedTargetMethods is refused, so no client changes which targets
-//     are held, or reaches them, past the gate;
+//     are held, or reaches them, past the gate, and a forwarded one passes
+//     only the params its policy names;
+//   - every target runs in the browser's own context: one the auto-attach
+//     reports in any other is closed while it is held, before it runs, and
+//     no client is attached to it (the context's id is read in start);
 //   - a service or shared worker runs only after the setup every waiting
 //     client sent on its session before resuming it took effect. See
 //     "Worker holds" below.
@@ -105,8 +109,9 @@ type message struct {
 
 // targetInfo is the part of DevTools' TargetInfo the gate reads.
 type targetInfo struct {
-	TargetID string `json:"targetId"`
-	Type     string `json:"type"`
+	TargetID         string `json:"targetId"`
+	Type             string `json:"type"`
+	BrowserContextID string `json:"browserContextId"`
 }
 
 // pendingCommand is a command the gate sent to the browser and the reply it
@@ -128,6 +133,8 @@ type target struct {
 	id   string
 	typ  string
 	info json.RawMessage
+	// context is the browser context the target runs in.
+	context string
 	// parent is the target this one was attached under, "" at the root, and
 	// parentSession the gate session it was attached under.
 	parent        string
@@ -258,6 +265,19 @@ type mux struct {
 	// it holds none. Events on it go to onGateEvent and to no client; a
 	// client addressing it is refused like any session it does not own.
 	browserSession string
+	// ownContext is the id of the browser's own context, read in start;
+	// a target in another is closed (foreignLocked). foreign holds the
+	// targets the gate closed for that, by the gate session the browser
+	// attached them on, until the browser lets go of the session.
+	ownContext string
+	foreign    map[string]string
+	// hidden are the targets outside the browser's own context that
+	// discovery or the gate reported: no client hears of them.
+	hidden map[string]bool
+	// contextPending is set while start takes the browser's own context
+	// from its first targets: until it knows the context, the gate resumes
+	// no target, and an ambiguous start fails with nothing released.
+	contextPending bool
 	// beforeAttach, when set, runs in start before the gate's auto-attach is
 	// asked for: setup that must be in place before any target can run.
 	// afterAttach, when set, runs once the auto-attach is in place and the
@@ -292,6 +312,8 @@ func newMux(p *pipe) *mux {
 		stashed:          make(map[string][]message),
 		discoverers:      make(map[*client]targetFilter),
 		known:            make(map[string]json.RawMessage),
+		foreign:          make(map[string]string),
+		hidden:           make(map[string]bool),
 		done:             make(chan struct{}),
 	}
 	go m.writeLoop()
@@ -454,6 +476,12 @@ func (m *mux) start(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := m.readOwnContext(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.contextPending = m.ownContext == ""
+	m.mu.Unlock()
 	// The browser reports the targets that exist before it answers, so
 	// gateSessions holds them when the call returns.
 	_, err := m.call(ctx, "", "Target.setAutoAttach", map[string]any{
@@ -462,10 +490,130 @@ func (m *mux) start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("attach to the browser's targets: %w", err)
 	}
+	var others []string
+	m.mu.Lock()
+	pending := m.contextPending
+	m.mu.Unlock()
+	if pending {
+		// The contexts the browser names as not its default, read once its
+		// first targets exist: none of them can be its own.
+		if others, err = m.readOtherContexts(ctx); err != nil {
+			return err
+		}
+	}
+	if err := m.settleOwnContext(others); err != nil {
+		return err
+	}
 	if m.afterAttach != nil {
 		return m.afterAttach(ctx)
 	}
 	return nil
+}
+
+// settleOwnContext completes the browser's own context, for a browser that
+// did not name it, from the targets that exist before any client can reach
+// the browser: every one must name the same context, and the browser must
+// not list that context among others, the contexts it names as not its
+// default. Only then are the targets held meanwhile resumed. A browser
+// whose first targets name no context, several, or one that names none, or
+// whose one context it lists among others, does not start, and nothing held
+// is let go: the gate takes no context for the browser's own that it cannot
+// place.
+func (m *mux) settleOwnContext(others []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.contextPending {
+		return nil
+	}
+	own, unnamed := "", false
+	for _, t := range m.allTargetsLocked() {
+		if t.context == "" {
+			unnamed = true
+			continue
+		}
+		if own != "" && t.context != own {
+			return errors.New("the browser's first targets are in more than one context")
+		}
+		own = t.context
+	}
+	if own == "" {
+		return errors.New("the browser named no context of its own")
+	}
+	if unnamed {
+		return errors.New("one of the browser's first targets names no context")
+	}
+	if slices.Contains(others, own) {
+		return errors.New("the browser's first targets are in a context it names as not its default")
+	}
+	m.ownContext = own
+	m.contextPending = false
+	for _, t := range m.allTargetsLocked() {
+		if m.foreignLocked(t.context) {
+			// Held since it was attached, and never offered to a client:
+			// none could connect yet.
+			session := t.gateSession
+			m.forgetTargetLocked(t)
+			m.closeForeignLocked(session, t.id)
+		}
+	}
+	for _, t := range m.allTargetsLocked() {
+		m.maybeResumeLocked(t)
+	}
+	return nil
+}
+
+// closeForeignLocked closes targetID, which the browser attached the gate to
+// on session and which runs outside the browser's own context. The gate's
+// auto-attach holds it until then, so it never runs.
+func (m *mux) closeForeignLocked(session, targetID string) {
+	m.foreign[session] = targetID
+	m.hidden[targetID] = true
+	m.gateCommand("", "Target.closeTarget", map[string]any{"targetId": targetID}, nil)
+}
+
+// readOwnContext reads the id of the browser's own context, the one every
+// target the gate serves runs in. A browser too old to name it leaves it
+// unset, and start takes it from the targets that exist before any client
+// can reach the browser.
+func (m *mux) readOwnContext(ctx context.Context) error {
+	result, err := m.call(ctx, "", "Target.getBrowserContexts", map[string]any{})
+	if err != nil {
+		return fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	var contexts struct {
+		Default string `json:"defaultBrowserContextId"`
+	}
+	if err := json.Unmarshal(result, &contexts); err != nil {
+		return fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	m.mu.Lock()
+	m.ownContext = contexts.Default
+	m.mu.Unlock()
+	return nil
+}
+
+// readOtherContexts reads the ids of the contexts the browser names as not
+// its default (Target.getBrowserContexts' browserContextIds).
+func (m *mux) readOtherContexts(ctx context.Context) ([]string, error) {
+	result, err := m.call(ctx, "", "Target.getBrowserContexts", map[string]any{})
+	if err != nil {
+		return nil, fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	var contexts struct {
+		Others []string `json:"browserContextIds"`
+	}
+	if err := json.Unmarshal(result, &contexts); err != nil {
+		return nil, fmt.Errorf("read the browser's contexts: %w", err)
+	}
+	return contexts.Others, nil
+}
+
+// foreignLocked reports whether a target in the context contextID runs
+// outside the browser's own context, once the gate knows it. A target that
+// names no context is outside too: Chrome names one for every target a
+// context holds, and the gate admits none it cannot place.
+func (m *mux) foreignLocked(contextID string) bool {
+	return m.ownContext != "" && contextID != m.ownContext
 }
 
 // handleBrowserMessage dispatches one message from the pipe.
@@ -588,6 +736,13 @@ func (m *mux) onAttachedLocked(msg message) {
 	// A client that asked for auto-attach on a session it attached itself
 	// gets that session's children as its own, as the browser gives them.
 	if owner, ok := m.explicitSessions[msg.SessionID]; ok && msg.SessionID != "" {
+		if m.foreignLocked(info.BrowserContextID) {
+			// Not the client's to see: the gate's root auto-attach closes it.
+			// The session is let go of on the one it was attached under,
+			// where the browser keeps it.
+			m.gateCommand(msg.SessionID, "Target.detachFromTarget", map[string]any{"sessionId": params.SessionID}, nil)
+			return
+		}
 		m.explicitSessions[params.SessionID] = owner
 		if rootWorker(info.Type) {
 			// The filter the gate gave the client's auto-attach leaves
@@ -606,6 +761,14 @@ func (m *mux) onAttachedLocked(msg message) {
 // the gate session parentSession ("" at the root), and attaches a private
 // session for every subscribed client.
 func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo, rawInfo json.RawMessage, waiting bool) {
+	if m.foreignLocked(info.BrowserContextID) {
+		// A target outside the browser's own context, made past the
+		// commands the gate refuses (a privileged page or worker can open
+		// one). The auto-attach holds it; it is closed before it runs, and
+		// no client is attached to it.
+		m.closeForeignLocked(session, info.TargetID)
+		return
+	}
 	parent := ""
 	if parentSession != "" {
 		pt, ok := m.gateSessions[parentSession]
@@ -618,6 +781,7 @@ func (m *mux) gateAttachedLocked(parentSession, session string, info targetInfo,
 		id:               info.TargetID,
 		typ:              info.Type,
 		info:             rawInfo,
+		context:          info.BrowserContextID,
 		parent:           parent,
 		parentSession:    parentSession,
 		gateSession:      session,
@@ -760,6 +924,9 @@ func (m *mux) dropStashedLocked(targetID, session string) message {
 // wait for it has resumed it and no private attach is in flight. A worker's
 // holds are released together (releaseWorkerLocked).
 func (m *mux) maybeResumeLocked(t *target) {
+	if m.contextPending {
+		return
+	}
 	if rootWorker(t.typ) {
 		m.releaseWorkerLocked(t.id)
 		return
@@ -807,6 +974,9 @@ func (m *mux) workerHeldLocked(targetID string) bool {
 // worker at the root, nothing is released: the page-level resume would let
 // the worker run.
 func (m *mux) releaseWorkerLocked(targetID string) {
+	if m.contextPending {
+		return
+	}
 	records := m.byID[targetID]
 	var root *target
 	settled := true
@@ -862,6 +1032,14 @@ func (m *mux) onDetachedLocked(msg message) {
 		// it: the gate closes, and the browser with it.
 		m.browserSession = ""
 		go m.close()
+		return
+	}
+	if targetID, ok := m.foreign[params.SessionID]; ok {
+		delete(m.foreign, params.SessionID)
+		if !m.discoverOn {
+			// No discovery event will name the target again.
+			delete(m.hidden, targetID)
+		}
 		return
 	}
 	if t, ok := m.gateSessions[params.SessionID]; ok {
@@ -993,8 +1171,23 @@ func (m *mux) onDiscoveryEventLocked(msg message, data []byte) {
 	switch msg.Method {
 	case "Target.targetCreated", "Target.targetInfoChanged":
 		if json.Unmarshal(params.TargetInfo, &info) == nil && info.TargetID != "" {
+			if m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
+				// Outside the browser's own context: no client hears of it.
+				m.hidden[info.TargetID] = true
+				delete(m.known, info.TargetID)
+				return
+			}
 			m.known[info.TargetID] = params.TargetInfo
 		}
+	case "Target.targetDestroyed", "Target.targetCrashed":
+		if m.hidden[params.TargetID] {
+			if msg.Method == "Target.targetDestroyed" {
+				delete(m.hidden, params.TargetID)
+			}
+			return
+		}
+	}
+	switch msg.Method {
 	case "Target.targetDestroyed":
 		if raw, ok := m.known[params.TargetID]; ok {
 			_ = json.Unmarshal(raw, &info)
@@ -1035,6 +1228,16 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 		c.deliverError(msg.ID, msg.SessionID, "Session with given id not found.")
 		return
 	}
+	if policy, ok := handledTargetMethods[msg.Method]; ok {
+		checked, err := policy.check(msg.Method, msg.Params)
+		if err != nil {
+			c.deliverError(msg.ID, sessionID, err.Error())
+			return
+		}
+		if checked != nil {
+			msg.Params = checked
+		}
+	}
 	switch msg.Method {
 	case "Target.setAutoAttach":
 		m.setAutoAttachLocked(c, msg, sessionID)
@@ -1059,40 +1262,292 @@ func (m *mux) handleClientCommand(c *client, msg message) {
 			c.deliverError(msg.ID, sessionID, err.Error())
 		}
 	default:
-		if (strings.HasPrefix(msg.Method, "Target.") && !forwardedTargetMethods[msg.Method]) || refusedMethods[msg.Method] {
+		if refusedMethods[msg.Method] {
 			c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
 			return
+		}
+		if strings.HasPrefix(msg.Method, "Target.") {
+			policy, ok := forwardedTargetMethods[msg.Method]
+			if !ok {
+				c.deliverError(msg.ID, sessionID, "the gate does not pass on "+msg.Method)
+				return
+			}
+			params, err := policy.check(msg.Method, msg.Params)
+			if err == nil {
+				err = m.checkContextLocked(msg.Method, params)
+			}
+			if err == nil {
+				err = m.checkTargetLocked(params)
+			}
+			if err != nil {
+				c.deliverError(msg.ID, sessionID, err.Error())
+				return
+			}
+			msg.Params = params
+			if filter, ok := targetReplyFilters[msg.Method]; ok {
+				m.forwardFilteredLocked(c, msg, sessionID, filter)
+				return
+			}
 		}
 		m.forwardLocked(c, msg, sessionID)
 	}
 }
 
-// forwardedTargetMethods are the Target commands the gate passes on as they
-// are; it handles the others it knows itself. Any other Target command is
-// refused: the domain decides which targets are held, who is attached to
-// them and over which connection, and a command the gate does not mediate
-// could change that under it (TXE-6223's security review: autoAttachRelated
-// turns the gate's own auto-attach off, exposeDevToolsProtocol opens a
-// connection the gate never sees, sendMessageToTarget reaches any session).
-// The clients the gate serves, Stagehand's driver, the write gate and the
-// hub's, use only these and the ones it handles.
+// targetReplyFilters rewrite the replies of the forwarded Target commands
+// that describe targets, so no client hears of a target outside the
+// browser's own context.
+var targetReplyFilters = map[string]func(m *mux, result json.RawMessage) (any, error){
+	"Target.getTargets": func(m *mux, result json.RawMessage) (any, error) {
+		return m.visibleTargetsLocked(result)
+	},
+	"Target.getTargetInfo": func(m *mux, result json.RawMessage) (any, error) {
+		var reply struct {
+			TargetInfo targetInfo `json:"targetInfo"`
+		}
+		if err := json.Unmarshal(result, &reply); err != nil {
+			return nil, err
+		}
+		if m.foreignLocked(reply.TargetInfo.BrowserContextID) || m.hidden[reply.TargetInfo.TargetID] {
+			return nil, errNoTarget
+		}
+		return result, nil
+	},
+}
+
+// visibleTargetsLocked rewrites a Target.getTargets result to the targets a
+// client may hear of: those in the browser's own context that the gate has
+// not hidden. Every list of targets the gate gives out, over DevTools or
+// HTTP, goes through it.
+func (m *mux) visibleTargetsLocked(result json.RawMessage) (map[string]any, error) {
+	var reply struct {
+		TargetInfos []json.RawMessage `json:"targetInfos"`
+	}
+	if err := json.Unmarshal(result, &reply); err != nil {
+		return nil, err
+	}
+	kept := make([]json.RawMessage, 0, len(reply.TargetInfos))
+	for _, raw := range reply.TargetInfos {
+		var info targetInfo
+		if json.Unmarshal(raw, &info) != nil || m.foreignLocked(info.BrowserContextID) || m.hidden[info.TargetID] {
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	return map[string]any{"targetInfos": kept}, nil
+}
+
+// listTargets is the browser's target list as a client hears it, for the
+// gate's own HTTP discovery (/json, /json/list).
+func (m *mux) listTargets(ctx context.Context) (json.RawMessage, error) {
+	result, err := m.call(ctx, "", "Target.getTargets", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	visible, err := m.visibleTargetsLocked(result)
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(visible)
+}
+
+// forwardFilteredLocked passes a command through and answers the client
+// with filter's rewrite of the browser's result.
+func (m *mux) forwardFilteredLocked(c *client, msg message, sessionID string, filter func(m *mux, result json.RawMessage) (any, error)) {
+	_, err := m.sendLocked(sessionID, msg.Method, msg.Params, &pendingCommand{onReply: func(result json.RawMessage, cdpErr *cdpError) {
+		if !m.clientAlive(c) {
+			return
+		}
+		if cdpErr != nil {
+			c.deliverBrowserError(msg.ID, sessionID, *cdpErr)
+			return
+		}
+		rewritten, err := filter(m, result)
+		if errors.Is(err, errNoTarget) {
+			c.deliverError(msg.ID, sessionID, errNoTarget.Error())
+			return
+		}
+		if err != nil {
+			c.deliverError(msg.ID, sessionID, msg.Method+": "+err.Error())
+			return
+		}
+		c.deliverResult(msg.ID, sessionID, rewritten)
+	}})
+	if err != nil {
+		c.deliverError(msg.ID, sessionID, err.Error())
+	}
+}
+
 // refusedMethods are the commands outside the Target domain the gate
-// refuses for the same reason: ServiceWorker.inspectWorker opens a DevTools
+// refuses for the same reason as the Target commands it does not mediate
+// (forwardedTargetMethods): ServiceWorker.inspectWorker opens a DevTools
 // window on a worker, an inspector the gate never sees (TXE-6223's Codex
 // review).
 var refusedMethods = map[string]bool{
 	"ServiceWorker.inspectWorker": true,
 }
 
-var forwardedTargetMethods = map[string]bool{
-	"Target.activateTarget":        true,
-	"Target.closeTarget":           true,
-	"Target.createBrowserContext":  true,
-	"Target.createTarget":          true,
-	"Target.disposeBrowserContext": true,
-	"Target.getBrowserContexts":    true,
-	"Target.getTargetInfo":         true,
-	"Target.getTargets":            true,
+// paramPolicy is the part of a Target command's params the gate passes on:
+// the names of the params it accepts. A param it does not name is refused,
+// whatever its value, so a param the browser adds later is refused until it
+// is read and listed here.
+type paramPolicy struct {
+	passed []string
+}
+
+// errParamsNotObject is the reply to a Target command whose params are not
+// a JSON object.
+var errParamsNotObject = errors.New("invalid parameters: params must be a JSON object")
+
+// check returns the params of a client's method as the gate passes them on,
+// or the error the client is answered with. What is passed on is the gate's
+// own encoding of the params it read, not the client's bytes, so the
+// browser reads the same params the gate checked: a repeated key, for one,
+// reaches it once. Params left out, or null, stay left out.
+func (p paramPolicy) check(method string, raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, fmt.Errorf("%s: %w", method, errParamsNotObject)
+	}
+	names := make([]string, 0, len(params))
+	for name := range params {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		if !slices.Contains(p.passed, name) {
+			return nil, fmt.Errorf("the gate does not pass on %s with the param %q", method, name)
+		}
+	}
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", method, errParamsNotObject)
+	}
+	return encoded, nil
+}
+
+// forwardedTargetMethods are the Target commands the gate passes on, each
+// with the params it passes; it handles the others it knows itself. Any
+// other Target command is refused: the domain decides which targets are
+// held, who is attached to them and over which connection, and a command
+// the gate does not mediate could change that under it (TXE-6223's security
+// review: autoAttachRelated turns the gate's own auto-attach off,
+// exposeDevToolsProtocol opens a connection the gate never sees,
+// sendMessageToTarget reaches any session). The clients the gate serves,
+// Stagehand's driver, the write gate and the hub's, use only these and the
+// ones it handles.
+//
+// An allowlist entry is a method and its param policy, never a method
+// alone: a forwarded method can take a param that changes the browser's
+// networking, proxying or isolation, and such a param is left out of the
+// policy and refused. Every param of each method below was read against the
+// DevTools protocol (TXE-7856); a method added here comes with its policy,
+// and TestMuxForwardedTargetMethodsHaveAuditedParamPolicies fails until the
+// audit table there lists it.
+//
+// Target.createBrowserContext is not passed on at all, whatever its params:
+// a new browser context is set apart from the browser's own, and what the
+// gate's clients set up for the browser does not reach into it. With no
+// context to create, Target.disposeBrowserContext has nothing to act on and
+// is not passed on either. Every target runs in the browser's own context.
+var forwardedTargetMethods = map[string]paramPolicy{
+	"Target.activateTarget": {passed: []string{"targetId"}},
+	"Target.closeTarget":    {passed: []string{"targetId"}},
+	"Target.createTarget": {passed: []string{
+		"url", "left", "top", "width", "height", "windowState", "browserContextId",
+		"enableBeginFrameControl", "newWindow", "background", "forTab", "hidden", "focus",
+	}},
+	"Target.getBrowserContexts": {passed: nil},
+	"Target.getTargetInfo":      {passed: []string{"targetId"}},
+	"Target.getTargets":         {passed: []string{"filter"}},
+}
+
+// errForeignContext is the reply to a command that would reach a target, or
+// make one, outside the browser's own context.
+var errForeignContext = errors.New("the gate serves only targets in the browser's own context")
+
+// checkContextLocked refuses a command whose browserContextId names a
+// context other than the browser's own (Target.createTarget's).
+func (m *mux) checkContextLocked(method string, params json.RawMessage) error {
+	var fields struct {
+		BrowserContextID *string `json:"browserContextId"`
+	}
+	if len(params) == 0 || json.Unmarshal(params, &fields) != nil || fields.BrowserContextID == nil {
+		return nil
+	}
+	if *fields.BrowserContextID != m.ownContext {
+		return fmt.Errorf("%s: %w", method, errForeignContext)
+	}
+	return nil
+}
+
+// errNoTarget is the browser's own answer to a command naming a target it
+// does not know. Every command that names a target, passed on or handled by
+// the gate, is answered in the same words and code for a target the gate
+// hid, so a client cannot tell a hidden target from one that never existed,
+// nor act on it.
+var errNoTarget = errors.New("No target with given id found") //nolint:staticcheck // the browser's own wording
+
+// noTargetCode is the error code the browser answers errNoTarget with.
+const noTargetCode = -32602
+
+// checkTargetLocked refuses a forwarded command whose targetId names a
+// target the gate hid: one outside the browser's own context
+// (Target.activateTarget's, closeTarget's and getTargetInfo's). Every
+// forwarded Target command is checked, so one that names a target by its id
+// cannot reach a hidden one.
+func (m *mux) checkTargetLocked(params json.RawMessage) error {
+	var fields struct {
+		TargetID *string `json:"targetId"`
+	}
+	if len(params) == 0 || json.Unmarshal(params, &fields) != nil || fields.TargetID == nil {
+		return nil
+	}
+	if m.hidden[*fields.TargetID] {
+		return errNoTarget
+	}
+	return nil
+}
+
+// foreignTargetLocked reports whether the gate knows targetID to run
+// outside the browser's own context, or event, the browser's
+// Target.attachedToTarget for it, places it outside.
+func (m *mux) foreignTargetLocked(targetID string, event message) bool {
+	if m.hidden[targetID] {
+		return true
+	}
+	var params struct {
+		TargetInfo targetInfo `json:"targetInfo"`
+	}
+	if event.Method == "" || json.Unmarshal(event.Params, &params) != nil {
+		return false
+	}
+	return m.foreignLocked(params.TargetInfo.BrowserContextID)
+}
+
+// clientAutoAttachParams is the param policy of a client's
+// Target.setAutoAttach, wherever it sends it. On a session it attached
+// itself, the gate passes those params on (rewritten by withoutRootWorkers);
+// everywhere else it handles the command itself.
+var clientAutoAttachParams = paramPolicy{passed: []string{"autoAttach", "waitForDebuggerOnStart", "flatten", "filter"}}
+
+// handledTargetMethods are the Target commands the gate handles itself,
+// each with the params the DevTools protocol defines for it. The gate builds
+// what it sends the browser for these, but a param outside the policy is
+// refused all the same, as for a forwarded method: the rule that a client's
+// Target command carries only audited params holds for every Target command
+// the gate accepts. TestMuxEveryAcceptedTargetMethodHasAParamPolicy fails
+// when the gate handles a Target command that is not listed here.
+var handledTargetMethods = map[string]paramPolicy{
+	"Target.setAutoAttach":      clientAutoAttachParams,
+	"Target.setDiscoverTargets": {passed: []string{"discover", "filter"}},
+	"Target.attachToTarget":     {passed: []string{"targetId", "flatten"}},
+	"Target.detachFromTarget":   {passed: []string{"sessionId", "targetId"}},
 }
 
 // ownsSessionLocked reports whether sessionID is the browser itself, c's
@@ -1151,8 +1606,15 @@ func (m *mux) setAutoAttachLocked(c *client, msg message, sessionID string) {
 		// let the worker run before the clients the gate holds it for set it
 		// up ("Worker holds").
 		// Every forwarded call is rewritten, whatever autoAttach parsed as
-		// here: the browser reads the params with its own parser.
-		rewritten, ok := withoutRootWorkers(msg.Params)
+		// here: the browser reads the params with its own parser. They are
+		// checked against the policy first, and what is rewritten is the
+		// gate's encoding of what it checked.
+		checked, err := clientAutoAttachParams.check(msg.Method, msg.Params)
+		if err != nil {
+			c.deliverError(msg.ID, sessionID, err.Error())
+			return
+		}
+		rewritten, ok := withoutRootWorkers(checked)
 		if !ok {
 			c.deliverError(msg.ID, sessionID, "Target.setAutoAttach: invalid parameters")
 			return
@@ -1279,6 +1741,10 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 		c.deliverError(msg.ID, sessionID, errFlattenRequired.Error())
 		return
 	}
+	if m.foreignTargetLocked(params.TargetID, message{}) {
+		c.deliverError(msg.ID, sessionID, errNoTarget.Error())
+		return
+	}
 	m.attaching[params.TargetID] = append(m.attaching[params.TargetID], &attachRequest{client: c, explicit: true})
 	m.gateCommand(sessionID, "Target.attachToTarget", map[string]any{"targetId": params.TargetID, "flatten": true},
 		func(result json.RawMessage, cdpErr *cdpError) {
@@ -1295,6 +1761,11 @@ func (m *mux) attachToTargetLocked(c *client, msg message, sessionID string) {
 				return
 			}
 			event := m.dropStashedLocked(params.TargetID, session)
+			if m.foreignTargetLocked(params.TargetID, event) {
+				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+				c.deliverError(msg.ID, sessionID, errNoTarget.Error())
+				return
+			}
 			if !m.clientAlive(c) {
 				m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
 				return
@@ -1460,6 +1931,10 @@ func (m *mux) removeClient(c *client) {
 // endpoint whose commands name no session.
 func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error {
 	m.mu.Lock()
+	if m.foreignTargetLocked(targetID, message{}) {
+		m.mu.Unlock()
+		return errNoTarget
+	}
 	m.attaching[targetID] = append(m.attaching[targetID], &attachRequest{client: c, explicit: true})
 	m.mu.Unlock()
 	result, err := m.call(ctx, "", "Target.attachToTarget", map[string]any{"targetId": targetID, "flatten": true})
@@ -1467,12 +1942,16 @@ func (m *mux) attachRoot(ctx context.Context, c *client, targetID string) error 
 	defer m.mu.Unlock()
 	m.popAttachLocked(targetID)
 	session := sessionOf(result)
-	m.dropStashedLocked(targetID, session)
+	event := m.dropStashedLocked(targetID, session)
 	if err != nil {
 		return err
 	}
 	if session == "" {
 		return errors.New("Target.attachToTarget: no session")
+	}
+	if m.foreignTargetLocked(targetID, event) {
+		m.gateCommand("", "Target.detachFromTarget", map[string]any{"sessionId": session}, nil)
+		return errNoTarget
 	}
 	c.root = session
 	m.explicitSessions[session] = c

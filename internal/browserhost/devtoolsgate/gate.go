@@ -170,7 +170,9 @@ func (g *gate) serveList(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), listTimeout)
 	defer cancel()
-	result, err := g.mux.call(ctx, "", "Target.getTargets", map[string]any{})
+	// The same list a client gets over DevTools: no target outside the
+	// browser's own context.
+	result, err := g.mux.listTargets(ctx)
 	if err != nil {
 		http.Error(w, "the browser did not list its targets", http.StatusBadGateway)
 		return

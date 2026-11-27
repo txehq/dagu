@@ -383,6 +383,10 @@ jobs:
         shell: bash
         run: scripts/ci/go-test-suite.sh "${{ matrix.suite }}" "${{ matrix.shard }}" "${{ matrix.shards }}" > "${RUNNER_TEMP}/go-test-plan.tsv"
 
+      - name: Install Chrome's headless shell for the DevTools gate's tests
+        shell: bash
+        run: scripts/ci/install-headless-shell.sh "${RUNNER_TEMP}/go-test-plan.tsv"
+
       - name: Build
         run: |
           make bin
@@ -878,6 +882,10 @@ jobs:
       - name: Plan test shard
         shell: bash
         run: scripts/ci/go-test-suite.sh "${{ matrix.suite }}" "${{ matrix.shard }}" "${{ matrix.shards }}" > "${RUNNER_TEMP}/go-test-plan.tsv"
+
+      - name: Install Chrome's headless shell for the DevTools gate's tests
+        shell: bash
+        run: scripts/ci/install-headless-shell.sh "${RUNNER_TEMP}/go-test-plan.tsv"
 
       - name: Build (Windows)
         shell: bash

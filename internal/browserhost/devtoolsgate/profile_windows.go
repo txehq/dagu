@@ -1,0 +1,40 @@
+// Copyright (C) 2026 Yota Hamada
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//go:build windows
+
+package devtoolsgate
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+)
+
+// openNoFollow is 0 on Windows, where an os.Root open does not follow a
+// link out of the directory, and Lstat checks come first.
+const openNoFollow = 0
+
+// profileInUse reports whether a running browser holds the profile: Chrome
+// keeps its lockfile open, shared with nobody, while it runs.
+func profileInUse(userDataDir string) bool {
+	file, err := os.OpenFile(filepath.Join(userDataDir, "lockfile"), os.O_RDWR, 0) //nolint:gosec // the profile's own lock file, opened only to see whether it is held
+	return lockFileHeld(file, err)
+}
+
+// profileInUseRoot is profileInUse for the profile directory open as root.
+func profileInUseRoot(root *os.Root) bool {
+	file, err := root.OpenFile("lockfile", os.O_RDWR, 0)
+	return lockFileHeld(file, err)
+}
+
+func lockFileHeld(file *os.File, err error) bool {
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		return true
+	}
+	_ = file.Close()
+	return false
+}

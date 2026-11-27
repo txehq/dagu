@@ -315,3 +315,28 @@ func TestGuardTokenNotOnCommandLine(t *testing.T) {
 		assert.NotContains(t, flag, token)
 	}
 }
+
+// TestGuardTargetListsGoThroughTheContextFilter fails when gate code outside
+// the mux asks the browser for its targets directly. Every list or
+// description of targets the gate gives out, over DevTools or HTTP, comes
+// from the mux, which keeps out targets outside the browser's own context
+// (TXE-7856). A second path, such as the HTTP discovery once was, would
+// show what the filter hides.
+func TestGuardTargetListsGoThroughTheContextFilter(t *testing.T) {
+	t.Parallel()
+	root := moduleRoot(t)
+	var direct []string
+	for path, file := range goSources(t, root) {
+		if !strings.HasPrefix(path, "internal/browserhost/devtoolsgate/") || path == "internal/browserhost/devtoolsgate/mux.go" {
+			continue
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			lit, ok := n.(*ast.BasicLit)
+			if ok && lit.Kind == token.STRING && (lit.Value == `"Target.getTargets"` || lit.Value == `"Target.getTargetInfo"`) {
+				direct = append(direct, path+": "+lit.Value)
+			}
+			return true
+		})
+	}
+	assert.Empty(t, direct, "list targets through mux.listTargets, which applies the context filter")
+}

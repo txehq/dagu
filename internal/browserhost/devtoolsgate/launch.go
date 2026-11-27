@@ -32,6 +32,15 @@ type browserProcess struct {
 // hands it its two pipe ends the way this platform does. Nothing is sent
 // yet; the caller speaks to the browser through the returned pipe.
 func launchBrowser(cfg Config) (*browserProcess, error) {
+	if err := disableOffTheRecord(cfg.Args); err != nil {
+		return nil, err
+	}
+	return startBrowserProcess(cfg)
+}
+
+// startBrowserProcess starts the browser as launchBrowser does, on a
+// profile whose preferences launchBrowser has already set.
+func startBrowserProcess(cfg Config) (*browserProcess, error) {
 	// The browser reads commands from browserRead and writes replies to
 	// browserWrite; the gate holds the other ends.
 	browserRead, gateWrite, err := os.Pipe()

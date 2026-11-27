@@ -45,7 +45,7 @@ func writeClientCertificate(t *testing.T, commonName, passphrase string) string 
 	require.NoError(t, err)
 	data, err := pkcs12.Modern.Encode(key, cert, nil, passphrase)
 	require.NoError(t, err)
-	path := filepath.Join(t.TempDir(), commonName+".p12")
+	path := filepath.Join(privateTempDir(t), commonName+".p12")
 	require.NoError(t, os.WriteFile(path, data, 0o600))
 	return path
 }
@@ -60,7 +60,7 @@ func TestTrustedCAsReachBrowser(t *testing.T) {
 	}
 	der, err := x509.CreateCertificate(rand.Reader, ca, ca, key.Public(), key)
 	require.NoError(t, err)
-	path := filepath.Join(t.TempDir(), "ca.pem")
+	path := filepath.Join(privateTempDir(t), "ca.pem")
 	require.NoError(t, os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600))
 	for _, host := range []string{"portal.example.com", "10.0.0.1", "localhost", "127.0.0.1", "::1", "169.254.1.1", "*.localhost"} {
 		t.Run(host, func(t *testing.T) {
@@ -74,7 +74,7 @@ func TestTrustedCAsReachBrowser(t *testing.T) {
 		})
 	}
 	run := newTestRun(t, pageModel(nil))
-	run.hostTrustedCAs = []cmnconfig.BrowserTrustedCA{{Hosts: []string{"portal.example.com"}, CAFile: filepath.Join(t.TempDir(), "missing.pem")}}
+	run.hostTrustedCAs = []cmnconfig.BrowserTrustedCA{{Hosts: []string{"portal.example.com"}, CAFile: filepath.Join(privateTempDir(t), "missing.pem")}}
 	require.ErrorContains(t, run.execute(`{"do":[{"goto":"https://portal.example.com/"}]}`, nil).err, "browser.trusted_cas[0]")
 	assert.Empty(t, run.launcher.launches)
 }
@@ -293,7 +293,7 @@ func TestAskResumeKeepsCertificateProxy(t *testing.T) {
 
 	// The certificate file is gone by the time the answer arrives; resuming
 	// does not read it.
-	run.hostCertificates[0].PFXFile = filepath.Join(t.TempDir(), "missing.p12")
+	run.hostCertificates[0].PFXFile = filepath.Join(privateTempDir(t), "missing.p12")
 	session := waiting.exec.GetAgentSession()
 	session.Interactions[0].Status = ir.AgentInteractionAnswered
 	session.Interactions[0].Answers = [][]string{{"123456"}}

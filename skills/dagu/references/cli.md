@@ -233,6 +233,15 @@ dagu browser session close <id> [--force] [--keep]
 dagu browser session list
 ```
 
+### dagu browser profile
+
+Claim a named browser profile (`browser.profile`, `--profile`) made before Dagu marked the profiles its browsers may change. A step or session refuses such a profile and leaves it as it is, logins and cookies included, until it is claimed. Dagu's browsers set `incognito.mode_availability = 1` in the profile's `Default/Preferences` each time they start and change nothing else there. `claim` checks the profile is `<data dir>/browser/profiles/<name>` itself and in use by no step, session or browser, and on Unix that it is private to the user (mode 0700, no access control entry for another account, its `Default` directory and preferences the user's and writable by no one else, its path free of symbolic links and of directories another account could change, on a local filesystem whose permissions Dagu reads: ext2/3/4, XFS, Btrfs, tmpfs or overlayfs on Linux, APFS or HFS+ on macOS; a profile that is not is refused, never changed to fit; on a macOS volume that reports no owner identity for a file, as APFS does not, an entry naming the owner itself is refused too; on Windows the owner and access are not checked), checks all of that before writing anything, keeps a copy of the preferences beside them (`Preferences.dagu-before-claim-<time>`) and the value it found, and prints both as JSON; the claim itself changes no preference. `unclaim` undoes it: the value is put back and every preference the browser wrote since is kept.
+
+```sh
+dagu browser profile claim <name>
+dagu browser profile unclaim <name>
+```
+
 ### dagu computer check
 
 Check that computer steps can capture the screen and send input in the current session. Run it as the user and in the session of the worker that runs computer steps. On macOS it also asks macOS to show the Screen Recording and Accessibility prompts for missing permissions. Exits nonzero and lists the problems when the desktop cannot be automated. `--format json` prints `{os, width, height, ready, problems}`, each problem with a `code` (such as `screen_recording`, `accessibility`, `screen_locked`, or `session_disconnected` for a Remote Desktop or child session whose client has gone) and a `message`.

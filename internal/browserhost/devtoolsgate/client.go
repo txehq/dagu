@@ -137,9 +137,25 @@ func (c *client) deliverResult(clientID json.RawMessage, sessionID string, resul
 	c.deliverJSON(reply)
 }
 
-// deliverError answers a command the gate refused.
+// deliverBrowserError answers a command with the browser's own error, as a
+// forwarded reply carries it.
+func (c *client) deliverBrowserError(clientID json.RawMessage, sessionID string, cdpErr cdpError) {
+	reply := map[string]any{"id": clientID, "error": cdpErr}
+	if sessionID != "" && sessionID != c.root {
+		reply["sessionId"] = sessionID
+	}
+	c.deliverJSON(reply)
+}
+
+// deliverError answers a command the gate refused. A refusal that stands
+// for the browser's own "no such target" (errNoTarget) goes out exactly as
+// the browser's would, code included.
 func (c *client) deliverError(clientID json.RawMessage, sessionID, text string) {
-	reply := map[string]any{"id": clientID, "error": cdpError{Code: -32000, Message: text}}
+	cdpErr := cdpError{Code: -32000, Message: text}
+	if text == errNoTarget.Error() {
+		cdpErr.Code = noTargetCode
+	}
+	reply := map[string]any{"id": clientID, "error": cdpErr}
 	if sessionID != "" && sessionID != c.root {
 		reply["sessionId"] = sessionID
 	}

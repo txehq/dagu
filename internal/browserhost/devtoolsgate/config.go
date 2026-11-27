@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -102,6 +103,9 @@ func (c Config) validate() error {
 		if strings.HasPrefix(arg, "--remote-debugging-") {
 			return ErrDebuggingFlagInArgs
 		}
+	}
+	if userDataDir, _ := profileDirs(c.Args); userDataDir == "" || !filepath.IsAbs(userDataDir) {
+		return ErrProfileRequired
 	}
 	return nil
 }

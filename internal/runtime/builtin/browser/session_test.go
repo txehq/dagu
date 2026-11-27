@@ -49,7 +49,7 @@ func newTestSessions(t *testing.T, answer func(*llmpkg.ChatRequest) (string, err
 		engine:   engine,
 		launcher: &fakeLauncher{engine: engine},
 		provider: &scriptedProvider{answer: answer},
-		dataDir:  t.TempDir(),
+		dataDir:  privateTempDir(t),
 		clock:    time.Now(),
 	}
 	ts.sessions = &Sessions{
@@ -384,7 +384,7 @@ func TestSessionReportsRefusedPage(t *testing.T) {
 func TestSessionKeepsRefusalWhenBrowserStopsAnswering(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	ts := newTestSessions(t, pageModel(nil))
 	ts.engine.outcome = pageOutcome{Host: "shop.example.com", Status: 403, BotCheck: browserhost.BotCheckCloudflare}
 	opened := ts.open(SessionOptions{URL: "https://shop.example.com/receipts"})
@@ -650,7 +650,7 @@ func TestSessionModelReadsItsKeyFromTheEnvironment(t *testing.T) {
 func TestSessionUploads(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	ts := newTestSessions(t, pageModel(nil))
 	ts.engine.snapshot = uploadPage("Upload receipt")
 	opened := ts.open(SessionOptions{URL: "https://books.example.com/receipts", LLM: testModel})
@@ -696,7 +696,7 @@ func TestSessionUploads(t *testing.T) {
 func TestSessionUploadsWithoutModel(t *testing.T) {
 	t.Parallel()
 
-	files := writeFiles(t, t.TempDir(), "invoice.pdf")
+	files := writeFiles(t, privateTempDir(t), "invoice.pdf")
 	ts := newTestSessions(t, pageModel(nil))
 	ts.engine.snapshot = uploadPage("Upload receipt")
 	opened := ts.open(SessionOptions{URL: "https://books.example.com/receipts"})
