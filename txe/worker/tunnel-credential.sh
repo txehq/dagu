@@ -42,19 +42,124 @@ ca="$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name==\"$cluster\")]
 [ -n "$server" ] || die "context $ctx has no cluster server"
 
 umask 077
-mkdir -p "$TXE_DAGU_HOME/tunnel"
-out="$TXE_DAGU_HOME/tunnel/kubeconfig"
+tdir="$TXE_DAGU_HOME/tunnel"
+mkdir -p "$tdir"
+# The token is written only into a directory this user owns, that no other
+# account can enter or replace: there, no other account can swap the candidate
+# for a link, read it even if its mode changes, or move the directory away
+# (TXE-7864). What this does not cover: a process of this same account, which
+# could read the token directly anyway.
+#
+# The order matters (independent review of PR 293). The tunnel directory may
+# not be a link. Its physical path is resolved first; then every directory
+# above it must be this user's or root's, and one that group or others can
+# write must have the sticky bit, so only its owner can rename what is in it
+# (/tmp); only then is the resolved directory itself checked: a directory
+# whose parents no other account can change cannot be swapped after that
+# check. From here on the physical path is used.
+[ ! -L "$tdir" ] || die "$tdir is a symbolic link; refusing to write a credential there"
+tdir="$(cd "$tdir" && pwd -P)" || die "cannot resolve $tdir"
+# Mode bits are not the whole story: an ACL can give another account the
+# right to add, rename or delete entries in a 0700 directory (independent
+# review of PR 293). macOS lists a path's ACL entries under ls -lde (its mode
+# column shows @ for extended attributes, which hides the + of an ACL); on
+# Linux ls -ld marks a path with one by a + after its mode. The tunnel
+# directory may carry none. Above it, macOS's deny entries (the home
+# directory's "group:everyone deny delete") are harmless, so only an allow
+# entry is refused there; on Linux any ACL above it is refused.
+acl_entries() { # the ACL entries of PATH, one per line; empty when it has none
+  # Fails closed: an ls that fails, or prints a mode column of another
+  # shape, reads as "unreadable", which every caller refuses.
+  local l
+  if [ "$(uname -s)" = Darwin ]; then
+    # shellcheck disable=SC2012 # ls -e is how macOS prints a path's ACL; the path is one argument
+    l="$(/bin/ls -lde -- "$1")" || { echo unreadable; return 0; }
+  else
+    # shellcheck disable=SC2012 # the + after the mode is how ls marks a POSIX ACL
+    l="$(/bin/ls -ld -- "$1")" || { echo unreadable; return 0; }
+  fi
+  [[ "$l" =~ ^[dl-][rwxsStT-]{9}[@+.\ ] ]] || { echo unreadable; return 0; }
+  if [ "$(uname -s)" = Darwin ]; then
+    printf '%s\n' "$l" | sed -n '2,$p'
+  elif [ "${l:10:1}" = + ]; then
+    echo acl
+  fi
+}
+has_acl() {
+  [ -n "$(acl_entries "$1")" ]
+}
+acl_allows() {
+  local e
+  e="$(acl_entries "$1")"
+  [ -n "$e" ] || return 1
+  [ "$(uname -s)" = Darwin ] || return 0
+  case "$e" in unreadable | *" allow "*) return 0 ;; esac
+  return 1
+}
+a="$tdir"
+while [ "$a" != / ]; do
+  a="${a%/*}"
+  [ -n "$a" ] || a=/
+  if ! { [ -O "$a" ] || [ -n "$(find "$a" -maxdepth 0 -user 0 -print)" ]; }; then
+    die "$a, above $tdir, belongs to another account; refusing to write a credential there"
+  fi
+  if [ -n "$(find "$a" -maxdepth 0 \( -perm -020 -o -perm -002 \) -print)" ] && [ ! -k "$a" ]; then
+    die "$a, above $tdir, is writable by group or others without the sticky bit, so the tunnel directory could be replaced; refusing to write a credential there"
+  fi
+  if acl_allows "$a"; then
+    die "$a, above $tdir, has an ACL that may let another account change it; refusing to write a credential there"
+  fi
+done
+# private PATH: no permission bit for group or others.
+private() {
+  [ -z "$(find "$1" -maxdepth 0 \( -perm -040 -o -perm -020 -o -perm -010 -o -perm -004 -o -perm -002 -o -perm -001 \) -print)" ]
+}
+if [ -L "$tdir" ] || [ ! -d "$tdir" ] || [ ! -O "$tdir" ]; then
+  die "$tdir is not a directory this user owns (or it is a symbolic link); refusing to write a credential there"
+fi
+if ! private "$tdir"; then
+  die "$tdir is open to group or others; refusing to write a credential there (chmod 700 it)"
+fi
+if has_acl "$tdir"; then
+  die "$tdir has an ACL, which may let another account into it; refusing to write a credential there (remove it: chmod -N on macOS, setfacl -b on Linux)"
+fi
+out="$tdir/kubeconfig"
 # The new credential is written to a private candidate and checked there. Only a
 # candidate that passes replaces the live kubeconfig, so a refused renewal leaves
 # the tunnel on the credential it already had.
 cand="$(mktemp "$out.XXXXXX")"
-trap 'RC=$?; set +e; rm -f "$cand" "$cand.expires"; exit "$RC"' EXIT
+# The candidate holds a service-account token. Leaving it behind is a defect, not
+# a best-effort cleanup (TXE-7864, the rule of txe's TXE-7858): when its removal
+# fails, or its absence cannot be proved, the script fails, and an earlier
+# failure keeps its own status. Absence is proved, never inferred from rm's
+# status: the parent can be searched and holds no entry by that name. A path
+# that became a symbolic link or a file of another account is reported too: its
+# link is removed, never followed, and the run fails. The candidate and its
+# .expires are one pair, checked and reported together. The message names the
+# path only, never the token or the file's contents.
+cand_absent() {
+  [ -d "${1%/*}" ] && [ -x "${1%/*}" ] && [ ! -e "$1" ] && [ ! -L "$1" ]
+}
+cleanup() {
+  local p
+  for p in "$cand" "$cand.expires"; do
+    if [ -L "$p" ] || { [ -e "$p" ] && [ ! -O "$p" ]; }; then
+      printf 'txe-dagu: FATAL: %s (a tunnel credential candidate) was replaced by a symbolic link or a file of another account; it was not written through, and only that entry is removed\n' "$p" >&2
+      [ "${RC:-0}" -ne 0 ] || RC=1
+    fi
+    if ! rm -f -- "$p" || ! cand_absent "$p"; then
+      printf 'txe-dagu: FATAL: %s (a token-bearing tunnel credential candidate) may still be on disk: its removal failed or its absence could not be verified (rm'"'"'s error, if any, is above); remove it\n' "$p" >&2
+      [ "${RC:-0}" -ne 0 ] || RC=1
+    fi
+  done
+}
+trap 'RC=$?; set +e; cleanup; exit "$RC"' EXIT
 
 # The token goes straight from kubectl into the file through python's stdin; it is
 # never in an argument, an environment variable or the terminal.
 kubectl --context "$ctx" -n "$TXE_DAGU_NAMESPACE" create token "$TXE_DAGU_TUNNEL_SA" --duration "$duration" \
   | python3 -I -c '
-import base64, json, os, sys
+import base64, json, os, stat, sys
 out, server, ca, ns = sys.argv[1:]
 token = sys.stdin.read().strip()
 if not token:
@@ -71,20 +176,61 @@ config = {
                   "context": {"cluster": "txe-dagu", "user": "dagu-tunnel", "namespace": ns}}],
     "current-context": "txe-dagu-tunnel",
 }
-os.chmod(out, 0o600)
-with open(out, "w") as f:
+# The candidate is the private file mktemp made: never followed if it became a
+# link, and refused unless it is a regular file of this user, with one link and
+# no access for group or others. Its .expires is created new, never reused.
+try:
+    fd = os.open(out, os.O_WRONLY | os.O_NOFOLLOW)
+except OSError:
+    sys.exit("txe-dagu: the credential candidate is not the file this run made; refusing to write the credential")
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink != 1 or st.st_mode & 0o077:
+    sys.exit("txe-dagu: the credential candidate is not a private file of this user; refusing to write the credential")
+os.ftruncate(fd, 0)
+with os.fdopen(fd, "w") as f:
     json.dump(config, f)
-with open(out + ".expires", "w") as f:
+try:
+    efd = os.open(out + ".expires", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+except OSError:
+    sys.exit("txe-dagu: the credential candidate'"'"'s .expires already exists; refusing to reuse it")
+with os.fdopen(efd, "w") as f:
     f.write(str(claims.get("exp", "")) + "\n")
 ' "$cand" "$server" "$ca" "$TXE_DAGU_NAMESPACE"
+
+# The pair is still the private files the writer made: neither has become a
+# link (which kubectl and mv would follow or promote), another account's file,
+# or open to others. Checked before each use of the candidate and before it is
+# moved; the directory is this user's alone, so no other account can swap it
+# in between.
+cand_intact() {
+  local p
+  for p in "$cand" "$cand.expires"; do
+    if [ -L "$p" ] || [ ! -f "$p" ] || [ ! -O "$p" ] || ! private "$p"; then
+      die "the credential candidate $p is no longer the private file this run wrote; refusing to use it, kept the previous credential"
+    fi
+  done
+}
+cand_intact
 
 # Prove the credential does what the tunnel needs, and no more than that.
 kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i create pods --subresource=portforward >/dev/null \
   || die "the new credential cannot port-forward in $TXE_DAGU_NAMESPACE; kept the previous one"
+cand_intact
 if kubectl --kubeconfig "$cand" -n "$TXE_DAGU_NAMESPACE" auth can-i get secrets >/dev/null 2>&1; then
   die "the new credential can read Secrets; the dagu-tunnel Role is wider than intended; kept the previous one"
 fi
+# The kubeconfig and its .expires are a pair: when the second move fails, the
+# live .expires would name the old credential's expiry, so it is removed and
+# the run fails. Two renames are not one atomic step: if that removal fails
+# too, the pair disagrees, and the FATAL line names the stale file.
+cand_intact
 mv -f "$cand" "$out"
-mv -f "$cand.expires" "$out.expires"
+if ! mv -f "$cand.expires" "$out.expires"; then
+  if ! rm -f -- "$out.expires" || [ -e "$out.expires" ] || [ -L "$out.expires" ]; then
+    printf 'txe-dagu: FATAL: %s may still hold the previous credential'"'"'s expiry beside the new credential in %s: its removal failed (rm'"'"'s error, if any, is above); remove it\n' "$out.expires" "$out" >&2
+    die "the new credential is in $out, but its expiry record could not be moved beside it, and the old one could not be removed; run this script again"
+  fi
+  die "the new credential is in $out, but its expiry record could not be moved beside it; $out.expires was removed so that status.sh does not report the old expiry; run this script again"
+fi
 printf 'wrote %s (expires %s)\n' "$out" \
   "$(date -r "$(cat "$out.expires")" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"

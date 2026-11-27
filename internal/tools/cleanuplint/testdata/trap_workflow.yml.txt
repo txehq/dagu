@@ -10,6 +10,8 @@ jobs:
           trap 'RC=$?; docker rm -f "pg-$GITHUB_RUN_ID" >/dev/null || echo "::warning::could not remove pg"; exit "$RC"' EXIT
           go test ./...
       - run: trap 'rm -f "$probe"' EXIT # want:trap-status
+      # In a plain value the word trap is an argument where the shell reads one (TXE-7864).
+      - run: echo trap 'rm -f "$probe"' EXIT
       # A quoted run: value is unquoted by YAML before the shell reads it (connector review of PR 292).
       - run: "trap 'false' EXIT; true" # want:trap-status
       - run: 'trap ''rm -f "$probe"'' EXIT' # want:trap-status

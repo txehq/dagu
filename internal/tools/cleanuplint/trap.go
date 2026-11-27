@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -156,9 +157,23 @@ func lintTraps(s source) []Finding {
 			}
 			continue
 		}
-		out = mergeFindings(out, trapFindings(s.rel, strings.Join(seg, "\n")))
+		out = mergeFindings(out, trapFindings(s.rel, strings.Join(runValue(seg), "\n")))
 	}
 	return out
+}
+
+// runValue returns a run: block with its key blanked, so that a plain value
+// (run: trap ... EXIT) starts a command where the shell starts one: the
+// script begins after the key, not at the key (TXE-7864). Columns are kept.
+func runValue(seg []string) []string {
+	for i, l := range seg {
+		if m := yamlRunKeyRe.FindStringIndex(l); m != nil {
+			out := slices.Clone(seg)
+			out[i] = strings.Repeat(" ", m[1]) + l[m[1]:]
+			return out
+		}
+	}
+	return seg
 }
 
 // quotedRun decodes a run: block whose value is a YAML quoted scalar,
@@ -299,8 +314,10 @@ func trapFindings(rel, text string) []Finding {
 
 // shellCode returns body with its comments removed and the text inside
 // quotes blanked, so a redirection mentioned in a message or a comment is not
-// read as one (connector review of PR 292). Line breaks are kept.
+// read as one (connector review of PR 292). Line breaks are kept, except a
+// backslash-newline, which the shell removes (TXE-7864).
 func shellCode(body string) string {
+	body = joinContinuations(body)
 	// A quoted redirection target is still a target: 2>"/dev/null".
 	body = quotedTargetRe.ReplaceAllString(body, "$1/dev/null")
 	var out strings.Builder
@@ -393,9 +410,43 @@ func orGuarded(st string) bool {
 	return last == "||"
 }
 
+// joinContinuations removes each backslash-newline outside single quotes and
+// comments, as the shell does when it reads the text: a handler single-quoted
+// when the trap is set keeps those bytes, and the shell joins its lines only
+// when the handler runs (connector review of PR 292, TXE-7864). A comment
+// ends at its newline whatever precedes it, so a backslash there joins
+// nothing, and the next line stays code.
+func joinContinuations(s string) string {
+	if !strings.Contains(s, "\\\n") {
+		return s
+	}
+	var b strings.Builder
+	var z quoter
+	for i := 0; i < len(s); {
+		if z.q == 0 && s[i] == '#' && (i == 0 || strings.IndexByte(" \t\n;&|()", s[i-1]) >= 0) {
+			end := strings.IndexByte(s[i:], '\n')
+			if end < 0 {
+				end = len(s) - i
+			}
+			b.WriteString(s[i : i+end])
+			i += end
+			continue
+		}
+		if z.q != '\'' && s[i] == '\\' && i+1 < len(s) && s[i+1] == '\n' {
+			i += 2
+			continue
+		}
+		next, _ := z.step(s, i)
+		b.WriteString(s[i:min(next, len(s))])
+		i = next
+	}
+	return b.String()
+}
+
 // statements splits a handler at ; and newlines outside quotes, $( ), ${ }
 // and braces, dropping comments and blank statements.
 func statements(body string) []string {
+	body = joinContinuations(body)
 	var out []string
 	var z quoter
 	depth, last := 0, 0
@@ -440,41 +491,214 @@ func statements(body string) []string {
 func findTraps(text string) []trapCmd {
 	var out []trapCmd
 	var z quoter
+	// cmd: the next word is where the shell reads a command name; target:
+	// the next word is a redirection's target, so cmd is unchanged.
+	cmd, target := true, false
+	// bodyEnd: where the here-documents started on this line end. The rest
+	// of the line is still shell (cat <<EOF; trap ...), so the bodies are
+	// skipped at its newline (connector review of PR 293).
+	bodyEnd := -1
+	// wordEnd: the end of the last word read. Its inside is not read again
+	// (FOO=a\ b, 2>&1), except after a ( that starts a command in it,
+	// x=$(trap ...).
+	wordEnd := 0
+	forwards := map[string]bool{}
 	for i := 0; i < len(text); {
 		c := text[i]
+		if z.q == 0 {
+			if c == '\n' && bodyEnd > i {
+				i, bodyEnd = bodyEnd, -1
+				continue
+			}
+			if strings.HasPrefix(text[i:], "<<<") {
+				// A here-string: its word is a redirection's target, so the
+				// command position is unchanged (<<< in trap ...).
+				i += 3
+				for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+					i++
+				}
+				if i < len(text) {
+					_, i = wordAt(text, i)
+				}
+				continue
+			}
+			if strings.HasPrefix(text[i:], "<<") {
+				if end, n := heredocAt(text, i); n > 0 {
+					bodyEnd = max(bodyEnd, end)
+					i += n // the delimiter, like any target, keeps the position
+				} else {
+					i += 2 // a shift, $((1<<n)), or a here-document no line ends
+				}
+				continue
+			}
+			if strings.HasPrefix(text[i:], "\\\n") {
+				i += 2 // a line continuation is a blank: it starts no word
+				continue
+			}
+			wordStart := i == 0 || (i >= wordEnd && strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0) || text[i-1] == '('
+			if wordStart && c == '#' {
+				for i < len(text) && text[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			if wordStart && strings.IndexByte(" \t\n;&|()", c) < 0 {
+				w, wend := wordAt(text, i)
+				wordEnd = wend
+				switch {
+				case target:
+					// The target may run into the next operator: > a> b.
+					_, _, target = wordRedir(w)
+				case w == "{":
+					// A group or a function body starts a command, also
+					// after function name (function f { trap ...; }).
+					cmd = true
+				case !cmd:
+				case w == "trap" && wend < len(text) && (text[wend] == ' ' || text[wend] == '\t'):
+					words, end := commandWords(text, wend)
+					if t, ok := parseTrap(words); ok {
+						t.line = strings.Count(text[:i], "\n") + 1
+						out = append(out, t)
+					}
+					i, cmd = end, false
+					continue
+				default:
+					// A redirection in the word (>/dev/null, FOO=1> f, 2>&1)
+					// keeps the position when what comes before it does; an
+					// operator at the word's end takes the next word.
+					if before, ok, needs := wordRedir(w); ok && (before == "" || redirFDRe.MatchString(before) || keepsCommand(before)) {
+						target = needs
+					} else if !keepsCommand(w) && !forwardsArgs(text, w, forwards) {
+						cmd = false
+					}
+				}
+			}
+		}
 		next, plain := z.step(text, i)
-		if !plain {
-			i = next
-			continue
-		}
-		if c == '<' && strings.HasPrefix(text[i:], "<<<") {
-			i += 3 // a here-string: its word is read as any other
-			continue
-		}
-		if c == '<' && strings.HasPrefix(text[i:], "<<") {
-			i = skipHeredoc(text, i)
-			continue
-		}
-		wordStart := i == 0 || strings.IndexByte(" \t\n;&|(", text[i-1]) >= 0
-		if c == '#' && wordStart {
-			for next < len(text) && text[next] != '\n' {
-				next++
-			}
-			i = next
-			continue
-		}
-		if wordStart && strings.HasPrefix(text[i:], "trap") && i+4 < len(text) && (text[i+4] == ' ' || text[i+4] == '\t') {
-			words, end := commandWords(text, i+4)
-			if t, ok := parseTrap(words); ok {
-				t.line = strings.Count(text[:i], "\n") + 1
-				out = append(out, t)
-			}
-			i = end
-			continue
+		// Inside a word read whole, only a ( starts a command ($( ), <( )).
+		if plain && (c == '(' || i >= wordEnd && strings.IndexByte("\n;&|)", c) >= 0) {
+			cmd, target = true, false
 		}
 		i = next
 	}
 	return out
+}
+
+// The trap rule reads trap only where the shell reads a command name, not
+// an argument: echo trap false EXIT sets no trap (connector review of PR 292,
+// TXE-7864). A command starts at the start of the script and after a newline,
+// ;, &, | or a parenthesis (a subshell, $( ), or a case pattern); a reserved
+// word or command prefix (if, then, !, builtin, command, ...), an option, an
+// assignment (FOO="a b") and a redirection with its target (>/dev/null,
+// 2> err) keep the next word in command position. Where the text is
+// ambiguous, a & or a parenthesis inside a word, or a { after any word, the
+// next word is read as a command, so the rule reads a trap it is unsure of
+// rather than miss one. A backslash-newline is a blank, as it is to the
+// shell (connector review of PR 293).
+
+// keepsCommand reports a word after which the next word is still a command.
+func keepsCommand(w string) bool {
+	return commandPrefixes[w] || assignmentRe.MatchString(w) || strings.HasPrefix(w, "-")
+}
+
+// commandPrefixes are the words after which the next word is still a
+// command: reserved words, and builtins that run their arguments as one.
+var commandPrefixes = map[string]bool{
+	"if": true, "then": true, "else": true, "elif": true, "do": true,
+	"while": true, "until": true, "!": true, "time": true, "{": true,
+	"builtin": true, "command": true, "coproc": true,
+	// eval runs its arguments as a command in this shell: eval trap ...
+	// sets a trap (connector security review of PR 293).
+	"eval": true,
+}
+
+var (
+	// assignmentRe is a variable assignment written before a command.
+	assignmentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=`)
+	// redirFDRe is what may stand before a redirection operator in its own
+	// word: a descriptor (2>), a {varname} (exec {fd}>), or the & of &>.
+	redirFDRe = regexp.MustCompile(`^(?:[0-9]+|\{[A-Za-z_]\w*\}|&)$`)
+)
+
+// forwardsArgs reports a function the script defines that runs its
+// arguments as a command in this shell, run() { "$@"; }: run trap ... EXIT
+// sets a trap (connector security review of PR 293). memo caches the answer
+// per name.
+func forwardsArgs(text, name string, memo map[string]bool) bool {
+	if v, ok := memo[name]; ok {
+		return v
+	}
+	memo[name] = false
+	body, ok := funcBody(text, name)
+	if !ok {
+		return false
+	}
+	for _, st := range statements(body) {
+		for f := range strings.FieldsSeq(st) {
+			if allArgsRe.MatchString(f) {
+				memo[name] = true
+				return true
+			}
+			if !keepsCommand(f) {
+				break
+			}
+		}
+	}
+	return false
+}
+
+// allArgsRe is a word that expands to a function's arguments: "$@", $*,
+// "${@:2}".
+var allArgsRe = regexp.MustCompile(`^"?\$(?:[@*]|\{[@*][^}]*\})"?$`)
+
+// wordRedir finds the redirections of a word, outside quotes and $( ): it
+// returns the text before the first operator, whether there is one, and
+// whether the last one ends the word, so that its operand is the next word
+// (FOO=1> /dev/null, >/dev/null< /dev/null; connector review of PR 293).
+func wordRedir(w string) (before string, found, needsTarget bool) {
+	var z quoter
+	depth, first, opEnd := 0, -1, -1
+	for i := 0; i < len(w); {
+		next, plain := z.step(w, i)
+		if plain {
+			switch c := w[i]; {
+			case c == '(':
+				depth++
+			case c == ')' && depth > 0:
+				depth--
+			case depth == 0 && (c == '<' || c == '>'):
+				if first < 0 {
+					first = i
+				}
+				for next < len(w) && strings.IndexByte("<>&|", w[next]) >= 0 {
+					next++
+				}
+				opEnd = next
+			}
+		}
+		i = next
+	}
+	if first < 0 {
+		return w, false, false
+	}
+	return w[:first], true, opEnd >= len(w)
+}
+
+// wordAt returns the shell word that starts at i and the index past it. A
+// & or | of a redirection operator (>&, <&, >|) is part of the word.
+func wordAt(text string, i int) (string, int) {
+	var z quoter
+	j := i
+	for j < len(text) {
+		next, plain := z.step(text, j)
+		if plain && strings.IndexByte(" \t\n;&|)", text[j]) >= 0 &&
+			(j == i || strings.IndexByte("&|", text[j]) < 0 || strings.IndexByte("<>", text[j-1]) < 0) {
+			break
+		}
+		j = next
+	}
+	j = min(j, len(text))
+	return text[i:j], j
 }
 
 // commandWords reads the words of one simple command starting at i, up to a
@@ -543,7 +767,11 @@ func unquote(w string) (string, bool) {
 			i += end + 1
 		case '"':
 			for i++; i < len(w) && w[i] != '"'; i++ {
-				if w[i] == '\\' && i+1 < len(w) && strings.IndexByte("\"\\$`\n", w[i+1]) >= 0 {
+				if w[i] == '\\' && i+1 < len(w) && w[i+1] == '\n' {
+					i++ // a line continuation: the shell removes both
+					continue
+				}
+				if w[i] == '\\' && i+1 < len(w) && strings.IndexByte("\"\\$`", w[i+1]) >= 0 {
 					i++
 				} else if w[i] == '$' {
 					early = true
@@ -553,7 +781,9 @@ func unquote(w string) (string, bool) {
 		case '\\':
 			if i+1 < len(w) {
 				i++
-				b.WriteByte(w[i])
+				if w[i] != '\n' { // a line continuation: the shell removes both
+					b.WriteByte(w[i])
+				}
 			}
 		case '$':
 			early = true
@@ -567,20 +797,21 @@ func unquote(w string) (string, bool) {
 
 var heredocRe = regexp.MustCompile(`^<<(-?)[ \t]*(?:'([^']*)'|"([^"]*)"|\\?([A-Za-z_][\w]*))`)
 
-// skipHeredoc returns the index past the here-document that starts with the
-// << at i, or past the << alone when it does not start one or no line ends it
-// (an arithmetic shift, $((1<<n)), reads the same): a skip never hides the
+// heredocAt reads a here-document operator at i: n is the length of the
+// operator with its delimiter word, and end the index of the newline that
+// ends its body. n is 0 when << starts none or no line ends it (an
+// arithmetic shift, $((1<<n)), reads the same), so a skip never hides the
 // rest of a script. Its body is data: an apostrophe or the word trap in it is
 // not shell.
-func skipHeredoc(text string, i int) int {
+func heredocAt(text string, i int) (end, n int) {
 	m := heredocRe.FindStringSubmatch(text[i:])
 	if m == nil {
-		return i + 2
+		return 0, 0
 	}
 	delim := m[2] + m[3] + m[4]
 	nl := strings.IndexByte(text[i:], '\n')
 	if nl < 0 {
-		return len(text)
+		return len(text), len(m[0])
 	}
 	j := i + nl + 1
 	for j < len(text) {
@@ -589,11 +820,11 @@ func skipHeredoc(text string, i int) int {
 			end = len(text) - j
 		}
 		if strings.TrimSpace(text[j:j+end]) == delim {
-			return j + end
+			return j + end, len(m[0])
 		}
 		j += end + 1
 	}
-	return i + 2
+	return 0, 0
 }
 
 // funcBody returns the body of the shell function name, if the script
